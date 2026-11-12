@@ -16,6 +16,9 @@
   1. **`yadb-db` (Sharded SQL & Tablets):** Dual-channel YDB-style `DataShardTablet` writing WALs to `walPool` (`Mirror-3`) and flushing sorted SSTables to `dataPool` (`ReedSolomon 4+2`) with CAS generation fencing.
   2. **`yadb-s3` (Object Storage):** Multi-chunk S3 engine with strong read-after-write consistency, `Range` reads, and sorted prefix listing.
   3. **`yadb-block` (Virtual Disks):** Thin-provisioned Copy-on-Write 4 KiB block volumes.
+- **Zero-Dependency Embedded OKD-Style Web Console (`yadbd`):**
+  - Compiled directly into the `yadbd` binary (`GET /` or `/ui`, ~41 KB, zero external JS/CSS/CDN files).
+  - Includes Cluster Overview, Project/Namespace switcher, RBAC Subject impersonation bar, `+ Import YAML` (`Plan` dry-run & `Apply`), SQL Query Workbench, S3 Bucket Browser, and 4 KiB BlockVolume Hex/ASCII Inspector.
 
 ## Quickstart
 

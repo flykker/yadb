@@ -6,7 +6,7 @@ use std::time::Duration;
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
-use axum::response::{IntoResponse, Response};
+use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use clap::Parser;
@@ -20,6 +20,8 @@ use yadb_metakv::{KvCommand, LocalMetaKv, MetaError, RaftRpc, WatchEvent};
 use yadb_s3::{ObjectStoreEngine, S3Error};
 
 const CONTROL_STATE_KEY: &str = "/sys/control_plane_state";
+const EMBEDDED_UI_HTML: &str = include_str!("ui/index.html");
+const EMBEDDED_SAMPLE_YAML: &str = include_str!("../../../examples/platform.yaml");
 
 #[derive(Parser)]
 #[command(name = "yadbd", version, about = "YADB Unified Storage, SQL, S3 & Block Node Daemon")]
@@ -184,6 +186,17 @@ fn parse_range_header(val: &str, total_size: u64) -> Option<(u64, u64)> {
         end_s.parse().ok()?
     };
     Some((start, end))
+}
+
+async fn handle_ui() -> Html<&'static str> {
+    Html(EMBEDDED_UI_HTML)
+}
+
+async fn handle_sample_yaml() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/yaml; charset=utf-8")],
+        EMBEDDED_SAMPLE_YAML,
+    )
 }
 
 async fn handle_health(State(st): State<AppState>) -> impl IntoResponse {
@@ -742,10 +755,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let app = Router::new()
+        .route("/", get(handle_ui))
+        .route("/ui", get(handle_ui))
         .route("/healthz", get(handle_health))
         .route("/raft/status", get(handle_raft_status))
         .route("/raft/elect", post(handle_raft_elect))
         .route("/raft/rpc", post(handle_raft_rpc))
+        .route("/v1/sample-yaml", get(handle_sample_yaml))
         .route("/v1/status", get(handle_status))
         .route("/v1/plan", post(handle_plan))
         .route("/v1/apply", post(handle_apply))

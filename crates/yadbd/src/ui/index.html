@@ -1,0 +1,1154 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>YADB Console · OKD Style</title>
+<style>
+  :root {
+    --pf-masthead-bg: #151515;
+    --pf-sidebar-bg: #212427;
+    --pf-sidebar-active: #2b2f33;
+    --pf-accent: #ee0000;
+    --pf-blue: #0066cc;
+    --pf-blue-hover: #004080;
+    --pf-bg: #f0f0f0;
+    --pf-card: #ffffff;
+    --pf-border: #d2d2d2;
+    --pf-text: #151515;
+    --pf-muted: #6a6e73;
+    --pf-ok: #3e8635;
+    --pf-warn: #f0ab00;
+    --pf-danger: #c9190b;
+    --pf-code-bg: #1b1d21;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "RedHatText", "Segoe UI", Roboto, sans-serif;
+    background: var(--pf-bg);
+    color: var(--pf-text);
+    display: flex;
+    flex-direction: column;
+    min-height: 100vh;
+  }
+  /* OKD Top Masthead */
+  header.masthead {
+    height: 56px;
+    background: var(--pf-masthead-bg);
+    border-top: 3px solid var(--pf-accent);
+    color: #fff;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 14px;
+    position: sticky;
+    top: 0;
+    z-index: 100;
+    gap: 10px;
+  }
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-weight: 700;
+    letter-spacing: 0.3px;
+    font-size: 15px;
+    white-space: nowrap;
+  }
+  .brand-logo {
+    width: 26px;
+    height: 26px;
+    border-radius: 50%;
+    border: 3px solid var(--pf-accent);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 11px;
+    font-weight: 900;
+    color: #fff;
+    background: #290000;
+  }
+  .brand-sub {
+    color: #b8bbbe;
+    font-weight: 400;
+    font-size: 12px;
+  }
+  .menu-btn {
+    display: none;
+    background: transparent;
+    border: 1px solid #444;
+    color: #fff;
+    border-radius: 3px;
+    padding: 4px 8px;
+    font-size: 16px;
+    cursor: pointer;
+  }
+  .masthead-tools {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+  .pill {
+    font-size: 12px;
+    padding: 3px 9px;
+    border-radius: 12px;
+    background: #2b2f33;
+    color: #e0e0e0;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #5ba352;
+  }
+  .dot.follower { background: var(--pf-warn); }
+  .subject-box {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 12px;
+    color: #d2d2d2;
+  }
+  .subject-box select, .subject-box input {
+    background: #26292d;
+    color: #fff;
+    border: 1px solid #4f5255;
+    border-radius: 3px;
+    padding: 4px 7px;
+    font-size: 12px;
+  }
+  .btn {
+    border: 1px solid transparent;
+    border-radius: 3px;
+    padding: 6px 12px;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    background: var(--pf-blue);
+    color: #fff;
+    transition: background 0.12s;
+  }
+  .btn:hover { background: var(--pf-blue-hover); }
+  .btn-secondary {
+    background: #fff;
+    color: var(--pf-blue);
+    border-color: var(--pf-blue);
+  }
+  .btn-secondary:hover { background: #e7f1fa; }
+  .btn-danger {
+    background: var(--pf-danger);
+    color: #fff;
+  }
+  .btn-sm {
+    padding: 4px 9px;
+    font-size: 12px;
+  }
+  .btn-plus {
+    background: #26292d;
+    border: 1px solid #555;
+    color: #fff;
+    padding: 5px 10px;
+    font-size: 12px;
+  }
+  .btn-plus:hover { border-color: #fff; background: #363a40; }
+
+  /* Subheader Project Bar (OKD Namespace bar) */
+  .context-bar {
+    background: #fff;
+    border-bottom: 1px solid var(--pf-border);
+    padding: 8px 18px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+  .context-left {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 13px;
+  }
+  .context-left select {
+    padding: 4px 8px;
+    border: 1px solid #8a8d90;
+    border-radius: 3px;
+    font-size: 13px;
+    font-weight: 600;
+    background: #fff;
+  }
+  .badge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 11px;
+    font-weight: 700;
+    padding: 2px 7px;
+    border-radius: 10px;
+    color: #fff;
+    letter-spacing: 0.2px;
+  }
+  .b-pr { background: #0066cc; }
+  .b-sp { background: #6753ac; }
+  .b-db { background: #009596; }
+  .b-os { background: #ec7a08; }
+  .b-bv { background: #3e8635; }
+  .b-cl { background: #ee0000; }
+
+  /* Layout Shell */
+  .shell {
+    display: flex;
+    flex: 1;
+    min-height: calc(100vh - 97px);
+  }
+  nav.sidebar {
+    width: 235px;
+    background: var(--pf-sidebar-bg);
+    color: #d2d2d2;
+    flex-shrink: 0;
+    padding: 10px 0;
+    display: flex;
+    flex-direction: column;
+    user-select: none;
+  }
+  .nav-group {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.7px;
+    color: #8a8d90;
+    padding: 12px 18px 5px;
+    font-weight: 700;
+  }
+  .nav-item {
+    padding: 10px 18px;
+    font-size: 13.5px;
+    color: #e0e0e0;
+    cursor: pointer;
+    border-left: 3px solid transparent;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  .nav-item:hover {
+    background: var(--pf-sidebar-active);
+    color: #fff;
+  }
+  .nav-item.active {
+    background: var(--pf-sidebar-active);
+    border-left-color: var(--pf-blue);
+    color: #fff;
+    font-weight: 600;
+  }
+  .nav-count {
+    background: #3c3f42;
+    color: #d2d2d2;
+    border-radius: 10px;
+    padding: 1px 7px;
+    font-size: 11px;
+  }
+
+  /* Main Workspace */
+  main.content {
+    flex: 1;
+    padding: 20px;
+    overflow-x: auto;
+  }
+  .page-title {
+    margin: 0 0 16px;
+    font-size: 21px;
+    font-weight: 600;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 14px;
+    margin-bottom: 18px;
+  }
+  .card {
+    background: var(--pf-card);
+    border: 1px solid var(--pf-border);
+    border-radius: 3px;
+    padding: 15px 16px;
+    box-shadow: 0 1px 2px rgba(0,0,0,0.04);
+    margin-bottom: 16px;
+  }
+  .grid .card { margin-bottom: 0; }
+  .card-title {
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--pf-muted);
+    font-weight: 700;
+    margin-bottom: 8px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+  .stat-big {
+    font-size: 26px;
+    font-weight: 700;
+    color: var(--pf-text);
+  }
+  .stat-sub {
+    font-size: 12px;
+    color: var(--pf-muted);
+    margin-top: 4px;
+  }
+  .status-ok {
+    color: var(--pf-ok);
+    font-weight: 600;
+  }
+
+  /* Tables */
+  table.pf-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+  }
+  table.pf-table th {
+    text-align: left;
+    padding: 9px 10px;
+    border-bottom: 2px solid var(--pf-border);
+    color: var(--pf-muted);
+    font-weight: 700;
+    font-size: 12px;
+  }
+  table.pf-table td {
+    padding: 9px 10px;
+    border-bottom: 1px solid #ececec;
+    vertical-align: middle;
+  }
+  table.pf-table tr:hover td { background: #fafafa; }
+
+  /* Forms & Editors */
+  textarea.code-editor {
+    width: 100%;
+    min-height: 290px;
+    background: var(--pf-code-bg);
+    color: #f8f8f2;
+    border: 1px solid #3c3f42;
+    border-radius: 3px;
+    padding: 12px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12.5px;
+    line-height: 1.45;
+    resize: vertical;
+  }
+  .sql-editor { min-height: 105px !important; }
+  .toolbar {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    flex-wrap: wrap;
+    margin: 10px 0;
+  }
+  input.pf-input, select.pf-select {
+    padding: 6px 9px;
+    border: 1px solid #8a8d90;
+    border-radius: 3px;
+    font-size: 13px;
+    background: #fff;
+  }
+  pre.console-out {
+    background: var(--pf-code-bg);
+    color: #d4d4d4;
+    padding: 12px;
+    border-radius: 3px;
+    font-size: 12px;
+    overflow-x: auto;
+    margin: 10px 0 0;
+  }
+  .alert {
+    padding: 10px 12px;
+    border-radius: 3px;
+    border-left: 4px solid var(--pf-blue);
+    background: #e7f1fa;
+    font-size: 13px;
+    margin: 10px 0;
+  }
+  .alert.err {
+    border-left-color: var(--pf-danger);
+    background: #faeae8;
+    color: #7d1007;
+  }
+  .alert.ok {
+    border-left-color: var(--pf-ok);
+    background: #edf6eb;
+    color: #1e4f18;
+  }
+  .empty-box {
+    text-align: center;
+    padding: 28px 14px;
+    color: var(--pf-muted);
+    font-size: 13.5px;
+  }
+  .hidden { display: none !important; }
+
+  @media (max-width: 820px) {
+    .menu-btn { display: inline-block; }
+    .brand-sub { display: none; }
+    nav.sidebar {
+      position: fixed;
+      top: 56px;
+      bottom: 0;
+      left: 0;
+      z-index: 99;
+      transform: translateX(-100%);
+      transition: transform 0.18s ease;
+    }
+    nav.sidebar.open { transform: translateX(0); }
+    main.content { padding: 12px; }
+  }
+</style>
+</head>
+<body>
+
+<header class="masthead">
+  <div class="brand">
+    <button class="menu-btn" onclick="toggleNav()" title="Menu">☰</button>
+    <span class="brand-logo">Y</span>
+    <span>YADB Console</span>
+    <span class="brand-sub">OKD / Storage &amp; Tablet Platform</span>
+  </div>
+  <div class="masthead-tools">
+    <div class="pill" id="raft-pill" title="Raft Consensus Node Status">
+      <span class="dot" id="raft-dot"></span>
+      <span id="raft-label">Connecting...</span>
+    </div>
+    <div class="subject-box">
+      <span>Subject:</span>
+      <select id="subject-preset" onchange="onSubjectPreset()">
+        <option value="sa:billing-backend">sa:billing-backend (RW)</option>
+        <option value="user:auditor">user:auditor (RO)</option>
+        <option value="custom">Custom...</option>
+      </select>
+      <input id="subject-input" class="hidden" value="sa:billing-backend" style="width:140px" />
+    </div>
+    <button class="btn btn-plus" onclick="switchView('yaml')">＋ Import YAML</button>
+  </div>
+</header>
+
+<div class="context-bar">
+  <div class="context-left">
+    <span class="badge b-pr">PR</span>
+    <strong>Project:</strong>
+    <select id="project-filter" onchange="renderCurrent()">
+      <option value="__all__">All Projects</option>
+    </select>
+    <span id="gen-indicator" style="color:var(--pf-muted);margin-left:6px">Generation: 0</span>
+  </div>
+  <div style="display:flex;gap:8px;align-items:center">
+    <button class="btn btn-secondary btn-sm" onclick="refreshAll()">↻ Refresh</button>
+    <button class="btn btn-secondary btn-sm" onclick="electLeader()" title="Trigger Raft Leader Election on this node">⚡ Elect Leader</button>
+  </div>
+</div>
+
+<div class="shell">
+  <nav class="sidebar" id="sidebar">
+    <div class="nav-group">Home</div>
+    <div class="nav-item active" data-view="overview" onclick="switchView('overview')">
+      <span>Cluster Overview</span>
+    </div>
+    <div class="nav-item" data-view="yaml" onclick="switchView('yaml')">
+      <span>Import / Apply YAML</span>
+    </div>
+
+    <div class="nav-group">Workloads &amp; Data</div>
+    <div class="nav-item" data-view="databases" onclick="switchView('databases')">
+      <span>SQL Databases</span>
+      <span class="nav-count" id="cnt-db">0</span>
+    </div>
+    <div class="nav-item" data-view="s3" onclick="switchView('s3')">
+      <span>ObjectStores (S3)</span>
+      <span class="nav-count" id="cnt-os">0</span>
+    </div>
+    <div class="nav-item" data-view="blocks" onclick="switchView('blocks')">
+      <span>BlockVolumes</span>
+      <span class="nav-count" id="cnt-bv">0</span>
+    </div>
+
+    <div class="nav-group">Storage &amp; Access</div>
+    <div class="nav-item" data-view="pools" onclick="switchView('pools')">
+      <span>StoragePools &amp; Nodes</span>
+      <span class="nav-count" id="cnt-sp">0</span>
+    </div>
+    <div class="nav-item" data-view="projects" onclick="switchView('projects')">
+      <span>Projects &amp; RBAC</span>
+      <span class="nav-count" id="cnt-pr">0</span>
+    </div>
+  </nav>
+
+  <main class="content">
+    <!-- OVERVIEW -->
+    <section id="view-overview">
+      <h1 class="page-title">Cluster Overview</h1>
+      <div id="bootstrap-banner" class="alert hidden">
+        Cluster is currently unconfigured (Generation 0).
+        <button class="btn btn-sm" style="margin-left:10px" onclick="bootstrapSample()">Bootstrap Sample Platform YAML</button>
+      </div>
+      <div class="grid">
+        <div class="card">
+          <div class="card-title"><span>Cluster Status</span><span class="badge b-cl">CL</span></div>
+          <div class="stat-big status-ok" id="ov-cluster-name">Unconfigured</div>
+          <div class="stat-sub" id="ov-cluster-sub">0 failure domains</div>
+        </div>
+        <div class="card">
+          <div class="card-title"><span>Raft MetaKV</span><span>Consensus</span></div>
+          <div class="stat-big" id="ov-raft-role">-</div>
+          <div class="stat-sub" id="ov-raft-sub">Term 0 · Revision 0</div>
+        </div>
+        <div class="card">
+          <div class="card-title"><span>Storage Pools</span><span class="badge b-sp">SP</span></div>
+          <div class="stat-big" id="ov-pools-cnt">0</div>
+          <div class="stat-sub" id="ov-pools-sub">Mirror &amp; Reed-Solomon</div>
+        </div>
+        <div class="card">
+          <div class="card-title"><span>Tenant Inventory</span><span class="badge b-pr">PR</span></div>
+          <div class="stat-big" id="ov-inv-cnt">0</div>
+          <div class="stat-sub" id="ov-inv-sub">0 DB · 0 S3 · 0 Disk</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">Failure Domains &amp; Storage Topology</div>
+        <div id="ov-topology"></div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">Provisioned Resources in Selected Scope</div>
+        <div id="ov-resources"></div>
+      </div>
+    </section>
+
+    <!-- YAML IMPORT / RECONCILER -->
+    <section id="view-yaml" class="hidden">
+      <h1 class="page-title">Import / Reconcile Declarative YAML</h1>
+      <div class="card">
+        <div class="toolbar" style="margin-top:0">
+          <button class="btn btn-secondary btn-sm" onclick="loadSampleYaml()">Load Sample Platform YAML</button>
+          <button class="btn btn-secondary" onclick="runYamlPlan()">Plan (Dry-Run Diff)</button>
+          <button class="btn" onclick="runYamlApply()">Apply Manifests</button>
+        </div>
+        <textarea id="yaml-editor" class="code-editor" spellcheck="false" placeholder="apiVersion: yadb.io/v1alpha1&#10;kind: Project..."></textarea>
+        <div id="yaml-result"></div>
+      </div>
+    </section>
+
+    <!-- SQL DATABASES -->
+    <section id="view-databases" class="hidden">
+      <h1 class="page-title"><span class="badge b-db">DB</span> Sharded SQL Databases</h1>
+      <div class="card">
+        <div class="card-title">Declared Databases</div>
+        <div id="db-list"></div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">SQL Query Workbench (DataShard Tablets)</div>
+        <div class="toolbar">
+          <label>Target Database:</label>
+          <select id="sql-target-db" class="pf-select"></select>
+          <button class="btn btn-secondary btn-sm" onclick="setSqlPreset('show')">SHOW TABLES</button>
+          <button class="btn btn-secondary btn-sm" onclick="setSqlPreset('create')">Sample CREATE</button>
+          <button class="btn btn-secondary btn-sm" onclick="setSqlPreset('insert')">Sample UPSERT</button>
+          <button class="btn btn-secondary btn-sm" onclick="setSqlPreset('select')">Sample SELECT</button>
+          <button class="btn btn-secondary btn-sm" onclick="setSqlPreset('flush')">FLUSH TABLE</button>
+        </div>
+        <textarea id="sql-input" class="code-editor sql-editor" spellcheck="false">SHOW TABLES;</textarea>
+        <div class="toolbar">
+          <button class="btn" onclick="runSqlQuery()">▶ Run SQL</button>
+        </div>
+        <div id="sql-output"></div>
+      </div>
+    </section>
+
+    <!-- S3 OBJECT STORES -->
+    <section id="view-s3" class="hidden">
+      <h1 class="page-title"><span class="badge b-os">OS</span> ObjectStores (S3 Gateway)</h1>
+      <div class="card">
+        <div class="card-title">Declared ObjectStores</div>
+        <div id="s3-store-list"></div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">Bucket Object Browser</div>
+        <div class="toolbar">
+          <label>Store:</label>
+          <select id="s3-target-store" class="pf-select" onchange="syncS3Buckets()"></select>
+          <label>Bucket:</label>
+          <select id="s3-target-bucket" class="pf-select" onchange="listS3Objects()"></select>
+          <input id="s3-prefix" class="pf-input" placeholder="prefix (e.g. nov/)" style="width:150px" />
+          <button class="btn btn-secondary btn-sm" onclick="listS3Objects()">List Objects</button>
+        </div>
+        <div class="toolbar" style="border-top:1px solid #eee;padding-top:10px">
+          <input id="s3-put-key" class="pf-input" placeholder="object key (e.g. docs/readme.txt)" style="width:220px" />
+          <input id="s3-put-body" class="pf-input" placeholder="text content to upload..." style="flex:1;min-width:180px" />
+          <button class="btn btn-sm" onclick="uploadS3Text()">Upload Object</button>
+        </div>
+        <div id="s3-msg"></div>
+        <div id="s3-objects-table"></div>
+        <pre id="s3-preview" class="console-out hidden"></pre>
+      </div>
+    </section>
+
+    <!-- BLOCK VOLUMES -->
+    <section id="view-blocks" class="hidden">
+      <h1 class="page-title"><span class="badge b-bv">BV</span> Thin-Provisioned BlockVolumes</h1>
+      <div class="card">
+        <div class="card-title">Declared BlockVolumes</div>
+        <div id="bv-list"></div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">Block Extent Inspector (4 KiB Copy-on-Write)</div>
+        <div class="toolbar">
+          <label>Volume:</label>
+          <select id="bv-target" class="pf-select"></select>
+          <label>Offset:</label>
+          <input id="bv-offset" type="number" class="pf-input" value="0" style="width:110px" />
+          <label>Read Len:</label>
+          <input id="bv-len" type="number" class="pf-input" value="64" style="width:90px" />
+          <button class="btn btn-secondary btn-sm" onclick="readBlock()">Read Bytes</button>
+        </div>
+        <div class="toolbar">
+          <input id="bv-write-data" class="pf-input" placeholder="UTF-8 payload to write at offset..." style="flex:1" />
+          <button class="btn btn-sm" onclick="writeBlock()">Write at Offset</button>
+        </div>
+        <div id="bv-output"></div>
+      </div>
+    </section>
+
+    <!-- STORAGE POOLS -->
+    <section id="view-pools" class="hidden">
+      <h1 class="page-title"><span class="badge b-sp">SP</span> StoragePools &amp; Erasure Coding</h1>
+      <div class="card">
+        <div class="card-title">Configured Storage Pools</div>
+        <div id="sp-list"></div>
+      </div>
+      <div class="card">
+        <div class="card-title">Cluster Nodes &amp; Volume Mounts</div>
+        <div id="sp-nodes"></div>
+      </div>
+    </section>
+
+    <!-- PROJECTS & RBAC -->
+    <section id="view-projects" class="hidden">
+      <h1 class="page-title"><span class="badge b-pr">PR</span> Projects, Quotas &amp; RBAC Bindings</h1>
+      <div class="card">
+        <div id="pr-list"></div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<script>
+let state = { generation: 0, pools: {}, projects: {}, databases: {}, object_stores: {}, block_volumes: {}, cluster: null };
+let raft = { node_id: 1, role: "Unknown", term: 0, leader_id: null, commit_index: 0, metakv_revision: 0 };
+let currentView = "overview";
+
+function esc(v) {
+  return String(v ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function fmtBytes(n) {
+  if (n == null) return "Unlimited";
+  const u = ["B", "KiB", "MiB", "GiB", "TiB"];
+  let i = 0, val = Number(n);
+  while (val >= 1024 && i < u.length - 1) { val /= 1024; i++; }
+  return (i === 0 ? val : val.toFixed(1)) + " " + u[i];
+}
+
+function activeSubject() {
+  const sel = document.getElementById("subject-preset").value;
+  return sel === "custom"
+    ? (document.getElementById("subject-input").value.trim() || "anonymous")
+    : sel;
+}
+
+function onSubjectPreset() {
+  const sel = document.getElementById("subject-preset").value;
+  const inp = document.getElementById("subject-input");
+  inp.classList.toggle("hidden", sel !== "custom");
+}
+
+function selectedProject() {
+  return document.getElementById("project-filter").value;
+}
+
+function inProjectScope(fullKey) {
+  const p = selectedProject();
+  if (p === "__all__") return true;
+  return fullKey.split("/")[0] === p;
+}
+
+function toggleNav() {
+  document.getElementById("sidebar").classList.toggle("open");
+}
+
+function switchView(v) {
+  currentView = v;
+  document.getElementById("sidebar").classList.remove("open");
+  document.querySelectorAll(".nav-item").forEach(el => {
+    el.classList.toggle("active", el.dataset.view === v);
+  });
+  ["overview", "yaml", "databases", "s3", "blocks", "pools", "projects"].forEach(id => {
+    document.getElementById("view-" + id).classList.toggle("hidden", id !== v);
+  });
+  renderCurrent();
+}
+
+async function api(path, opts = {}) {
+  const headers = Object.assign({ "x-yadb-subject": activeSubject() }, opts.headers || {});
+  const res = await fetch(path, Object.assign({}, opts, { headers }));
+  const text = await res.text();
+  let json = null;
+  try { json = JSON.parse(text); } catch (_) {}
+  return { ok: res.ok, status: res.status, text, json };
+}
+
+async function refreshAll() {
+  const [h, s] = await Promise.all([api("/healthz"), api("/v1/status")]);
+  if (h.ok && h.json) raft = h.json;
+  if (s.ok && s.json) state = s.json;
+
+  // Update Masthead Raft Pill
+  const dot = document.getElementById("raft-dot");
+  dot.className = "dot" + (raft.role === "Leader" ? "" : " follower");
+  document.getElementById("raft-label").textContent =
+    `Node #${raft.node_id} · ${raft.role} · Term ${raft.term}`;
+  document.getElementById("gen-indicator").textContent =
+    `Generation: ${state.generation} · Rev: ${raft.metakv_revision ?? 0}`;
+
+  // Update Project Selector preserving selection
+  const pf = document.getElementById("project-filter");
+  const prev = pf.value || "__all__";
+  const projNames = Object.keys(state.projects || {});
+  pf.innerHTML = `<option value="__all__">All Projects (${projNames.length})</option>` +
+    projNames.map(p => `<option value="${esc(p)}">${esc(p)}</option>`).join("");
+  if (projNames.includes(prev)) pf.value = prev;
+
+  // Update Sidebar Counters
+  document.getElementById("cnt-db").textContent = Object.keys(state.databases || {}).length;
+  document.getElementById("cnt-os").textContent = Object.keys(state.object_stores || {}).length;
+  document.getElementById("cnt-bv").textContent = Object.keys(state.block_volumes || {}).length;
+  document.getElementById("cnt-sp").textContent = Object.keys(state.pools || {}).length;
+  document.getElementById("cnt-pr").textContent = projNames.length;
+
+  renderCurrent();
+}
+
+function renderCurrent() {
+  renderOverview();
+  if (currentView === "databases") renderDatabases();
+  if (currentView === "s3") renderS3();
+  if (currentView === "blocks") renderBlocks();
+  if (currentView === "pools") renderPools();
+  if (currentView === "projects") renderProjects();
+}
+
+function formatErasure(er) {
+  if (!er) return "-";
+  if (er.scheme === "mirror") return `Mirror (${er.replicas}x replicas)`;
+  if (er.scheme === "reed-solomon") return `Reed-Solomon (k=${er.k}, m=${er.m})`;
+  return JSON.stringify(er);
+}
+
+function renderOverview() {
+  const unconf = state.generation === 0;
+  document.getElementById("bootstrap-banner").classList.toggle("hidden", !unconf);
+
+  if (state.cluster) {
+    const [meta, spec] = state.cluster;
+    document.getElementById("ov-cluster-name").textContent = meta.name;
+    const doms = spec.domains || [];
+    const nodes = doms.reduce((a, d) => a + (d.nodes || []).length, 0);
+    document.getElementById("ov-cluster-sub").textContent =
+      `${doms.length} failure domains · ${nodes} nodes`;
+
+    document.getElementById("ov-topology").innerHTML = `
+      <table class="pf-table">
+        <thead><tr><th>Failure Domain</th><th>Node ID</th><th>Address</th><th>Filesystem Mounts</th></tr></thead>
+        <tbody>
+          ${doms.flatMap(d => (d.nodes || []).map(n => `
+            <tr>
+              <td><strong>${esc(d.name)}</strong></td>
+              <td>#${n.id}</td>
+              <td><code>${esc(n.addr)}</code></td>
+              <td>${(n.mounts || []).map(m => `<code>${esc(m)}</code>`).join(", ")}</td>
+            </tr>
+          `)).join("")}
+        </tbody>
+      </table>`;
+  } else {
+    document.getElementById("ov-cluster-name").textContent = "Unconfigured";
+    document.getElementById("ov-cluster-sub").textContent = "Import YAML to initialize";
+    document.getElementById("ov-topology").innerHTML = `<div class="empty-box">No cluster topology declared yet.</div>`;
+  }
+
+  document.getElementById("ov-raft-role").textContent = raft.role || "-";
+  document.getElementById("ov-raft-sub").textContent =
+    `Leader: ${raft.leader_id ?? "-"} · Term ${raft.term} · Commit #${raft.commit_index}`;
+
+  const poolKeys = Object.keys(state.pools || {});
+  document.getElementById("ov-pools-cnt").textContent = poolKeys.length;
+  document.getElementById("ov-pools-sub").textContent = poolKeys.join(", ") || "No pools";
+
+  const dbs = Object.entries(state.databases || {}).filter(([k]) => inProjectScope(k));
+  const oss = Object.entries(state.object_stores || {}).filter(([k]) => inProjectScope(k));
+  const bvs = Object.entries(state.block_volumes || {}).filter(([k]) => inProjectScope(k));
+  document.getElementById("ov-inv-cnt").textContent = dbs.length + oss.length + bvs.length;
+  document.getElementById("ov-inv-sub").textContent =
+    `${dbs.length} Databases · ${oss.length} ObjectStores · ${bvs.length} BlockVolumes`;
+
+  const rows = [
+    ...dbs.map(([k, v]) => `<tr><td><span class="badge b-db">DB</span> <strong>${esc(k)}</strong></td><td>SQL Sharded (${v.shards} shards)</td><td>WAL: <code>${esc(v.walPool)}</code> · Data: <code>${esc(v.dataPool)}</code></td><td><button class="btn btn-secondary btn-sm" onclick="switchView('databases')">Open SQL</button></td></tr>`),
+    ...oss.map(([k, v]) => `<tr><td><span class="badge b-os">OS</span> <strong>${esc(k)}</strong></td><td>S3 ObjectStore</td><td>Pool: <code>${esc(v.pool)}</code> · Buckets: ${(v.buckets||[]).map(esc).join(", ")}</td><td><button class="btn btn-secondary btn-sm" onclick="switchView('s3')">Browse S3</button></td></tr>`),
+    ...bvs.map(([k, v]) => `<tr><td><span class="badge b-bv">BV</span> <strong>${esc(k)}</strong></td><td>BlockVolume (${fmtBytes(v.sizeBytes)})</td><td>Pool: <code>${esc(v.pool)}</code></td><td><button class="btn btn-secondary btn-sm" onclick="switchView('blocks')">Inspect</button></td></tr>`)
+  ];
+  document.getElementById("ov-resources").innerHTML = rows.length
+    ? `<table class="pf-table"><thead><tr><th>Resource</th><th>Type</th><th>Storage Mapping</th><th>Action</th></tr></thead><tbody>${rows.join("")}</tbody></table>`
+    : `<div class="empty-box">No workload resources in current project scope.</div>`;
+}
+
+async function loadSampleYaml() {
+  const r = await api("/v1/sample-yaml");
+  if (r.ok) document.getElementById("yaml-editor").value = r.text;
+}
+
+async function bootstrapSample() {
+  await loadSampleYaml();
+  switchView("yaml");
+  await runYamlApply();
+}
+
+function renderDiffOps(title, ops, gen) {
+  const lines = (ops || []).map(op => {
+    if (op.Create) return `<div style="color:#73bcf7">+ create    ${esc(op.Create.key)}</div>`;
+    if (op.Update) return `<div style="color:#f0ab00">~ update    ${esc(op.Update.key)}</div>`;
+    if (op.Unchanged) return `<div style="color:#8a8d90">= unchanged ${esc(op.Unchanged.key)}</div>`;
+    return `<div>${esc(JSON.stringify(op))}</div>`;
+  }).join("");
+  return `<div class="alert ok">${esc(title)} (Generation → <strong>${gen}</strong>)</div><pre class="console-out">${lines}</pre>`;
+}
+
+async function runYamlPlan() {
+  const yaml = document.getElementById("yaml-editor").value;
+  const r = await api("/v1/plan", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ yaml })
+  });
+  const box = document.getElementById("yaml-result");
+  if (!r.ok) {
+    box.innerHTML = `<div class="alert err">Plan failed (${r.status}): ${esc(r.json?.error || r.text)}</div>`;
+    return;
+  }
+  box.innerHTML = renderDiffOps("Dry-Run Plan Validated", r.json.ops, r.json.next_generation);
+}
+
+async function runYamlApply() {
+  const yaml = document.getElementById("yaml-editor").value;
+  const r = await api("/v1/apply", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ yaml })
+  });
+  const box = document.getElementById("yaml-result");
+  if (!r.ok) {
+    box.innerHTML = `<div class="alert err">Apply failed (${r.status}): ${esc(r.json?.error || r.text)}</div>`;
+    return;
+  }
+  box.innerHTML = renderDiffOps("Manifests Reconciled & Committed", r.json.ops, r.json.generation);
+  await refreshAll();
+}
+
+async function electLeader() {
+  await api("/raft/elect", { method: "POST" });
+  await refreshAll();
+}
+
+/* SQL Databases */
+function renderDatabases() {
+  const entries = Object.entries(state.databases || {}).filter(([k]) => inProjectScope(k));
+  document.getElementById("db-list").innerHTML = entries.length ? `
+    <table class="pf-table">
+      <thead><tr><th>Project / Name</th><th>Shards</th><th>WAL Pool (ch=1)</th><th>Data Pool (ch=2)</th><th>Isolation</th></tr></thead>
+      <tbody>${entries.map(([k, d]) => `
+        <tr>
+          <td><strong>${esc(k)}</strong></td>
+          <td>${d.shards}</td>
+          <td><code>${esc(d.walPool)}</code></td>
+          <td><code>${esc(d.dataPool)}</code></td>
+          <td>${esc(d.isolation)}</td>
+        </tr>`).join("")}
+      </tbody>
+    </table>` : `<div class="empty-box">No SQL Databases declared.</div>`;
+
+  const sel = document.getElementById("sql-target-db");
+  const prev = sel.value;
+  sel.innerHTML = entries.map(([k]) => `<option value="${esc(k)}">${esc(k)}</option>`).join("");
+  if (entries.some(([k]) => k === prev)) sel.value = prev;
+}
+
+function setSqlPreset(kind) {
+  const presets = {
+    show: "SHOW TABLES;",
+    create: "CREATE TABLE IF NOT EXISTS accounts (id INT PRIMARY KEY, owner TEXT, balance INT, active BOOL);",
+    insert: "UPSERT INTO accounts VALUES (101, 'alice', 5400, true), (102, 'bob', 2150, true), (103, 'carol', 8900, false);",
+    select: "SELECT id, owner, balance, active FROM accounts ORDER BY balance DESC;",
+    flush: "FLUSH TABLE accounts;"
+  };
+  document.getElementById("sql-input").value = presets[kind] || "";
+}
+
+async function runSqlQuery() {
+  const target = document.getElementById("sql-target-db").value;
+  const out = document.getElementById("sql-output");
+  if (!target) {
+    out.innerHTML = `<div class="alert err">No Database available. Apply YAML first.</div>`;
+    return;
+  }
+  const [proj, db] = target.split("/");
+  const sql = document.getElementById("sql-input").value;
+  const r = await api(`/db/${encodeURIComponent(proj)}/${encodeURIComponent(db)}/query`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ sql })
+  });
+  if (!r.ok) {
+    out.innerHTML = `<div class="alert err">HTTP ${r.status}: ${esc(r.json?.error || r.text)}</div>`;
+    return;
+  }
+  const qr = r.json;
+  if (!qr.columns || qr.columns.length === 0) {
+    out.innerHTML = `<div class="alert ok">Statement executed · <strong>rows_affected = ${qr.rows_affected}</strong></div>`;
+    return;
+  }
+  out.innerHTML = `
+    <div class="stat-sub" style="margin:8px 0">${qr.rows.length} row(s) returned as <code>${esc(activeSubject())}</code></div>
+    <table class="pf-table">
+      <thead><tr>${qr.columns.map(c => `<th>${esc(c)}</th>`).join("")}</tr></thead>
+      <tbody>${qr.rows.map(row => `<tr>${row.map(v => `<td>${esc(v === null ? "NULL" : v)}</td>`).join("")}</tr>`).join("")}</tbody>
+    </table>`;
+}
+
+/* S3 ObjectStores */
+function renderS3() {
+  const entries = Object.entries(state.object_stores || {}).filter(([k]) => inProjectScope(k));
+  document.getElementById("s3-store-list").innerHTML = entries.length ? `
+    <table class="pf-table">
+      <thead><tr><th>Project / Store</th><th>Storage Pool</th><th>Declared Buckets</th><th>Isolation</th></tr></thead>
+      <tbody>${entries.map(([k, s]) => `
+        <tr>
+          <td><strong>${esc(k)}</strong></td>
+          <td><code>${esc(s.pool)}</code></td>
+          <td>${(s.buckets || []).map(b => `<code>${esc(b)}</code>`).join(", ")}</td>
+          <td>${esc(s.isolation)}</td>
+        </tr>`).join("")}
+      </tbody>
+    </table>` : `<div class="empty-box">No ObjectStores declared.</div>`;
+
+  const sel = document.getElementById("s3-target-store");
+  const prev = sel.value;
+  sel.innerHTML = entries.map(([k]) => `<option value="${esc(k)}">${esc(k)}</option>`).join("");
+  if (entries.some(([k]) => k === prev)) sel.value = prev;
+  syncS3Buckets();
+}
+
+function syncS3Buckets() {
+  const key = document.getElementById("s3-target-store").value;
+  const spec = (state.object_stores || {})[key];
+  const bsel = document.getElementById("s3-target-bucket");
+  const prev = bsel.value;
+  const buckets = spec?.buckets || [];
+  bsel.innerHTML = buckets.map(b => `<option value="${esc(b)}">${esc(b)}</option>`).join("");
+  if (buckets.includes(prev)) bsel.value = prev;
+  if (buckets.length) listS3Objects();
+}
+
+async function listS3Objects() {
+  const target = document.getElementById("s3-target-store").value;
+  const bucket = document.getElementById("s3-target-bucket").value;
+  const prefix = document.getElementById("s3-prefix").value.trim();
+  const tbl = document.getElementById("s3-objects-table");
+  if (!target || !bucket) { tbl.innerHTML = ""; return; }
+  const [proj, store] = target.split("/");
+  const r = await api(`/s3/${proj}/${store}/${bucket}?prefix=${encodeURIComponent(prefix)}`);
+  if (!r.ok) {
+    tbl.innerHTML = `<div class="alert err">S3 List failed (${r.status}): ${esc(r.json?.error || r.text)}</div>`;
+    return;
+  }
+  const objs = r.json.objects || [];
+  tbl.innerHTML = objs.length ? `
+    <table class="pf-table">
+      <thead><tr><th>Key</th><th>Size</th><th>ETag</th><th>Version</th><th>Actions</th></tr></thead>
+      <tbody>${objs.map(o => `
+        <tr>
+          <td><code>${esc(o.key)}</code></td>
+          <td>${fmtBytes(o.size)}</td>
+          <td><code>${esc(o.etag)}</code></td>
+          <td>v${o.version}</td>
+          <td>
+            <button class="btn btn-secondary btn-sm" onclick="previewS3Object('${esc(o.key)}')">Preview</button>
+            <button class="btn btn-danger btn-sm" onclick="deleteS3Object('${esc(o.key)}')">Delete</button>
+          </td>
+        </tr>`).join("")}
+      </tbody>
+    </table>` : `<div class="empty-box">Bucket <code>${esc(bucket)}</code> has no matching objects.</div>`;
+}
+
+async function uploadS3Text() {
+  const target = document.getElementById("s3-target-store").value;
+  const bucket = document.getElementById("s3-target-bucket").value;
+  const key = document.getElementById("s3-put-key").value.trim().replace(/^\/+/, "");
+  const body = document.getElementById("s3-put-body").value;
+  const msg = document.getElementById("s3-msg");
+  if (!target || !bucket || !key) {
+    msg.innerHTML = `<div class="alert err">Specify store, bucket, and object key.</div>`;
+    return;
+  }
+  const [proj, store] = target.split("/");
+  const r = await api(`/s3/${proj}/${store}/${bucket}/${key}`, {
+    method: "PUT",
+    headers: { "Content-Type": "text/plain; charset=utf-8" },
+    body
+  });
+  if (!r.ok) {
+    msg.innerHTML = `<div class="alert err">PUT denied/failed (${r.status}): ${esc(r.json?.error || r.text)}</div>`;
+    return;
+  }
+  msg.innerHTML = `<div class="alert ok">Uploaded <code>${esc(key)}</code> (${r.json.size} B, pool=${esc(r.json.pool)})</div>`;
+  await listS3Objects();
+}
+
+async function previewS3Object(key) {
+  const [proj, store] = document.getElementById("s3-target-store").value.split("/");
+  const bucket = document.getElementById("s3-target-bucket").value;
+  const r = await api(`/s3/${proj}/${store}/${bucket}/${key}`);
+  const pre = document.getElementById("s3-preview");
+  pre.classList.remove("hidden");
+  pre.textContent = r.ok ? `// s3://${bucket}/${key}\n` + r.text : `Error (${r.status}): ${r.text}`;
+}
+
+async function deleteS3Object(key) {
+  const [proj, store] = document.getElementById("s3-target-store").value.split("/");
+  const bucket = document.getElementById("s3-target-bucket").value;
+  const r = await api(`/s3/${proj}/${store}/${bucket}/${key}`, { method: "DELETE" });
+  const msg = document.getElementById("s3-msg");
+  if (!r.ok) {
+    msg.innerHTML = `<div class="alert err">DELETE denied/failed (${r.status}): ${esc(r.json?.error || r.text)}</div>`;
+    return;
+  }
+  msg.innerHTML = `<div class="alert ok">Deleted <code>${esc(key)}</code></div>`;
+  document.getElementById("s3-preview").classList.add("hidden");
+  await listS3Objects();
+}
+
+/* BlockVolumes */
+function renderBlocks() {
+  const entries = Object.entries(state.block_volumes || {}).filter(([k]) => inProjectScope(k));
+  document.getElementById("bv-list").innerHTML = entries.length ? `
+    <table class="pf-table">
+      <thead><tr><th>Project / Volume</th><th>Storage Pool</th><th>Provisioned Size</th></tr></thead>
+      <tbody>${entries.map(([k, v]) => `
+        <tr>
+          <td><strong>${esc(k)}</strong></td>
+          <td><code>${esc(v.pool)}</code></td>
+          <td>${fmtBytes(v.sizeBytes)}</td>
+        </tr>`).join("")}
+      </tbody>
+    </table>` : `<div class="empty-box">No BlockVolumes declared.</div>`;
+
+  const sel = document.getElementById("bv-target");
+  const prev = sel.value;
+  sel.innerHTML = entries.map(([k]) => `<option value="${esc(k)}">${esc(k)}</option>`).join("");
+  if (entries.some(([k]) => k === prev)) sel.value = prev;
+}
+
+async function writeBlock() {
+  const target = document.getElementById("bv-target").value;
+  const offset = Number(document.getElementById("bv-offset").value || 0);
+  const data = document.getElementById("bv-write-data").value;
+  const out = document.getElementById("bv-output");
+  if (!target) return;
+  const [proj, vol] = target.split("/");
+  const r = await api(`/block/${proj}/${vol}?offset=${offset}`, { method: "PUT", body: data });
+  out.innerHTML = r.ok
+    ? `<div class="alert ok">Wrote ${r.json.bytes_written} bytes at offset ${r.json.offset}</div>`
+    : `<div class="alert err">Write failed (${r.status}): ${esc(r.json?.error || r.text)}</div>`;
+}
+
+async function readBlock() {
+  const target = document.getElementById("bv-target").value;
+  const offset = Number(document.getElementById("bv-offset").value || 0);
+  const len = Number(document.getElementById("bv-len").value || 64);
+  const out = document.getElementById("bv-output");
+  if (!target) return;
+  const [proj, vol] = target.split("/");
+  const res = await fetch(`/block/${proj}/${vol}?offset=${offset}&len=${len}`, {
+    headers: { "x-yadb-subject": activeSubject() }
+  });
+  if (!res.ok) {
+    const t = await res.text();
+    out.innerHTML = `<div class="alert err">Read failed (${res.status}): ${esc(t)}</div>`;
+    return;
+  }
+  const buf = new Uint8Array(await res.arrayBuffer());
+  const hex = Array.from(buf.slice(0, 128)).map(b => b.toString(16).padStart(2, "0")).join(" ");
+  const ascii = Array.from(buf.slice(0, 128)).map(b => (b >= 32 && b <= 126) ? String.fromCharCode(b) : ".").join("");
+  out.innerHTML = `<pre class="console-out">Offset ${offset}..${offset + buf.length} (${buf.length} bytes)\nHEX  : ${esc(hex)}\nASCII: ${esc(ascii)}</pre>`;
+}
+
+/* Storage Pools */
+function renderPools() {
+  const entries = Object.entries(state.pools || {});
+  document.getElementById("sp-list").innerHTML = entries.length ? `
+    <table class="pf-table">
+      <thead><tr><th>Pool Name</th><th>Redundancy / Erasure Scheme</th><th>Required Failure Domains</th></tr></thead>
+      <tbody>${entries.map(([k, p]) => `
+        <tr>
+          <td><span class="badge b-sp">SP</span> <strong>${esc(k)}</strong></td>
+          <td>${esc(formatErasure(p.erasure))}</td>
+          <td>${p.failureDomains}</td>
+        </tr>`).join("")}
+      </tbody>
+    </table>` : `<div class="empty-box">No StoragePools configured.</div>`;
+
+  document.getElementById("sp-nodes").innerHTML = document.getElementById("ov-topology").innerHTML;
+}
+
+/* Projects & RBAC */
+function renderProjects() {
+  const entries = Object.entries(state.projects || {});
+  document.getElementById("pr-list").innerHTML = entries.length ? `
+    <table class="pf-table">
+      <thead><tr><th>Project</th><th>Internal ID</th><th>Max Storage Quota</th><th>Max IOPS</th><th>RBAC Members</th></tr></thead>
+      <tbody>${entries.map(([name, [pid, spec]]) => `
+        <tr>
+          <td><span class="badge b-pr">PR</span> <strong>${esc(name)}</strong></td>
+          <td><code>#${pid}</code></td>
+          <td>${fmtBytes(spec.quotas?.maxStorageBytes)}</td>
+          <td>${spec.quotas?.maxIops ?? "Unlimited"}</td>
+          <td>${(spec.members || []).map(m => `<code>${esc(m.subject)}</code> (${esc(m.role)})`).join("<br/>")}</td>
+        </tr>`).join("")}
+      </tbody>
+    </table>` : `<div class="empty-box">No Projects declared.</div>`;
+}
+
+loadSampleYaml();
+refreshAll();
+setInterval(refreshAll, 5000);
+</script>
+</body>
+</html>
