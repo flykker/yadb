@@ -22,7 +22,9 @@ pub enum MetaError {
     #[error("node is not Raft leader (known leader: {leader:?})")]
     NotLeader { leader: Option<u32> },
 
-    #[error("log index {0} is not yet committed by quorum")]
+    /// No confirmed result for the original proposal. It may still commit, or a
+    /// later leader may replace it; callers must not interpret this as rollback.
+    #[error("no confirmed result for proposal at log index {0}; write outcome is unknown")]
     UncommittedIndex(u64),
 }
 
@@ -159,6 +161,70 @@ mod tests {
         for id in 1..=3 {
             assert_eq!(cluster.nodes[&id].get("committed").unwrap().value, b"before");
             assert_eq!(cluster.nodes[&id].get("conflict").unwrap().value, b"majority");
+        }
+    }
+
+    #[test]
+    fn replicated_write_can_commit_after_response_loss_and_leader_change() {
+        let mut cluster = SimCluster::new(&[1, 2, 3]);
+
+        // Elect node 1 and commit the leader's current-term no-op.
+        let msgs = cluster.nodes.get_mut(&1).unwrap().start_election().unwrap();
+        cluster.enqueue_from(1, msgs);
+        cluster.drain_network();
+        assert_eq!(cluster.nodes[&1].role(), RoleState::Leader);
+
+        // Keep node 1's client-facing process alive. Deliver the proposal to node
+        // 2 and deliberately drop its successful AppendEntries reply. At this
+        // boundary execute() can return UncommittedIndex even though the entry
+        // may later become committed.
+        let (ambiguous_index, msgs) = cluster.nodes.get_mut(&1).unwrap().propose(
+            KvCommand::Put {
+                key: "ambiguous".into(),
+                value: b"may-commit".to_vec(),
+            },
+        ).unwrap();
+        let to_node_2 = msgs
+            .into_iter()
+            .find(|msg| msg.to == 2)
+            .expect("leader must send the proposal to node 2");
+        let replies = cluster.nodes.get_mut(&2).unwrap().step(to_node_2.rpc).unwrap();
+        assert!(matches!(
+            replies.first().map(|msg| &msg.rpc),
+            Some(RaftRpc::AppendEntriesReply { success: true, match_index, .. })
+                if *match_index >= ambiguous_index
+        ));
+        // The reply is lost. Node 1 has not learned that a majority stored the
+        // entry, and neither node has applied the value yet.
+        assert!(cluster.nodes[&1].commit_index() < ambiguous_index);
+        assert!(cluster.nodes[&1].get("ambiguous").is_none());
+        assert!(cluster.nodes[&2].get("ambiguous").is_none());
+
+        // Node 2 wins the majority election. Its current-term no-op carries the
+        // old proposal to node 3, which makes the old proposal commit even though
+        // the original client never received the replication response.
+        let msgs = cluster.nodes.get_mut(&2).unwrap().start_election().unwrap();
+        cluster.enqueue_from(2, msgs);
+        cluster.drain_network();
+        assert_eq!(cluster.nodes[&2].role(), RoleState::Leader);
+        assert_eq!(
+            cluster.nodes[&2].get("ambiguous").unwrap().value,
+            b"may-commit"
+        );
+        assert_eq!(
+            cluster.nodes[&3].get("ambiguous").unwrap().value,
+            b"may-commit"
+        );
+
+        // The old leader converges; the value is not silently rolled back.
+        let msgs = cluster.nodes.get(&2).unwrap().broadcast_append_entries();
+        cluster.enqueue_from(2, msgs);
+        cluster.drain_network();
+        for id in 1..=3 {
+            assert_eq!(
+                cluster.nodes[&id].get("ambiguous").unwrap().value,
+                b"may-commit"
+            );
         }
     }
 

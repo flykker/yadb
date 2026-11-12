@@ -11,6 +11,12 @@ YADB uses ordinary filesystems; raw PDisk and NBD are not project goals.
 - [ ] Build a repeatable fault-injection suite covering process crashes at write and
   commit boundaries, complete cluster restart, node loss and recovery, network
   partitions, quorum loss, and a stale leader returning.
+- [x] Verify ambiguous Raft proposal results at the transport boundary. Tests now
+  cover a lost replication response followed by commit, replacement of an
+  uncommitted entry after leader change, and a lost commit notification. Proposal
+  results are matched by `(log index, term)` so an old caller cannot receive the
+  result of a newer leader's command at the same index. An unknown outcome still
+  requires caller-level idempotency/status handling.
 - [x] Investigate intermittent responses observed before fault injection while
   running the three-node E2E through local peer proxies. The failures were caused
   by the test proxy's default TCP listen backlog of 5: concurrent Raft/VDisk

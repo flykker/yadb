@@ -172,6 +172,13 @@ The protocol frontends are covered by `python3 tests/protocols.py`, which uses i
 stdlib clients to test SigV4, PostgreSQL framing/session behavior, iSCSI CHAP/SCSI I/O,
 UNMAP, negotiated burst limits, and continued operation after killing a Raft leader.
 
+A write timeout, connection loss, or `write outcome is unknown` error is **not a
+rollback guarantee**. A Raft proposal can commit after its replication reply is
+lost, including after a leader change. Reconcile application state before retrying
+non-idempotent operations; there is no general request-ID deduplication/status API
+yet. Deterministic MetaKV tests cover lost replies, entry replacement across terms,
+and lost commit notifications, but not all end-to-end protocol failure boundaries.
+
 Native-client checks were run on aarch64 Alpine with **psql 17.11**, **AWS CLI 2.22.10**,
 and **libiscsi 1.20.3**. Verified cases include SQL queries/commit and bad passwords;
 S3 PUT (default Content-MD5 and explicit CRC32), HEAD/GET/LIST, Unicode/escaped keys,

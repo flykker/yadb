@@ -680,7 +680,15 @@ impl<FS: StorageFs> LocalMetaKv<FS> {
         self.drive_outbound(msgs)
     }
 
-    fn drive_outbound(&self, mut pending: Vec<OutboundMsg>) -> Result<(), MetaError> {
+    fn drive_outbound(&self, pending: Vec<OutboundMsg>) -> Result<(), MetaError> {
+        self.drive_outbound_with(pending, &mut send_raft_http_rpc)
+    }
+
+    fn drive_outbound_with(
+        &self,
+        mut pending: Vec<OutboundMsg>,
+        send: &mut impl FnMut(&str, &RaftRpc) -> Result<Option<RaftRpc>, std::io::Error>,
+    ) -> Result<(), MetaError> {
         // Bound synchronous cascade rounds (e.g. RequestVote -> become_leader -> AppendEntries -> commit broadcast)
         for _round in 0..8 {
             if pending.is_empty() {
@@ -690,7 +698,7 @@ impl<FS: StorageFs> LocalMetaKv<FS> {
             let mut replies = Vec::new();
             for msg in batch {
                 if let Some(addr) = self.peer_addrs.get(&msg.to) {
-                    if let Ok(Some(reply_rpc)) = send_raft_http_rpc(addr, &msg.rpc) {
+                    if let Ok(Some(reply_rpc)) = send(addr, &msg.rpc) {
                         replies.push(reply_rpc);
                     }
                 }
@@ -707,15 +715,32 @@ impl<FS: StorageFs> LocalMetaKv<FS> {
         Ok(())
     }
 
+    /// Returns the result only for this proposal's (index, term). An error after
+    /// proposing is not a rollback guarantee: replication may still commit it.
     pub fn execute(&self, cmd: KvCommand) -> Result<KvResult, MetaError> {
-        let (idx, msgs) = {
+        self.execute_with(cmd, &mut send_raft_http_rpc)
+    }
+
+    fn execute_with(
+        &self,
+        cmd: KvCommand,
+        send: &mut impl FnMut(&str, &RaftRpc) -> Result<Option<RaftRpc>, std::io::Error>,
+    ) -> Result<KvResult, MetaError> {
+        let (idx, term, msgs) = {
             let mut guard = self.inner.lock().unwrap();
-            guard.propose(cmd)?
+            let (idx, msgs) = guard.propose(cmd)?;
+            (idx, guard.current_term(), msgs)
         };
         if !msgs.is_empty() {
-            self.drive_outbound(msgs)?;
+            self.drive_outbound_with(msgs, send)?;
         }
         let mut guard = self.inner.lock().unwrap();
+        // A new leader may have replaced the uncommitted proposal while the
+        // mutex was released for RPCs. An index alone does not identify an
+        // entry across terms; never return (or consume) the replacement's result.
+        if guard.term_at(idx) != Some(term) {
+            return Err(MetaError::UncommittedIndex(idx));
+        }
         guard
             .take_applied_result(idx)
             .ok_or(MetaError::UncommittedIndex(idx))
@@ -773,4 +798,161 @@ fn send_raft_http_rpc(peer_addr: &str, rpc: &RaftRpc) -> Result<Option<RaftRpc>,
     }
     let parsed: Option<RaftRpc> = serde_json::from_slice(payload).ok().flatten();
     Ok(parsed)
+}
+
+#[cfg(test)]
+mod transport_tests {
+    use super::*;
+    use yadb_io::SimFs;
+
+    fn cluster() -> BTreeMap<u32, LocalMetaKv<SimFs>> {
+        let peers: BTreeMap<_, _> = (1..=3).map(|id| (id, id.to_string())).collect();
+        let nodes: BTreeMap<_, _> = (1..=3).map(|id| {
+            let fs = SimFs::new(2000 + id as u64);
+            let meta = LocalMetaKv::open_clustered(&fs, "meta", id, peers.clone()).unwrap();
+            (id, meta)
+        }).collect();
+        elect(&nodes, 1);
+        nodes
+    }
+
+    fn deliver(
+        nodes: &BTreeMap<u32, LocalMetaKv<SimFs>>,
+        addr: &str,
+        rpc: &RaftRpc,
+    ) -> Result<Option<RaftRpc>, std::io::Error> {
+        Ok(nodes[&addr.parse::<u32>().unwrap()].step_rpc(rpc.clone()).unwrap())
+    }
+
+    fn elect(nodes: &BTreeMap<u32, LocalMetaKv<SimFs>>, id: u32) {
+        let msgs = nodes[&id].inner.lock().unwrap().start_election().unwrap();
+        nodes[&id].drive_outbound_with(msgs, &mut |addr, rpc| deliver(nodes, addr, rpc)).unwrap();
+        assert_eq!(nodes[&id].role_info().1, RoleState::Leader);
+    }
+
+    #[test]
+    fn execute_error_can_be_followed_by_commit_or_discard_after_election() {
+        // The caller sees the same error in both cases, but the new leader either
+        // retains the proposal (delivery followed by reply loss) or replaces it
+        // (failure before delivery). There is no automatic retry of the command.
+        for delivered in [false, true] {
+            let nodes = cluster();
+            let result = nodes[&1].execute_with(KvCommand::Put {
+                key: "ambiguous".into(), value: b"original".to_vec(),
+            }, &mut |addr, rpc| {
+                if delivered && addr == "2" {
+                    let reply = deliver(&nodes, addr, rpc)?;
+                    assert!(matches!(reply, Some(RaftRpc::AppendEntriesReply { success: true, .. })));
+                }
+                Err(std::io::Error::new(std::io::ErrorKind::ConnectionReset, "injected reply loss"))
+            });
+            assert!(matches!(result, Err(MetaError::UncommittedIndex(_))), "{result:?}");
+            assert!(nodes[&1].get("ambiguous").is_none());
+            elect(&nodes, 2);
+            for node in nodes.values() {
+                assert_eq!(node.get("ambiguous").is_some(), delivered);
+            }
+        }
+    }
+
+    #[test]
+    fn execute_must_not_return_result_of_replacement_at_same_index() {
+        let nodes = cluster();
+        let mut changed_leader = false;
+        let result = nodes[&1].execute_with(KvCommand::Put {
+            key: "discarded".into(), value: b"original".to_vec(),
+        }, &mut |addr, rpc| {
+            if !changed_leader {
+                changed_leader = true;
+                // Before the proposal reaches any follower, elect node 2. Its
+                // no-op replaces and commits the pending proposal's log index
+                // on node 1 while that node's execute() is outside its mutex.
+                elect(&nodes, 2);
+            }
+            deliver(&nodes, addr, rpc)
+        });
+        assert!(matches!(result, Err(MetaError::UncommittedIndex(_))), "{result:?}");
+        assert!(nodes.values().all(|node| node.get("discarded").is_none()));
+        // Rejecting the stale caller must not consume the replacement's result.
+        assert!(matches!(nodes[&1].inner.lock().unwrap().take_applied_result(2),
+            Some(KvResult::TxnOk { .. })));
+    }
+
+    #[test]
+    fn execute_must_not_return_success_for_replacement_put() {
+        let nodes = cluster();
+        // Leave an earlier unreplicated entry at index 2, so the original Put
+        // below uses index 3. The new leader's no-op will occupy index 2 and its
+        // own Put will occupy index 3.
+        let pending = nodes[&1].execute_with(KvCommand::Put {
+            key: "earlier".into(), value: b"pending".to_vec(),
+        }, &mut |_, _| Ok(None));
+        assert!(matches!(pending, Err(MetaError::UncommittedIndex(2))));
+        let mut changed_leader = false;
+        let result = nodes[&1].execute_with(KvCommand::Put {
+            key: "discarded".into(), value: b"original".to_vec(),
+        }, &mut |addr, rpc| {
+            if !changed_leader {
+                changed_leader = true;
+                elect(&nodes, 2);
+                let replacement = nodes[&2].execute_with(KvCommand::Put {
+                    key: "replacement".into(), value: b"new leader".to_vec(),
+                }, &mut |addr, rpc| deliver(&nodes, addr, rpc)).unwrap();
+                assert!(matches!(replacement, KvResult::PutOk { .. }));
+            }
+            deliver(&nodes, addr, rpc)
+        });
+        assert!(matches!(result, Err(MetaError::UncommittedIndex(_))), "{result:?}");
+        assert!(nodes.values().all(|node| node.get("discarded").is_none()));
+        for node in nodes.values() {
+            assert_eq!(node.get("replacement").unwrap().value, b"new leader");
+        }
+    }
+
+    #[test]
+    fn execute_returns_original_committed_result_after_leader_change() {
+        let nodes = cluster();
+        let mut changed_leader = false;
+        let result = nodes[&1].execute_with(KvCommand::Put {
+            key: "retained".into(), value: b"original".to_vec(),
+        }, &mut |addr, rpc| {
+            // The first replication round commits the Put on node 1. Change
+            // leaders during the subsequent commit broadcast, before execute
+            // reads its result. Rejecting every term change would lose success.
+            if !changed_leader && matches!(rpc, RaftRpc::AppendEntries { leader_commit, .. }
+                if *leader_commit >= 2) {
+                changed_leader = true;
+                elect(&nodes, 2);
+            }
+            deliver(&nodes, addr, rpc)
+        });
+        assert!(changed_leader);
+        assert!(matches!(result, Ok(KvResult::PutOk { version: 1, .. })), "{result:?}");
+        for node in nodes.values() {
+            assert_eq!(node.get("retained").unwrap().value, b"original");
+        }
+    }
+
+    #[test]
+    fn execute_succeeds_when_commit_notification_is_lost() {
+        let nodes = cluster();
+        let mut lost_notifications = 0;
+        let result = nodes[&1].execute_with(KvCommand::Put {
+            key: "committed".into(), value: b"original".to_vec(),
+        }, &mut |addr, rpc| {
+            if matches!(rpc, RaftRpc::AppendEntries { leader_commit, .. } if *leader_commit >= 2) {
+                lost_notifications += 1;
+                return Err(std::io::Error::new(std::io::ErrorKind::ConnectionReset, "lost commit broadcast"));
+            }
+            deliver(&nodes, addr, rpc)
+        });
+        assert!(lost_notifications > 0);
+        assert!(matches!(result, Ok(KvResult::PutOk { version: 1, .. })), "{result:?}");
+        assert!(nodes[&2].get("committed").is_none());
+        let msgs = nodes[&1].inner.lock().unwrap().broadcast_append_entries();
+        nodes[&1].drive_outbound_with(msgs, &mut |addr, rpc| deliver(&nodes, addr, rpc)).unwrap();
+        for node in nodes.values() {
+            assert_eq!(node.get("committed").unwrap().value, b"original");
+        }
+    }
 }
