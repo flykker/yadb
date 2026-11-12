@@ -11,10 +11,12 @@ YADB uses ordinary filesystems; raw PDisk and NBD are not project goals.
 - [ ] Build a repeatable fault-injection suite covering process crashes at write and
   commit boundaries, complete cluster restart, node loss and recovery, network
   partitions, quorum loss, and a stale leader returning.
-- [ ] Investigate intermittent `not yet committed by quorum` responses observed
-  before fault injection while running the three-node E2E through local peer
-  proxies. Two runs failed (SQL CREATE and concurrent S3 PUT); later runs passed.
-  The cause and the final outcome of the failed requests are not established.
+- [x] Investigate intermittent responses observed before fault injection while
+  running the three-node E2E through local peer proxies. The failures were caused
+  by the test proxy's default TCP listen backlog of 5: concurrent Raft/VDisk
+  connections timed out under load. The harness now uses backlog 128 and captures
+  proxy/node diagnostics; repeated concurrent and native-client runs pass. This
+  does not change production listener limits or prove arbitrary overload behavior.
 - [ ] Check durability ordering from filesystem sync through fragment quorum and
   metadata commit; test torn writes, disk-full errors and corruption/repair.
 - [ ] Verify tablet generation fencing, concurrent old/new owners, recovery and

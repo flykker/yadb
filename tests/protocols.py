@@ -34,6 +34,9 @@ class PeerProxy(socketserver.ThreadingTCPServer):
     """One directed peer link; toggling it also closes in-flight connections."""
     allow_reuse_address = True
     daemon_threads = True
+    # The stdlib default backlog (5) is smaller than the concurrent client
+    # burst, even before Raft heartbeats and VDisk scrub connections.
+    request_queue_size = 128
 
     def __init__(self, source, target):
         self.source = source
@@ -497,6 +500,27 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
             assert signed(19202, "PUT", "/invoices-2026/bad-md5", b"bad", {"content-md5": "AAAAAAAAAAAAAAAAAAAAAA=="})[0] == 400
             assert signed(19202, "POST", "/invoices-2026/multipart?uploads")[0] == 501
             print("PASS S3 SigV4, XML listing, escaped keys, PUT/GET/HEAD/Range/DELETE, bad signatures")
+
+            concurrent_results = []
+            concurrent_lock = threading.Lock()
+            def concurrent_put(i):
+                try:
+                    result = signed(19202, "PUT", f"/invoices-2026/concurrent/{i}", f"value-{i}".encode())
+                except Exception as e:
+                    result = (None, {}, repr(e))
+                with concurrent_lock:
+                    concurrent_results.append((i, result))
+            writers = [threading.Thread(target=concurrent_put, args=(i,)) for i in range(24)]
+            for writer in writers:
+                writer.start()
+            for writer in writers:
+                writer.join()
+            assert len(concurrent_results) == len(writers), concurrent_results
+            failures = [(i, result) for i, result in concurrent_results if result[0] != 200]
+            assert not failures, failures
+            for i in range(24):
+                assert signed(19203, "GET", f"/invoices-2026/concurrent/{i}")[2] == f"value-{i}".encode()
+            print("PASS concurrent Raft-backed S3 proposals")
 
             if native_clients:
                 native_client_checks(temp, 19102, 19202)
