@@ -17,6 +17,11 @@ YADB uses ordinary filesystems; raw PDisk and NBD are not project goals.
   results are matched by `(log index, term)` so an old caller cannot receive the
   result of a newer leader's command at the same index. An unknown outcome still
   requires caller-level idempotency/status handling.
+- [x] Exercise ambiguous SQL and S3 writes through live three-node processes.
+  The test drops Raft replies after forwarding requests, forces a majority
+  election, and verifies after convergence that each failed request is either
+  absent or present with exactly its original value. It does not claim a client
+  can determine which outcome occurred without a status/idempotency API.
 - [x] Investigate intermittent responses observed before fault injection while
   running the three-node E2E through local peer proxies. The failures were caused
   by the test proxy's default TCP listen backlog of 5: concurrent Raft/VDisk

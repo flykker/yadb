@@ -42,6 +42,9 @@ class PeerProxy(socketserver.ThreadingTCPServer):
         self.source = source
         self.target = target
         self.blocked = threading.Event()
+        self.raft_request_fault = None
+        self.raft_reply_fault = None
+        self.dropped_raft_reply = threading.Event()
         self.events = deque(maxlen=30)
         self.events_lock = threading.Lock()
         super().__init__(("127.0.0.1", 19400 + source * 10 + target), PeerHandler)
@@ -60,12 +63,49 @@ class PeerHandler(socketserver.BaseRequestHandler):
             with socket.create_connection(("127.0.0.1", 19000+self.server.target), timeout=2) as upstream:
                 upstream.settimeout(2)
                 self.request.settimeout(2)
+                drop_raft_reply = False
+                drop_raft_request = False
+                reply_fault = self.server.raft_reply_fault
+                request_fault = self.server.raft_request_fault
+                if reply_fault is not None or request_fault is not None:
+                    # Classify the HTTP request before relaying any response.
+                    # VDisk fragment writes must still receive acknowledgements
+                    # so the fault reaches metadata commit rather than blob PUT.
+                    header = b""
+                    while b"\r\n\r\n" not in header:
+                        chunk = self.request.recv(65536)
+                        if not chunk:
+                            return
+                        header += chunk
+                        assert len(header) <= 128 * 1024, "oversized proxy request header"
+                    if header.startswith(b"POST /raft/rpc "):
+                        head, body = header.split(b"\r\n\r\n", 1)
+                        headers = dict(line.split(b":", 1) for line in head.split(b"\r\n")[1:])
+                        length = int(headers[b"Content-Length"].strip())
+                        assert length <= 16 * 1024 * 1024, "oversized proxy Raft request"
+                        while len(body) < length:
+                            chunk = self.request.recv(min(65536, length-len(body)))
+                            if not chunk:
+                                return
+                            header += chunk
+                            body += chunk
+                        rpc = json.loads(body)
+                        drop_raft_reply = reply_fault is not None and reply_fault(rpc)
+                        drop_raft_request = request_fault is not None and request_fault(rpc)
+                        if drop_raft_request:
+                            self.server.record("dropped Raft request")
+                            return
+                    upstream.sendall(header)
                 sockets = (self.request, upstream)
                 while not self.server.blocked.is_set():
                     ready, _, _ = select.select(sockets, [], [], .05)
                     for sock in ready:
                         data = sock.recv(65536)
                         if not data:
+                            return
+                        if sock is upstream and drop_raft_reply:
+                            self.server.record(f"dropped {len(data)} Raft response bytes")
+                            self.server.dropped_raft_reply.set()
                             return
                         (upstream if sock is self.request else self.request).sendall(data)
         except OSError as e:
@@ -625,6 +665,76 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
             assert disk.read(lba=4096) == b"R"*512
             disk.s.close()
             print("PASS full cluster SIGKILL/restart: committed SQL, S3, iSCSI and uncommitted SQL rollback")
+
+            def has_entries(rpc):
+                return bool(rpc.get("AppendEntries", {}).get("entries"))
+
+            def begin_ambiguous_write(old, label):
+                peers = [i for i in range(1, 4) if i != old]
+                delivered = peers[0]
+                blocked = peers[1]
+                # One follower durably receives the proposal but its reply is
+                # lost; the other follower never receives it. The client sees
+                # an error without this test retrying the command.
+                proxies[old, delivered].raft_reply_fault = has_entries
+                proxies[old, blocked].raft_request_fault = has_entries
+                for peer in peers:
+                    proxies[old, peer].dropped_raft_reply.clear()
+
+                def recover():
+                    proxies[old, delivered].raft_reply_fault = None
+                    proxies[old, blocked].raft_request_fault = None
+                    for peer in peers:
+                        proxies[old, peer].blocked.set()
+                        proxies[peer, old].blocked.set()
+                    deadline = time.monotonic()+20
+                    while True:
+                        statuses = [json.loads(request(19000+i, "GET", "/raft/status")[2]) for i in peers]
+                        leaders = [s["node_id"] for s in statuses if s["role"] == "Leader"]
+                        if len(leaders) == 1:
+                            break
+                        assert time.monotonic() < deadline, statuses
+                        time.sleep(.1)
+                    new = leaders[0]
+                    for proxy in proxies.values():
+                        proxy.blocked.clear()
+                    deadline = time.monotonic()+20
+                    while True:
+                        statuses = [json.loads(request(19000+i, "GET", "/raft/status")[2]) for i in range(1, 4)]
+                        if all(s["leader_id"] == new for s in statuses) and statuses[old-1]["role"] == "Follower":
+                            break
+                        assert time.monotonic() < deadline, statuses
+                        time.sleep(.1)
+                    print(f"PASS ambiguous {label} write: error did not imply rollback")
+
+                return recover
+
+            # S3: the manifest may or may not survive the leader change, but a
+            # failed client request must never produce a different object value.
+            old = json.loads(request(19002, "GET", "/raft/status")[2])["leader_id"]
+            ambiguous_s3_key = "/invoices-2026/ambiguous-process-s3"
+            recover = begin_ambiguous_write(old, "S3")
+            s3_fault = signed(19200+old, "PUT", ambiguous_s3_key, b"ambiguous-s3")
+            assert not 200 <= s3_fault[0] < 300, s3_fault
+            recover()
+            s3_check = signed(19200+old, "GET", ambiguous_s3_key)
+            assert s3_check[0] in (200, 404), s3_check
+            if s3_check[0] == 200:
+                assert s3_check[2] == b"ambiguous-s3", s3_check
+
+            # SQL: same transport fault at the metadata commit boundary. The
+            # INSERT is not retried; after convergence only 0 or 1 exact row is
+            # acceptable, never a success for another command.
+            old = json.loads(request(19002, "GET", "/raft/status")[2])["leader_id"]
+            recover = begin_ambiguous_write(old, "SQL")
+            sql_fault = Pg(19100+old)
+            sql_fault.s.settimeout(10)
+            sql_fault.query("INSERT INTO wire VALUES (96,996);", fail=True)
+            sql_fault.close()
+            recover()
+            sql_check = Pg(19100+old)
+            assert sql_check.rows("SELECT balance FROM wire WHERE id=96;") in ([], [["996"]])
+            sql_check.close()
 
             # Leave the current leader alive but remove both voting peers. A
             # rejected or timed-out write may still commit after recovery, so do
