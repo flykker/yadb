@@ -531,7 +531,9 @@ pub async fn handle(State(st): State<S3State>, request: Request) -> Response {
             }
             let mut range = None;
             if let Some(v) = headers.get(header::RANGE).and_then(|v| v.to_str().ok()) {
-                range = parse_range_header(v, head.size);
+                range = parse_range_header(v, head.size).and_then(|(a, b)| {
+                    (a < head.size && a <= b).then(|| (a, b.min(head.size - 1)))
+                });
                 if range.is_none() {
                     let mut r = err(
                         StatusCode::RANGE_NOT_SATISFIABLE,
@@ -560,21 +562,31 @@ pub async fn handle(State(st): State<S3State>, request: Request) -> Response {
                         "range exceeds 16 MiB",
                     );
                 }
-                gateway_headers.insert(header::RANGE, format!("bytes={a}-{b}").parse().unwrap());
             }
-            let mut response =
-                handle_s3_get(State(st.app.clone()), gateway_headers, Path(path)).await;
-            if response.status().is_success() {
-                response
-                    .headers_mut()
-                    .insert(header::ACCEPT_RANGES, "bytes".parse().unwrap());
-                response
-                    .headers_mut()
-                    .insert(header::LAST_MODIFIED, modified.parse().unwrap());
-                response
-            } else {
-                map_error(response).await
+            let engine = st.app.s3.clone();
+            let snapshot = head.clone();
+            let read = tokio::task::spawn_blocking(move || {
+                if snapshot.size == 0 {
+                    Ok(Vec::new())
+                } else {
+                    let (start, end) = range.unwrap_or((0, snapshot.size - 1));
+                    engine.read_manifest_range(&snapshot, start, end)
+                }
+            }).await;
+            let bytes = match read {
+                Ok(Ok(bytes)) => bytes,
+                _ => return err(StatusCode::SERVICE_UNAVAILABLE, "ServiceUnavailable", "object read failed"),
+            };
+            let mut response = Response::builder()
+                .status(if range.is_some() { StatusCode::PARTIAL_CONTENT } else { StatusCode::OK })
+                .header(header::CONTENT_TYPE, head.content_type)
+                .header(header::ETAG, head.etag)
+                .header(header::LAST_MODIFIED, modified)
+                .header(header::ACCEPT_RANGES, "bytes");
+            if let Some((a, b)) = range {
+                response = response.header(header::CONTENT_RANGE, format!("bytes {a}-{b}/{}", head.size));
             }
+            response.body(axum::body::Body::from(bytes)).unwrap()
         }
         Method::DELETE => {
             let response =

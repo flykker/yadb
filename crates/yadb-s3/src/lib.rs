@@ -260,6 +260,18 @@ impl<FS: StorageFs> ObjectStoreEngine<FS> {
         end: u64,
     ) -> Result<(ObjectManifest, Vec<u8>), S3Error> {
         let manifest = self.head_object(project_id, store, bucket, key)?;
+        let bytes = self.read_manifest_range(&manifest, start, end)?;
+        Ok((manifest, bytes))
+    }
+
+    /// Read the selected immutable manifest, not a newer version of its key.
+    /// Callers must obtain the manifest from an authorized object lookup.
+    pub fn read_manifest_range(
+        &self,
+        manifest: &ObjectManifest,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<u8>, S3Error> {
         if start > end || end >= manifest.size {
             return Err(S3Error::InvalidRange {
                 start,
@@ -267,16 +279,6 @@ impl<FS: StorageFs> ObjectStoreEngine<FS> {
                 size: manifest.size,
             });
         }
-        let bytes = self.read_manifest_range(&manifest, start, end)?;
-        Ok((manifest, bytes))
-    }
-
-    fn read_manifest_range(
-        &self,
-        manifest: &ObjectManifest,
-        start: u64,
-        end: u64,
-    ) -> Result<Vec<u8>, S3Error> {
         let pool = self.get_pool(&manifest.pool)?;
         let mut out = Vec::with_capacity((end - start + 1) as usize);
 
@@ -398,6 +400,12 @@ mod tests {
             )
             .unwrap();
         assert_eq!(slice.as_slice(), &payload[4090..=8200]);
+
+        // A reader holding the original manifest must not switch versions when
+        // the object is replaced between metadata lookup and payload read.
+        s3.put_object(1, "receipts", "data-ec", "invoices-2026", "nov/inv-002.bin", "text/plain", b"replacement").unwrap();
+        assert_eq!(s3.read_manifest_range(&mf, 4090, 8200).unwrap(), payload[4090..=8200]);
+        assert!(matches!(s3.read_manifest_range(&mf, 0, mf.size), Err(S3Error::InvalidRange { .. })));
 
         // Sorted listing
         let listed = s3

@@ -18,6 +18,7 @@ import struct
 import subprocess
 import tempfile
 import time
+import threading
 import urllib.parse
 import xml.etree.ElementTree as ET
 
@@ -391,11 +392,39 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
             assert signed(19202, "PUT", key, b"hello aws")[0] == 200
             assert signed(19203, "GET", key)[2] == b"hello aws"
             assert signed(19203, "GET", key, extra={"range": "bytes=1-4"})[2] == b"ello"
+            status, hs, body = signed(19203, "GET", key, extra={"range": "bytes=7-999"})
+            assert status == 206 and body == b"ws", (status, hs, body)
+            assert next(v for k, v in hs.items() if k.lower() == "content-range") == "bytes 7-8/9"
             assert signed(19203, "HEAD", key)[0] == 200
+            # A successful conditional GET must return the version whose ETag
+            # was matched, even while a different version is being published.
+            race_key = "/invoices-2026/conditional-race"
+            original, replacement = b"old version", b"new version has another size"
+            status, hs, _ = signed(19202, "PUT", race_key, original)
+            assert status == 200
+            etag = next(v for k, v in hs.items() if k.lower() == "etag")
+            failures = []
+            def overwrite():
+                try:
+                    for i in range(60):
+                        assert signed(19202, "PUT", race_key, replacement if i % 2 == 0 else original)[0] == 200
+                except BaseException as e:
+                    failures.append(e)
+            writer = threading.Thread(target=overwrite)
+            writer.start()
+            try:
+                for _ in range(120):
+                    status, _, body = signed(19202, "GET", race_key, extra={"if-match": etag})
+                    assert status == 412 or (status == 200 and body == original), (status, body)
+            finally:
+                writer.join()
+            assert not failures, failures
+            print("PASS S3 conditional GET under concurrent overwrites")
             status, _, body = signed(19203, "GET", "/invoices-2026?list-type=2&prefix=dir%2F")
             assert status == 200 and ET.fromstring(body).find("{*}Contents/{*}Key").text == "dir/a +&.txt", body
             assert signed(19202, "GET", key, secret="wrong-password")[0] == 403
-            assert signed(19202, "GET", key, extra={"range": "bytes=900-999"})[0] == 416
+            invalid_range = signed(19202, "GET", key, extra={"range": "bytes=900-999"})
+            assert invalid_range[0] == 416, invalid_range
             assert signed(19202, "DELETE", key)[0] == 204
             assert signed(19202, "GET", key)[0] == 404
             for name in ["a", "b", "c"]:
