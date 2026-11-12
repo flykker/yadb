@@ -473,7 +473,7 @@ mod tests {
     fn parses_reconciles_and_enforces_project_rbac() {
         let yaml = include_str!("../../../examples/platform.yaml");
         let manifests = parse_manifests(yaml).unwrap();
-        assert_eq!(manifests.len(), 6);
+        assert_eq!(manifests.len(), 7);
 
         let mut state = ControlPlaneState::new();
         let ops1 = state.apply(&manifests).unwrap();

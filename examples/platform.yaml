@@ -75,3 +75,12 @@ spec:
   pool: data-ec
   isolation: shared
   buckets: [invoices-2026, exports]
+---
+apiVersion: yadb.io/v1alpha1
+kind: BlockVolume
+metadata:
+  name: vm-root
+  project: billing
+spec:
+  pool: wal-fast
+  sizeBytes: 10737418240

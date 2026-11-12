@@ -1,6 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpStream};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use yadb_io::StorageFs;
@@ -536,10 +539,12 @@ impl<FS: StorageFs> RaftCore<FS> {
     }
 }
 
-/// Thread-safe embedded handle to `MetaKv` for gateways (`yadb-s3`, `yadbd`, future SQL tablets).
+/// Thread-safe handle to `MetaKv` supporting both zero-hop single-node mode and
+/// multi-node Raft cluster replication over HTTP (`/raft/rpc`).
 #[derive(Clone)]
 pub struct LocalMetaKv<FS: StorageFs> {
     inner: Arc<Mutex<RaftCore<FS>>>,
+    peer_addrs: Arc<BTreeMap<u32, String>>,
 }
 
 impl<FS: StorageFs> LocalMetaKv<FS> {
@@ -547,12 +552,104 @@ impl<FS: StorageFs> LocalMetaKv<FS> {
         let core = RaftCore::open(fs, dir, node_id, vec![node_id], true)?;
         Ok(Self {
             inner: Arc::new(Mutex::new(core)),
+            peer_addrs: Arc::new(BTreeMap::new()),
         })
     }
 
-    pub fn execute(&self, cmd: KvCommand) -> Result<KvResult, MetaError> {
+    pub fn open_clustered(
+        fs: &FS,
+        dir: &str,
+        node_id: u32,
+        peer_addrs: BTreeMap<u32, String>,
+    ) -> Result<Self, MetaError> {
+        let mut peer_ids: Vec<u32> = peer_addrs.keys().copied().collect();
+        if !peer_ids.contains(&node_id) {
+            peer_ids.push(node_id);
+        }
+        let core = RaftCore::open(fs, dir, node_id, peer_ids, true)?;
+        Ok(Self {
+            inner: Arc::new(Mutex::new(core)),
+            peer_addrs: Arc::new(peer_addrs),
+        })
+    }
+
+    pub fn role_info(&self) -> (u32, RoleState, u64, Option<u32>, u64) {
+        let g = self.inner.lock().unwrap();
+        (
+            g.node_id(),
+            g.role(),
+            g.current_term(),
+            g.leader_id(),
+            g.commit_index(),
+        )
+    }
+
+    pub fn peer_addr(&self, node_id: u32) -> Option<String> {
+        self.peer_addrs.get(&node_id).cloned()
+    }
+
+    /// Handles an inbound Raft RPC (`RequestVote` or `AppendEntries`) and returns any immediate reply RPC.
+    pub fn step_rpc(&self, rpc: RaftRpc) -> Result<Option<RaftRpc>, MetaError> {
         let mut guard = self.inner.lock().unwrap();
-        let (idx, _) = guard.propose(cmd)?;
+        let mut out = guard.step(rpc)?;
+        Ok(out.pop().map(|m| m.rpc))
+    }
+
+    /// Triggers a Raft election round across configured peers and returns the resulting role.
+    pub fn trigger_election(&self) -> Result<RoleState, MetaError> {
+        let initial_msgs = {
+            let mut guard = self.inner.lock().unwrap();
+            guard.start_election()?
+        };
+        self.drive_outbound(initial_msgs)?;
+        Ok(self.inner.lock().unwrap().role())
+    }
+
+    /// Broadcasts a heartbeat / catch-up `AppendEntries` round if this node is Leader.
+    pub fn broadcast_heartbeat(&self) -> Result<(), MetaError> {
+        let msgs = {
+            let guard = self.inner.lock().unwrap();
+            guard.broadcast_append_entries()
+        };
+        self.drive_outbound(msgs)
+    }
+
+    fn drive_outbound(&self, mut pending: Vec<OutboundMsg>) -> Result<(), MetaError> {
+        // Bound synchronous cascade rounds (e.g. RequestVote -> become_leader -> AppendEntries -> commit broadcast)
+        for _round in 0..8 {
+            if pending.is_empty() {
+                break;
+            }
+            let batch = std::mem::take(&mut pending);
+            let mut replies = Vec::new();
+            for msg in batch {
+                if let Some(addr) = self.peer_addrs.get(&msg.to) {
+                    if let Ok(Some(reply_rpc)) = send_raft_http_rpc(addr, &msg.rpc) {
+                        replies.push(reply_rpc);
+                    }
+                }
+            }
+            if replies.is_empty() {
+                break;
+            }
+            let mut guard = self.inner.lock().unwrap();
+            for rep in replies {
+                let next_msgs = guard.step(rep)?;
+                pending.extend(next_msgs);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn execute(&self, cmd: KvCommand) -> Result<KvResult, MetaError> {
+        let (idx, msgs) = {
+            let mut guard = self.inner.lock().unwrap();
+            guard.propose(cmd)?
+        };
+        if !msgs.is_empty() {
+            self.drive_outbound(msgs)?;
+        }
+        let mut guard = self.inner.lock().unwrap();
         guard
             .take_applied_result(idx)
             .ok_or(MetaError::UncommittedIndex(idx))
@@ -573,4 +670,41 @@ impl<FS: StorageFs> LocalMetaKv<FS> {
     pub fn watch_prefix(&self, prefix: impl Into<String>) -> Receiver<WatchEvent> {
         self.inner.lock().unwrap().watch_prefix(prefix)
     }
+}
+
+fn send_raft_http_rpc(peer_addr: &str, rpc: &RaftRpc) -> Result<Option<RaftRpc>, std::io::Error> {
+    let clean = peer_addr
+        .trim()
+        .strip_prefix("http://")
+        .unwrap_or(peer_addr.trim())
+        .trim_end_matches('/');
+    let sock: SocketAddr = clean
+        .parse()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+
+    let body = serde_json::to_vec(rpc)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let mut stream = TcpStream::connect_timeout(&sock, Duration::from_millis(350))?;
+    stream.set_read_timeout(Some(Duration::from_millis(500)))?;
+    stream.set_write_timeout(Some(Duration::from_millis(350)))?;
+
+    let req = format!(
+        "POST /raft/rpc HTTP/1.1\r\nHost: {clean}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(req.as_bytes())?;
+    stream.write_all(&body)?;
+    stream.flush()?;
+
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw)?;
+    let Some(split) = raw.windows(4).position(|w| w == b"\r\n\r\n") else {
+        return Ok(None);
+    };
+    let payload = &raw[split + 4..];
+    if payload.is_empty() {
+        return Ok(None);
+    }
+    let parsed: Option<RaftRpc> = serde_json::from_slice(payload).ok().flatten();
+    Ok(parsed)
 }

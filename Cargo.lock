@@ -665,6 +665,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "yadb-block"
+version = "0.1.0"
+dependencies = [
+ "crc32fast",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "yadb-blob",
+ "yadb-io",
+ "yadb-metakv",
+]
+
+[[package]]
 name = "yadb-control"
 version = "0.1.0"
 dependencies = [
@@ -672,6 +685,19 @@ dependencies = [
  "serde_json",
  "thiserror",
  "yadb-blob",
+]
+
+[[package]]
+name = "yadb-db"
+version = "0.1.0"
+dependencies = [
+ "crc32fast",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "yadb-blob",
+ "yadb-io",
+ "yadb-metakv",
 ]
 
 [[package]]
@@ -714,6 +740,7 @@ dependencies = [
  "serde_json",
  "yadb-blob",
  "yadb-control",
+ "yadb-db",
  "yadb-io",
 ]
 
@@ -728,7 +755,9 @@ dependencies = [
  "serde_json",
  "tokio",
  "yadb-blob",
+ "yadb-block",
  "yadb-control",
+ "yadb-db",
  "yadb-io",
  "yadb-metakv",
  "yadb-s3",

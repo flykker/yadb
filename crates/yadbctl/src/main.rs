@@ -7,13 +7,14 @@ use clap::{Parser, Subcommand};
 use serde::Deserialize;
 use yadb_blob::{BlobId, ErasureScheme, PoolStriper, VolumeConfig, VolumeStore};
 use yadb_control::{parse_manifests, ControlPlaneState, DiffOp, Role};
+use yadb_db::{QueryResult, SqlValue};
 use yadb_io::{FaultConfig, OsFs, SimFs, StorageFs};
 
 #[derive(Parser)]
 #[command(
     name = "yadbctl",
     version,
-    about = "Declarative control & storage CLI for YADB (Yet Another DB & Data Platform)"
+    about = "Declarative control, SQL, S3 & Block CLI for YADB (Yet Another DB & Data Platform)"
 )]
 struct Cli {
     /// Live `yadbd` HTTP endpoint (e.g. `http://127.0.0.1:8420`). If omitted, uses local state file.
@@ -40,8 +41,12 @@ enum Command {
         #[arg(short = 'f', long)]
         file: PathBuf,
     },
-    /// Show current cluster generation, pools, projects, databases, and object stores
+    /// Show current cluster generation, pools, projects, databases, object stores, and block volumes
     Status,
+    /// Show Raft consensus role, term, leader, and commit index of a `yadbd` node
+    RaftStatus,
+    /// Trigger a Raft election round on the target `yadbd` node
+    RaftElect,
     /// Verify local zero-hop RBAC authorization for a subject on a project
     AuthCheck {
         #[arg(long)]
@@ -50,6 +55,47 @@ enum Command {
         subject: String,
         #[arg(long, default_value_t = false)]
         write: bool,
+    },
+    /// Execute a SQL query against a sharded project Database on `yadbd`
+    Sql {
+        #[arg(long)]
+        project: String,
+        #[arg(long)]
+        db: String,
+        #[arg(long)]
+        subject: String,
+        /// SQL statement (`CREATE TABLE`, `INSERT`, `UPSERT`, `SELECT`, `DELETE`, `FLUSH TABLE`, `SHOW TABLES`)
+        query: String,
+    },
+    /// Write raw bytes (from `--data` string or `-f` file) at `--offset` on a project's BlockVolume
+    BlockWrite {
+        #[arg(long)]
+        project: String,
+        #[arg(long)]
+        volume: String,
+        #[arg(long)]
+        subject: String,
+        #[arg(long, default_value_t = 0)]
+        offset: u64,
+        #[arg(long)]
+        data: Option<String>,
+        #[arg(short = 'f', long)]
+        file: Option<PathBuf>,
+    },
+    /// Read `--len` bytes at `--offset` from a project's thin-provisioned BlockVolume
+    BlockRead {
+        #[arg(long)]
+        project: String,
+        #[arg(long)]
+        volume: String,
+        #[arg(long)]
+        subject: String,
+        #[arg(long, default_value_t = 0)]
+        offset: u64,
+        #[arg(long)]
+        len: usize,
+        #[arg(short = 'o', long)]
+        out: Option<PathBuf>,
     },
     /// Upload an object to a project's ObjectStore on a live `yadbd` node
     S3Put {
@@ -267,6 +313,67 @@ fn print_status(state: &ControlPlaneState) {
             os.pool, os.isolation, os.buckets
         );
     }
+    println!("BlockVolumes ({}):", state.block_volumes.len());
+    for (full_key, bv) in &state.block_volumes {
+        println!(
+            "  - {full_key}: pool={}, size_bytes={}",
+            bv.pool, bv.size_bytes
+        );
+    }
+}
+
+fn format_sql_val(v: &SqlValue) -> String {
+    match v {
+        SqlValue::Null => "NULL".into(),
+        SqlValue::Bool(b) => b.to_string(),
+        SqlValue::Int(n) => n.to_string(),
+        SqlValue::Text(s) => s.clone(),
+    }
+}
+
+fn print_query_result(qr: &QueryResult) {
+    if qr.columns.is_empty() {
+        println!("OK (rows_affected={})", qr.rows_affected);
+        return;
+    }
+
+    let mut widths: Vec<usize> = qr.columns.iter().map(|c| c.len()).collect();
+    let rendered: Vec<Vec<String>> = qr
+        .rows
+        .iter()
+        .map(|row| {
+            row.iter()
+                .enumerate()
+                .map(|(i, cell)| {
+                    let s = format_sql_val(cell);
+                    if i < widths.len() {
+                        widths[i] = widths[i].max(s.len());
+                    }
+                    s
+                })
+                .collect()
+        })
+        .collect();
+
+    let hdr: Vec<String> = qr
+        .columns
+        .iter()
+        .enumerate()
+        .map(|(i, c)| format!("{:<width$}", c, width = widths[i]))
+        .collect();
+    let sep: Vec<String> = widths.iter().map(|&w| "-".repeat(w)).collect();
+
+    println!("{}", hdr.join(" | "));
+    println!("{}", sep.join("-+-"));
+    for r in &rendered {
+        let line: Vec<String> = r
+            .iter()
+            .enumerate()
+            .map(|(i, cell)| format!("{:<width$}", cell, width = widths[i]))
+            .collect();
+        println!("{}", line.join(" | "));
+    }
+    println!("({} rows)", rendered.len());
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -345,6 +452,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             print_status(&state);
         }
+        Command::RaftStatus => {
+            let srv = cli.server.as_deref().unwrap_or("http://127.0.0.1:8420");
+            let (code, body) = http_request(srv, "GET", "/raft/status", &[], &[])?;
+            if code != 200 {
+                eprintln!(
+                    "Raft status failed ({code}): {}",
+                    String::from_utf8_lossy(&body)
+                );
+                std::process::exit(1);
+            }
+            let val: serde_json::Value = serde_json::from_slice(&body)?;
+            println!("{}", serde_json::to_string_pretty(&val)?);
+        }
+        Command::RaftElect => {
+            let srv = cli.server.as_deref().unwrap_or("http://127.0.0.1:8420");
+            let (code, body) = http_request(srv, "POST", "/raft/elect", &[], &[])?;
+            if code != 200 {
+                eprintln!(
+                    "Raft elect failed ({code}): {}",
+                    String::from_utf8_lossy(&body)
+                );
+                std::process::exit(1);
+            }
+            let val: serde_json::Value = serde_json::from_slice(&body)?;
+            println!("{}", serde_json::to_string_pretty(&val)?);
+        }
         Command::AuthCheck {
             project,
             subject,
@@ -365,6 +498,92 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     eprintln!("DENY: {e}");
                     std::process::exit(1);
                 }
+            }
+        }
+        Command::Sql {
+            project,
+            db,
+            subject,
+            query,
+        } => {
+            let srv = cli.server.as_deref().unwrap_or("http://127.0.0.1:8420");
+            let payload = serde_json::to_vec(&serde_json::json!({ "sql": query }))?;
+            let path = format!("/db/{project}/{db}/query");
+            let (code, body) = http_request(
+                srv,
+                "POST",
+                &path,
+                &[
+                    ("Content-Type", "application/json"),
+                    ("x-yadb-subject", &subject),
+                ],
+                &payload,
+            )?;
+            if code != 200 {
+                eprintln!("SQL failed ({code}): {}", String::from_utf8_lossy(&body));
+                std::process::exit(1);
+            }
+            let qr: QueryResult = serde_json::from_slice(&body)?;
+            print_query_result(&qr);
+        }
+        Command::BlockWrite {
+            project,
+            volume,
+            subject,
+            offset,
+            data,
+            file,
+        } => {
+            let srv = cli.server.as_deref().unwrap_or("http://127.0.0.1:8420");
+            let bytes = if let Some(p) = file {
+                fs::read(p)?
+            } else if let Some(s) = data {
+                s.into_bytes()
+            } else {
+                return Err("specify either `--data <str>` or `-f <file>`".into());
+            };
+            let path = format!("/block/{project}/{volume}?offset={offset}");
+            let (code, body) = http_request(
+                srv,
+                "PUT",
+                &path,
+                &[("x-yadb-subject", &subject)],
+                &bytes,
+            )?;
+            if code != 200 {
+                eprintln!(
+                    "Block write failed ({code}): {}",
+                    String::from_utf8_lossy(&body)
+                );
+                std::process::exit(1);
+            }
+            println!("Block WRITE OK: {}", String::from_utf8_lossy(&body));
+        }
+        Command::BlockRead {
+            project,
+            volume,
+            subject,
+            offset,
+            len,
+            out,
+        } => {
+            let srv = cli.server.as_deref().unwrap_or("http://127.0.0.1:8420");
+            let path = format!("/block/{project}/{volume}?offset={offset}&len={len}");
+            let (code, body) =
+                http_request(srv, "GET", &path, &[("x-yadb-subject", &subject)], &[])?;
+            if code != 200 {
+                eprintln!(
+                    "Block read failed ({code}): {}",
+                    String::from_utf8_lossy(&body)
+                );
+                std::process::exit(1);
+            }
+            if let Some(dst) = out {
+                fs::write(&dst, &body)?;
+                println!("Saved {} bytes from BlockVolume to {:?}", body.len(), dst);
+            } else {
+                std::io::stdout().write_all(&body)?;
+                println!();
             }
         }
         Command::S3Put {

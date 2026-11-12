@@ -12,6 +12,7 @@ path = "src/main.rs"
 yadb-io = { path = "../yadb-io" }
 yadb-blob = { path = "../yadb-blob" }
 yadb-control = { path = "../yadb-control" }
+yadb-db = { path = "../yadb-db" }
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
