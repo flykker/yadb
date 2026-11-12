@@ -13,7 +13,9 @@ import http.client
 import json
 import os
 from pathlib import Path
+import select
 import socket
+import socketserver
 import struct
 import subprocess
 import tempfile
@@ -25,6 +27,37 @@ import xml.etree.ElementTree as ET
 ROOT = Path(__file__).resolve().parents[1]
 SECRET = "integration-secret-12345"
 SUBJECT = "sa:billing-backend"
+
+
+class PeerProxy(socketserver.ThreadingTCPServer):
+    """One directed peer link; toggling it also closes in-flight connections."""
+    allow_reuse_address = True
+    daemon_threads = True
+
+    def __init__(self, source, target):
+        self.target = target
+        self.blocked = threading.Event()
+        super().__init__(("127.0.0.1", 19400 + source * 10 + target), PeerHandler)
+
+
+class PeerHandler(socketserver.BaseRequestHandler):
+    def handle(self):
+        if self.server.blocked.is_set():
+            return
+        try:
+            with socket.create_connection(("127.0.0.1", 19000+self.server.target), timeout=2) as upstream:
+                upstream.settimeout(2)
+                self.request.settimeout(2)
+                sockets = (self.request, upstream)
+                while not self.server.blocked.is_set():
+                    ready, _, _ = select.select(sockets, [], [], .05)
+                    for sock in ready:
+                        data = sock.recv(65536)
+                        if not data:
+                            return
+                        (upstream if sock is self.request else self.request).sendall(data)
+        except OSError:
+            pass
 
 
 def exact(sock, n):
@@ -353,9 +386,10 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
         os.chmod(creds, 0o600)
         nodes = []
         logs = []
-        peers = ",".join(f"{i}=127.0.0.1:{19000+i}" for i in range(1, 4))
+        proxies = {}
         portals = ",".join(f"127.0.0.1:{19300+i}" for i in range(1, 4))
         def start_node(i):
+            peers = ",".join(f"{j}=127.0.0.1:{19000+j if i == j else 19400+i*10+j}" for j in range(1, 4))
             return subprocess.Popen([str(ROOT/"target/debug/yadbd"), "--node-id", str(i),
                 "--listen", f"127.0.0.1:{19000+i}", "--peers", peers, "--data-dir", str(temp/f"n{i}"),
                 "--protocol-credentials", str(creds), "--pg-listen", f"127.0.0.1:{19100+i}",
@@ -363,6 +397,12 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
                 "--s3-listen", f"127.0.0.1:{19200+i}", "--s3-target", "billing/receipts"],
                 stdout=logs[i-1], stderr=logs[i-1])
         try:
+            for i in range(1, 4):
+                for j in range(1, 4):
+                    if i != j:
+                        proxy = PeerProxy(i, j)
+                        proxies[i, j] = proxy
+                        threading.Thread(target=proxy.serve_forever, daemon=True).start()
             for i in range(1, 4):
                 log = open(temp/f"node{i}.log", "wb")
                 logs.append(log)
@@ -417,7 +457,8 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
             def overwrite():
                 try:
                     for i in range(60):
-                        assert signed(19202, "PUT", race_key, replacement if i % 2 == 0 else original)[0] == 200
+                        result = signed(19202, "PUT", race_key, replacement if i % 2 == 0 else original)
+                        assert result[0] == 200, result
                 except BaseException as e:
                     failures.append(e)
             writer = threading.Thread(target=overwrite)
@@ -590,6 +631,58 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
             wait(19000+i)
             print("PASS quorum loss: no SQL/S3 acknowledgement without peers; majority recovery")
 
+            # Partition the live leader from both peers in both directions.
+            # Direct client ports stay reachable on all three processes.
+            deadline = time.monotonic()+20
+            while True:
+                statuses = [json.loads(request(19000+i, "GET", "/raft/status")[2]) for i in range(1, 4)]
+                leaders = [s["node_id"] for s in statuses if s["role"] == "Leader"]
+                if len(leaders) == 1 and all(s["leader_id"] == leaders[0] for s in statuses):
+                    break
+                assert time.monotonic() < deadline, statuses
+                time.sleep(.1)
+            old = leaders[0]
+            majority = [i for i in range(1, 4) if i != old]
+            for peer in majority:
+                proxies[old, peer].blocked.set()
+                proxies[peer, old].blocked.set()
+            stale = signed(19200+old, "PUT", "/invoices-2026/partition-stale", b"minority")
+            assert not 200 <= stale[0] < 300, stale
+            stale_pg = Pg(19100+old)
+            stale_pg.s.settimeout(10)
+            stale_pg.query("INSERT INTO wire VALUES (98,998);", fail=True)
+            stale_pg.close()
+            deadline = time.monotonic()+20
+            while True:
+                statuses = [json.loads(request(19000+i, "GET", "/raft/status")[2]) for i in majority]
+                leaders = [s["node_id"] for s in statuses if s["role"] == "Leader"]
+                if len(leaders) == 1:
+                    break
+                assert time.monotonic() < deadline, statuses
+                time.sleep(.1)
+            new = leaders[0]
+            result = signed(19200+new, "PUT", "/invoices-2026/partition-majority", b"majority")
+            assert result[0] == 200, result
+            majority_pg = Pg(19100+new)
+            majority_pg.query("INSERT INTO wire VALUES (97,997);")
+            majority_pg.close()
+            assert all(p.poll() is None for p in nodes)
+            for proxy in proxies.values():
+                proxy.blocked.clear()
+            deadline = time.monotonic()+20
+            while True:
+                statuses = [json.loads(request(19000+i, "GET", "/raft/status")[2]) for i in range(1, 4)]
+                if all(s["leader_id"] == new for s in statuses) and statuses[old-1]["role"] == "Follower":
+                    break
+                assert time.monotonic() < deadline, statuses
+                time.sleep(.1)
+            assert signed(19200+old, "GET", "/invoices-2026/partition-majority")[2] == b"majority"
+            assert signed(19200+old, "GET", "/invoices-2026/restart")[2] == b"durable object"
+            reunited_pg = Pg(19100+old)
+            assert reunited_pg.rows("SELECT balance FROM wire WHERE id=97;") == [["997"]]
+            reunited_pg.close()
+            print("PASS live bidirectional partition: minority rejected, majority elected, rejoined")
+
             leader = json.loads(request(19002, "GET", "/raft/status")[2])["leader_id"]
             survivor = next(i for i in range(1, 4) if i != leader)
             alive = Iscsi(19300+survivor)
@@ -624,6 +717,9 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
                 p.wait(timeout=10)
             for log in logs:
                 log.close()
+            for proxy in proxies.values():
+                proxy.shutdown()
+                proxy.server_close()
 
 
 if __name__ == "__main__":
