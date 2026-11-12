@@ -383,8 +383,15 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
             assert b.rows("SELECT balance FROM wire WHERE id=1;") == [["90"]]
             a.query("BEGIN; UPDATE wire SET balance=0 WHERE id=1;")
             a.query("SELECT missing FROM wire;", fail=True)
-            a.query("COMMIT;", fail=True)
-            a.query("ROLLBACK;")
+            assert a.query("SELECT balance FROM wire;", fail=True)[-1] == (b"Z", b"E")
+            # PostgreSQL treats COMMIT in an aborted transaction as ROLLBACK.
+            out = a.query("COMMIT;")
+            assert (b"C", b"ROLLBACK\0") in out and out[-1] == (b"Z", b"I"), out
+            assert b.rows("SELECT balance FROM wire WHERE id=1;") == [["90"]]
+            a.query("BEGIN; UPDATE wire SET balance=0 WHERE id=1;")
+            assert a.query("INVALID SQL;", fail=True)[-1] == (b"Z", b"E")
+            assert a.query("ROLLBACK;")[-1] == (b"Z", b"I")
+            assert b.rows("SELECT balance FROM wire WHERE id=1;") == [["90"]]
             a.close()
             print("PASS pgwire password, result framing, multi-statements, session isolation, rollback")
 

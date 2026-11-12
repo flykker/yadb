@@ -179,11 +179,15 @@ pub fn connection(mut c: TcpStream, st: AppState, credentials: Credentials) -> i
                     let sources = split(query);
                     if sources.len() != stmts.len() {
                         error(&mut c, "42601", "invalid statement boundaries")?;
+                        if status == b'T' {
+                            status = b'E';
+                        }
                         ready(&mut c, status)?;
                         continue;
                     }
                     for (stmt, sql) in stmts.iter().zip(sources) {
-                        let rollback = matches!(stmt, SqlStmt::Rollback);
+                        let aborted_commit = status == b'E' && matches!(stmt, SqlStmt::Commit);
+                        let rollback = matches!(stmt, SqlStmt::Rollback) || aborted_commit;
                         if status == b'E' && !rollback {
                             error(&mut c, "25P02", "transaction aborted; ROLLBACK required")?;
                             break;
@@ -198,6 +202,7 @@ pub fn connection(mut c: TcpStream, st: AppState, credentials: Credentials) -> i
                             )?;
                             break;
                         }
+                        let sql = if aborted_commit { "ROLLBACK;" } else { sql };
                         let body=serde_json::to_vec(&serde_json::json!({"sql":sql,"session_id":session,"force_leader":true,"require_transaction":status==b'T' && !rollback})).map_err(io::Error::other)?;
                         let (code, body) =
                             http(&st.listen_addr, "POST", &path, &cred.subject, &body)?;
@@ -223,7 +228,7 @@ pub fn connection(mut c: TcpStream, st: AppState, credentials: Credentials) -> i
                             }
                             SqlStmt::Commit => {
                                 status = b'I';
-                                "COMMIT".into()
+                                if aborted_commit { "ROLLBACK" } else { "COMMIT" }.into()
                             }
                             SqlStmt::Rollback => {
                                 status = b'I';
