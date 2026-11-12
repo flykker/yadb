@@ -365,6 +365,22 @@ impl<FS: StorageFs> VolumeStore<FS> {
             .map(|(&id, &e)| (id, e))
             .collect();
 
+        // Barriers are durable state too. They are not part of the live-blob
+        // index, so copying only `live_items` would silently drop a barrier
+        // when its old segment is compacted. Preserve the current barriers in
+        // the replacement segment; duplicate markers are harmless during
+        // recovery and keep fencing intact even if every old segment is
+        // compacted away.
+        let barrier_markers: Vec<BlobId> = self
+            .barriers
+            .read()
+            .unwrap()
+            .iter()
+            .map(|(&(project_id, owner_id, channel), &generation)| {
+                BlobId::new(project_id, owner_id, generation, 0, channel, 0)
+            })
+            .collect();
+
         let tmp_path = format!("{}.compact", segment_path(&self.dir, seg_id));
         let final_path = segment_path(&self.dir, seg_id);
         let tmp_file = self.fs.open_rw(&tmp_path, true)?;
@@ -389,6 +405,12 @@ impl<FS: StorageFs> VolumeStore<FS> {
                     data_crc: entry.data_crc,
                 },
             ));
+        }
+
+        for marker_id in barrier_markers {
+            let hdr = encode_record_header(REC_KIND_BARRIER, marker_id, 0, 0);
+            tmp_file.write_at(pos, &hdr)?;
+            pos += RECORD_HEADER_LEN as u64;
         }
 
         tmp_file.sync_data()?;

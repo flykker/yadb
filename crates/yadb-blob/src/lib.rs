@@ -146,6 +146,31 @@ mod tests {
     }
 
     #[test]
+    fn compaction_preserves_gc_fencing_after_restart() {
+        let fs = SimFs::new(1235);
+        let cfg = VolumeConfig {
+            max_segment_bytes: 256,
+            max_blob_bytes: 1024,
+            sync_on_put: true,
+        };
+        let old = BlobId::new(10, 50, 1, 1, 2, 0);
+        let live = BlobId::new(10, 50, 2, 1, 2, 0);
+        let store = VolumeStore::open(fs.clone(), "gc_restart", cfg).unwrap();
+        store.put(old, &[b'x'; 100]).unwrap();
+        store.collect_garbage_barrier(10, 50, 2, 1).unwrap();
+        // Seal the segment containing the barrier, then compact it away.
+        store.put(live, &[b'y'; 100]).unwrap();
+        assert!(store.compact_sealed_segments().unwrap() > 0);
+        drop(store);
+        fs.simulate_power_cut();
+        let reopened = VolumeStore::open(fs, "gc_restart", cfg).unwrap();
+        assert_eq!(reopened.get(live).unwrap(), vec![b'y'; 100]);
+        assert!(matches!(reopened.get(old), Err(BlobError::NotFound(_))));
+        assert!(matches!(reopened.put(old, b"late orphan fragment"),
+            Err(BlobError::FencedByBarrier { barrier_gen: 1, .. })));
+    }
+
+    #[test]
     fn pool_striper_survives_bitrot_and_repairs_missing_domain() {
         let fs = SimFs::new(2026);
         let mut domains = Vec::new();

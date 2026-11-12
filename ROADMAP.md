@@ -36,6 +36,14 @@ YADB uses ordinary filesystems; raw PDisk and NBD are not project goals.
   behavior; state only the isolation guarantees actually established.
 - [ ] Prove GC and compaction do not remove live data, including during recovery,
   concurrent operations and failed commits; reclaim unreferenced block fragments.
+- [x] Reproduce and fix loss of a durable GC barrier when a sealed volume segment
+  is compacted and the node restarts. Compaction now carries barrier markers into
+  the replacement segment; a regression test confirms old-generation writes remain
+  fenced after recovery.
+- [ ] Add a safe S3 orphan-fragment collector. A failed fragment quorum can leave
+  an unreferenced immutable fragment after the manifest commit is skipped; current
+  scrub verifies referenced fragments but deliberately does not delete unknown
+  fragments.
 - [ ] Run kernel open-iscsi + dm-multipath + KVM guest I/O on a Linux host; kill
   active targets, partition networks, restore paths and verify guest data integrity.
   This is blocked on this Android environment by missing KVM and device mapper.

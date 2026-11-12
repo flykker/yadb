@@ -345,7 +345,7 @@ impl<FS: StorageFs> ObjectStoreEngine<FS> {
 mod tests {
     use super::*;
     use yadb_blob::{ErasureScheme, VolumeConfig, VolumeStore};
-    use yadb_io::SimFs;
+    use yadb_io::{FaultConfig, SimFs};
 
     #[test]
     fn multi_chunk_s3_object_supports_range_read_and_listing_over_rs_4_2() {
@@ -414,5 +414,90 @@ mod tests {
         assert_eq!(listed.len(), 2);
         assert_eq!(listed[0].key, "nov/inv-001.bin");
         assert_eq!(listed[1].key, "nov/inv-002.bin");
+    }
+
+    #[test]
+    fn failed_fragment_quorum_leaves_no_manifest_but_retains_orphan_after_restart() {
+        let meta_fs = SimFs::new(6001);
+        let data_fs = SimFs::new(6002);
+        let meta = LocalMetaKv::open_single_node(&meta_fs, "meta", 1).unwrap();
+        let s3 = ObjectStoreEngine::new(meta, 4096);
+        let mut domains = Vec::new();
+        for i in 0..3 {
+            domains.push(
+                VolumeStore::open(
+                    data_fs.clone(),
+                    format!("mirror-{i}"),
+                    VolumeConfig::default(),
+                )
+                .unwrap(),
+            );
+        }
+        let pool = Arc::new(PoolStriper::new(
+            ErasureScheme::Mirror { replicas: 3 },
+            domains,
+        )
+        .unwrap());
+        s3.register_pool("wal-fast", pool.clone());
+
+        // The metadata WAL remains healthy; only fragment writes are faulted.
+        // This produces a failed 1/3 mirror write after one durable fragment,
+        // but no ObjectManifest is published.
+        data_fs.set_faults(FaultConfig {
+            // SplitMix64 values for seed 13 make the first mirror write pass,
+            // then tear the next two writes deterministically.
+            seed: 13,
+            torn_write_prob: 0.5,
+            read_eio_prob: 0.0,
+        });
+        let result = s3.put_object(
+            1,
+            "receipts",
+            "wal-fast",
+            "invoices-2026",
+            "failed-fragment-write",
+            "application/octet-stream",
+            b"payload whose manifest must not become visible",
+        );
+        assert!(matches!(result, Err(S3Error::Blob(_))), "{result:?}");
+        assert!(matches!(
+            s3.head_object(1, "receipts", "invoices-2026", "failed-fragment-write"),
+            Err(S3Error::ObjectNotFound { .. })
+        ));
+
+        let live_fragments: usize = pool
+            .slots()
+            .iter()
+            .map(|slot| slot.local_store().unwrap().stats().unwrap().live_blobs)
+            .sum();
+        assert_eq!(live_fragments, 1);
+        // A failed fragment PUT is not an atomic rollback. The acknowledged
+        // fragment remains on disk, but without a manifest it is not an S3
+        // object. No automatic S3 orphan collector exists yet.
+        drop(s3);
+        drop(pool);
+        data_fs.set_faults(FaultConfig::default());
+        data_fs.simulate_power_cut();
+        meta_fs.simulate_power_cut();
+        let meta = LocalMetaKv::open_single_node(&meta_fs, "meta", 1).unwrap();
+        let recovered = ObjectStoreEngine::new(meta, 4096);
+        assert!(matches!(
+            recovered.head_object(1, "receipts", "invoices-2026", "failed-fragment-write"),
+            Err(S3Error::ObjectNotFound { .. })
+        ));
+        let remaining: usize = (0..3)
+            .map(|i| {
+                VolumeStore::open(
+                    data_fs.clone(),
+                    format!("mirror-{i}"),
+                    VolumeConfig::default(),
+                )
+                .unwrap()
+                .stats()
+                .unwrap()
+                .live_blobs
+            })
+            .sum();
+        assert_eq!(remaining, 1);
     }
 }
