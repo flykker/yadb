@@ -400,6 +400,10 @@ impl<FS: StorageFs> RaftCore<FS> {
                     }]);
                 }
 
+                // Only the prefix covered by this RPC is known to match the
+                // leader. A follower may still have an unrelated local suffix.
+                let matched_index = prev_log_index + entries.len() as u64;
+
                 // Truncate any conflicting uncommitted suffix and append new entries
                 let mut write_start: Option<u64> = None;
                 let mut to_persist: Vec<LogEntry> = Vec::new();
@@ -431,7 +435,7 @@ impl<FS: StorageFs> RaftCore<FS> {
                 }
 
                 if leader_commit > self.commit_index {
-                    self.commit_index = leader_commit.min(self.last_log_index());
+                    self.commit_index = self.commit_index.max(leader_commit.min(matched_index));
                     self.apply_committed();
                 }
 
@@ -441,7 +445,7 @@ impl<FS: StorageFs> RaftCore<FS> {
                         from: self.node_id,
                         term: self.current_term,
                         success: true,
-                        match_index: self.last_log_index(),
+                        match_index: matched_index,
                     },
                 }])
             }

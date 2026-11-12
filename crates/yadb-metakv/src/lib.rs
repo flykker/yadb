@@ -89,6 +89,80 @@ mod tests {
     }
 
     #[test]
+    fn heartbeat_does_not_confirm_or_commit_divergent_suffix() {
+        let mut cluster = SimCluster::new(&[1, 2, 3]);
+        let msgs = cluster.nodes.get_mut(&1).unwrap().start_election().unwrap();
+        cluster.enqueue_from(1, msgs);
+        cluster.drain_network();
+        let common = cluster.nodes[&1].commit_index();
+        cluster.isolate_subset(&[1], &[2, 3]);
+        for value in [b"stale-1".as_slice(), b"stale-2".as_slice()] {
+            let (_, msgs) = cluster.nodes.get_mut(&1).unwrap().propose(KvCommand::Put {
+                key: "key".into(), value: value.to_vec(),
+            }).unwrap();
+            cluster.enqueue_from(1, msgs);
+            cluster.drain_network();
+        }
+        assert_eq!(cluster.nodes[&1].commit_index(), common);
+        let term = cluster.nodes[&1].current_term();
+        let replies = cluster.nodes.get_mut(&1).unwrap().step(RaftRpc::AppendEntries {
+            term: term + 1,
+            leader_id: 2,
+            prev_log_index: common,
+            prev_log_term: term,
+            entries: vec![],
+            leader_commit: common + 2,
+        }).unwrap();
+        assert!(matches!(replies[0].rpc, RaftRpc::AppendEntriesReply {
+            success: true, match_index, ..
+        } if match_index == common), "{replies:?}");
+        assert_eq!(cluster.nodes[&1].commit_index(), common);
+        assert!(cluster.nodes[&1].get("key").is_none());
+    }
+
+    #[test]
+    fn three_node_partition_discards_stale_leader_suffix() {
+        let mut cluster = SimCluster::new(&[1, 2, 3]);
+        let msgs = cluster.nodes.get_mut(&1).unwrap().start_election().unwrap();
+        cluster.enqueue_from(1, msgs);
+        cluster.drain_network();
+        let (_, msgs) = cluster.nodes.get_mut(&1).unwrap().propose(KvCommand::Put {
+            key: "committed".into(), value: b"before".to_vec(),
+        }).unwrap();
+        cluster.enqueue_from(1, msgs);
+        cluster.drain_network();
+
+        cluster.isolate_subset(&[1], &[2, 3]);
+        let (stale_index, msgs) = cluster.nodes.get_mut(&1).unwrap().propose(KvCommand::Put {
+            key: "conflict".into(), value: b"minority".to_vec(),
+        }).unwrap();
+        cluster.enqueue_from(1, msgs);
+        cluster.drain_network();
+        assert!(cluster.nodes[&1].commit_index() < stale_index);
+        assert!(cluster.nodes[&1].get("conflict").is_none());
+
+        let msgs = cluster.nodes.get_mut(&2).unwrap().start_election().unwrap();
+        cluster.enqueue_from(2, msgs);
+        cluster.drain_network();
+        assert_eq!(cluster.nodes[&2].role(), RoleState::Leader);
+        let (majority_index, msgs) = cluster.nodes.get_mut(&2).unwrap().propose(KvCommand::Put {
+            key: "conflict".into(), value: b"majority".to_vec(),
+        }).unwrap();
+        cluster.enqueue_from(2, msgs);
+        cluster.drain_network();
+        assert!(cluster.nodes[&2].commit_index() >= majority_index);
+        cluster.heal_all();
+        let msgs = cluster.nodes[&2].broadcast_append_entries();
+        cluster.enqueue_from(2, msgs);
+        cluster.drain_network();
+        assert_eq!(cluster.nodes[&1].role(), RoleState::Follower);
+        for id in 1..=3 {
+            assert_eq!(cluster.nodes[&id].get("committed").unwrap().value, b"before");
+            assert_eq!(cluster.nodes[&id].get("conflict").unwrap().value, b"majority");
+        }
+    }
+
+    #[test]
     fn five_node_raft_survives_leader_kill_and_prevents_split_brain() {
         let mut cluster = SimCluster::new(&[1, 2, 3, 4, 5]);
 
