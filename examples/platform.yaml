@@ -1,0 +1,77 @@
+apiVersion: yadb.io/v1alpha1
+kind: Cluster
+metadata:
+  name: phone-dev-cluster
+spec:
+  domains:
+    - name: az-1
+      nodes:
+        - id: 1
+          addr: 127.0.0.1:9101
+          mounts: [/data/az1/disk0, /data/az1/disk1]
+    - name: az-2
+      nodes:
+        - id: 2
+          addr: 127.0.0.1:9102
+          mounts: [/data/az2/disk0, /data/az2/disk1]
+    - name: az-3
+      nodes:
+        - id: 3
+          addr: 127.0.0.1:9103
+          mounts: [/data/az3/disk0, /data/az3/disk1]
+---
+apiVersion: yadb.io/v1alpha1
+kind: StoragePool
+metadata:
+  name: wal-fast
+spec:
+  erasure:
+    scheme: mirror
+    replicas: 3
+  failureDomains: 3
+---
+apiVersion: yadb.io/v1alpha1
+kind: StoragePool
+metadata:
+  name: data-ec
+spec:
+  erasure:
+    scheme: reed-solomon
+    k: 4
+    m: 2
+  failureDomains: 3
+---
+apiVersion: yadb.io/v1alpha1
+kind: Project
+metadata:
+  name: billing
+spec:
+  quotas:
+    maxStorageBytes: 1099511627776
+    maxIops: 25000
+  members:
+    - subject: sa:billing-backend
+      role: readWrite
+    - subject: user:auditor
+      role: readOnly
+---
+apiVersion: yadb.io/v1alpha1
+kind: Database
+metadata:
+  name: ledger
+  project: billing
+spec:
+  walPool: wal-fast
+  dataPool: data-ec
+  isolation: shared
+  shards: 4
+---
+apiVersion: yadb.io/v1alpha1
+kind: ObjectStore
+metadata:
+  name: receipts
+  project: billing
+spec:
+  pool: data-ec
+  isolation: shared
+  buckets: [invoices-2026, exports]

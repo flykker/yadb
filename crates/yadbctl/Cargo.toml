@@ -1,0 +1,16 @@
+[package]
+name = "yadbctl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "yadbctl"
+path = "src/main.rs"
+
+[dependencies]
+yadb-io = { path = "../yadb-io" }
+yadb-blob = { path = "../yadb-blob" }
+yadb-control = { path = "../yadb-control" }
+clap.workspace = true
+serde_json.workspace = true

@@ -1,0 +1,3 @@
+[build]
+# Keep memory usage friendly on ARM64 mobile hardware (~1.8 GB free RAM)
+jobs = 2
