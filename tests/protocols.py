@@ -431,6 +431,25 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
             r, data = x.recv()
             assert r[0] == 0x21 and r[3] == 0 and not data
             assert r[1] & 2 and int.from_bytes(r[44:48], "big") == 36, r
+            # Respect the SCSI CDB allocation length independently from the
+            # iSCSI Expected Data Transfer Length and report the difference.
+            for cdb, allocated in [
+                (bytes([0x03, 0, 0, 0, 4, 0]), 4),
+                (bytes([0x1a, 0, 8, 0, 4, 0]), 4),
+                (bytes([0x5a, 0, 8, 0, 0, 0, 0, 0, 4, 0]), 4),
+                (bytes([0x9e, 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0]), 4),
+                (bytes([0xa0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0]), 4),
+            ]:
+                x.itt += 1
+                h = x.header(1, 0xc1)
+                h[20:24] = (32).to_bytes(4, "big")
+                h[32:32+len(cdb)] = cdb
+                x.send(h)
+                x.cmd += 1
+                r, data = x.recv()
+                assert r[0] == 0x25 and r[1] & 1 and r[3] == 0, (cdb, r)
+                assert len(data) == allocated, (cdb, len(data))
+                assert r[1] & 2 and int.from_bytes(r[44:48], "big") == 32-allocated, (cdb, r)
             x.write(b"A"*512)
             assert y.read() == b"A"*512
             x.write(b"B"*4096, immediate=False)

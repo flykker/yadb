@@ -517,19 +517,20 @@ fn command(c: &mut TcpStream, st: &AppState, s: &mut Session, p: Pdu) -> io::Res
             d[8..12].copy_from_slice(&512u32.to_be_bytes());
             d[13] = 3;
             d[14] = 0xc0;
+            d.truncate(u32at(cdb, 10) as usize);
             send_data(c, s, &p, d)
         }
         0xa0 => {
             let mut d = vec![0; 16];
             d[3] = 8;
+            d.truncate(u32at(cdb, 6) as usize);
             send_data(c, s, &p, d)
         }
-        0x03 => send_data(
-            c,
-            s,
-            &p,
-            vec![0x70, 0, 0, 0, 0, 0, 0, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-        ),
+        0x03 => {
+            let mut d = vec![0x70, 0, 0, 0, 0, 0, 0, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+            d.truncate(cdb[4] as usize);
+            send_data(c, s, &p, d)
+        }
         0x1a | 0x5a => {
             let page = cdb[2] & 0x3f;
             if page != 8 && page != 0x3f {
@@ -550,6 +551,12 @@ fn command(c: &mut TcpStream, st: &AppState, s: &mut Session, p: Pdu) -> io::Res
             } else {
                 d[..2].copy_from_slice(&((n - 2) as u16).to_be_bytes());
             }
+            let alloc = if op == 0x1a {
+                cdb[4] as usize
+            } else {
+                u16::from_be_bytes([cdb[7], cdb[8]]) as usize
+            };
+            d.truncate(alloc);
             send_data(c, s, &p, d)
         }
         0x28 | 0x88 | 0x2a | 0x8a => {
