@@ -6,10 +6,12 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use yadb_blob::{BlobError, BlobId, PoolStriper};
 use yadb_io::StorageFs;
-use yadb_metakv::{KvCommand, LocalMetaKv, MetaError};
+use yadb_metakv::{KvCommand, KvResult, LocalMetaKv, MetaError};
 
 #[derive(Debug, Error)]
 pub enum S3Error {
+    #[error("object generation allocation exhausted or contended")]
+    GenerationExhausted,
     #[error("blob engine error: {0}")]
     Blob(#[from] BlobError),
 
@@ -45,6 +47,8 @@ pub struct ObjectManifest {
     pub content_type: String,
     pub pool: String,
     pub chunks: Vec<ChunkRef>,
+    #[serde(default)]
+    pub last_modified: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -53,6 +57,8 @@ pub struct ObjectSummary {
     pub size: u64,
     pub etag: String,
     pub version: u64,
+    #[serde(default)]
+    pub last_modified: u64,
 }
 
 /// Multi-tenant S3 / ObjectStore engine built directly on top of YADB's `MetaKV` + `PoolStriper`.
@@ -135,7 +141,40 @@ impl<FS: StorageFs> ObjectStoreEngine<FS> {
 
         // Bind blob generation to durable MetaKV revision + 1 so restarts/failovers never collide!
         let mkey = Self::meta_key(project_id, store, bucket, key);
-        let next_gen = ((self.meta.revision() as u32).saturating_add(1)).min(BlobId::MAX_U24);
+        let alloc_key = format!("/s3-alloc/{project_id}/{store}/{bucket}/{key}");
+        let mut reserved = None;
+        for _ in 0..32 {
+            let cur = self.meta.get(&alloc_key);
+            let version = cur.as_ref().map_or(0, |v| v.version);
+            let previous = match cur {
+                Some(v) => serde_json::from_slice::<u32>(&v.value)?,
+                None => 0,
+            };
+            // Also stay above generations used by older versions of the engine.
+            let floor = self
+                .meta
+                .get(&mkey)
+                .and_then(|v| serde_json::from_slice::<ObjectManifest>(&v.value).ok())
+                .and_then(|m| m.chunks.iter().map(|c| c.blob_id.generation()).max())
+                .unwrap_or(0);
+            let next = previous
+                .max(floor)
+                .checked_add(1)
+                .filter(|v| *v <= BlobId::MAX_U24)
+                .ok_or(S3Error::GenerationExhausted)?;
+            if matches!(
+                self.meta.execute(KvCommand::CompareAndSwap {
+                    key: alloc_key.clone(),
+                    expected_version: version,
+                    new_value: Some(serde_json::to_vec(&next)?),
+                })?,
+                KvResult::CasOk { .. }
+            ) {
+                reserved = Some(next);
+                break;
+            }
+        }
+        let next_gen = reserved.ok_or(S3Error::GenerationExhausted)?;
 
         let mut chunks = Vec::new();
         let mut offset = 0u64;
@@ -161,6 +200,10 @@ impl<FS: StorageFs> ObjectStoreEngine<FS> {
             content_type: content_type.to_string(),
             pool: pool_name.to_string(),
             chunks,
+            last_modified: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
         };
 
         let encoded = serde_json::to_vec(&manifest)?;
@@ -180,10 +223,13 @@ impl<FS: StorageFs> ObjectStoreEngine<FS> {
         key: &str,
     ) -> Result<ObjectManifest, S3Error> {
         let mkey = Self::meta_key(project_id, store, bucket, key);
-        let kv = self.meta.get(&mkey).ok_or_else(|| S3Error::ObjectNotFound {
-            bucket: bucket.to_string(),
-            key: key.to_string(),
-        })?;
+        let kv = self
+            .meta
+            .get(&mkey)
+            .ok_or_else(|| S3Error::ObjectNotFound {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+            })?;
         Ok(serde_json::from_slice(&kv.value)?)
     }
 
@@ -276,13 +322,17 @@ impl<FS: StorageFs> ObjectStoreEngine<FS> {
         let rows = self.meta.scan_prefix(&full_prefix);
         let mut out = Vec::with_capacity(rows.len());
         for (full_key, kv) in rows {
-            let obj_key = full_key.strip_prefix(&base).unwrap_or(&full_key).to_string();
+            let obj_key = full_key
+                .strip_prefix(&base)
+                .unwrap_or(&full_key)
+                .to_string();
             let manifest: ObjectManifest = serde_json::from_slice(&kv.value)?;
             out.push(ObjectSummary {
                 key: obj_key,
                 size: manifest.size,
                 etag: manifest.etag,
                 version: kv.version,
+                last_modified: manifest.last_modified,
             });
         }
         Ok(out)
@@ -307,9 +357,8 @@ mod tests {
                 VolumeStore::open(fs.clone(), format!("d{i}"), VolumeConfig::default()).unwrap(),
             );
         }
-        let pool = Arc::new(
-            PoolStriper::new(ErasureScheme::ReedSolomon { k: 4, m: 2 }, domains).unwrap(),
-        );
+        let pool =
+            Arc::new(PoolStriper::new(ErasureScheme::ReedSolomon { k: 4, m: 2 }, domains).unwrap());
         s3.register_pool("data-ec", pool);
 
         let payload: Vec<u8> = (0..15_000u32).map(|i| (i % 251) as u8).collect();

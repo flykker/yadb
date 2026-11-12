@@ -134,6 +134,7 @@ pub struct DatabaseEngine<FS: StorageFs> {
     #[allow(clippy::type_complexity)]
     shards: Arc<Mutex<BTreeMap<String, Arc<Mutex<DataShardTablet<FS>>>>>>,
     sessions: Arc<Mutex<BTreeMap<String, TxBuffer>>>,
+    query_lock: Arc<Mutex<()>>,
     flush_threshold_rows: usize,
 }
 
@@ -144,18 +145,23 @@ impl<FS: StorageFs> Clone for DatabaseEngine<FS> {
             pools: self.pools.clone(),
             shards: self.shards.clone(),
             sessions: self.sessions.clone(),
+            query_lock: self.query_lock.clone(),
             flush_threshold_rows: self.flush_threshold_rows,
         }
     }
 }
 
 impl<FS: StorageFs> DatabaseEngine<FS> {
+    pub fn has_session(&self, pid: u32, db: &str, subject: &str) -> bool {
+        self.sessions.lock().unwrap().contains_key(&format!("{pid}:{db}:{subject}"))
+    }
     pub fn new(meta: LocalMetaKv<FS>, flush_threshold_rows: usize) -> Self {
         Self {
             meta,
             pools: Arc::new(RwLock::new(BTreeMap::new())),
             shards: Arc::new(Mutex::new(BTreeMap::new())),
             sessions: Arc::new(Mutex::new(BTreeMap::new())),
+            query_lock: Arc::new(Mutex::new(())),
             flush_threshold_rows: flush_threshold_rows.max(16),
         }
     }
@@ -493,6 +499,9 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
             }
             let (schema, schema_ver) = self.load_schema_with_ver(project_id, db, &table)?;
             for (pk_bytes, (old_row, new_row)) in pk_map {
+                if self.read_committed_row(project_id, db, &schema, &pk_bytes)? != old_row {
+                    return Err(DbError::InvalidQuery("transaction write conflict; restart transaction".into()));
+                }
                 if old_row == new_row {
                     continue;
                 }
@@ -634,6 +643,7 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
         sql: &str,
     ) -> Result<QueryResult, DbError> {
         let stmts = parse_sql_script(sql)?;
+        let _serial = self.query_lock.lock().unwrap();
         let session_key = session_subject.map(|subj| format!("{project_id}:{db}:{subj}"));
 
         let mut active_tx: Option<TxBuffer> = if let Some(sk) = &session_key {
@@ -691,6 +701,7 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
         default_shards: u32,
         stmt: SqlStmt,
     ) -> Result<QueryResult, DbError> {
+        let _serial = self.query_lock.lock().unwrap();
         let mut active_tx = None;
         self.execute_one_in_ctx(
             project_id,

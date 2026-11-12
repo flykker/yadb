@@ -1,0 +1,356 @@
+#!/usr/bin/env python3
+"""Offline protocol integration tests using independent stdlib wire clients.
+
+Not a replacement for libiscsi/dm-multipath, libpq or AWS CLI interoperability tests.
+Run after cargo build --offline: python3 tests/protocols.py
+"""
+import datetime
+import hashlib
+import hmac
+import http.client
+import json
+import os
+from pathlib import Path
+import socket
+import struct
+import subprocess
+import tempfile
+import time
+import urllib.parse
+import xml.etree.ElementTree as ET
+
+ROOT = Path(__file__).resolve().parents[1]
+SECRET = "integration-secret-12345"
+SUBJECT = "sa:billing-backend"
+
+
+def exact(sock, n):
+    data = b""
+    while len(data) < n:
+        chunk = sock.recv(n - len(data))
+        if not chunk:
+            raise EOFError("connection closed")
+        data += chunk
+    return data
+
+
+def request(port, method, path, body=b"", headers=None):
+    c = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
+    c.request(method, path, body, headers or {})
+    r = c.getresponse()
+    status, hs, data = r.status, dict(r.getheaders()), r.read()
+    c.close()
+    return status, hs, data
+
+
+def signed(port, method, path, body=b"", extra=None, secret=SECRET):
+    now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    date = now[:8]
+    headers = {"host": f"127.0.0.1:{port}", "x-amz-date": now,
+               "x-amz-content-sha256": hashlib.sha256(body).hexdigest()}
+    headers.update(extra or {})
+    names = ";".join(sorted(headers))
+    uri, _, query = path.partition("?")
+    encode = lambda s: urllib.parse.quote(s, safe="-_.~")
+    cp = "/".join(encode(urllib.parse.unquote(s)) for s in uri.split("/"))
+    pairs = [(encode(urllib.parse.unquote(k)), encode(urllib.parse.unquote(v)))
+             for p in query.split("&") if p for k, _, v in [p.partition("=")]]
+    cq = "&".join(f"{k}={v}" for k, v in sorted(pairs))
+    ch = "".join(f"{k}:{headers[k]}\n" for k in sorted(headers))
+    canonical = f"{method}\n{cp}\n{cq}\n{ch}\n{names}\n{headers['x-amz-content-sha256']}"
+    scope = f"{date}/us-east-1/s3/aws4_request"
+    text = f"AWS4-HMAC-SHA256\n{now}\n{scope}\n{hashlib.sha256(canonical.encode()).hexdigest()}"
+    key = ("AWS4" + secret).encode()
+    for v in [date, "us-east-1", "s3", "aws4_request"]:
+        key = hmac.new(key, v.encode(), hashlib.sha256).digest()
+    sig = hmac.new(key, text.encode(), hashlib.sha256).hexdigest()
+    headers["authorization"] = f"AWS4-HMAC-SHA256 Credential=backend/{scope}, SignedHeaders={names}, Signature={sig}"
+    return request(port, method, path, body, headers)
+
+
+class Pg:
+    def __init__(self, port):
+        self.s = socket.create_connection(("127.0.0.1", port), timeout=30)
+        startup = struct.pack("!I", 196608) + b"user\0backend\0database\0billing/ledger\0\0"
+        self.s.sendall(struct.pack("!I", len(startup)+4)+startup)
+        assert self.packet() == (b"R", struct.pack("!I", 3))
+        self.send(b"p", SECRET.encode()+b"\0")
+        self.until_ready()
+
+    def send(self, k, b):
+        self.s.sendall(k + struct.pack("!I", len(b)+4)+b)
+
+    def packet(self):
+        kind = exact(self.s, 1)
+        n, = struct.unpack("!I", exact(self.s, 4))
+        return kind, exact(self.s, n-4)
+
+    def until_ready(self):
+        out = []
+        while True:
+            kind, data = self.packet()
+            out.append((kind, data))
+            if kind == b"Z":
+                return out
+
+    def query(self, sql, fail=False):
+        self.send(b"Q", sql.encode()+b"\0")
+        out = self.until_ready()
+        assert any(k == b"E" for k, _ in out) == fail, out
+        return out
+
+    def rows(self, sql):
+        out = []
+        for k, data in self.query(sql):
+            if k != b"D":
+                continue
+            n, = struct.unpack("!H", data[:2])
+            data = data[2:]
+            row = []
+            for _ in range(n):
+                length, = struct.unpack("!i", data[:4])
+                data = data[4:]
+                row.append(None if length == -1 else data[:length].decode())
+                if length != -1:
+                    data = data[length:]
+            out.append(row)
+        return out
+
+    def close(self):
+        self.send(b"X", b"")
+        self.s.close()
+
+
+class Iscsi:
+    def __init__(self, port, discovery=False, secret=SECRET):
+        self.s = socket.create_connection(("127.0.0.1", port), timeout=30)
+        self.cmd = 1
+        self.itt = 1
+        self.login = True
+        keys = {"InitiatorName": "iqn.2026-11.test:client", "SessionType": "Discovery" if discovery else "Normal",
+                "AuthMethod": "CHAP"}
+        if not discovery:
+            keys["TargetName"] = "iqn.2026-11.io.yadb:billing:vm-root"
+        r, _ = self.exchange(3, 0, self.text(keys), login=True)
+        assert r[36] == 0
+        r, data = self.exchange(3, 0, b"CHAP_A=5\0", login=True)
+        fields = dict(s.split("=", 1) for s in data.decode().split("\0") if "=" in s)
+        challenge = bytes.fromhex(fields["CHAP_C"][2:])
+        digest = hashlib.md5(bytes([int(fields["CHAP_I"])]) + secret.encode() + challenge).hexdigest()
+        r, _ = self.exchange(3, 0x81, self.text({"CHAP_N": "backend", "CHAP_R": "0x"+digest}), login=True)
+        if secret != SECRET:
+            assert r[36] == 2
+            self.s.close()
+            return
+        assert r[1] == 0x81
+        r, _ = self.exchange(3, 0x87, self.text({"HeaderDigest": "None", "DataDigest": "None", "MaxRecvDataSegmentLength": "8192"}), login=True)
+        assert r[1] == 0x87 and r[36] == 0
+        self.login = False
+
+    @staticmethod
+    def text(keys):
+        return "".join(f"{k}={v}\0" for k, v in keys.items()).encode()
+
+    def send(self, h, data=b""):
+        h[5:8] = len(data).to_bytes(3, "big")
+        self.s.sendall(h+data+b"\0"*((-len(data)) % 4))
+
+    def recv(self):
+        h = exact(self.s, 48)
+        n = int.from_bytes(h[5:8], "big")
+        data = exact(self.s, n)
+        exact(self.s, (-n) % 4)
+        return h, data
+
+    def header(self, op, flags, login=False):
+        h = bytearray(48)
+        h[0] = op | (0x40 if login or op == 4 else 0)
+        h[1] = flags
+        h[8:14] = b"\x80\x01\x02\x03\x04\x05" if login else bytes(6)
+        h[16:20] = self.itt.to_bytes(4, "big")
+        h[24:28] = self.cmd.to_bytes(4, "big")
+        return h
+
+    def exchange(self, op, flags, data=b"", login=False):
+        self.send(self.header(op, flags, login), data)
+        return self.recv()
+
+    def scsi(self, cdb, expected=0, write=None, immediate=True):
+        self.itt += 1
+        h = self.header(1, 0x80 | (0x20 if write is not None else 0x40 if expected else 0) | 1)
+        h[20:24] = expected.to_bytes(4, "big")
+        h[32:32+len(cdb)] = cdb
+        self.send(h, write if write is not None and immediate else b"")
+        self.cmd += 1
+        data = b""
+        while True:
+            r, payload = self.recv()
+            if r[0] == 0x31:
+                assert write is not None
+                offset = int.from_bytes(r[40:44], "big")
+                length = int.from_bytes(r[44:48], "big")
+                d = self.header(5, 0x80)
+                d[20:24] = r[20:24]
+                d[40:44] = offset.to_bytes(4, "big")
+                self.send(d, write[offset:offset+length])
+            elif r[0] == 0x25:
+                data += payload
+                if r[1] & 1:
+                    assert r[3] == 0, (r, payload)
+                    return data
+            else:
+                assert r[0] == 0x21 and r[3] == 0, (r, payload)
+                return data
+
+    def read(self, lba=0, blocks=1):
+        cdb = bytearray(10)
+        cdb[0] = 0x28
+        cdb[2:6] = lba.to_bytes(4, "big")
+        cdb[7:9] = blocks.to_bytes(2, "big")
+        return self.scsi(cdb, blocks*512)
+
+    def write(self, data, lba=0, immediate=True):
+        cdb = bytearray(10)
+        cdb[0] = 0x2a
+        cdb[2:6] = lba.to_bytes(4, "big")
+        cdb[7:9] = (len(data)//512).to_bytes(2, "big")
+        self.scsi(cdb, len(data), data, immediate)
+
+
+def wait(port):
+    deadline = time.monotonic()+10
+    while time.monotonic() < deadline:
+        try:
+            if request(port, "GET", "/healthz")[0] == 200:
+                return
+        except OSError:
+            pass
+        time.sleep(.05)
+    raise RuntimeError("daemon not ready")
+
+
+def run():
+    base = "/data/data/com.foxdebug.acodefree/cache/opencode"
+    with tempfile.TemporaryDirectory(prefix="yadb-protocols-", dir=base) as temp:
+        temp = Path(temp)
+        creds = temp/"credentials.json"
+        creds.write_text(json.dumps({"users": {"backend": {"subject": SUBJECT, "secret": SECRET}}}))
+        os.chmod(creds, 0o600)
+        nodes = []
+        logs = []
+        peers = ",".join(f"{i}=127.0.0.1:{19000+i}" for i in range(1, 4))
+        portals = ",".join(f"127.0.0.1:{19300+i}" for i in range(1, 4))
+        try:
+            for i in range(1, 4):
+                log = open(temp/f"node{i}.log", "wb")
+                logs.append(log)
+                nodes.append(subprocess.Popen([str(ROOT/"target/debug/yadbd"), "--node-id", str(i),
+                    "--listen", f"127.0.0.1:{19000+i}", "--peers", peers, "--data-dir", str(temp/f"n{i}"),
+                    "--protocol-credentials", str(creds), "--pg-listen", f"127.0.0.1:{19100+i}",
+                    "--iscsi-listen", f"127.0.0.1:{19300+i}", "--iscsi-portals", portals,
+                    "--s3-listen", f"127.0.0.1:{19200+i}", "--s3-target", "billing/receipts"], stdout=log, stderr=log))
+            for i in range(1, 4):
+                wait(19000+i)
+            body = json.dumps({"yaml": (ROOT/"examples/platform.yaml").read_text()}).encode()
+            assert request(19002, "POST", "/v1/apply", body, {"Content-Type": "application/json"})[0] == 200
+            for i in range(1, 4):
+                deadline = time.monotonic()+10
+                while "billing/ledger" not in json.loads(request(19000+i, "GET", "/v1/status")[2])["databases"]:
+                    assert time.monotonic() < deadline, "control cache not replicated"
+                    time.sleep(.05)
+            a, b = Pg(19102), Pg(19103)
+            a.query("CREATE TABLE wire (id INT PRIMARY KEY, balance INT);")
+            a.query("INSERT INTO wire VALUES (1,100), (2,200);")
+            a.query("BEGIN; UPDATE wire SET balance=balance-10 WHERE id=1;")
+            assert a.rows("SELECT balance FROM wire WHERE id=1;") == [["90"]]
+            assert b.rows("SELECT balance FROM wire WHERE id=1;") == [["100"]]
+            a.query("COMMIT;")
+            assert b.rows("SELECT balance FROM wire WHERE id=1;") == [["90"]]
+            a.query("BEGIN; UPDATE wire SET balance=0 WHERE id=1;")
+            a.query("SELECT missing FROM wire;", fail=True)
+            a.query("COMMIT;", fail=True)
+            a.query("ROLLBACK;")
+            a.close()
+            print("PASS pgwire password, result framing, multi-statements, session isolation, rollback")
+
+            key = "/invoices-2026/dir/a%20%2B%26.txt"
+            assert signed(19202, "PUT", key, b"hello aws")[0] == 200
+            assert signed(19203, "GET", key)[2] == b"hello aws"
+            assert signed(19203, "GET", key, extra={"range": "bytes=1-4"})[2] == b"ello"
+            assert signed(19203, "HEAD", key)[0] == 200
+            status, _, body = signed(19203, "GET", "/invoices-2026?list-type=2&prefix=dir%2F")
+            assert status == 200 and ET.fromstring(body).find("{*}Contents/{*}Key").text == "dir/a +&.txt", body
+            assert signed(19202, "GET", key, secret="wrong-password")[0] == 403
+            assert signed(19202, "GET", key, extra={"range": "bytes=900-999"})[0] == 416
+            assert signed(19202, "DELETE", key)[0] == 204
+            assert signed(19202, "GET", key)[0] == 404
+            for name in ["a", "b", "c"]:
+                assert signed(19202, "PUT", "/invoices-2026/page/"+name, name.encode())[0] == 200
+            _, _, first = signed(19202, "GET", "/invoices-2026?list-type=2&prefix=page%2F&max-keys=1")
+            token = ET.fromstring(first).find("{*}NextContinuationToken").text
+            _, _, second = signed(19202, "GET", "/invoices-2026?list-type=2&prefix=page%2F&max-keys=1&continuation-token="+token)
+            assert ET.fromstring(second).find("{*}Contents/{*}Key").text == "page/b"
+            assert signed(19202, "PUT", "/invoices-2026/bad", b"bad", {"x-amz-checksum-crc32": "AAAAAA=="})[0] == 400
+            assert signed(19202, "POST", "/invoices-2026/multipart?uploads")[0] == 501
+            print("PASS S3 SigV4, XML listing, escaped keys, PUT/GET/HEAD/Range/DELETE, bad signatures")
+
+            Iscsi(19302, secret="wrong-password")
+            discovery = Iscsi(19302, discovery=True)
+            _, data = discovery.exchange(4, 0x80, b"SendTargets=All\0")
+            assert data.count(b"TargetAddress=") == 3, data
+            discovery.s.close()
+            x, y = Iscsi(19302), Iscsi(19303)
+            cdb = bytes([0x12, 1, 0x83, 0, 255, 0])
+            assert x.scsi(cdb, 255) == y.scsi(cdb, 255)
+            x.write(b"A"*512)
+            assert y.read() == b"A"*512
+            x.write(b"B"*4096, immediate=False)
+            assert y.read(blocks=8) == b"B"*4096
+            unmap = struct.pack("!HHI Q I I", 22, 16, 0, 0, 8, 0)
+            cdb = bytearray(10)
+            cdb[0] = 0x42
+            cdb[7:9] = len(unmap).to_bytes(2, "big")
+            x.scsi(cdb, len(unmap), unmap)
+            assert y.read(blocks=8) == bytes(4096)
+            x.write(b"C"*512)
+            x.scsi(bytes([0x35])+bytes(9))
+            print("PASS iSCSI CHAP, discovery, stable VPD83, READ/WRITE, R2T/Data-Out, UNMAP")
+
+            leader = json.loads(request(19002, "GET", "/raft/status")[2])["leader_id"]
+            survivor = next(i for i in range(1, 4) if i != leader)
+            alive = Iscsi(19300+survivor)
+            tx = Pg(19100+survivor)
+            tx.query("BEGIN; UPDATE wire SET balance=1 WHERE id=1;")
+            nodes[leader-1].kill()
+            nodes[leader-1].wait(timeout=10)
+            # Existing session survives storage leader loss if its gateway did not die;
+            # a dead gateway requires initiator multipath to a different session.
+            alive.write(b"D"*512)
+            assert alive.read() == b"D"*512
+            assert signed(19200+survivor, "PUT", "/invoices-2026/after-failover", b"ok")[0] == 200
+            p = Pg(19100+survivor)
+            assert p.rows("SELECT balance FROM wire WHERE id=1;") == [["90"]]
+            tx.query("COMMIT;", fail=True)
+            tx.query("ROLLBACK;")
+            assert tx.rows("SELECT balance FROM wire WHERE id=1;") == [["90"]]
+            tx.close()
+            p.close()
+            print("PASS leader SIGKILL: surviving iSCSI portal, pgwire and S3 remain usable")
+        except Exception:
+            for log in logs:
+                log.flush()
+            for path in temp.glob("*.log"):
+                print(path.name, path.read_text())
+            raise
+        finally:
+            for p in nodes:
+                if p.poll() is None:
+                    p.terminate()
+            for p in nodes:
+                p.wait(timeout=10)
+            for log in logs:
+                log.close()
+
+
+if __name__ == "__main__":
+    run()

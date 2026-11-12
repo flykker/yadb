@@ -6,12 +6,17 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use yadb_blob::{BlobError, BlobId, PoolStriper};
 use yadb_io::StorageFs;
-use yadb_metakv::{KvCommand, LocalMetaKv, MetaError};
+use yadb_metakv::{KvCommand, KvResult, LocalMetaKv, MetaError};
 
 pub const DEFAULT_BLOCK_SIZE: u32 = 4096;
 
 #[derive(Debug, Error)]
 pub enum BlockError {
+    #[error("concurrent volume update; retry the request")]
+    Conflict,
+
+    #[error("volume blob generation space exhausted")]
+    GenerationExhausted,
     #[error("blob engine error: {0}")]
     Blob(#[from] BlobError),
 
@@ -126,49 +131,130 @@ impl<FS: StorageFs> BlockVolumeEngine<FS> {
         }
 
         let pool = self.get_pool(pool_name)?;
-        let mut map = self.load_map(project_id, volume)?;
-        map.generation = ((self.meta.revision() as u32)
-            .saturating_add(1)
-            .max(map.generation.saturating_add(1)))
-        .min(BlobId::MAX_U24);
-        let bs = map.block_size as u64;
-        let owner = Self::owner_id(volume);
+        for _ in 0..32 {
+            let key = Self::meta_key(project_id, volume);
+            let current = self.meta.get(&key);
+            let version = current.as_ref().map_or(0, |v| v.version);
+            let mut map = match current {
+                Some(kv) => serde_json::from_slice::<VolumeExtentMap>(&kv.value)?,
+                None => self.load_map(project_id, volume)?,
+            };
+            map.generation = self.reserve_generation(project_id, volume, map.generation)?;
+            let bs = map.block_size as u64;
+            let owner = Self::owner_id(volume);
 
-        let mut cursor = 0usize;
-        while cursor < data.len() {
-            let abs_pos = offset + cursor as u64;
-            let blk_idx = abs_pos / bs;
-            let in_blk_off = (abs_pos % bs) as usize;
-            let copy_len = (data.len() - cursor).min(bs as usize - in_blk_off);
+            let mut cursor = 0usize;
+            while cursor < data.len() {
+                let abs_pos = offset + cursor as u64;
+                let blk_idx = abs_pos / bs;
+                let in_blk_off = (abs_pos % bs) as usize;
+                let copy_len = (data.len() - cursor).min(bs as usize - in_blk_off);
 
-            let mut blk_buf = if in_blk_off != 0 || copy_len < bs as usize {
-                if let Some(&prev_id) = map.blocks.get(&blk_idx) {
-                    pool.get_blob(prev_id)?
+                let mut blk_buf = if in_blk_off != 0 || copy_len < bs as usize {
+                    if let Some(&prev_id) = map.blocks.get(&blk_idx) {
+                        pool.get_blob(prev_id)?
+                    } else {
+                        vec![0u8; bs as usize]
+                    }
                 } else {
                     vec![0u8; bs as usize]
-                }
-            } else {
-                vec![0u8; bs as usize]
-            };
+                };
 
-            blk_buf[in_blk_off..in_blk_off + copy_len]
-                .copy_from_slice(&data[cursor..cursor + copy_len]);
+                blk_buf[in_blk_off..in_blk_off + copy_len]
+                    .copy_from_slice(&data[cursor..cursor + copy_len]);
 
-            let step = (self.step_seq.fetch_add(1, Ordering::Relaxed) % BlobId::MAX_U24).max(1);
-            let blob_id = BlobId::new(project_id, owner, map.generation, step, 3, 0);
-            pool.put_blob(blob_id, &blk_buf)?;
-            map.blocks.insert(blk_idx, blob_id);
+                let step = (self.step_seq.fetch_add(1, Ordering::Relaxed) % BlobId::MAX_U24).max(1);
+                let blob_id = BlobId::new(project_id, owner, map.generation, step, 3, 0);
+                pool.put_blob(blob_id, &blk_buf)?;
+                map.blocks.insert(blk_idx, blob_id);
 
-            cursor += copy_len;
+                cursor += copy_len;
+            }
+
+            let encoded = serde_json::to_vec(&map)?;
+            match self.meta.execute(KvCommand::CompareAndSwap {
+                key,
+                expected_version: version,
+                new_value: Some(encoded),
+            })? {
+                KvResult::CasOk { .. } => return Ok(data.len()),
+                KvResult::CasConflict { .. } => continue,
+                _ => unreachable!(),
+            }
         }
+        Err(BlockError::Conflict)
+    }
 
-        let encoded = serde_json::to_vec(&map)?;
-        self.meta.execute(KvCommand::Put {
-            key: Self::meta_key(project_id, volume),
-            value: encoded,
-        })?;
+    // Persist the allocation BEFORE writing fragments. Failed CAS writes and process restarts
+    // must never reuse an immutable BlobId for different bytes.
+    fn reserve_generation(&self, pid: u32, volume: &str, floor: u32) -> Result<u32, BlockError> {
+        let key = format!("/block-alloc/{pid}/{volume}");
+        for _ in 0..32 {
+            let cur = self.meta.get(&key);
+            let version = cur.as_ref().map_or(0, |v| v.version);
+            let prev = match cur {
+                Some(v) => serde_json::from_slice::<u32>(&v.value)?,
+                None => floor,
+            };
+            let next = prev
+                .max(floor)
+                .checked_add(1)
+                .filter(|n| *n <= BlobId::MAX_U24)
+                .ok_or(BlockError::GenerationExhausted)?;
+            if matches!(
+                self.meta.execute(KvCommand::CompareAndSwap {
+                    key: key.clone(),
+                    expected_version: version,
+                    new_value: Some(serde_json::to_vec(&next)?),
+                })?,
+                KvResult::CasOk { .. }
+            ) {
+                return Ok(next);
+            }
+        }
+        Err(BlockError::Conflict)
+    }
 
-        Ok(data.len())
+    /// Discard aligned full blocks. Partial-block discard is rejected, not rounded outward.
+    pub fn unmap_at(
+        &self,
+        pid: u32,
+        volume: &str,
+        size: u64,
+        offset: u64,
+        len: u64,
+    ) -> Result<(), BlockError> {
+        if offset.checked_add(len).is_none_or(|end| end > size) {
+            return Err(BlockError::OutOfBounds {
+                offset,
+                len: usize::try_from(len).unwrap_or(usize::MAX),
+                size_bytes: size,
+            });
+        }
+        let key = Self::meta_key(pid, volume);
+        for _ in 0..32 {
+            let cur = self.meta.get(&key);
+            let version = cur.as_ref().map_or(0, |v| v.version);
+            let mut map = self.load_map(pid, volume)?;
+            let bs = map.block_size as u64;
+            if offset % bs != 0 || len % bs != 0 {
+                return Err(BlockError::Conflict);
+            }
+            let end = (offset + len) / bs;
+            map.blocks
+                .retain(|index, _| *index < offset / bs || *index >= end);
+            if matches!(
+                self.meta.execute(KvCommand::CompareAndSwap {
+                    key: key.clone(),
+                    expected_version: version,
+                    new_value: Some(serde_json::to_vec(&map)?),
+                })?,
+                KvResult::CasOk { .. }
+            ) {
+                return Ok(());
+            }
+        }
+        Err(BlockError::Conflict)
     }
 
     /// Reads arbitrary byte range across logical blocks; unmapped blocks return zero bytes with 0 disk I/O!
@@ -234,9 +320,7 @@ mod tests {
                 VolumeStore::open(fs.clone(), format!("m{i}"), VolumeConfig::default()).unwrap(),
             );
         }
-        let pool = Arc::new(
-            PoolStriper::new(ErasureScheme::Mirror { replicas: 3 }, doms).unwrap(),
-        );
+        let pool = Arc::new(PoolStriper::new(ErasureScheme::Mirror { replicas: 3 }, doms).unwrap());
         engine.register_pool("wal-fast", pool);
 
         let tib = 1024 * 1024 * 1024 * 1024u64; // 1 TiB thin-provisioned volume!
@@ -255,5 +339,56 @@ mod tests {
         assert_eq!(&read_back[..2], &[0, 0]);
         assert_eq!(&read_back[2..14], b"HELLO-BLOCKS");
         assert_eq!(&read_back[14..], &[0, 0]);
+    }
+
+    #[test]
+    fn concurrent_partial_writes_restart_and_unmap() {
+        let fs = SimFs::new(777);
+        let meta = LocalMetaKv::open_single_node(&fs, "meta", 1).unwrap();
+        let engine = BlockVolumeEngine::new(meta.clone(), 4096);
+        let domains = (0..3)
+            .map(|i| {
+                VolumeStore::open(fs.clone(), format!("d{i}"), VolumeConfig::default()).unwrap()
+            })
+            .collect();
+        let pool =
+            Arc::new(PoolStriper::new(ErasureScheme::Mirror { replicas: 3 }, domains).unwrap());
+        engine.register_pool("data", pool.clone());
+        let barrier = Arc::new(std::sync::Barrier::new(4));
+        let threads = (0..4)
+            .map(|i| {
+                let engine = engine.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    engine
+                        .write_at(1, "disk", "data", 8192, i * 512, &vec![i as u8 + 1; 512])
+                        .unwrap();
+                })
+            })
+            .collect::<Vec<_>>();
+        for t in threads {
+            t.join().unwrap();
+        }
+        let expected = (0..4).flat_map(|i| vec![i + 1; 512]).collect::<Vec<_>>();
+        assert_eq!(
+            engine.read_at(1, "disk", "data", 8192, 0, 2048).unwrap(),
+            expected
+        );
+        let reopened = BlockVolumeEngine::new(meta, 4096);
+        reopened.register_pool("data", pool);
+        reopened
+            .write_at(1, "disk", "data", 8192, 2048, b"restart")
+            .unwrap();
+        assert_eq!(
+            reopened.read_at(1, "disk", "data", 8192, 0, 2048).unwrap(),
+            expected
+        );
+        assert!(reopened.unmap_at(1, "disk", 8192, 512, 4096).is_err());
+        reopened.unmap_at(1, "disk", 8192, 0, 4096).unwrap();
+        assert_eq!(
+            reopened.read_at(1, "disk", "data", 8192, 0, 4096).unwrap(),
+            vec![0; 4096]
+        );
     }
 }

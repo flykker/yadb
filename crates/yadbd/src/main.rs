@@ -24,6 +24,8 @@ use yadb_io::OsFs;
 use yadb_metakv::{KvCommand, LocalMetaKv, MetaError, RaftRpc, RoleState, WatchEvent};
 use yadb_s3::{ObjectManifest, ObjectStoreEngine, S3Error};
 
+mod protocols;
+
 const CONTROL_STATE_KEY: &str = "/sys/control_plane_state";
 const EMBEDDED_UI_HTML: &str = include_str!("ui/index.html");
 const EMBEDDED_SAMPLE_YAML: &str = include_str!("../../../examples/platform.yaml");
@@ -51,6 +53,25 @@ struct Args {
     /// MemTable auto-flush threshold per SQL shard (default 1024 rows)
     #[arg(long, default_value_t = 1024)]
     db_flush_rows: usize,
+
+    /// Opt-in iSCSI listener (CHAP required).
+    #[arg(long)]
+    iscsi_listen: Option<String>,
+    /// Advertised iSCSI portals, independent of HTTP peer ports.
+    #[arg(long, value_delimiter = ',')]
+    iscsi_portals: Vec<String>,
+    /// Opt-in PostgreSQL v3 Simple Query listener.
+    #[arg(long)]
+    pg_listen: Option<String>,
+    /// Opt-in AWS S3 path-style listener.
+    #[arg(long, requires = "s3_target")]
+    s3_listen: Option<String>,
+    /// Declarative project/ObjectStore exposed on the S3 listener.
+    #[arg(long)]
+    s3_target: Option<String>,
+    /// JSON users -> {subject, secret}; file must be mode 0600.
+    #[arg(long)]
+    protocol_credentials: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -106,6 +127,12 @@ struct ListQuery {
 #[derive(Serialize, Deserialize)]
 struct SqlQueryPayload {
     sql: String,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    force_leader: bool,
+    #[serde(default)]
+    require_transaction: bool,
 }
 
 #[derive(Deserialize)]
@@ -117,7 +144,12 @@ struct BlockWriteQuery {
 struct BlockReadQuery {
     offset: u64,
     len: usize,
+    #[serde(default)]
+    consistent: bool,
 }
+
+#[derive(Serialize, Deserialize)]
+struct UnmapPayload { offset: u64, len: u64 }
 
 impl AppState {
     fn open_or_get_local_vdisk(
@@ -823,7 +855,7 @@ async fn handle_db_query(
     };
     let subject = extract_subject(&headers);
 
-    if has_writes {
+    if has_writes || req.force_leader {
         if let Ok(raw_body) = serde_json::to_vec(&req) {
             if let Some(proxied) = maybe_forward_write(
                 &st,
@@ -862,8 +894,14 @@ async fn handle_db_query(
     };
 
     let db_engine = st.db.clone();
+    if req.require_transaction {
+        let session = req.session_id.as_ref().map(|id| format!("{subject}#{id}"));
+        if !session.as_ref().is_some_and(|s| db_engine.has_session(project_id, &database, s)) {
+            return api_err(StatusCode::CONFLICT, "transaction lost on leader change; ROLLBACK and restart");
+        }
+    }
     let sql_raw = req.sql;
-    let subj_session = subject;
+    let subj_session = req.session_id.map(|id| format!("{subject}#{id}")).unwrap_or(subject);
     let exec = tokio::task::spawn_blocking(move || {
         db_engine.execute_sql_with_session(
             project_id,
@@ -974,6 +1012,15 @@ async fn handle_block_read(
     Path((project, volume)): Path<(String, String)>,
     Query(q): Query<BlockReadQuery>,
 ) -> Response {
+    if q.len > 16 * 1024 * 1024 { return api_err(StatusCode::PAYLOAD_TOO_LARGE, "maximum block read is 16 MiB"); }
+    if q.consistent {
+        if let Some(resp) = maybe_forward_write(&st, &headers, "GET",
+            format!("/block/{project}/{volume}?offset={}&len={}&consistent=true", q.offset, q.len),
+            "application/octet-stream".into(), Bytes::new()).await { return resp; }
+        let meta = st.meta.clone();
+        let fence = tokio::task::spawn_blocking(move || meta.execute(KvCommand::Txn { guards: vec![], ops: vec![] })).await;
+        if !matches!(fence, Ok(Ok(_))) { return api_err(StatusCode::SERVICE_UNAVAILABLE, "read quorum unavailable"); }
+    }
     let subject = extract_subject(&headers);
     let (project_id, pool_name, size_bytes) = {
         let cp = st.control.read().unwrap();
@@ -1001,6 +1048,19 @@ async fn handle_block_read(
         }
         Ok(Err(e)) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
         Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+async fn handle_block_unmap(State(st): State<AppState>, headers: HeaderMap,
+    Path((project,volume)): Path<(String,String)>, Json(req): Json<UnmapPayload>) -> Response {
+    let body = Bytes::from(serde_json::to_vec(&req).unwrap());
+    if let Some(resp) = maybe_forward_write(&st,&headers,"POST",format!("/block/{project}/{volume}/unmap"),"application/json".into(),body).await { return resp; }
+    let subject = extract_subject(&headers);
+    let (pid,_,size) = match resolve_block_target(&st.control.read().unwrap(),&project,&volume,&subject,Role::ReadWrite) { Ok(v)=>v,Err(r)=>return r };
+    if req.offset % DEFAULT_BLOCK_SIZE as u64 != 0 || req.len % DEFAULT_BLOCK_SIZE as u64 != 0 {return api_err(StatusCode::BAD_REQUEST,"UNMAP must be 4 KiB aligned");}
+    match tokio::task::spawn_blocking(move||st.block.unmap_at(pid,&volume,size,req.offset,req.len)).await {
+        Ok(Ok(()))=>StatusCode::OK.into_response(),
+        _=>api_err(StatusCode::SERVICE_UNAVAILABLE,"UNMAP failed"),
     }
 }
 
@@ -1082,7 +1142,7 @@ async fn handle_s3_put(
         &st,
         &headers,
         "PUT",
-        format!("/s3/{project}/{store}/{bucket}/{key}"),
+        format!("/s3/{}/{}/{}/{}", protocols::url(&project), protocols::url(&store), protocols::url(&bucket), key.split('/').map(protocols::url).collect::<Vec<_>>().join("/")),
         content_type.clone(),
         body.clone(),
     )
@@ -1219,7 +1279,7 @@ async fn handle_s3_delete(
         &st,
         &headers,
         "DELETE",
-        format!("/s3/{project}/{store}/{bucket}/{key}"),
+        format!("/s3/{}/{}/{}/{}", protocols::url(&project), protocols::url(&store), protocols::url(&bucket), key.split('/').map(protocols::url).collect::<Vec<_>>().join("/")),
         "application/octet-stream".to_string(),
         Bytes::new(),
     )
@@ -1376,6 +1436,10 @@ async fn handle_pools_scrub(State(st): State<AppState>) -> Response {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+    let enabled = args.pg_listen.is_some() || args.iscsi_listen.is_some() || args.s3_listen.is_some();
+    let credentials = if enabled {
+        protocols::Credentials::load(args.protocol_credentials.as_deref().ok_or("--protocol-credentials is required for protocol listeners")?)?
+    } else { protocols::Credentials::default() };
     let fs = OsFs::new(&args.data_dir)?;
 
     let meta = if let Some(peers_raw) = &args.peers {
@@ -1468,6 +1532,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
+    if let Some(addr) = &args.pg_listen {
+        let listener = std::net::TcpListener::bind(addr)?;
+        let st = state.clone(); let creds = credentials.clone();
+        protocols::serve(listener, move |c| protocols::pg::connection(c,st.clone(),creds.clone()));
+        println!("pgwire Simple Query listening on {addr} (no TLS; trusted networks only)");
+    }
+    if let Some(addr) = &args.iscsi_listen {
+        let listener = std::net::TcpListener::bind(addr)?;
+        let portals = if args.iscsi_portals.is_empty() {
+            let a: SocketAddr = addr.parse()?;
+            if a.ip().is_unspecified() { return Err("set --iscsi-portals when listening on a wildcard address".into()); }
+            vec![addr.clone()]
+        } else { args.iscsi_portals.clone() };
+        for p in &portals { let _: SocketAddr = p.parse()?; }
+        let st = state.clone(); let creds = credentials.clone();
+        protocols::serve(listener, move |c| protocols::iscsi::connection(c,st.clone(),creds.clone(),portals.clone()));
+        println!("iSCSI listening on {addr} (CHAP, ERL=0; multipath managed by initiator)");
+    }
+    if let Some(addr) = &args.s3_listen {
+        let (project,store) = args.s3_target.as_deref().and_then(|s|s.split_once('/')).ok_or("--s3-target must be project/store")?;
+        let listener = tokio::net::TcpListener::bind(addr).await?;
+        let s3state = protocols::s3::S3State { app: state.clone(), credentials: credentials.clone(), project:project.into(),store:store.into() };
+        let router = Router::new().fallback(protocols::s3::handle).with_state(s3state);
+        tokio::spawn(async move { if let Err(e)=axum::serve(listener,router).await {eprintln!("S3 listener stopped: {e}");} });
+        println!("AWS S3 path-style listening on {addr}");
+    }
+
     let app = Router::new()
         .route("/", get(handle_ui))
         .route("/ui", get(handle_ui))
@@ -1494,6 +1585,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             post(handle_vdisk_barrier),
         )
         .route("/db/{project}/{database}/query", post(handle_db_query))
+        .route("/block/{project}/{volume}/unmap", post(handle_block_unmap))
         .route(
             "/block/{project}/{volume}",
             put(handle_block_write).get(handle_block_read),
@@ -1503,6 +1595,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/s3/{project}/{store}/{bucket}/{*key}",
             put(handle_s3_put).get(handle_s3_get).delete(handle_s3_delete),
         )
+        .layer(axum::extract::DefaultBodyLimit::max(16 * 1024 * 1024))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&args.listen).await?;
