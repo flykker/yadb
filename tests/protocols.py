@@ -355,15 +355,18 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
         logs = []
         peers = ",".join(f"{i}=127.0.0.1:{19000+i}" for i in range(1, 4))
         portals = ",".join(f"127.0.0.1:{19300+i}" for i in range(1, 4))
+        def start_node(i):
+            return subprocess.Popen([str(ROOT/"target/debug/yadbd"), "--node-id", str(i),
+                "--listen", f"127.0.0.1:{19000+i}", "--peers", peers, "--data-dir", str(temp/f"n{i}"),
+                "--protocol-credentials", str(creds), "--pg-listen", f"127.0.0.1:{19100+i}",
+                "--iscsi-listen", f"127.0.0.1:{19300+i}", "--iscsi-portals", portals,
+                "--s3-listen", f"127.0.0.1:{19200+i}", "--s3-target", "billing/receipts"],
+                stdout=logs[i-1], stderr=logs[i-1])
         try:
             for i in range(1, 4):
                 log = open(temp/f"node{i}.log", "wb")
                 logs.append(log)
-                nodes.append(subprocess.Popen([str(ROOT/"target/debug/yadbd"), "--node-id", str(i),
-                    "--listen", f"127.0.0.1:{19000+i}", "--peers", peers, "--data-dir", str(temp/f"n{i}"),
-                    "--protocol-credentials", str(creds), "--pg-listen", f"127.0.0.1:{19100+i}",
-                    "--iscsi-listen", f"127.0.0.1:{19300+i}", "--iscsi-portals", portals,
-                    "--s3-listen", f"127.0.0.1:{19200+i}", "--s3-target", "billing/receipts"], stdout=log, stderr=log))
+                nodes.append(start_node(i))
             for i in range(1, 4):
                 wait(19000+i)
             body = json.dumps({"yaml": (ROOT/"examples/platform.yaml").read_text()}).encode()
@@ -517,6 +520,37 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
                 probe_env = os.environ.copy()
                 probe_env["YADB_TEST_SECRET"] = SECRET
                 print(native([libiscsi_probe, "127.0.0.1:19302"], probe_env).strip())
+
+            # Abruptly stop every process after acknowledged writes, retaining
+            # the same storage directories. One SQL transaction remains open.
+            assert signed(19202, "PUT", "/invoices-2026/restart", b"durable object")[0] == 200
+            x.write(b"R"*512, lba=4096)
+            uncommitted = Pg(19102)
+            uncommitted.query("BEGIN; UPDATE wire SET balance=7 WHERE id=1;")
+            for node in nodes:
+                node.kill()
+            for node in nodes:
+                node.wait(timeout=10)
+            uncommitted.s.close()
+            b.s.close()
+            x.s.close()
+            y.s.close()
+            nodes[:] = [start_node(i) for i in range(1, 4)]
+            for i in range(1, 4):
+                wait(19000+i)
+            for i in range(1, 4):
+                deadline = time.monotonic()+20
+                while "billing/ledger" not in json.loads(request(19000+i, "GET", "/v1/status")[2])["databases"]:
+                    assert time.monotonic() < deadline, "control cache not recovered"
+                    time.sleep(.05)
+            restored = Pg(19102)
+            assert restored.rows("SELECT balance FROM wire WHERE id=1;") == [["90"]]
+            restored.close()
+            assert signed(19203, "GET", "/invoices-2026/restart")[2] == b"durable object"
+            disk = Iscsi(19303)
+            assert disk.read(lba=4096) == b"R"*512
+            disk.s.close()
+            print("PASS full cluster SIGKILL/restart: committed SQL, S3, iSCSI and uncommitted SQL rollback")
 
             leader = json.loads(request(19002, "GET", "/raft/status")[2])["leader_id"]
             survivor = next(i for i in range(1, 4) if i != leader)

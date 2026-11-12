@@ -188,7 +188,7 @@ impl<FS: StorageFs> RaftCore<FS> {
         })?;
 
         if self.votes_received.len() >= self.quorum_size() {
-            return Ok(self.become_leader());
+            return self.become_leader();
         }
 
         let last_log_index = self.last_log_index();
@@ -210,7 +210,7 @@ impl<FS: StorageFs> RaftCore<FS> {
         Ok(out)
     }
 
-    fn become_leader(&mut self) -> Vec<OutboundMsg> {
+    fn become_leader(&mut self) -> Result<Vec<OutboundMsg>, MetaError> {
         self.role = RoleState::Leader;
         self.leader_id = Some(self.node_id);
         let next = self.last_log_index() + 1;
@@ -227,7 +227,11 @@ impl<FS: StorageFs> RaftCore<FS> {
                 },
             );
         }
-        self.broadcast_append_entries()
+        // A new leader must commit an entry in its own term before older
+        // committed entries can be safely applied after a full restart. An empty
+        // transaction is a no-op on keys and uses the existing WAL format.
+        let (_, messages) = self.propose(KvCommand::Txn { guards: vec![], ops: vec![] })?;
+        Ok(messages)
     }
 
     /// Proposes a KV mutation on the Leader, appends to local WAL, and returns replication RPCs
@@ -340,7 +344,7 @@ impl<FS: StorageFs> RaftCore<FS> {
                 if self.role == RoleState::Candidate && term == self.current_term && vote_granted {
                     self.votes_received.insert(from);
                     if self.votes_received.len() >= self.quorum_size() {
-                        return Ok(self.become_leader());
+                        return self.become_leader();
                     }
                 }
                 Ok(Vec::new())
