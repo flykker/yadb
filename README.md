@@ -82,14 +82,20 @@ export AWS_ACCESS_KEY_ID=backend
 export AWS_SECRET_ACCESS_KEY='replace-with-a-random-secret-at-least-12-chars'
 export AWS_DEFAULT_REGION=us-east-1
 
-aws --endpoint-url http://10.0.0.11:9000 s3 cp image.raw s3://invoices-2026/image.raw
+# Current API buffers uploads, with a 16 MiB request limit and no multipart API.
+# Use s3api put-object for a file <= 16 MiB (high-level `s3 cp` can choose multipart).
+aws --endpoint-url http://10.0.0.11:9000 s3api put-object \
+  --bucket invoices-2026 --key sample.txt --body sample.txt
 aws --endpoint-url http://10.0.0.11:9000 s3 ls s3://invoices-2026/ --recursive
 aws --endpoint-url http://10.0.0.11:9000 s3api head-object \
   --bucket invoices-2026 --key image.raw
 ```
 
 Use a separate listener (`--s3-target project/store`) for each tenant ObjectStore, or put
-an authenticated proxy in front if host-style virtual buckets are required.
+an authenticated proxy in front if host-style virtual buckets are required. Configure
+AWS clients for path-style addressing. GET/Range responses are also limited to 16 MiB;
+presigned URLs, session tokens, native TLS, and a complete AWS S3 implementation are not
+provided yet. Credentials and object bytes require HTTPS termination or a trusted network.
 
 ### iSCSI block volumes and failover
 
@@ -100,18 +106,48 @@ to Linux `open-iscsi` and use `dm-multipath` so all sessions with the same VPD83
 one device:
 
 ```bash
+# Configure these in /etc/iscsi/iscsid.conf BEFORE discovery (protect the file):
+# discovery.sendtargets.auth.authmethod = CHAP
+# discovery.sendtargets.auth.username = backend
+# discovery.sendtargets.auth.password = <same secret as the credentials file>
+# node.session.auth.authmethod = CHAP
+# node.session.auth.username = backend
+# node.session.auth.password = <same secret as the credentials file>
+
+systemctl enable --now iscsid multipathd
 iscsiadm -m discovery -t sendtargets -p 10.0.0.11:3260
 iscsiadm -m node --login
-
-# /etc/multipath.conf: do not use a single-path device
-systemctl enable --now iscsid multipathd
 multipath -ll
 ```
 
+Example device stanza for `/etc/multipath.conf` (adapt timeouts to the host and test
+under network failure, not just process termination):
+
+```text
+devices {
+  device {
+    vendor "YADB"
+    product "Distributed Disk"
+    path_grouping_policy multibus
+    path_selector "round-robin 0"
+    path_checker tur
+    prio const
+    no_path_retry 12
+  }
+}
+```
+
+Use the actual `/dev/mapper/<WWID>` reported by `multipath -ll`, or explicitly assign
+that WWID the alias `yadb-billing-vm-root` in a `multipaths` stanza. Verify that all three
+portal sessions are present; discovery alone does not establish usable alternate paths.
+
 The discovery response advertises the same target IQN and all configured portals, while
 each portal performs the same CHAP/RBAC check and serves the same logical `BlockVolume`.
-When one `yadbd` node dies, multipath retries the outstanding SCSI command over another
-live session; the VM sees a short I/O pause rather than a different disk. A single QEMU
+With a correctly configured initiator and healthy storage quorum, multipath can retry
+I/O over another live session when one `yadbd` node dies. Detection and retry pauses
+depend on the initiator timeouts; zero errors and millisecond failover are not guaranteed.
+Losing all paths or the storage quorum eventually causes I/O failure according to that
+policy. A single QEMU
 `iscsi://node1/...` URL is **not** equivalent to multipath and can still lose its TCP
 session when that target node fails.
 
@@ -129,6 +165,12 @@ The protocol frontends are covered by `python3 tests/protocols.py`, which uses i
 stdlib clients to test SigV4, PostgreSQL framing/session behavior, iSCSI CHAP/SCSI I/O,
 UNMAP, and continued operation after killing a Raft leader. Native `psql`, AWS CLI,
 `iscsiadm`, and a production multipath stack should still be included in deployment CI.
+The current target has no SCSI persistent reservations, ALUA, mutual CHAP, or encrypted
+transport. Multipath paths to one VM are supported by the design; sharing the same raw
+filesystem read-write across multiple VMs is not safe without additional coordination.
+UNMAP drops logical extent references; it does not yet reclaim the old fragments on disk.
+Keep the legacy HTTP/control-plane ports private: their existing subject headers are a
+trusted internal interface, not a replacement for protocol authentication.
   2. **`yadb-s3` (Object Storage):** Multi-chunk S3 engine with strong read-after-write consistency, `Range` reads, and sorted prefix listing.
   3. **`yadb-block` (Virtual Disks):** Thin-provisioned Copy-on-Write 4 KiB block volumes.
 - **Zero-Dependency Embedded OKD-Style Web Console (`yadbd`):**
