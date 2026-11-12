@@ -552,6 +552,44 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
             disk.s.close()
             print("PASS full cluster SIGKILL/restart: committed SQL, S3, iSCSI and uncommitted SQL rollback")
 
+            # Leave the current leader alive but remove both voting peers. A
+            # rejected or timed-out write may still commit after recovery, so do
+            # not assume its final outcome; only assert it was not acknowledged.
+            leader = json.loads(request(19002, "GET", "/raft/status")[2])["leader_id"]
+            assert leader in (1, 2, 3), leader
+            stopped = [i for i in range(1, 4) if i != leader]
+            for i in stopped:
+                nodes[i-1].kill()
+            for i in stopped:
+                nodes[i-1].wait(timeout=10)
+            result = signed(19200+leader, "PUT", "/invoices-2026/no-quorum", b"unknown outcome")
+            assert not 200 <= result[0] < 300, result
+            isolated = Pg(19100+leader)
+            isolated.s.settimeout(10)
+            isolated.query("INSERT INTO wire VALUES (99,999);", fail=True)
+            isolated.close()
+
+            # Restore only one follower first: two out of three form a quorum.
+            i = stopped[0]
+            nodes[i-1] = start_node(i)
+            wait(19000+i)
+            deadline = time.monotonic()+20
+            while True:
+                result = signed(19200+leader, "PUT", "/invoices-2026/quorum-restored", b"recovered")
+                if result[0] == 200:
+                    break
+                assert time.monotonic() < deadline, result
+                time.sleep(.1)
+            assert signed(19200+leader, "GET", "/invoices-2026/restart")[2] == b"durable object"
+            assert signed(19200+leader, "GET", "/invoices-2026/quorum-restored")[2] == b"recovered"
+            check = Pg(19100+leader)
+            assert check.rows("SELECT balance FROM wire WHERE id=1;") == [["90"]]
+            check.close()
+            i = stopped[1]
+            nodes[i-1] = start_node(i)
+            wait(19000+i)
+            print("PASS quorum loss: no SQL/S3 acknowledgement without peers; majority recovery")
+
             leader = json.loads(request(19002, "GET", "/raft/status")[2])["leader_id"]
             survivor = next(i for i in range(1, 4) if i != leader)
             alive = Iscsi(19300+survivor)
