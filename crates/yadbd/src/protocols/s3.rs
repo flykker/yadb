@@ -442,7 +442,6 @@ pub async fn handle(State(st): State<S3State>, request: Request) -> Response {
             for name in [
                 "x-amz-server-side-encryption",
                 "x-amz-acl",
-                "content-md5",
                 "x-amz-checksum-crc32c",
                 "x-amz-checksum-crc64nvme",
                 "x-amz-checksum-sha1",
@@ -456,6 +455,7 @@ pub async fn handle(State(st): State<S3State>, request: Request) -> Response {
                 }
             }
             for (name, value) in [
+                ("content-md5", super::iscsi::md5(&body).to_vec()),
                 (
                     "x-amz-checksum-crc32",
                     crc32fast::hash(&body).to_be_bytes().to_vec(),

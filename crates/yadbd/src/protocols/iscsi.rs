@@ -70,6 +70,9 @@ struct Session {
     subject: String,
     target: String,
     discovery: bool,
+    immediate: bool,
+    max_burst: usize,
+    first_burst: usize,
 }
 impl Session {
     fn sequence(&mut self, p: &mut Pdu, increment: bool) {
@@ -97,6 +100,9 @@ pub fn connection(
         subject: String::new(),
         target: String::new(),
         discovery: false,
+        immediate: true,
+        max_burst: MAX_IO,
+        first_burst: 65536,
     };
     let mut offered = false;
     let mut authenticated = false;
@@ -159,15 +165,41 @@ pub fn connection(
                 r.h[1] = 0x81;
             }
         } else if stage == 1 && authenticated {
+            // Boolean AND and numerical minimum negotiation (RFC 7143).
+            // In particular, never turn an initiator's ImmediateData=No into Yes.
+            if let Some(v) = kv.get("ImmediateData") {
+                match v.as_str() {
+                    "No" => s.immediate = false,
+                    "Yes" => {}
+                    _ => failed = true,
+                }
+            }
+            for (key, limit) in [
+                ("MaxBurstLength", &mut s.max_burst),
+                ("FirstBurstLength", &mut s.first_burst),
+            ] {
+                if let Some(v) = kv.get(key) {
+                    match v.parse::<usize>() {
+                        Ok(n) if (512..=0xff_ffff).contains(&n) => *limit = (*limit).min(n),
+                        _ => failed = true,
+                    }
+                }
+            }
+            s.first_burst = s.first_burst.min(s.max_burst);
+            for key in ["HeaderDigest", "DataDigest"] {
+                if kv
+                    .get(key)
+                    .is_some_and(|v| !v.split(',').any(|v| v == "None"))
+                {
+                    failed = true;
+                }
+            }
             for (k, v) in [
                 ("HeaderDigest", "None"),
                 ("DataDigest", "None"),
                 ("MaxConnections", "1"),
                 ("InitialR2T", "Yes"),
-                ("ImmediateData", "Yes"),
                 ("MaxRecvDataSegmentLength", "1048576"),
-                ("MaxBurstLength", "1048576"),
-                ("FirstBurstLength", "65536"),
                 ("DefaultTime2Wait", "2"),
                 ("DefaultTime2Retain", "0"),
                 ("MaxOutstandingR2T", "1"),
@@ -178,6 +210,13 @@ pub fn connection(
             ] {
                 text(&mut r, k, v);
             }
+            text(
+                &mut r,
+                "ImmediateData",
+                if s.immediate { "Yes" } else { "No" },
+            );
+            text(&mut r, "MaxBurstLength", &s.max_burst.to_string());
+            text(&mut r, "FirstBurstLength", &s.first_burst.to_string());
             if !s.discovery && target(&st, &s, Role::ReadOnly).is_err() {
                 failed = true;
             }
@@ -318,38 +357,60 @@ fn send_data(c: &mut TcpStream, s: &mut Session, p: &Pdu, mut data: Vec<u8>) -> 
         return good(c, s, p);
     }
     let total = data.len();
-    for (seq, chunk) in data.chunks(s.limit).enumerate() {
-        let offset = seq * s.limit;
-        let last = offset + chunk.len() == total;
-        let mut r = Pdu::new(0x25, if last { 0x81 } else { 0 }, &p.h[16..20]);
-        r.h[20..24].fill(255);
-        if last && total < expected {
-            r.h[1] |= 2;
-            r.h[44..48].copy_from_slice(&((expected - total) as u32).to_be_bytes());
+    let mut offset = 0;
+    let mut seq = 0u32;
+    while offset < total {
+        let burst_end = (offset + s.max_burst).min(total);
+        while offset < burst_end {
+            let end = (offset + s.limit).min(burst_end);
+            let chunk = &data[offset..end];
+            let last = end == total;
+            let flags = if last {
+                0x81
+            } else if end == burst_end {
+                0x80
+            } else {
+                0
+            };
+            let mut r = Pdu::new(0x25, flags, &p.h[16..20]);
+            r.h[20..24].fill(255);
+            if last && total < expected {
+                r.h[1] |= 2;
+                r.h[44..48].copy_from_slice(&((expected - total) as u32).to_be_bytes());
+            }
+            r.h[36..40].copy_from_slice(&seq.to_be_bytes());
+            r.h[40..44].copy_from_slice(&(offset as u32).to_be_bytes());
+            s.sequence(&mut r, last);
+            r.data = chunk.to_vec();
+            r.send(c)?;
+            offset = end;
+            seq = seq.wrapping_add(1);
         }
-        r.h[36..40].copy_from_slice(&(seq as u32).to_be_bytes());
-        r.h[40..44].copy_from_slice(&(offset as u32).to_be_bytes());
-        s.sequence(&mut r, last);
-        r.data = chunk.to_vec();
-        r.send(c)?;
     }
     Ok(())
 }
 fn receive_data(c: &mut TcpStream, s: &mut Session, p: &Pdu, len: usize) -> io::Result<Vec<u8>> {
-    if len > MAX_IO || p.data.len() > len {
+    if len > MAX_IO
+        || p.data.len() > len
+        || p.data.len() > s.first_burst
+        || (!s.immediate && !p.data.is_empty())
+    {
         return Err(io::Error::other("transfer size invalid"));
     }
     let mut data = p.data.clone();
-    if data.len() < len {
+    let mut r2tsn = 0u32;
+    while data.len() < len {
+        let burst_end = (data.len() + s.max_burst).min(len);
         let mut r = Pdu::new(0x31, 0x80, &p.h[16..20]);
         r.h[8..16].copy_from_slice(&p.h[8..16]);
         r.h[20..24].copy_from_slice(&1u32.to_be_bytes());
         r.h[40..44].copy_from_slice(&(data.len() as u32).to_be_bytes());
-        r.h[44..48].copy_from_slice(&((len - data.len()) as u32).to_be_bytes());
+        r.h[36..40].copy_from_slice(&r2tsn.to_be_bytes());
+        r.h[44..48].copy_from_slice(&((burst_end - data.len()) as u32).to_be_bytes());
         s.sequence(&mut r, false);
         r.send(c)?;
         let mut seq = 0;
-        while data.len() < len {
+        while data.len() < burst_end {
             let d = Pdu::read(c)?;
             if d.h[0] & 0x3f != 5
                 || d.h[16..20] != p.h[16..20]
@@ -357,16 +418,17 @@ fn receive_data(c: &mut TcpStream, s: &mut Session, p: &Pdu, len: usize) -> io::
                 || u32at(&d.h, 36) != seq
                 || u32at(&d.h, 40) as usize != data.len()
                 || d.data.is_empty()
-                || data.len() + d.data.len() > len
+                || data.len() + d.data.len() > burst_end
             {
                 return Err(io::Error::other("invalid Data-Out"));
             }
             data.extend(d.data);
             seq += 1;
-            if (d.h[1] & 0x80 != 0) != (data.len() == len) {
+            if (d.h[1] & 0x80 != 0) != (data.len() == burst_end) {
                 return Err(io::Error::other("invalid final Data-Out"));
             }
         }
+        r2tsn = r2tsn.wrapping_add(1);
     }
     Ok(data)
 }
@@ -570,7 +632,7 @@ fn command(c: &mut TcpStream, st: &AppState, s: &mut Session, p: Pdu) -> io::Res
 }
 
 // RFC 1321 MD5 is required by CHAP algorithm 5 (not used for password storage).
-fn md5(input: &[u8]) -> [u8; 16] {
+pub(super) fn md5(input: &[u8]) -> [u8; 16] {
     let mut v = input.to_vec();
     let bits = (v.len() as u64) * 8;
     v.push(0x80);

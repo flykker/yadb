@@ -15,6 +15,11 @@
   - Per-project RBAC (`readOnly`, `readWrite`, `admin`) cached locally in memory via `MetaKV` watches (`~0` network hops on the hot path).
 - **Three Pluggable Data Services over One Storage Kernel:**
   1. **`yadb-db` (Distributed SQL & Tablets):** Dual-channel YDB-style `DataShardTablet` (`walPool` + `dataPool`) supporting cross-shard 2PC transactions (`BEGIN / COMMIT / ROLLBACK`), `UPDATE ... SET col = col +/- N`, secondary indexes (`CREATE INDEX`), `GROUP BY` + `COUNT / SUM / MIN / MAX / AVG`, and SSTable compaction (`COMPACT TABLE`) with cross-node VDisk GC barriers.
+  2. **`yadb-s3` (Object Storage):** Multi-chunk S3 engine with strong read-after-write consistency, `Range` reads, and sorted prefix listing.
+  3. **`yadb-block` (Virtual Disks):** Thin-provisioned Copy-on-Write 4 KiB block volumes.
+- **Zero-Dependency Embedded OKD-Style Web Console (`yadbd`):**
+  - Compiled directly into the `yadbd` binary (`GET /` or `/ui`, ~41 KB, zero external JS/CSS/CDN files).
+  - Includes Cluster Overview, Project/Namespace switcher, RBAC Subject impersonation bar, `+ Import YAML` (`Plan` dry-run & `Apply`), SQL Query Workbench, S3 Bucket Browser, and 4 KiB BlockVolume Hex/ASCII Inspector.
 
 ## Standard client protocols
 
@@ -73,7 +78,7 @@ portal; committed rows remain available through Raft and the replicated BlobStor
 
 The S3 listener is path-style and binds one declarative `Project/ObjectStore` per listener.
 It supports AWS Signature Version 4, `PUT`, `GET`, `HEAD`, `DELETE`, XML `ListObjectsV2`,
-conditional reads, byte ranges, continuation tokens, and checksum validation. Multipart
+conditional reads, byte ranges, continuation tokens, and CRC32/SHA256/Content-MD5 validation. Multipart
 upload, server-side copy, ACLs, custom metadata, and streaming chunk signatures are
 explicitly rejected until implemented.
 
@@ -163,19 +168,35 @@ For libvirt, use the discovered multipath device as a raw disk, with cache disab
 
 The protocol frontends are covered by `python3 tests/protocols.py`, which uses independent
 stdlib clients to test SigV4, PostgreSQL framing/session behavior, iSCSI CHAP/SCSI I/O,
-UNMAP, and continued operation after killing a Raft leader. Native `psql`, AWS CLI,
-`iscsiadm`, and a production multipath stack should still be included in deployment CI.
+UNMAP, negotiated burst limits, and continued operation after killing a Raft leader.
+
+Native-client checks were run on aarch64 Alpine with **psql 17.11**, **AWS CLI 2.22.10**,
+and **libiscsi 1.20.3**. Verified cases include SQL queries/commit and bad passwords;
+S3 PUT (default Content-MD5 and explicit CRC32), HEAD/GET/LIST, Unicode/escaped keys,
+Range and bad credentials; iSCSI CHAP, INQUIRY, READ CAPACITY(16), and a 512 KiB
+WRITE(16) using R2T/Data-Out followed by byte-for-byte READ(16) verification.
+This is not a claim of complete PostgreSQL/S3/SCSI conformance.
+
+To repeat the optional native checks, install psql and AWS CLI, and install libiscsi
+including its development headers and utilities. Build the probe **outside the source
+tree** (it overwrites a region of the disposable test volume):
+
+```bash
+cc tests/libiscsi_probe.c $(pkg-config --cflags --libs libiscsi) -o /path/to/libiscsi-probe
+python3 tests/protocols.py --native-clients \
+  --libiscsi-dir /path/to/libiscsi/bin --libiscsi-probe /path/to/libiscsi-probe
+```
+
+Actual `open-iscsi` kernel sessions, `dm-multipath`, a VM filesystem workload and failure
+of an active target path remain **unverified**. The Android-hosted test environment has
+no `/dev/kvm` or `/dev/mapper/control`; installing userspace tools does not remove this
+limitation. Run those tests on a dedicated Linux/KVM host before production use.
 The current target has no SCSI persistent reservations, ALUA, mutual CHAP, or encrypted
 transport. Multipath paths to one VM are supported by the design; sharing the same raw
 filesystem read-write across multiple VMs is not safe without additional coordination.
 UNMAP drops logical extent references; it does not yet reclaim the old fragments on disk.
 Keep the legacy HTTP/control-plane ports private: their existing subject headers are a
 trusted internal interface, not a replacement for protocol authentication.
-  2. **`yadb-s3` (Object Storage):** Multi-chunk S3 engine with strong read-after-write consistency, `Range` reads, and sorted prefix listing.
-  3. **`yadb-block` (Virtual Disks):** Thin-provisioned Copy-on-Write 4 KiB block volumes.
-- **Zero-Dependency Embedded OKD-Style Web Console (`yadbd`):**
-  - Compiled directly into the `yadbd` binary (`GET /` or `/ui`, ~41 KB, zero external JS/CSS/CDN files).
-  - Includes Cluster Overview, Project/Namespace switcher, RBAC Subject impersonation bar, `+ Import YAML` (`Plan` dry-run & `Apply`), SQL Query Workbench, S3 Bucket Browser, and 4 KiB BlockVolume Hex/ASCII Inspector.
 
 ## Quickstart
 

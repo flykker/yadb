@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Offline protocol integration tests using independent stdlib wire clients.
 
-Not a replacement for libiscsi/dm-multipath, libpq or AWS CLI interoperability tests.
 Run after cargo build --offline: python3 tests/protocols.py
+Add --native-clients for psql/AWS CLI, --libiscsi-dir for libiscsi utilities,
+and --libiscsi-probe for the compiled libiscsi_probe.c. Not a kernel multipath test.
 """
 import datetime
+import argparse
 import hashlib
 import hmac
 import http.client
@@ -122,7 +124,7 @@ class Pg:
 
 
 class Iscsi:
-    def __init__(self, port, discovery=False, secret=SECRET):
+    def __init__(self, port, discovery=False, secret=SECRET, negotiation=None):
         self.s = socket.create_connection(("127.0.0.1", port), timeout=30)
         self.cmd = 1
         self.itt = 1
@@ -143,7 +145,10 @@ class Iscsi:
             self.s.close()
             return
         assert r[1] == 0x81
-        r, _ = self.exchange(3, 0x87, self.text({"HeaderDigest": "None", "DataDigest": "None", "MaxRecvDataSegmentLength": "8192"}), login=True)
+        keys = {"HeaderDigest": "None", "DataDigest": "None", "MaxRecvDataSegmentLength": "8192"}
+        keys.update(negotiation or {})
+        r, data = self.exchange(3, 0x87, self.text(keys), login=True)
+        self.negotiated = dict(s.split("=", 1) for s in data.decode().split("\0") if "=" in s)
         assert r[1] == 0x87 and r[36] == 0
         self.login = False
 
@@ -229,7 +234,116 @@ def wait(port):
     raise RuntimeError("daemon not ready")
 
 
-def run():
+def native(command, env=None):
+    """Run a real client and include its output in failures."""
+    result = subprocess.run(command, text=True, capture_output=True, env=env, timeout=45)
+    if result.returncode:
+        raise AssertionError(
+            f"native client failed ({result.returncode}): {' '.join(command)}\n"
+            f"stdout={result.stdout}\nstderr={result.stderr}"
+        )
+    return result.stdout
+
+
+def native_error(command, env, expected):
+    result = subprocess.run(command, text=True, capture_output=True, env=env, timeout=45)
+    assert result.returncode != 0 and expected in result.stderr, (result.stdout, result.stderr)
+
+
+def native_client_checks(temp, pg_port, s3_port):
+    pg_env = os.environ.copy()
+    pg_env["PGPASSWORD"] = SECRET
+    pg_env["PGSSLMODE"] = "prefer"
+    pg_env["PGCONNECT_TIMEOUT"] = "10"
+    out = native([
+        "psql", "-X", "-A", "-t", "-v", "ON_ERROR_STOP=1",
+        "-h", "127.0.0.1", "-p", str(pg_port), "-U", "backend",
+        "-d", "billing/ledger", "-c", "SELECT balance FROM wire WHERE id=1",
+    ], pg_env)
+    assert out.strip() == "90", repr(out)
+    native([
+        "psql", "-X", "-v", "ON_ERROR_STOP=1", "-h", "127.0.0.1",
+        "-p", str(pg_port), "-U", "backend", "-d", "billing/ledger",
+        "-c", "BEGIN; UPDATE wire SET balance=91 WHERE id=1; COMMIT;",
+    ], pg_env)
+    assert native([
+        "psql", "-X", "-A", "-t", "-v", "ON_ERROR_STOP=1", "-h",
+        "127.0.0.1", "-p", str(pg_port), "-U", "backend", "-d",
+        "billing/ledger", "-c", "SELECT balance FROM wire WHERE id=1",
+    ], pg_env).strip() == "91"
+    native([
+        "psql", "-X", "-v", "ON_ERROR_STOP=1", "-h", "127.0.0.1",
+        "-p", str(pg_port), "-U", "backend", "-d", "billing/ledger",
+        "-c", "UPDATE wire SET balance=90 WHERE id=1;",
+    ], pg_env)
+    bad_pg = pg_env.copy()
+    bad_pg["PGPASSWORD"] = "incorrect-secret"
+    native_error([
+        "psql", "-X", "-h", "127.0.0.1", "-p", str(pg_port), "-U", "backend",
+        "-d", "billing/ledger", "-c", "SELECT balance FROM wire",
+    ], bad_pg, "invalid credentials")
+
+    aws_env = os.environ.copy()
+    aws_env.update({
+        "AWS_ACCESS_KEY_ID": "backend",
+        "AWS_SECRET_ACCESS_KEY": SECRET,
+        "AWS_DEFAULT_REGION": "us-east-1",
+        "AWS_EC2_METADATA_DISABLED": "true",
+        "AWS_CLI_AUTO_PROMPT": "off",
+    })
+    config = Path(temp)/"aws-config"
+    config.write_text("[default]\nregion = us-east-1\ns3 =\n    addressing_style = path\n")
+    aws_env["AWS_CONFIG_FILE"] = str(config)
+    aws_env["AWS_SHARED_CREDENTIALS_FILE"] = str(Path(temp)/"unused-credentials")
+    endpoint = f"http://127.0.0.1:{s3_port}"
+    object_path = Path(temp) / "native-aws.txt"
+    object_path.write_text("native aws cli\n")
+    native([
+        "aws", "--endpoint-url", endpoint, "s3api", "put-object",
+        "--bucket", "invoices-2026", "--key", "native/aws.txt",
+        "--body", str(object_path), "--checksum-algorithm", "CRC32",
+        "--no-cli-pager",
+    ], aws_env)
+    head = native([
+        "aws", "--endpoint-url", endpoint, "s3api", "head-object",
+        "--bucket", "invoices-2026", "--key", "native/aws.txt",
+        "--no-cli-pager",
+    ], aws_env)
+    assert '"ContentLength": 15' in head, head
+    downloaded = Path(temp) / "native-downloaded.txt"
+    native([
+        "aws", "--endpoint-url", endpoint, "s3api", "get-object",
+        "--bucket", "invoices-2026", "--key", "native/aws.txt",
+        str(downloaded), "--no-cli-pager",
+    ], aws_env)
+    assert downloaded.read_text() == "native aws cli\n"
+    listed = native([
+        "aws", "--endpoint-url", endpoint, "s3api", "list-objects-v2",
+        "--bucket", "invoices-2026", "--prefix", "native/", "--no-cli-pager",
+    ], aws_env)
+    assert "native/aws.txt" in listed, listed
+    # Exercise defaults too: older AWS CLI versions commonly send Content-MD5.
+    native([
+        "aws", "--endpoint-url", endpoint, "s3api", "put-object",
+        "--bucket", "invoices-2026", "--key", "native/юникод +&%.txt",
+        "--body", str(object_path), "--no-cli-pager",
+    ], aws_env)
+    native([
+        "aws", "--endpoint-url", endpoint, "s3api", "get-object",
+        "--bucket", "invoices-2026", "--key", "native/юникод +&%.txt",
+        "--range", "bytes=1-4", str(downloaded), "--no-cli-pager",
+    ], aws_env)
+    assert downloaded.read_bytes() == b"ativ"
+    bad_aws = aws_env.copy()
+    bad_aws["AWS_SECRET_ACCESS_KEY"] = "incorrect-secret"
+    native_error([
+        "aws", "--endpoint-url", endpoint, "s3api", "head-object",
+        "--bucket", "invoices-2026", "--key", "native/aws.txt", "--no-cli-pager",
+    ], bad_aws, "403")
+    print("PASS native psql 17 and AWS CLI 2 (Simple Query, transaction, S3 PUT/HEAD/GET/LIST)")
+
+
+def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
     base = "/data/data/com.foxdebug.acodefree/cache/opencode"
     with tempfile.TemporaryDirectory(prefix="yadb-protocols-", dir=base) as temp:
         temp = Path(temp)
@@ -291,8 +405,12 @@ def run():
             _, _, second = signed(19202, "GET", "/invoices-2026?list-type=2&prefix=page%2F&max-keys=1&continuation-token="+token)
             assert ET.fromstring(second).find("{*}Contents/{*}Key").text == "page/b"
             assert signed(19202, "PUT", "/invoices-2026/bad", b"bad", {"x-amz-checksum-crc32": "AAAAAA=="})[0] == 400
+            assert signed(19202, "PUT", "/invoices-2026/bad-md5", b"bad", {"content-md5": "AAAAAAAAAAAAAAAAAAAAAA=="})[0] == 400
             assert signed(19202, "POST", "/invoices-2026/multipart?uploads")[0] == 501
             print("PASS S3 SigV4, XML listing, escaped keys, PUT/GET/HEAD/Range/DELETE, bad signatures")
+
+            if native_clients:
+                native_client_checks(temp, 19102, 19202)
 
             Iscsi(19302, secret="wrong-password")
             discovery = Iscsi(19302, discovery=True)
@@ -315,6 +433,24 @@ def run():
             x.write(b"C"*512)
             x.scsi(bytes([0x35])+bytes(9))
             print("PASS iSCSI CHAP, discovery, stable VPD83, READ/WRITE, R2T/Data-Out, UNMAP")
+            limited = Iscsi(19302, negotiation={"ImmediateData": "No", "MaxBurstLength": "4096", "FirstBurstLength": "4096"})
+            assert limited.negotiated["ImmediateData"] == "No", limited.negotiated
+            assert limited.negotiated["MaxBurstLength"] == "4096", limited.negotiated
+            payload = bytes(range(256))*64
+            limited.write(payload, lba=512, immediate=False)
+            assert limited.read(lba=512, blocks=32) == payload
+            limited.s.close()
+            print("PASS iSCSI ImmediateData=No, negotiated burst limits, multiple R2Ts")
+            if libiscsi_dir:
+                iscsi_url = f"iscsi://backend%{SECRET}@127.0.0.1:19302/iqn.2026-11.io.yadb:billing:vm-root/0"
+                output = native([str(Path(libiscsi_dir)/"iscsi-inq"), "-d", "3", iscsi_url])
+                assert "YADB" in output, output
+                print(native([str(Path(libiscsi_dir)/"iscsi-readcapacity16"), iscsi_url]))
+                print("PASS native libiscsi INQUIRY and READ CAPACITY(16)")
+            if libiscsi_probe:
+                probe_env = os.environ.copy()
+                probe_env["YADB_TEST_SECRET"] = SECRET
+                print(native([libiscsi_probe, "127.0.0.1:19302"], probe_env).strip())
 
             leader = json.loads(request(19002, "GET", "/raft/status")[2])["leader_id"]
             survivor = next(i for i in range(1, 4) if i != leader)
@@ -353,4 +489,10 @@ def run():
 
 
 if __name__ == "__main__":
-    run()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--native-clients", action="store_true", help="also require psql and AWS CLI")
+    parser.add_argument("--libiscsi-dir", help="directory containing libiscsi utilities")
+    parser.add_argument("--libiscsi-probe", help="compiled tests/libiscsi_probe.c (temporary volume only)")
+    args = parser.parse_args()
+    run(native_clients=args.native_clients, libiscsi_dir=args.libiscsi_dir,
+        libiscsi_probe=args.libiscsi_probe)
