@@ -7,6 +7,7 @@ and --libiscsi-probe for the compiled libiscsi_probe.c. Not a kernel multipath t
 """
 import datetime
 import argparse
+from collections import deque
 import hashlib
 import hmac
 import http.client
@@ -35,14 +36,22 @@ class PeerProxy(socketserver.ThreadingTCPServer):
     daemon_threads = True
 
     def __init__(self, source, target):
+        self.source = source
         self.target = target
         self.blocked = threading.Event()
+        self.events = deque(maxlen=30)
+        self.events_lock = threading.Lock()
         super().__init__(("127.0.0.1", 19400 + source * 10 + target), PeerHandler)
+
+    def record(self, event):
+        with self.events_lock:
+            self.events.append((round(time.monotonic(), 3), event))
 
 
 class PeerHandler(socketserver.BaseRequestHandler):
     def handle(self):
         if self.server.blocked.is_set():
+            self.server.record("blocked on accept")
             return
         try:
             with socket.create_connection(("127.0.0.1", 19000+self.server.target), timeout=2) as upstream:
@@ -56,8 +65,8 @@ class PeerHandler(socketserver.BaseRequestHandler):
                         if not data:
                             return
                         (upstream if sock is self.request else self.request).sendall(data)
-        except OSError:
-            pass
+        except OSError as e:
+            self.server.record(f"{type(e).__name__}: {e}; blocked={self.server.blocked.is_set()}")
 
 
 def exact(sock, n):
@@ -704,6 +713,20 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
             p.close()
             print("PASS leader SIGKILL: surviving iSCSI portal, pgwire and S3 remain usable")
         except Exception:
+            print("Failure diagnostics: node Raft status and recent peer proxy events")
+            for i in range(1, 4):
+                try:
+                    c = http.client.HTTPConnection("127.0.0.1", 19000+i, timeout=2)
+                    try:
+                        c.request("GET", "/raft/status")
+                        print(f"node {i}: {c.getresponse().read().decode()}")
+                    finally:
+                        c.close()
+                except (OSError, http.client.HTTPException) as e:
+                    print(f"node {i}: {e}")
+            for (source, target), proxy in proxies.items():
+                with proxy.events_lock:
+                    print(f"peer {source}->{target}, blocked={proxy.blocked.is_set()}: {list(proxy.events)}")
             for log in logs:
                 log.flush()
             for path in temp.glob("*.log"):
