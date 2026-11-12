@@ -1,0 +1,22 @@
+[package]
+name = "yadbd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "yadbd"
+path = "src/main.rs"
+
+[dependencies]
+yadb-io = { path = "../yadb-io" }
+yadb-blob = { path = "../yadb-blob" }
+yadb-control = { path = "../yadb-control" }
+yadb-metakv = { path = "../yadb-metakv" }
+yadb-s3 = { path = "../yadb-s3" }
+axum.workspace = true
+bytes.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true

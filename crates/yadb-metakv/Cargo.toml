@@ -1,0 +1,12 @@
+[package]
+name = "yadb-metakv"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+yadb-io = { path = "../yadb-io" }
+crc32fast.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

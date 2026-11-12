@@ -1,7 +1,10 @@
 use std::fs;
+use std::io::{Read, Write};
+use std::net::TcpStream;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
+use serde::Deserialize;
 use yadb_blob::{BlobId, ErasureScheme, PoolStriper, VolumeConfig, VolumeStore};
 use yadb_control::{parse_manifests, ControlPlaneState, DiffOp, Role};
 use yadb_io::{FaultConfig, OsFs, SimFs, StorageFs};
@@ -13,7 +16,11 @@ use yadb_io::{FaultConfig, OsFs, SimFs, StorageFs};
     about = "Declarative control & storage CLI for YADB (Yet Another DB & Data Platform)"
 )]
 struct Cli {
-    /// Path to local state file (simulating MetaKV persistence until Raft node daemon is started)
+    /// Live `yadbd` HTTP endpoint (e.g. `http://127.0.0.1:8420`). If omitted, uses local state file.
+    #[arg(short = 's', long, global = true)]
+    server: Option<String>,
+
+    /// Path to offline state file when `--server` is not set
     #[arg(long, default_value = ".yadb-state.json", global = true)]
     state: PathBuf,
 
@@ -28,7 +35,7 @@ enum Command {
         #[arg(short = 'f', long)]
         file: PathBuf,
     },
-    /// Apply declarative YAML manifests and advance cluster generation
+    /// Apply declarative YAML manifests to `yadbd` (or local state) and advance generation
     Apply {
         #[arg(short = 'f', long)]
         file: PathBuf,
@@ -44,6 +51,52 @@ enum Command {
         #[arg(long, default_value_t = false)]
         write: bool,
     },
+    /// Upload an object to a project's ObjectStore on a live `yadbd` node
+    S3Put {
+        #[arg(long)]
+        project: String,
+        #[arg(long)]
+        store: String,
+        #[arg(long)]
+        bucket: String,
+        #[arg(long)]
+        key: String,
+        #[arg(long)]
+        subject: String,
+        #[arg(short = 'f', long)]
+        file: PathBuf,
+    },
+    /// Download an object (or byte range) from a project's ObjectStore on `yadbd`
+    S3Get {
+        #[arg(long)]
+        project: String,
+        #[arg(long)]
+        store: String,
+        #[arg(long)]
+        bucket: String,
+        #[arg(long)]
+        key: String,
+        #[arg(long)]
+        subject: String,
+        /// Optional inclusive byte range, e.g. `0-63`
+        #[arg(long)]
+        range: Option<String>,
+        #[arg(short = 'o', long)]
+        out: Option<PathBuf>,
+    },
+    /// List objects in a project's ObjectStore bucket by prefix
+    S3Ls {
+        #[arg(long)]
+        project: String,
+        #[arg(long)]
+        store: String,
+        #[arg(long)]
+        bucket: String,
+        #[arg(long)]
+        subject: String,
+        #[arg(long, default_value = "")]
+        prefix: String,
+    },
     /// Run deterministic seeded crash & Reed-Solomon self-healing simulation in memory
     SimCrash {
         #[arg(long, default_value_t = 2026)]
@@ -54,6 +107,100 @@ enum Command {
         #[arg(long, default_value = "/data/data/com.foxdebug.acodefree/cache/opencode/yadb-demo")]
         dir: PathBuf,
     },
+}
+
+#[derive(Deserialize)]
+struct RemotePlanResp {
+    current_generation: u64,
+    next_generation: u64,
+    ops: Vec<DiffOp>,
+}
+
+#[derive(Deserialize)]
+struct RemoteApplyResp {
+    generation: u64,
+    ops: Vec<DiffOp>,
+}
+
+/// Zero-dependency HTTP/1.1 client over `TcpStream` (`Connection: close`) for fast `yadbd` calls.
+fn http_request(
+    base_url: &str,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+) -> Result<(u16, Vec<u8>), Box<dyn std::error::Error>> {
+    let addr = base_url
+        .trim()
+        .strip_prefix("http://")
+        .unwrap_or(base_url.trim())
+        .trim_end_matches('/');
+
+    let mut stream = TcpStream::connect(addr)?;
+    let mut req = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {}\r\nConnection: close\r\n",
+        body.len()
+    );
+    for (k, v) in headers {
+        req.push_str(&format!("{k}: {v}\r\n"));
+    }
+    req.push_str("\r\n");
+
+    stream.write_all(req.as_bytes())?;
+    if !body.is_empty() {
+        stream.write_all(body)?;
+    }
+    stream.flush()?;
+
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw)?;
+
+    let split = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .ok_or("malformed HTTP response from yadbd")?;
+    let head_str = std::str::from_utf8(&raw[..split])?;
+    let status_line = head_str.lines().next().ok_or("empty HTTP status line")?;
+    let status: u16 = status_line
+        .split_whitespace()
+        .nth(1)
+        .ok_or("missing HTTP status code")?
+        .parse()?;
+
+    let payload = &raw[split + 4..];
+    let is_chunked = head_str.lines().any(|l| {
+        l.to_ascii_lowercase().starts_with("transfer-encoding:")
+            && l.to_ascii_lowercase().contains("chunked")
+    });
+    let decoded = if is_chunked {
+        decode_chunked(payload)?
+    } else {
+        payload.to_vec()
+    };
+
+    Ok((status, decoded))
+}
+
+fn decode_chunked(mut src: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let mut out = Vec::new();
+    loop {
+        let crlf = src
+            .windows(2)
+            .position(|w| w == b"\r\n")
+            .ok_or("invalid chunked framing")?;
+        let len_hex = std::str::from_utf8(&src[..crlf])?.trim();
+        let chunk_len = usize::from_str_radix(len_hex, 16)?;
+        src = &src[crlf + 2..];
+        if chunk_len == 0 {
+            break;
+        }
+        if src.len() < chunk_len + 2 {
+            return Err("truncated HTTP chunk".into());
+        }
+        out.extend_from_slice(&src[..chunk_len]);
+        src = &src[chunk_len + 2..];
+    }
+    Ok(out)
 }
 
 fn load_state(path: &PathBuf) -> Result<ControlPlaneState, Box<dyn std::error::Error>> {
@@ -80,78 +227,135 @@ fn print_ops(ops: &[DiffOp]) {
     }
 }
 
+fn print_status(state: &ControlPlaneState) {
+    println!("Cluster Generation : {}", state.generation);
+    if let Some((meta, spec)) = &state.cluster {
+        println!(
+            "Cluster            : {} ({} failure domains)",
+            meta.name,
+            spec.domains.len()
+        );
+    } else {
+        println!("Cluster            : <unconfigured>");
+    }
+    println!("Storage Pools ({}):", state.pools.len());
+    for (name, p) in &state.pools {
+        println!(
+            "  - {name}: {:?} across {} failure domains",
+            p.erasure, p.failure_domains
+        );
+    }
+    println!("Projects ({}):", state.projects.len());
+    for (name, (pid, spec)) in &state.projects {
+        println!(
+            "  - {name} (project_id={pid}, members={}, max_iops={:?})",
+            spec.members.len(),
+            spec.quotas.max_iops
+        );
+    }
+    println!("Databases ({}):", state.databases.len());
+    for (full_key, db) in &state.databases {
+        println!(
+            "  - {full_key}: wal={}, data={}, isolation={:?}, shards={}",
+            db.wal_pool, db.data_pool, db.isolation, db.shards
+        );
+    }
+    println!("ObjectStores ({}):", state.object_stores.len());
+    for (full_key, os) in &state.object_stores {
+        println!(
+            "  - {full_key}: pool={}, isolation={:?}, buckets={:?}",
+            os.pool, os.isolation, os.buckets
+        );
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     match cli.cmd {
         Command::Plan { file } => {
             let yaml = fs::read_to_string(&file)?;
-            let manifests = parse_manifests(&yaml)?;
-            let state = load_state(&cli.state)?;
-            let (ops, next) = state.plan(&manifests)?;
-            println!(
-                "Plan OK (current generation: {}, next generation: {}):",
-                state.generation, next.generation
-            );
-            print_ops(&ops);
+            if let Some(srv) = &cli.server {
+                let payload = serde_json::to_vec(&serde_json::json!({ "yaml": yaml }))?;
+                let (code, body) = http_request(
+                    srv,
+                    "POST",
+                    "/v1/plan",
+                    &[("Content-Type", "application/json")],
+                    &payload,
+                )?;
+                if code != 200 {
+                    eprintln!("Server error ({code}): {}", String::from_utf8_lossy(&body));
+                    std::process::exit(1);
+                }
+                let resp: RemotePlanResp = serde_json::from_slice(&body)?;
+                println!(
+                    "Remote Plan OK (current generation: {}, next generation: {}):",
+                    resp.current_generation, resp.next_generation
+                );
+                print_ops(&resp.ops);
+            } else {
+                let manifests = parse_manifests(&yaml)?;
+                let state = load_state(&cli.state)?;
+                let (ops, next) = state.plan(&manifests)?;
+                println!(
+                    "Plan OK (current generation: {}, next generation: {}):",
+                    state.generation, next.generation
+                );
+                print_ops(&ops);
+            }
         }
         Command::Apply { file } => {
             let yaml = fs::read_to_string(&file)?;
-            let manifests = parse_manifests(&yaml)?;
-            let mut state = load_state(&cli.state)?;
-            let ops = state.apply(&manifests)?;
-            save_state(&cli.state, &state)?;
-            println!("Applied successfully -> generation {}", state.generation);
-            print_ops(&ops);
+            if let Some(srv) = &cli.server {
+                let payload = serde_json::to_vec(&serde_json::json!({ "yaml": yaml }))?;
+                let (code, body) = http_request(
+                    srv,
+                    "POST",
+                    "/v1/apply",
+                    &[("Content-Type", "application/json")],
+                    &payload,
+                )?;
+                if code != 200 {
+                    eprintln!("Apply failed ({code}): {}", String::from_utf8_lossy(&body));
+                    std::process::exit(1);
+                }
+                let resp: RemoteApplyResp = serde_json::from_slice(&body)?;
+                println!("Applied to yadbd -> generation {}", resp.generation);
+                print_ops(&resp.ops);
+            } else {
+                let manifests = parse_manifests(&yaml)?;
+                let mut state = load_state(&cli.state)?;
+                let ops = state.apply(&manifests)?;
+                save_state(&cli.state, &state)?;
+                println!("Applied locally -> generation {}", state.generation);
+                print_ops(&ops);
+            }
         }
         Command::Status => {
-            let state = load_state(&cli.state)?;
-            println!("Cluster Generation : {}", state.generation);
-            if let Some((meta, spec)) = &state.cluster {
-                println!(
-                    "Cluster            : {} ({} failure domains)",
-                    meta.name,
-                    spec.domains.len()
-                );
+            let state = if let Some(srv) = &cli.server {
+                let (code, body) = http_request(srv, "GET", "/v1/status", &[], &[])?;
+                if code != 200 {
+                    eprintln!("Status failed ({code}): {}", String::from_utf8_lossy(&body));
+                    std::process::exit(1);
+                }
+                serde_json::from_slice(&body)?
             } else {
-                println!("Cluster            : <unconfigured>");
-            }
-            println!("Storage Pools ({}):", state.pools.len());
-            for (name, p) in &state.pools {
-                println!(
-                    "  - {name}: {:?} across {} failure domains",
-                    p.erasure, p.failure_domains
-                );
-            }
-            println!("Projects ({}):", state.projects.len());
-            for (name, (pid, spec)) in &state.projects {
-                println!(
-                    "  - {name} (project_id={pid}, members={}, max_iops={:?})",
-                    spec.members.len(),
-                    spec.quotas.max_iops
-                );
-            }
-            println!("Databases ({}):", state.databases.len());
-            for (full_key, db) in &state.databases {
-                println!(
-                    "  - {full_key}: wal={}, data={}, isolation={:?}, shards={}",
-                    db.wal_pool, db.data_pool, db.isolation, db.shards
-                );
-            }
-            println!("ObjectStores ({}):", state.object_stores.len());
-            for (full_key, os) in &state.object_stores {
-                println!(
-                    "  - {full_key}: pool={}, isolation={:?}, buckets={:?}",
-                    os.pool, os.isolation, os.buckets
-                );
-            }
+                load_state(&cli.state)?
+            };
+            print_status(&state);
         }
         Command::AuthCheck {
             project,
             subject,
             write,
         } => {
-            let state = load_state(&cli.state)?;
+            let state = if let Some(srv) = &cli.server {
+                let (_, body) = http_request(srv, "GET", "/v1/status", &[], &[])?;
+                serde_json::from_slice(&body)?
+            } else {
+                load_state(&cli.state)?
+            };
             let role = if write { Role::ReadWrite } else { Role::ReadOnly };
             match state.authorize(&project, &subject, role) {
                 Ok(pid) => println!(
@@ -162,6 +366,87 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     std::process::exit(1);
                 }
             }
+        }
+        Command::S3Put {
+            project,
+            store,
+            bucket,
+            key,
+            subject,
+            file,
+        } => {
+            let srv = cli
+                .server
+                .as_deref()
+                .unwrap_or("http://127.0.0.1:8420");
+            let data = fs::read(&file)?;
+            let path = format!("/s3/{project}/{store}/{bucket}/{}", key.trim_start_matches('/'));
+            let (code, body) = http_request(
+                srv,
+                "PUT",
+                &path,
+                &[("x-yadb-subject", &subject)],
+                &data,
+            )?;
+            if code != 200 {
+                eprintln!("S3 PUT denied/failed ({code}): {}", String::from_utf8_lossy(&body));
+                std::process::exit(1);
+            }
+            println!("S3 PUT OK: {}", String::from_utf8_lossy(&body));
+        }
+        Command::S3Get {
+            project,
+            store,
+            bucket,
+            key,
+            subject,
+            range,
+            out,
+        } => {
+            let srv = cli
+                .server
+                .as_deref()
+                .unwrap_or("http://127.0.0.1:8420");
+            let path = format!("/s3/{project}/{store}/{bucket}/{}", key.trim_start_matches('/'));
+            let mut hdrs = vec![("x-yadb-subject", subject.as_str())];
+            let range_val;
+            if let Some(r) = &range {
+                range_val = format!("bytes={r}");
+                hdrs.push(("Range", range_val.as_str()));
+            }
+            let (code, body) = http_request(srv, "GET", &path, &hdrs, &[])?;
+            if code != 200 && code != 206 {
+                eprintln!("S3 GET failed ({code}): {}", String::from_utf8_lossy(&body));
+                std::process::exit(1);
+            }
+            if let Some(dst) = out {
+                fs::write(&dst, &body)?;
+                println!("Saved {} bytes (HTTP {code}) to {:?}", body.len(), dst);
+            } else {
+                std::io::stdout().write_all(&body)?;
+                println!();
+            }
+        }
+        Command::S3Ls {
+            project,
+            store,
+            bucket,
+            subject,
+            prefix,
+        } => {
+            let srv = cli
+                .server
+                .as_deref()
+                .unwrap_or("http://127.0.0.1:8420");
+            let path = format!("/s3/{project}/{store}/{bucket}?prefix={prefix}");
+            let (code, body) =
+                http_request(srv, "GET", &path, &[("x-yadb-subject", &subject)], &[])?;
+            if code != 200 {
+                eprintln!("S3 LS failed ({code}): {}", String::from_utf8_lossy(&body));
+                std::process::exit(1);
+            }
+            let pretty: serde_json::Value = serde_json::from_slice(&body)?;
+            println!("{}", serde_json::to_string_pretty(&pretty)?);
         }
         Command::SimCrash { seed } => {
             println!("Running deterministic crash & erasure self-healing simulation (seed={seed})...");
@@ -182,7 +467,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 striper.put_blob(id, &payload)?;
             }
 
-            // Inject torn write + power cut + bitrot on domain-0 and complete loss of domain-2!
             fs.set_faults(FaultConfig {
                 seed: seed ^ 0xDEAD_BEEF,
                 torn_write_prob: 1.0,
@@ -199,7 +483,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 fs.corrupt_byte(&format!("domain-0/{f0}"), 48)?;
             }
 
-            // Reopen all domains after crash and verify + repair every single blob!
             let mut reopened_domains = Vec::new();
             for d in 0..6 {
                 reopened_domains.push(VolumeStore::open(
@@ -239,8 +522,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             let pool = PoolStriper::new(ErasureScheme::ReedSolomon { k: 4, m: 2 }, domains)?;
             let start = std::time::Instant::now();
-            let block = vec![0xABu8; 64 * 1024]; // 64 KiB SST/chunk
-            let count = 64u32; // 4 MiB logical payload
+            let block = vec![0xABu8; 64 * 1024];
+            let count = 64u32;
             for step in 1..=count {
                 let id = BlobId::new(1, 42, 1, step, 2, 0);
                 pool.put_blob(id, &block)?;
