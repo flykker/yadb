@@ -420,6 +420,17 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
             x, y = Iscsi(19302), Iscsi(19303)
             cdb = bytes([0x12, 1, 0x83, 0, 255, 0])
             assert x.scsi(cdb, 255) == y.scsi(cdb, 255)
+            # INQUIRY allocation length zero but iSCSI expects 36 bytes: the
+            # SCSI response must report the entire transfer as underflow.
+            x.itt += 1
+            h = x.header(1, 0xc1)
+            h[20:24] = (36).to_bytes(4, "big")
+            h[32:38] = bytes([0x12, 0, 0, 0, 0, 0])
+            x.send(h)
+            x.cmd += 1
+            r, data = x.recv()
+            assert r[0] == 0x21 and r[3] == 0 and not data
+            assert r[1] & 2 and int.from_bytes(r[44:48], "big") == 36, r
             x.write(b"A"*512)
             assert y.read() == b"A"*512
             x.write(b"B"*4096, immediate=False)

@@ -354,7 +354,13 @@ fn send_data(c: &mut TcpStream, s: &mut Session, p: &Pdu, mut data: Vec<u8>) -> 
     let expected = u32at(&p.h, 20) as usize;
     data.truncate(expected);
     if data.is_empty() {
-        return good(c, s, p);
+        let mut r = Pdu::new(0x21, 0x80, &p.h[16..20]);
+        if expected != 0 {
+            r.h[1] |= 2; // Underflow: no bytes of the expected transfer were sent.
+            r.h[44..48].copy_from_slice(&(expected as u32).to_be_bytes());
+        }
+        s.sequence(&mut r, true);
+        return r.send(c);
     }
     let total = data.len();
     let mut offset = 0;

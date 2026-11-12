@@ -1,5 +1,7 @@
 # YADB — Yet Another DB & Declarative Storage Platform
 
+Development priorities, reliability work and future features: [ROADMAP.md](ROADMAP.md).
+
 `yadb` is a modular Rust distributed storage and multi-tenant data platform inspired by **YDB's immutable `BlobStorage` + Tablets** and **Kubernetes' declarative YAML control plane**—designed to run directly on standard Linux filesystems (`ext4`/`xfs`) without raw `PDisk` block devices.
 
 ## Highlights
