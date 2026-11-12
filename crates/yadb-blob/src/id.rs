@@ -91,6 +91,19 @@ impl BlobId {
     pub fn with_part(self, part: u8) -> Self {
         Self((self.0 & !0xFFu128) | (part as u128))
     }
+
+    #[inline]
+    pub fn to_hex(self) -> String {
+        format!("{:032x}", self.0)
+    }
+
+    #[inline]
+    pub fn from_hex(s: &str) -> Option<Self> {
+        if s.len() != 32 {
+            return None;
+        }
+        u128::from_str_radix(s, 16).ok().map(Self)
+    }
 }
 
 impl fmt::Debug for BlobId {

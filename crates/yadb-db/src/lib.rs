@@ -177,7 +177,70 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
             .clone())
     }
 
-    /// Executes a SQL statement against a multi-tenant sharded `Database`.
+    fn read_shard_row(
+        &self,
+        project_id: u32,
+        db: &str,
+        schema: &TableSchema,
+        shard_idx: u32,
+        pk_bytes: &[u8],
+    ) -> Result<Option<Vec<SqlValue>>, DbError> {
+        let mkey = Self::shard_meta_key(project_id, db, &schema.table, shard_idx);
+        let meta_ver = self.meta.get(&mkey).map(|kv| kv.version).unwrap_or(0);
+        if meta_ver == 0 {
+            return Ok(None);
+        }
+        if let Some(existing) = self.shards.lock().unwrap().get(&mkey).cloned() {
+            let guard = existing.lock().unwrap();
+            if guard.manifest_version() == meta_ver {
+                return guard.get_row(pk_bytes);
+            }
+        }
+        let wal_striper = self.get_pool(&schema.wal_pool)?;
+        let data_striper = self.get_pool(&schema.data_pool)?;
+        if let Some(ro) = DataShardTablet::open_readonly_snapshot(
+            self.meta.clone(),
+            mkey,
+            wal_striper,
+            data_striper,
+        )? {
+            ro.get_row(pk_bytes)
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn scan_shard_rows(
+        &self,
+        project_id: u32,
+        db: &str,
+        schema: &TableSchema,
+        shard_idx: u32,
+    ) -> Result<Vec<Vec<SqlValue>>, DbError> {
+        let mkey = Self::shard_meta_key(project_id, db, &schema.table, shard_idx);
+        let meta_ver = self.meta.get(&mkey).map(|kv| kv.version).unwrap_or(0);
+        if meta_ver == 0 {
+            return Ok(Vec::new());
+        }
+        if let Some(existing) = self.shards.lock().unwrap().get(&mkey).cloned() {
+            let guard = existing.lock().unwrap();
+            if guard.manifest_version() == meta_ver {
+                return guard.scan_all_live_rows();
+            }
+        }
+        let wal_striper = self.get_pool(&schema.wal_pool)?;
+        let data_striper = self.get_pool(&schema.data_pool)?;
+        if let Some(ro) = DataShardTablet::open_readonly_snapshot(
+            self.meta.clone(),
+            mkey,
+            wal_striper,
+            data_striper,
+        )? {
+            ro.scan_all_live_rows()
+        } else {
+            Ok(Vec::new())
+        }
+    }
     pub fn execute_sql(
         &self,
         project_id: u32,
@@ -401,16 +464,15 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
                 let mut candidate_rows = Vec::new();
                 if let Some(pk_bytes) = exact_pk_lookup {
                     let shard_idx = Self::route_shard(&pk_bytes, schema.shards);
-                    let shard = self.get_or_open_shard(project_id, db, &schema, shard_idx)?;
-                    let guard = shard.lock().unwrap();
-                    if let Some(row) = guard.get_row(&pk_bytes)? {
+                    if let Some(row) =
+                        self.read_shard_row(project_id, db, &schema, shard_idx, &pk_bytes)?
+                    {
                         candidate_rows.push(row);
                     }
                 } else {
                     for shard_idx in 0..schema.shards {
-                        let shard = self.get_or_open_shard(project_id, db, &schema, shard_idx)?;
-                        let guard = shard.lock().unwrap();
-                        candidate_rows.extend(guard.scan_all_live_rows()?);
+                        candidate_rows
+                            .extend(self.scan_shard_rows(project_id, db, &schema, shard_idx)?);
                     }
                     // Deterministic default sort by PRIMARY KEY across shards
                     let pk_i = schema.pk_index;

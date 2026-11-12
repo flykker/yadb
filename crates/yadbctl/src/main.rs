@@ -47,6 +47,10 @@ enum Command {
     RaftStatus,
     /// Trigger a Raft election round on the target `yadbd` node
     RaftElect,
+    /// Show distributed VDisk / StoragePool slot placement and online health across nodes
+    PoolHealth,
+    /// Run a deep CRC32 scrub & self-healing repair pass across all StoragePools
+    PoolScrub,
     /// Verify local zero-hop RBAC authorization for a subject on a project
     AuthCheck {
         #[arg(long)]
@@ -471,6 +475,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if code != 200 {
                 eprintln!(
                     "Raft elect failed ({code}): {}",
+                    String::from_utf8_lossy(&body)
+                );
+                std::process::exit(1);
+            }
+            let val: serde_json::Value = serde_json::from_slice(&body)?;
+            println!("{}", serde_json::to_string_pretty(&val)?);
+        }
+        Command::PoolHealth => {
+            let srv = cli.server.as_deref().unwrap_or("http://127.0.0.1:8420");
+            let (code, body) = http_request(srv, "GET", "/v1/pools/health", &[], &[])?;
+            if code != 200 {
+                eprintln!(
+                    "Pool health failed ({code}): {}",
+                    String::from_utf8_lossy(&body)
+                );
+                std::process::exit(1);
+            }
+            let val: serde_json::Value = serde_json::from_slice(&body)?;
+            println!("{}", serde_json::to_string_pretty(&val)?);
+        }
+        Command::PoolScrub => {
+            let srv = cli.server.as_deref().unwrap_or("http://127.0.0.1:8420");
+            let (code, body) = http_request(srv, "POST", "/v1/pools/scrub", &[], &[])?;
+            if code != 200 {
+                eprintln!(
+                    "Pool scrub failed ({code}): {}",
                     String::from_utf8_lossy(&body)
                 );
                 std::process::exit(1);

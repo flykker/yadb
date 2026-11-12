@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Mutex, RwLock};
 
+use serde::{Deserialize, Serialize};
 use yadb_io::{StorageFs, VirtualFile};
 
 use crate::{BlobError, BlobId};
@@ -45,7 +46,7 @@ struct ActiveSegment<F: VirtualFile> {
     write_pos: u64,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct VolumeStats {
     pub live_blobs: usize,
     pub live_bytes: u64,
@@ -147,12 +148,16 @@ impl<FS: StorageFs> VolumeStore<FS> {
 
         let data_crc = crc32fast::hash(data);
 
-        // Idempotency check for immutable blobs
+        // Idempotency check for immutable blobs (also verifies on-disk CRC32 so Scrubber
+        // can heal silent bit-rot by appending a fresh verified copy when on-disk bytes corrupted!)
         if let Some(existing) = self.index.read().unwrap().get(&id).copied() {
             if existing.data_len == data.len() as u32 && existing.data_crc == data_crc {
-                return Ok(());
+                if self.get(id).is_ok() {
+                    return Ok(());
+                }
+            } else {
+                return Err(BlobError::ImmutableConflict(id));
             }
-            return Err(BlobError::ImmutableConflict(id));
         }
 
         let mut writer = self.writer.lock().unwrap();

@@ -171,6 +171,42 @@ impl<FS: StorageFs> DataShardTablet<FS> {
         self.manifest.generation
     }
 
+    pub fn manifest_version(&self) -> u64 {
+        self.manifest_ver
+    }
+
+    /// Opens a read-only view of a shard from replicated `MetaKV` + distributed `PoolStriper`
+    /// without mutating Raft state or bumping the leader's fencing `generation`!
+    pub fn open_readonly_snapshot(
+        meta: LocalMetaKv<FS>,
+        meta_key: String,
+        wal_striper: Arc<PoolStriper<FS>>,
+        data_striper: Arc<PoolStriper<FS>>,
+    ) -> Result<Option<Self>, DbError> {
+        let Some(kv) = meta.get(&meta_key) else {
+            return Ok(None);
+        };
+        let manifest: TabletManifest = serde_json::from_slice(&kv.value)?;
+        let mut memtable = BTreeMap::new();
+        for &wal_id in &manifest.wal_blobs {
+            let raw = wal_striper.get_blob(wal_id)?;
+            let batch: WalBatch = serde_json::from_slice(&raw)?;
+            for (pk, entry) in batch.mutations {
+                memtable.insert(pk, entry);
+            }
+        }
+        Ok(Some(Self {
+            meta_key,
+            manifest_ver: kv.version,
+            manifest,
+            meta,
+            wal_striper,
+            data_striper,
+            memtable,
+            flush_threshold_rows: usize::MAX,
+        }))
+    }
+
     pub fn sst_count(&self) -> usize {
         self.manifest.sst_blobs.len()
     }

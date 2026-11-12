@@ -65,7 +65,7 @@ pub struct ObjectStoreEngine<FS: StorageFs> {
     meta: LocalMetaKv<FS>,
     pools: Arc<RwLock<BTreeMap<String, Arc<PoolStriper<FS>>>>>,
     chunk_size: usize,
-    step_seq: AtomicU32,
+    step_seq: Arc<AtomicU32>,
 }
 
 impl<FS: StorageFs> Clone for ObjectStoreEngine<FS> {
@@ -74,7 +74,7 @@ impl<FS: StorageFs> Clone for ObjectStoreEngine<FS> {
             meta: self.meta.clone(),
             pools: self.pools.clone(),
             chunk_size: self.chunk_size,
-            step_seq: AtomicU32::new(self.step_seq.load(Ordering::Relaxed)),
+            step_seq: self.step_seq.clone(),
         }
     }
 }
@@ -85,7 +85,7 @@ impl<FS: StorageFs> ObjectStoreEngine<FS> {
             meta,
             pools: Arc::new(RwLock::new(BTreeMap::new())),
             chunk_size: chunk_size.max(4096),
-            step_seq: AtomicU32::new(1),
+            step_seq: Arc::new(AtomicU32::new(1)),
         }
     }
 
@@ -114,8 +114,8 @@ impl<FS: StorageFs> ObjectStoreEngine<FS> {
         format!("/s3/{project_id}/{store}/{bucket}/{prefix}")
     }
 
-    fn owner_hash(store: &str, bucket: &str) -> u32 {
-        crc32fast::hash(format!("{store}/{bucket}").as_bytes()).max(1)
+    fn owner_hash(store: &str, bucket: &str, key: &str) -> u32 {
+        crc32fast::hash(format!("{store}/{bucket}/{key}").as_bytes()).max(1)
     }
 
     /// Writes object chunks to erasure-coded `PoolStriper` first (idempotent, consensus-free),
@@ -131,15 +131,11 @@ impl<FS: StorageFs> ObjectStoreEngine<FS> {
         payload: &[u8],
     ) -> Result<ObjectManifest, S3Error> {
         let pool = self.get_pool(pool_name)?;
-        let owner_id = Self::owner_hash(store, bucket);
+        let owner_id = Self::owner_hash(store, bucket, key);
 
-        // Next manifest version becomes the blob generation so overwrites never collide!
+        // Bind blob generation to durable MetaKV revision + 1 so restarts/failovers never collide!
         let mkey = Self::meta_key(project_id, store, bucket, key);
-        let next_gen = self
-            .meta
-            .get(&mkey)
-            .map_or(1u32, |kv| (kv.version as u32).saturating_add(1))
-            .min(BlobId::MAX_U24);
+        let next_gen = ((self.meta.revision() as u32).saturating_add(1)).min(BlobId::MAX_U24);
 
         let mut chunks = Vec::new();
         let mut offset = 0u64;

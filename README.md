@@ -4,9 +4,10 @@
 
 ## Highlights
 
-- **Immutable Append-Only `VolumeStore` + Erasure Coding (`yadb-blob`):**
+- **Immutable Append-Only `VolumeStore` + Distributed `VDisk` Erasure Coding (`yadb-blob`):**
   - Packs fragments into CRC32-verified segment slabs (`vol_XXXXXXXX.dat`) with crash tail recovery, `get_slice` partial reads, generation barrier GC, and segment compaction.
-  - Built-in `Mirror` (low-latency WAL) and systematic `ReedSolomon { k, m }` over $GF(2^8)$ (`PoolStriper`) with automatic bit-rot recovery and `repair_blob` self-healing.
+  - Each `StoragePool` chooses **either** `Mirror` (e.g. `3x` replicas) **or** systematic `ReedSolomon { k, m }` over $GF(2^8)$ (e.g. `4+2`).
+  - Distributed `PoolSlot` (`Local` disk + `Remote` HTTP/TCP `/internal/vdisk/*` RPC) stripes fragments physically across cluster failure domains & nodes, supports degraded reads & degraded writes when a node dies, and runs an automatic **Self-Healing Scrubber** (`/v1/pools/scrub`, `yadbctl pool-scrub`).
 - **Raft Consensus + Ordered `MetaKV` (`yadb-metakv`):**
   - Durable `RaftWal`, multi-node elections & quorum log replication (§5.4.2), CAS by per-key `version`, lexicographical prefix scans, and `Watch` streams.
 - **Kubernetes-Style Declarative Control Plane & Zero-Hop Multi-Tenancy (`yadb-control`):**

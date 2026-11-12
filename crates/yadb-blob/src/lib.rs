@@ -5,7 +5,10 @@ pub mod volume;
 
 pub use erasure::{ErasureCodec, ErasureScheme};
 pub use id::BlobId;
-pub use pool::{PoolStriper, RepairReport};
+pub use pool::{
+    BarrierRequest, BarrierResponse, PoolHealthSnapshot, PoolHealthState, PoolSlot, PoolStriper,
+    RepairReport, SlotHealthSnapshot,
+};
 pub use volume::{VolumeConfig, VolumeStats, VolumeStore};
 
 use thiserror::Error;
@@ -171,5 +174,13 @@ mod tests {
         // Transparent read still succeeds via RS(4+2)!
         let read_back = striper.get_blob(id).unwrap();
         assert_eq!(read_back.as_slice(), secret);
+
+        // Now run self-healing Scrubber repair_blob: both the bit-rotted az0 shard AND
+        // the missing/corrupt shard should be healed back to 6/6 intact!
+        let report = striper.repair_blob(id).unwrap();
+        assert!(report.repaired_parts >= 1);
+        let second_check = striper.repair_blob(id).unwrap();
+        assert_eq!(second_check.intact_parts, 6);
+        assert_eq!(second_check.repaired_parts, 0);
     }
 }

@@ -584,8 +584,16 @@ impl<FS: StorageFs> LocalMetaKv<FS> {
         )
     }
 
+    pub fn node_id(&self) -> u32 {
+        self.inner.lock().unwrap().node_id()
+    }
+
     pub fn peer_addr(&self, node_id: u32) -> Option<String> {
         self.peer_addrs.get(&node_id).cloned()
+    }
+
+    pub fn peer_addrs(&self) -> &BTreeMap<u32, String> {
+        &self.peer_addrs
     }
 
     /// Handles an inbound Raft RPC (`RequestVote` or `AppendEntries`) and returns any immediate reply RPC.

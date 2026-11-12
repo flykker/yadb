@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -11,13 +11,16 @@ use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
-use yadb_blob::{PoolStriper, VolumeConfig, VolumeStore};
-use yadb_block::{BlockError, BlockVolumeEngine, DEFAULT_BLOCK_SIZE};
+use yadb_blob::{
+    BarrierRequest, BarrierResponse, BlobError, BlobId, PoolHealthSnapshot, PoolSlot, PoolStriper,
+    VolumeConfig, VolumeStore,
+};
+use yadb_block::{BlockError, BlockVolumeEngine, VolumeExtentMap, DEFAULT_BLOCK_SIZE};
 use yadb_control::{parse_manifests, ControlPlaneState, DiffOp, Role};
-use yadb_db::{parse_sql, DatabaseEngine, DbError};
+use yadb_db::{parse_sql, DatabaseEngine, DbError, TabletManifest};
 use yadb_io::OsFs;
-use yadb_metakv::{KvCommand, LocalMetaKv, MetaError, RaftRpc, WatchEvent};
-use yadb_s3::{ObjectStoreEngine, S3Error};
+use yadb_metakv::{KvCommand, LocalMetaKv, MetaError, RaftRpc, RoleState, WatchEvent};
+use yadb_s3::{ObjectManifest, ObjectStoreEngine, S3Error};
 
 const CONTROL_STATE_KEY: &str = "/sys/control_plane_state";
 const EMBEDDED_UI_HTML: &str = include_str!("ui/index.html");
@@ -50,12 +53,28 @@ struct Args {
 
 #[derive(Clone)]
 struct AppState {
+    listen_addr: String,
     fs: OsFs,
     meta: LocalMetaKv<OsFs>,
     control: Arc<RwLock<ControlPlaneState>>,
+    pools: Arc<RwLock<BTreeMap<String, Arc<PoolStriper<OsFs>>>>>,
+    #[allow(clippy::type_complexity)]
+    local_vdisks: Arc<RwLock<BTreeMap<(String, usize), Arc<VolumeStore<OsFs>>>>>,
+    last_scrub: Arc<RwLock<Option<ScrubSummary>>>,
     s3: ObjectStoreEngine<OsFs>,
     db: DatabaseEngine<OsFs>,
     block: BlockVolumeEngine<OsFs>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct ScrubSummary {
+    pub pools_checked: usize,
+    pub blobs_checked: usize,
+    pub blobs_intact: usize,
+    pub blobs_repaired: usize,
+    pub fragments_repaired: usize,
+    pub blobs_unrecoverable: usize,
+    pub pools: Vec<PoolHealthSnapshot>,
 }
 
 #[derive(Deserialize)]
@@ -99,27 +118,243 @@ struct BlockReadQuery {
 }
 
 impl AppState {
-    /// Reconciles local `VolumeStore` + `PoolStriper` instances across S3, DB, and Block engines!
-    fn materialize_pools(&self, cp: &ControlPlaneState) -> Result<(), String> {
-        for (pool_name, spec) in &cp.pools {
-            if self.s3.has_pool(pool_name) && self.db.has_pool(pool_name) {
-                continue;
+    fn open_or_get_local_vdisk(
+        &self,
+        pool_name: &str,
+        slot: usize,
+    ) -> Result<Arc<VolumeStore<OsFs>>, String> {
+        let key = (pool_name.to_string(), slot);
+        if let Some(existing) = self.local_vdisks.read().unwrap().get(&key) {
+            return Ok(existing.clone());
+        }
+        let dir = format!("pools/{pool_name}/slot_{slot:02}");
+        let store = Arc::new(
+            VolumeStore::open(self.fs.clone(), dir, VolumeConfig::default())
+                .map_err(|e| e.to_string())?,
+        );
+        self.local_vdisks
+            .write()
+            .unwrap()
+            .insert(key, store.clone());
+        Ok(store)
+    }
+
+    /// Computes `(domain_name, node_id, peer_addr)` targets across failure domains.
+    /// In clustered `--peers` mode, slots are striped across real cluster nodes in domain round-robin!
+    fn placement_targets(&self, cp: &ControlPlaneState) -> Vec<(String, u32, Option<String>)> {
+        let my_id = self.meta.node_id();
+        let peer_addrs = self.meta.peer_addrs();
+
+        if peer_addrs.len() > 1 {
+            let mut targets: Vec<(String, u32, Option<String>)> = Vec::new();
+            let mut seen_nodes = BTreeSet::new();
+
+            // Interleave across declared Cluster failure domains first (round-robin across racks/AZs)
+            if let Some((_, cluster_spec)) = &cp.cluster {
+                let max_len = cluster_spec
+                    .domains
+                    .iter()
+                    .map(|d| d.nodes.len())
+                    .max()
+                    .unwrap_or(0);
+                for depth in 0..max_len {
+                    for dom in &cluster_spec.domains {
+                        if let Some(node) = dom.nodes.get(depth) {
+                            if let Some(addr) = peer_addrs.get(&node.id) {
+                                if seen_nodes.insert(node.id) {
+                                    targets.push((
+                                        dom.name.clone(),
+                                        node.id,
+                                        Some(addr.clone()),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
             }
+
+            // Include any remaining `--peers` nodes not listed in ClusterSpec
+            for (&nid, addr) in peer_addrs {
+                if seen_nodes.insert(nid) {
+                    targets.push((format!("zone-{nid}"), nid, Some(addr.clone())));
+                }
+            }
+
+            if !targets.is_empty() {
+                return targets;
+            }
+        }
+
+        // Single-node mode: all slots reside locally on `my_id`, tagged with Cluster domain names
+        if let Some((_, cluster_spec)) = &cp.cluster {
+            if !cluster_spec.domains.is_empty() {
+                return cluster_spec
+                    .domains
+                    .iter()
+                    .map(|d| (d.name.clone(), my_id, Some(self.listen_addr.clone())))
+                    .collect();
+            }
+        }
+
+        vec![("local".to_string(), my_id, Some(self.listen_addr.clone()))]
+    }
+
+    /// Reconciles distributed `PoolSlot` (`Local` + `Remote` VDisks) + `PoolStriper` instances
+    /// across S3, SQL Database, and BlockVolume engines!
+    fn materialize_pools(&self, cp: &ControlPlaneState) -> Result<(), String> {
+        let my_id = self.meta.node_id();
+        let targets = self.placement_targets(cp);
+
+        for (pool_name, spec) in &cp.pools {
             let scheme = spec.erasure.to_scheme();
             let parts = scheme.total_parts();
-            let mut domains = Vec::with_capacity(parts);
+            let mut slots = Vec::with_capacity(parts);
+
             for slot in 0..parts {
-                let dir = format!("pools/{pool_name}/slot_{slot:02}");
-                let store = VolumeStore::open(self.fs.clone(), dir, VolumeConfig::default())
-                    .map_err(|e| e.to_string())?;
-                domains.push(store);
+                let (dom_name, target_node, target_addr) = &targets[slot % targets.len()];
+                if *target_node == my_id {
+                    let store = self.open_or_get_local_vdisk(pool_name, slot)?;
+                    slots.push(PoolSlot::local(
+                        slot,
+                        dom_name.clone(),
+                        *target_node,
+                        target_addr.clone(),
+                        store,
+                    ));
+                } else {
+                    let addr = target_addr
+                        .clone()
+                        .ok_or_else(|| format!("missing address for remote node {target_node}"))?;
+                    slots.push(PoolSlot::remote(
+                        pool_name.clone(),
+                        slot,
+                        dom_name.clone(),
+                        *target_node,
+                        addr,
+                    ));
+                }
             }
-            let striper = Arc::new(PoolStriper::new(scheme, domains).map_err(|e| e.to_string())?);
+
+            let striper = Arc::new(
+                PoolStriper::from_slots(pool_name.clone(), scheme, slots)
+                    .map_err(|e| e.to_string())?,
+            );
+            self.pools
+                .write()
+                .unwrap()
+                .insert(pool_name.clone(), striper.clone());
             self.s3.register_pool(pool_name.clone(), striper.clone());
             self.db.register_pool(pool_name.clone(), striper.clone());
             self.block.register_pool(pool_name.clone(), striper);
         }
         Ok(())
+    }
+
+    fn collect_pool_health(&self, probe_remote: bool) -> Vec<PoolHealthSnapshot> {
+        let pools: Vec<Arc<PoolStriper<OsFs>>> =
+            self.pools.read().unwrap().values().cloned().collect();
+        pools
+            .into_iter()
+            .map(|p| p.health_snapshot(probe_remote))
+            .collect()
+    }
+
+    /// Scans all live SQL Tablet manifests, S3 Object manifests, and BlockVolume extent maps in `MetaKV`,
+    /// verifies every fragment across cluster VDisks, and heals missing or bit-rotted fragments!
+    fn scrub_all_pools(&self) -> ScrubSummary {
+        let mut live_blobs: BTreeSet<(String, BlobId)> = BTreeSet::new();
+
+        // 1. SQL DataShard Tablets (`/db/{pid}/{db}/shards/{table}/{idx}`)
+        for (k, kv) in self.meta.scan_prefix("/db/") {
+            if k.contains("/shards/") {
+                if let Ok(mf) = serde_json::from_slice::<TabletManifest>(&kv.value) {
+                    for b in mf.wal_blobs {
+                        live_blobs.insert((mf.wal_pool.clone(), b));
+                    }
+                    for sst in mf.sst_blobs {
+                        live_blobs.insert((mf.data_pool.clone(), sst.blob_id));
+                    }
+                }
+            }
+        }
+
+        // 2. S3 ObjectStore manifests (`/s3/{pid}/{store}/{bucket}/{key}`)
+        for (_k, kv) in self.meta.scan_prefix("/s3/") {
+            if let Ok(mf) = serde_json::from_slice::<ObjectManifest>(&kv.value) {
+                for ch in mf.chunks {
+                    live_blobs.insert((mf.pool.clone(), ch.blob_id));
+                }
+            }
+        }
+
+        // 3. Thin-Provisioned BlockVolumes (`/block/{pid}/{volume}`)
+        let block_pool_lookup: BTreeMap<(u32, String), String> = {
+            let cp = self.control.read().unwrap();
+            let mut map = BTreeMap::new();
+            for (full_name, spec) in &cp.block_volumes {
+                if let Some((proj, vol)) = full_name.split_once('/') {
+                    if let Some((pid, _)) = cp.projects.get(proj) {
+                        map.insert((*pid, vol.to_string()), spec.pool.clone());
+                    }
+                }
+            }
+            map
+        };
+        for (k, kv) in self.meta.scan_prefix("/block/") {
+            let rest = k.strip_prefix("/block/").unwrap_or("");
+            if let Some((pid_s, vol_name)) = rest.split_once('/') {
+                if let Ok(pid) = pid_s.parse::<u32>() {
+                    if let Some(pool_name) = block_pool_lookup.get(&(pid, vol_name.to_string())) {
+                        if let Ok(ext) = serde_json::from_slice::<VolumeExtentMap>(&kv.value) {
+                            for &bid in ext.blocks.values() {
+                                live_blobs.insert((pool_name.clone(), bid));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let pools_map = self.pools.read().unwrap().clone();
+        let mut blobs_checked = 0usize;
+        let mut blobs_intact = 0usize;
+        let mut blobs_repaired = 0usize;
+        let mut fragments_repaired = 0usize;
+        let mut blobs_unrecoverable = 0usize;
+
+        for (pool_name, blob_id) in live_blobs {
+            let Some(striper) = pools_map.get(&pool_name) else {
+                continue;
+            };
+            blobs_checked += 1;
+            match striper.repair_blob(blob_id) {
+                Ok(rep) => {
+                    if rep.repaired_parts == 0 {
+                        blobs_intact += 1;
+                    } else {
+                        blobs_repaired += 1;
+                        fragments_repaired += rep.repaired_parts;
+                    }
+                }
+                Err(_) => {
+                    blobs_unrecoverable += 1;
+                }
+            }
+        }
+
+        let pools_health = self.collect_pool_health(true);
+        let summary = ScrubSummary {
+            pools_checked: pools_health.len(),
+            blobs_checked,
+            blobs_intact,
+            blobs_repaired,
+            fragments_repaired,
+            blobs_unrecoverable,
+            pools: pools_health,
+        };
+        *self.last_scrub.write().unwrap() = Some(summary.clone());
+        summary
     }
 }
 
@@ -466,19 +701,23 @@ async fn handle_block_read(
         }
     };
 
-    match st
-        .block
-        .read_at(project_id, &volume, &pool_name, size_bytes, q.offset, q.len)
-    {
-        Ok(bytes) => (
+    let blk = st.block.clone();
+    let res = tokio::task::spawn_blocking(move || {
+        blk.read_at(project_id, &volume, &pool_name, size_bytes, q.offset, q.len)
+    })
+    .await;
+
+    match res {
+        Ok(Ok(bytes)) => (
             StatusCode::OK,
             [(header::CONTENT_TYPE, "application/octet-stream")],
             bytes,
         )
             .into_response(),
-        Err(e @ BlockError::OutOfBounds { .. }) => {
+        Ok(Err(e @ BlockError::OutOfBounds { .. })) => {
             api_err(StatusCode::RANGE_NOT_SATISFIABLE, e.to_string())
         }
+        Ok(Err(e)) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
         Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }
@@ -612,7 +851,11 @@ async fn handle_s3_get(
         }
     };
 
-    if let Some(range_hdr) = headers.get(header::RANGE).and_then(|h| h.to_str().ok()) {
+    if let Some(range_hdr) = headers
+        .get(header::RANGE)
+        .and_then(|h| h.to_str().ok())
+        .map(str::to_string)
+    {
         let head = match st.s3.head_object(project_id, &store, &bucket, &key) {
             Ok(h) => h,
             Err(S3Error::ObjectNotFound { .. }) => {
@@ -620,14 +863,16 @@ async fn handle_s3_get(
             }
             Err(e) => return api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
         };
-        let Some((start, end)) = parse_range_header(range_hdr, head.size) else {
+        let Some((start, end)) = parse_range_header(&range_hdr, head.size) else {
             return api_err(StatusCode::RANGE_NOT_SATISFIABLE, "invalid Range header");
         };
-        return match st
-            .s3
-            .get_object_range(project_id, &store, &bucket, &key, start, end)
-        {
-            Ok((mf, bytes)) => (
+        let s3 = st.s3.clone();
+        let res = tokio::task::spawn_blocking(move || {
+            s3.get_object_range(project_id, &store, &bucket, &key, start, end)
+        })
+        .await;
+        return match res {
+            Ok(Ok((mf, bytes))) => (
                 StatusCode::PARTIAL_CONTENT,
                 [
                     (header::CONTENT_TYPE, mf.content_type),
@@ -640,15 +885,20 @@ async fn handle_s3_get(
                 bytes,
             )
                 .into_response(),
-            Err(S3Error::InvalidRange { .. }) => {
+            Ok(Err(S3Error::InvalidRange { .. })) => {
                 api_err(StatusCode::RANGE_NOT_SATISFIABLE, "range out of bounds")
             }
+            Ok(Err(e)) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
             Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
         };
     }
 
-    match st.s3.get_object(project_id, &store, &bucket, &key) {
-        Ok((mf, bytes)) => (
+    let s3 = st.s3.clone();
+    let res = tokio::task::spawn_blocking(move || s3.get_object(project_id, &store, &bucket, &key))
+        .await;
+
+    match res {
+        Ok(Ok((mf, bytes))) => (
             StatusCode::OK,
             [
                 (header::CONTENT_TYPE, mf.content_type),
@@ -657,9 +907,10 @@ async fn handle_s3_get(
             bytes,
         )
             .into_response(),
-        Err(S3Error::ObjectNotFound { .. }) => {
+        Ok(Err(S3Error::ObjectNotFound { .. })) => {
             api_err(StatusCode::NOT_FOUND, "object not found")
         }
+        Ok(Err(e)) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
         Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }
@@ -691,6 +942,127 @@ async fn handle_s3_delete(
     }
 }
 
+// ============================================================================
+// Distributed VDisk RPC & Self-Healing Pool Scrubber
+// ============================================================================
+
+async fn handle_vdisk_put(
+    State(st): State<AppState>,
+    Path((pool, slot, blob_hex)): Path<(String, usize, String)>,
+    body: Bytes,
+) -> Response {
+    let Some(blob_id) = BlobId::from_hex(&blob_hex) else {
+        return api_err(StatusCode::BAD_REQUEST, "invalid 32-char hex BlobId");
+    };
+    let Some(store) = st.local_vdisks.read().unwrap().get(&(pool, slot)).cloned() else {
+        return api_err(StatusCode::NOT_FOUND, "local VDisk slot not hosted on this node");
+    };
+
+    let res = tokio::task::spawn_blocking(move || store.put(blob_id, &body)).await;
+    match res {
+        Ok(Ok(())) => StatusCode::OK.into_response(),
+        Ok(Err(BlobError::ImmutableConflict(_))) => {
+            api_err(StatusCode::CONFLICT, "immutable blob conflict")
+        }
+        Ok(Err(BlobError::FencedByBarrier { .. })) => {
+            api_err(StatusCode::PRECONDITION_FAILED, "fenced by GC barrier")
+        }
+        Ok(Err(e)) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+async fn handle_vdisk_get(
+    State(st): State<AppState>,
+    Path((pool, slot, blob_hex)): Path<(String, usize, String)>,
+) -> Response {
+    let Some(blob_id) = BlobId::from_hex(&blob_hex) else {
+        return api_err(StatusCode::BAD_REQUEST, "invalid 32-char hex BlobId");
+    };
+    let Some(store) = st.local_vdisks.read().unwrap().get(&(pool, slot)).cloned() else {
+        return api_err(StatusCode::NOT_FOUND, "local VDisk slot not hosted on this node");
+    };
+
+    let res = tokio::task::spawn_blocking(move || store.get(blob_id)).await;
+    match res {
+        Ok(Ok(bytes)) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/octet-stream")],
+            Bytes::from(bytes),
+        )
+            .into_response(),
+        Ok(Err(BlobError::NotFound(_))) => api_err(StatusCode::NOT_FOUND, "fragment not found"),
+        Ok(Err(BlobError::CorruptData { reason, .. })) => {
+            api_err(StatusCode::UNPROCESSABLE_ENTITY, reason)
+        }
+        Ok(Err(e)) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+async fn handle_vdisk_stats(
+    State(st): State<AppState>,
+    Path((pool, slot)): Path<(String, usize)>,
+) -> Response {
+    let Some(store) = st.local_vdisks.read().unwrap().get(&(pool, slot)).cloned() else {
+        return api_err(StatusCode::NOT_FOUND, "local VDisk slot not hosted on this node");
+    };
+    match store.stats() {
+        Ok(stats) => Json(stats).into_response(),
+        Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+async fn handle_vdisk_barrier(
+    State(st): State<AppState>,
+    Path((pool, slot)): Path<(String, usize)>,
+    Json(req): Json<BarrierRequest>,
+) -> Response {
+    let Some(store) = st.local_vdisks.read().unwrap().get(&(pool, slot)).cloned() else {
+        return api_err(StatusCode::NOT_FOUND, "local VDisk slot not hosted on this node");
+    };
+    let res = tokio::task::spawn_blocking(move || {
+        store.collect_garbage_barrier(
+            req.project_id,
+            req.owner_id,
+            req.channel,
+            req.up_to_generation,
+        )
+    })
+    .await;
+    match res {
+        Ok(Ok(evicted)) => Json(BarrierResponse { evicted }).into_response(),
+        Ok(Err(e)) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+async fn handle_pools_health(State(st): State<AppState>) -> Response {
+    let st_clone = st.clone();
+    let res = tokio::task::spawn_blocking(move || st_clone.collect_pool_health(true)).await;
+    match res {
+        Ok(pools) => {
+            let last_scrub = st.last_scrub.read().unwrap().clone();
+            Json(serde_json::json!({
+                "node_id": st.meta.node_id(),
+                "pools": pools,
+                "last_scrub": last_scrub,
+            }))
+            .into_response()
+        }
+        Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+async fn handle_pools_scrub(State(st): State<AppState>) -> Response {
+    let st_clone = st.clone();
+    let res = tokio::task::spawn_blocking(move || st_clone.scrub_all_pools()).await;
+    match res {
+        Ok(summary) => Json(summary).into_response(),
+        Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
@@ -715,9 +1087,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let block = BlockVolumeEngine::new(meta.clone(), DEFAULT_BLOCK_SIZE);
 
     let state = AppState {
+        listen_addr: args.listen.clone(),
         fs,
         meta: meta.clone(),
         control: Arc::new(RwLock::new(recovered_cp.clone())),
+        pools: Arc::new(RwLock::new(BTreeMap::new())),
+        local_vdisks: Arc::new(RwLock::new(BTreeMap::new())),
+        last_scrub: Arc::new(RwLock::new(None)),
         s3,
         db,
         block,
@@ -741,7 +1117,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // Periodic Raft leader heartbeat in multi-node mode
+    // Periodic Raft leader heartbeat + automatic Self-Healing VDisk Scrubber in multi-node mode
     if args.peers.is_some() {
         let hb_meta = meta.clone();
         tokio::spawn(async move {
@@ -750,6 +1126,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 interval.tick().await;
                 let m = hb_meta.clone();
                 let _ = tokio::task::spawn_blocking(move || m.broadcast_heartbeat()).await;
+            }
+        });
+
+        let scrub_state = state.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(4));
+            loop {
+                interval.tick().await;
+                let (_, role, _, _, _) = scrub_state.meta.role_info();
+                if role == RoleState::Leader {
+                    let st = scrub_state.clone();
+                    let _ = tokio::task::spawn_blocking(move || st.scrub_all_pools()).await;
+                }
             }
         });
     }
@@ -765,6 +1154,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/status", get(handle_status))
         .route("/v1/plan", post(handle_plan))
         .route("/v1/apply", post(handle_apply))
+        .route("/v1/pools/health", get(handle_pools_health))
+        .route("/v1/pools/scrub", post(handle_pools_scrub))
+        .route(
+            "/internal/vdisk/{pool}/{slot}/blob/{blob_hex}",
+            put(handle_vdisk_put).get(handle_vdisk_get),
+        )
+        .route(
+            "/internal/vdisk/{pool}/{slot}/stats",
+            get(handle_vdisk_stats),
+        )
+        .route(
+            "/internal/vdisk/{pool}/{slot}/barrier",
+            post(handle_vdisk_barrier),
+        )
         .route("/db/{project}/{database}/query", post(handle_db_query))
         .route(
             "/block/{project}/{volume}",

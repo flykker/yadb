@@ -47,7 +47,7 @@ pub struct BlockVolumeEngine<FS: StorageFs> {
     meta: LocalMetaKv<FS>,
     pools: Arc<RwLock<BTreeMap<String, Arc<PoolStriper<FS>>>>>,
     block_size: u32,
-    step_seq: AtomicU32,
+    step_seq: Arc<AtomicU32>,
 }
 
 impl<FS: StorageFs> Clone for BlockVolumeEngine<FS> {
@@ -56,7 +56,7 @@ impl<FS: StorageFs> Clone for BlockVolumeEngine<FS> {
             meta: self.meta.clone(),
             pools: self.pools.clone(),
             block_size: self.block_size,
-            step_seq: AtomicU32::new(self.step_seq.load(Ordering::Relaxed)),
+            step_seq: self.step_seq.clone(),
         }
     }
 }
@@ -67,7 +67,7 @@ impl<FS: StorageFs> BlockVolumeEngine<FS> {
             meta,
             pools: Arc::new(RwLock::new(BTreeMap::new())),
             block_size: block_size.max(512),
-            step_seq: AtomicU32::new(1),
+            step_seq: Arc::new(AtomicU32::new(1)),
         }
     }
 
@@ -127,6 +127,10 @@ impl<FS: StorageFs> BlockVolumeEngine<FS> {
 
         let pool = self.get_pool(pool_name)?;
         let mut map = self.load_map(project_id, volume)?;
+        map.generation = ((self.meta.revision() as u32)
+            .saturating_add(1)
+            .max(map.generation.saturating_add(1)))
+        .min(BlobId::MAX_U24);
         let bs = map.block_size as u64;
         let owner = Self::owner_id(volume);
 

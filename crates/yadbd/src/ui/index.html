@@ -627,7 +627,15 @@
 
     <!-- STORAGE POOLS -->
     <section id="view-pools" class="hidden">
-      <h1 class="page-title"><span class="badge b-sp">SP</span> StoragePools &amp; Erasure Coding</h1>
+      <h1 class="page-title"><span class="badge b-sp">SP</span> StoragePools, VDisks &amp; Self-Healing Scrubber</h1>
+      <div class="card">
+        <div class="card-title">
+          <span>Distributed VDisk Health Matrix (Mirror OR Reed-Solomon)</span>
+          <button class="btn btn-sm" onclick="runPoolScrub()">🛠 Scrub &amp; Self-Heal Pools</button>
+        </div>
+        <div id="scrub-banner"></div>
+        <div id="sp-vdisks"></div>
+      </div>
       <div class="card">
         <div class="card-title">Configured Storage Pools</div>
         <div id="sp-list"></div>
@@ -651,6 +659,7 @@
 <script>
 let state = { generation: 0, pools: {}, projects: {}, databases: {}, object_stores: {}, block_volumes: {}, cluster: null };
 let raft = { node_id: 1, role: "Unknown", term: 0, leader_id: null, commit_index: 0, metakv_revision: 0 };
+let poolHealth = { pools: [], last_scrub: null };
 let currentView = "overview";
 
 function esc(v) {
@@ -718,9 +727,14 @@ async function api(path, opts = {}) {
 }
 
 async function refreshAll() {
-  const [h, s] = await Promise.all([api("/healthz"), api("/v1/status")]);
+  const [h, s, ph] = await Promise.all([
+    api("/healthz"),
+    api("/v1/status"),
+    api("/v1/pools/health")
+  ]);
   if (h.ok && h.json) raft = h.json;
   if (s.ok && s.json) state = s.json;
+  if (ph.ok && ph.json) poolHealth = ph.json;
 
   // Update Masthead Raft Pill
   const dot = document.getElementById("raft-dot");
@@ -801,8 +815,14 @@ function renderOverview() {
     `Leader: ${raft.leader_id ?? "-"} · Term ${raft.term} · Commit #${raft.commit_index}`;
 
   const poolKeys = Object.keys(state.pools || {});
+  const phList = poolHealth.pools || [];
+  const degradedCnt = phList.filter(p => p.status !== "Healthy").length;
   document.getElementById("ov-pools-cnt").textContent = poolKeys.length;
-  document.getElementById("ov-pools-sub").textContent = poolKeys.join(", ") || "No pools";
+  document.getElementById("ov-pools-sub").textContent = phList.length
+    ? (degradedCnt === 0
+        ? `All Healthy (${phList.map(p => `${p.pool_name}: ${p.online_slots}/${p.total_slots}`).join(", ")})`
+        : `⚠ ${degradedCnt} Degraded/Offline (${phList.map(p => `${p.pool_name}: ${p.online_slots}/${p.total_slots}`).join(", ")})`)
+    : (poolKeys.join(", ") || "No pools");
 
   const dbs = Object.entries(state.databases || {}).filter(([k]) => inProjectScope(k));
   const oss = Object.entries(state.object_stores || {}).filter(([k]) => inProjectScope(k));
@@ -1110,8 +1130,57 @@ async function readBlock() {
   out.innerHTML = `<pre class="console-out">Offset ${offset}..${offset + buf.length} (${buf.length} bytes)\nHEX  : ${esc(hex)}\nASCII: ${esc(ascii)}</pre>`;
 }
 
-/* Storage Pools */
+/* Storage Pools & VDisk Health */
+async function runPoolScrub() {
+  const banner = document.getElementById("scrub-banner");
+  banner.innerHTML = `<div class="alert">Running deep CRC32 scrub &amp; Reed-Solomon/Mirror self-healing across cluster VDisks...</div>`;
+  const r = await api("/v1/pools/scrub", { method: "POST" });
+  if (!r.ok) {
+    banner.innerHTML = `<div class="alert err">Scrub failed (${r.status}): ${esc(r.json?.error || r.text)}</div>`;
+    return;
+  }
+  const s = r.json;
+  banner.innerHTML = `<div class="alert ok">Scrub complete · Checked <strong>${s.blobs_checked}</strong> logical blobs (${s.blobs_intact} intact, <strong>${s.blobs_repaired}</strong> blobs healed, <strong>${s.fragments_repaired}</strong> fragments reconstructed, ${s.blobs_unrecoverable} unrecoverable)</div>`;
+  await refreshAll();
+}
+
 function renderPools() {
+  const phList = poolHealth.pools || [];
+  const vdBox = document.getElementById("sp-vdisks");
+  if (!phList.length) {
+    vdBox.innerHTML = `<div class="empty-box">No active VDisk pools materialized yet.</div>`;
+  } else {
+    vdBox.innerHTML = phList.map(p => {
+      const stColor = p.status === "Healthy" ? "#3e8635" : (p.status === "Degraded" ? "#f0ab00" : "#c9190b");
+      const tiles = (p.slots || []).map(s => {
+        const bdr = s.online ? "#3e8635" : "#c9190b";
+        const bg = s.online ? "#f7fcf6" : "#fdf2f1";
+        return `<div style="border:1px solid #d2d2d2;border-left:4px solid ${bdr};background:${bg};padding:9px 11px;border-radius:3px">
+          <div style="display:flex;justify-content:space-between;font-weight:700;font-size:12.5px">
+            <span>Slot #${s.slot_index} · ${esc(s.domain)}</span>
+            <span style="color:${bdr}">${s.online ? "ONLINE" : "OFFLINE"}</span>
+          </div>
+          <div style="font-size:11.5px;color:#4f5255;margin-top:4px">
+            Node #${s.node_id} (${s.is_local ? "LOCAL DISK" : "REMOTE RPC"})<br/>
+            <code>${esc(s.addr || "local")}</code>
+          </div>
+          <div style="font-size:11.5px;color:#151515;margin-top:5px">
+            Blobs: <strong>${s.live_blobs}</strong> · Live: <strong>${fmtBytes(s.live_bytes)}</strong> · Healed: <strong>${s.repairs_ok}</strong>
+          </div>
+        </div>`;
+      }).join("");
+      return `<div style="margin-bottom:16px">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;flex-wrap:wrap;gap:6px">
+          <div><span class="badge b-sp">SP</span> <strong>${esc(p.pool_name)}</strong> — <code>${esc(p.scheme)}</code></div>
+          <div style="font-size:12.5px;font-weight:700;color:${stColor}">
+            ${esc(p.status)} · ${p.online_slots}/${p.total_slots} slots online (min read: ${p.min_read_slots}, min write: ${p.min_write_slots}, repairs: ${p.total_repairs})
+          </div>
+        </div>
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:10px">${tiles}</div>
+      </div>`;
+    }).join("");
+  }
+
   const entries = Object.entries(state.pools || {});
   document.getElementById("sp-list").innerHTML = entries.length ? `
     <table class="pf-table">
