@@ -146,10 +146,13 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
         shard_idx: u32,
     ) -> Result<Arc<Mutex<DataShardTablet<FS>>>, DbError> {
         let mkey = Self::shard_meta_key(project_id, db, &schema.table, shard_idx);
+        let cur_meta_ver = self.meta.get(&mkey).map(|kv| kv.version).unwrap_or(0);
         {
             let map = self.shards.lock().unwrap();
             if let Some(existing) = map.get(&mkey) {
-                return Ok(existing.clone());
+                if existing.lock().unwrap().manifest_version() == cur_meta_ver {
+                    return Ok(existing.clone());
+                }
             }
         }
 
@@ -171,10 +174,8 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
 
         let handle = Arc::new(Mutex::new(tablet));
         let mut map = self.shards.lock().unwrap();
-        Ok(map
-            .entry(mkey)
-            .or_insert_with(|| handle.clone())
-            .clone())
+        map.insert(mkey, handle.clone());
+        Ok(handle)
     }
 
     fn read_shard_row(

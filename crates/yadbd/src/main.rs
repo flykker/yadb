@@ -1,4 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -77,7 +79,7 @@ struct ScrubSummary {
     pub pools: Vec<PoolHealthSnapshot>,
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct ManifestPayload {
     yaml: String,
 }
@@ -101,7 +103,7 @@ struct ListQuery {
     prefix: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct SqlQueryPayload {
     sql: String,
 }
@@ -411,6 +413,219 @@ fn extract_subject(headers: &HeaderMap) -> String {
     "anonymous".to_string()
 }
 
+/// Raw HTTP/1.1 forwarding helper used by Followers to transparently proxy client writes to the Raft Leader.
+fn proxy_http_to_peer(
+    peer_addr: &str,
+    method: &str,
+    path_and_query: &str,
+    subject: &str,
+    content_type: &str,
+    body: &[u8],
+) -> Result<(u16, String, Option<String>, Vec<u8>), std::io::Error> {
+    let clean = peer_addr
+        .trim()
+        .strip_prefix("http://")
+        .unwrap_or(peer_addr.trim())
+        .trim_end_matches('/');
+    let sock: SocketAddr = clean
+        .parse()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+
+    let mut stream = TcpStream::connect_timeout(&sock, Duration::from_millis(400))?;
+    stream.set_read_timeout(Some(Duration::from_millis(5000)))?;
+    stream.set_write_timeout(Some(Duration::from_millis(3000)))?;
+
+    let req = format!(
+        "{method} {path_and_query} HTTP/1.1\r\nHost: {clean}\r\nx-yadb-subject: {subject}\r\nx-yadb-forwarded: 1\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(req.as_bytes())?;
+    if !body.is_empty() {
+        stream.write_all(body)?;
+    }
+    stream.flush()?;
+
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw)?;
+
+    let Some(hdr_end) = raw.windows(4).position(|w| w == b"\r\n\r\n") else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "malformed HTTP response from Raft Leader",
+        ));
+    };
+    let hdr_str = String::from_utf8_lossy(&raw[..hdr_end]);
+    let status_code: u16 = hdr_str
+        .lines()
+        .next()
+        .unwrap_or("")
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid status line from Raft Leader",
+            )
+        })?;
+
+    let mut resp_ct = "application/json".to_string();
+    let mut resp_etag = None;
+    let mut is_chunked = false;
+    for line in hdr_str.lines().skip(1) {
+        if let Some((k, v)) = line.split_once(':') {
+            let kl = k.trim().to_ascii_lowercase();
+            let vt = v.trim();
+            if kl == "content-type" {
+                resp_ct = vt.to_string();
+            } else if kl == "etag" {
+                resp_etag = Some(vt.to_string());
+            } else if kl == "transfer-encoding" && vt.to_ascii_lowercase().contains("chunked") {
+                is_chunked = true;
+            }
+        }
+    }
+
+    let payload_slice = &raw[hdr_end + 4..];
+    let decoded = if is_chunked {
+        decode_http_chunked(payload_slice)?
+    } else {
+        payload_slice.to_vec()
+    };
+    Ok((status_code, resp_ct, resp_etag, decoded))
+}
+
+fn decode_http_chunked(mut input: &[u8]) -> Result<Vec<u8>, std::io::Error> {
+    let mut out = Vec::new();
+    loop {
+        let Some(line_end) = input.windows(2).position(|w| w == b"\r\n") else {
+            break;
+        };
+        let size_str = std::str::from_utf8(&input[..line_end])
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim();
+        let chunk_len = usize::from_str_radix(size_str, 16)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        input = &input[line_end + 2..];
+        if chunk_len == 0 {
+            break;
+        }
+        if input.len() < chunk_len + 2 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "truncated chunked response",
+            ));
+        }
+        out.extend_from_slice(&input[..chunk_len]);
+        input = &input[chunk_len + 2..];
+    }
+    Ok(out)
+}
+
+/// Transparently forwards mutating requests from any Raft Follower to the active Raft Leader!
+/// If the known leader just crashed (connection refused) or no leader is elected yet, automatically
+/// triggers a Raft election and either executes locally (if promoted to Leader) or routes to the new Leader.
+async fn maybe_forward_write(
+    st: &AppState,
+    headers: &HeaderMap,
+    method: &'static str,
+    path_and_query: String,
+    content_type: String,
+    body: Bytes,
+) -> Option<Response> {
+    if headers.contains_key("x-yadb-forwarded") {
+        return None;
+    }
+    let (_, role, _, _, _) = st.meta.role_info();
+    if role == RoleState::Leader {
+        return None;
+    }
+
+    let subject = extract_subject(headers);
+    let meta = st.meta.clone();
+
+    let outcome = tokio::task::spawn_blocking(move || {
+        for attempt in 0..3 {
+            let (my_id, cur_role, _, leader_opt, _) = meta.role_info();
+            if cur_role == RoleState::Leader {
+                return Ok(None);
+            }
+            let target_id = match leader_opt {
+                Some(id) if id != my_id => id,
+                _ => {
+                    // No known leader yet: trigger election or wait briefly for peer election
+                    let _ = meta.trigger_election();
+                    let (_, new_role, _, new_leader, _) = meta.role_info();
+                    if new_role == RoleState::Leader {
+                        return Ok(None);
+                    }
+                    if let Some(lid) = new_leader {
+                        lid
+                    } else {
+                        std::thread::sleep(Duration::from_millis(120 * (attempt + 1)));
+                        continue;
+                    }
+                }
+            };
+
+            let Some(peer_addr) = meta.peer_addr(target_id) else {
+                break;
+            };
+
+            match proxy_http_to_peer(
+                &peer_addr,
+                method,
+                &path_and_query,
+                &subject,
+                &content_type,
+                &body,
+            ) {
+                Ok((409, _, _, resp_body))
+                    if String::from_utf8_lossy(&resp_body).contains("not Raft leader") =>
+                {
+                    let _ = meta.trigger_election();
+                    continue;
+                }
+                Ok(ok_tuple) => return Ok(Some((target_id, ok_tuple))),
+                Err(_) => {
+                    // Old leader just died! Immediately run failover election and retry!
+                    let _ = meta.trigger_election();
+                    let (_, new_role, _, _, _) = meta.role_info();
+                    if new_role == RoleState::Leader {
+                        return Ok(None);
+                    }
+                }
+            }
+        }
+        Err("cluster has no reachable Raft leader (quorum unavailable)".to_string())
+    })
+    .await;
+
+    match outcome {
+        Ok(Ok(None)) => None, // This node just became Leader; execute locally!
+        Ok(Ok(Some((leader_id, (code, ct, etag_opt, resp_bytes))))) => {
+            let status = StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            let mut builder = Response::builder()
+                .status(status)
+                .header(header::CONTENT_TYPE, ct)
+                .header("x-yadb-leader-id", leader_id.to_string());
+            if let Some(etag) = etag_opt {
+                builder = builder.header(header::ETAG, etag);
+            }
+            Some(
+                builder
+                    .body(axum::body::Body::from(resp_bytes))
+                    .unwrap_or_else(|e| api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+            )
+        }
+        Ok(Err(msg)) => Some(api_err(StatusCode::SERVICE_UNAVAILABLE, msg)),
+        Err(e) => Some(api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+    }
+}
+
 fn parse_range_header(val: &str, total_size: u64) -> Option<(u64, u64)> {
     let spec = val.trim().strip_prefix("bytes=")?;
     let (start_s, end_s) = spec.split_once('-')?;
@@ -516,8 +731,33 @@ async fn handle_plan(
 
 async fn handle_apply(
     State(st): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<ManifestPayload>,
 ) -> Response {
+    if let Ok(raw_body) = serde_json::to_vec(&req) {
+        if let Some(proxied) = maybe_forward_write(
+            &st,
+            &headers,
+            "POST",
+            "/v1/apply".to_string(),
+            "application/json".to_string(),
+            Bytes::from(raw_body),
+        )
+        .await
+        {
+            // Ensure local zero-hop cache & VDisk pools are immediately synced before returning!
+            if proxied.status().is_success() {
+                if let Some(kv) = st.meta.get(CONTROL_STATE_KEY) {
+                    if let Ok(cp) = serde_json::from_slice::<ControlPlaneState>(&kv.value) {
+                        let _ = st.materialize_pools(&cp);
+                        *st.control.write().unwrap() = cp;
+                    }
+                }
+            }
+            return proxied;
+        }
+    }
+
     let manifests = match parse_manifests(&req.yaml) {
         Ok(m) => m,
         Err(e) => return api_err(StatusCode::BAD_REQUEST, e.to_string()),
@@ -581,6 +821,23 @@ async fn handle_db_query(
         Role::ReadOnly
     };
     let subject = extract_subject(&headers);
+
+    if stmt.is_write() {
+        if let Ok(raw_body) = serde_json::to_vec(&req) {
+            if let Some(proxied) = maybe_forward_write(
+                &st,
+                &headers,
+                "POST",
+                format!("/db/{project}/{database}/query"),
+                "application/json".to_string(),
+                Bytes::from(raw_body),
+            )
+            .await
+            {
+                return proxied;
+            }
+        }
+    }
 
     let (project_id, wal_pool, data_pool, shards) = {
         let cp = st.control.read().unwrap();
@@ -656,6 +913,19 @@ async fn handle_block_write(
     Query(q): Query<BlockWriteQuery>,
     body: Bytes,
 ) -> Response {
+    if let Some(proxied) = maybe_forward_write(
+        &st,
+        &headers,
+        "PUT",
+        format!("/block/{project}/{volume}?offset={}", q.offset),
+        "application/octet-stream".to_string(),
+        body.clone(),
+    )
+    .await
+    {
+        return proxied;
+    }
+
     let subject = extract_subject(&headers);
     let (project_id, pool_name, size_bytes) = {
         let cp = st.control.read().unwrap();
@@ -790,6 +1060,25 @@ async fn handle_s3_put(
     Path((project, store, bucket, key)): Path<(String, String, String, String)>,
     body: Bytes,
 ) -> Response {
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream")
+        .to_string();
+
+    if let Some(proxied) = maybe_forward_write(
+        &st,
+        &headers,
+        "PUT",
+        format!("/s3/{project}/{store}/{bucket}/{key}"),
+        content_type.clone(),
+        body.clone(),
+    )
+    .await
+    {
+        return proxied;
+    }
+
     let subject = extract_subject(&headers);
     let (project_id, pool_name) = {
         let cp = st.control.read().unwrap();
@@ -798,12 +1087,6 @@ async fn handle_s3_put(
             Err(resp) => return resp,
         }
     };
-
-    let content_type = headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("application/octet-stream")
-        .to_string();
 
     let s3 = st.s3.clone();
     let res = tokio::task::spawn_blocking(move || {
@@ -920,6 +1203,19 @@ async fn handle_s3_delete(
     headers: HeaderMap,
     Path((project, store, bucket, key)): Path<(String, String, String, String)>,
 ) -> Response {
+    if let Some(proxied) = maybe_forward_write(
+        &st,
+        &headers,
+        "DELETE",
+        format!("/s3/{project}/{store}/{bucket}/{key}"),
+        "application/octet-stream".to_string(),
+        Bytes::new(),
+    )
+    .await
+    {
+        return proxied;
+    }
+
     let subject = extract_subject(&headers);
     let (project_id, _) = {
         let cp = st.control.read().unwrap();
@@ -1117,15 +1413,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // Periodic Raft leader heartbeat + automatic Self-Healing VDisk Scrubber in multi-node mode
+    // Periodic Raft leader heartbeat, automatic follower election timeout & Self-Healing VDisk Scrubber
     if args.peers.is_some() {
         let hb_meta = meta.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_millis(250));
+            let mut interval = tokio::time::interval(Duration::from_millis(200));
             loop {
                 interval.tick().await;
                 let m = hb_meta.clone();
                 let _ = tokio::task::spawn_blocking(move || m.broadcast_heartbeat()).await;
+            }
+        });
+
+        let elect_meta = meta.clone();
+        let node_id = args.node_id;
+        tokio::spawn(async move {
+            let mut tick_no: u64 = 0;
+            let mut interval = tokio::time::interval(Duration::from_millis(150));
+            loop {
+                interval.tick().await;
+                tick_no = tick_no.wrapping_add(1);
+                let jitter_ms = ((node_id as u64).wrapping_mul(193).wrapping_add(tick_no * 37)) % 450;
+                let timeout = Duration::from_millis(850 + jitter_ms);
+                let m = elect_meta.clone();
+                let _ = tokio::task::spawn_blocking(move || m.check_election_timeout(timeout)).await;
             }
         });
 

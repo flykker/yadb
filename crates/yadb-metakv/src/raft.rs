@@ -3,7 +3,7 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use yadb_io::StorageFs;
@@ -545,6 +545,7 @@ impl<FS: StorageFs> RaftCore<FS> {
 pub struct LocalMetaKv<FS: StorageFs> {
     inner: Arc<Mutex<RaftCore<FS>>>,
     peer_addrs: Arc<BTreeMap<u32, String>>,
+    last_leader_contact: Arc<Mutex<Instant>>,
 }
 
 impl<FS: StorageFs> LocalMetaKv<FS> {
@@ -553,6 +554,7 @@ impl<FS: StorageFs> LocalMetaKv<FS> {
         Ok(Self {
             inner: Arc::new(Mutex::new(core)),
             peer_addrs: Arc::new(BTreeMap::new()),
+            last_leader_contact: Arc::new(Mutex::new(Instant::now())),
         })
     }
 
@@ -570,6 +572,7 @@ impl<FS: StorageFs> LocalMetaKv<FS> {
         Ok(Self {
             inner: Arc::new(Mutex::new(core)),
             peer_addrs: Arc::new(peer_addrs),
+            last_leader_contact: Arc::new(Mutex::new(Instant::now())),
         })
     }
 
@@ -598,25 +601,72 @@ impl<FS: StorageFs> LocalMetaKv<FS> {
 
     /// Handles an inbound Raft RPC (`RequestVote` or `AppendEntries`) and returns any immediate reply RPC.
     pub fn step_rpc(&self, rpc: RaftRpc) -> Result<Option<RaftRpc>, MetaError> {
-        let mut guard = self.inner.lock().unwrap();
-        let mut out = guard.step(rpc)?;
-        Ok(out.pop().map(|m| m.rpc))
+        let is_heartbeat = matches!(&rpc, RaftRpc::AppendEntries { .. });
+        let reply = {
+            let mut guard = self.inner.lock().unwrap();
+            let cur_term = guard.current_term();
+            let valid_ae = match &rpc {
+                RaftRpc::AppendEntries { term, .. } => *term >= cur_term,
+                _ => false,
+            };
+            let mut out = guard.step(rpc)?;
+            let r = out.pop().map(|m| m.rpc);
+            let granted_vote = matches!(
+                &r,
+                Some(RaftRpc::RequestVoteReply {
+                    vote_granted: true,
+                    ..
+                })
+            );
+            if (is_heartbeat && valid_ae) || granted_vote {
+                *self.last_leader_contact.lock().unwrap() = Instant::now();
+            }
+            r
+        };
+        Ok(reply)
     }
 
     /// Triggers a Raft election round across configured peers and returns the resulting role.
     pub fn trigger_election(&self) -> Result<RoleState, MetaError> {
+        *self.last_leader_contact.lock().unwrap() = Instant::now();
         let initial_msgs = {
             let mut guard = self.inner.lock().unwrap();
             guard.start_election()?
         };
         self.drive_outbound(initial_msgs)?;
-        Ok(self.inner.lock().unwrap().role())
+        let role = self.inner.lock().unwrap().role();
+        if role == RoleState::Leader {
+            *self.last_leader_contact.lock().unwrap() = Instant::now();
+        }
+        Ok(role)
+    }
+
+    /// Checks whether the follower election timeout has elapsed without valid Leader heartbeats;
+    /// if so, automatically triggers a new Raft election round!
+    pub fn check_election_timeout(&self, timeout: Duration) -> Result<bool, MetaError> {
+        if self.peer_addrs.len() <= 1 {
+            return Ok(false);
+        }
+        let is_leader = self.inner.lock().unwrap().role() == RoleState::Leader;
+        if is_leader {
+            *self.last_leader_contact.lock().unwrap() = Instant::now();
+            return Ok(false);
+        }
+        let elapsed = self.last_leader_contact.lock().unwrap().elapsed();
+        if elapsed >= timeout {
+            let _ = self.trigger_election()?;
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     /// Broadcasts a heartbeat / catch-up `AppendEntries` round if this node is Leader.
     pub fn broadcast_heartbeat(&self) -> Result<(), MetaError> {
         let msgs = {
             let guard = self.inner.lock().unwrap();
+            if guard.role() == RoleState::Leader {
+                *self.last_leader_contact.lock().unwrap() = Instant::now();
+            }
             guard.broadcast_append_entries()
         };
         self.drive_outbound(msgs)
