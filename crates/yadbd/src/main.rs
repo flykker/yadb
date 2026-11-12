@@ -19,7 +19,7 @@ use yadb_blob::{
 };
 use yadb_block::{BlockError, BlockVolumeEngine, VolumeExtentMap, DEFAULT_BLOCK_SIZE};
 use yadb_control::{parse_manifests, ControlPlaneState, DiffOp, Role};
-use yadb_db::{parse_sql, DatabaseEngine, DbError, TabletManifest};
+use yadb_db::{parse_sql_script, script_has_writes, DatabaseEngine, DbError, TabletManifest};
 use yadb_io::OsFs;
 use yadb_metakv::{KvCommand, LocalMetaKv, MetaError, RaftRpc, RoleState, WatchEvent};
 use yadb_s3::{ObjectManifest, ObjectStoreEngine, S3Error};
@@ -810,19 +810,20 @@ async fn handle_db_query(
     Path((project, database)): Path<(String, String)>,
     Json(req): Json<SqlQueryPayload>,
 ) -> Response {
-    let stmt = match parse_sql(&req.sql) {
+    let stmts = match parse_sql_script(&req.sql) {
         Ok(s) => s,
         Err(e) => return api_err(StatusCode::BAD_REQUEST, e.to_string()),
     };
 
-    let min_role = if stmt.is_write() {
+    let has_writes = script_has_writes(&stmts);
+    let min_role = if has_writes {
         Role::ReadWrite
     } else {
         Role::ReadOnly
     };
     let subject = extract_subject(&headers);
 
-    if stmt.is_write() {
+    if has_writes {
         if let Ok(raw_body) = serde_json::to_vec(&req) {
             if let Some(proxied) = maybe_forward_write(
                 &st,
@@ -861,19 +862,30 @@ async fn handle_db_query(
     };
 
     let db_engine = st.db.clone();
+    let sql_raw = req.sql;
+    let subj_session = subject;
     let exec = tokio::task::spawn_blocking(move || {
-        db_engine.execute_stmt(project_id, &database, &wal_pool, &data_pool, shards, stmt)
+        db_engine.execute_sql_with_session(
+            project_id,
+            &database,
+            &wal_pool,
+            &data_pool,
+            shards,
+            Some(&subj_session),
+            &sql_raw,
+        )
     })
     .await;
 
     match exec {
         Ok(Ok(res)) => Json(res).into_response(),
-        Ok(Err(DbError::TableNotFound(t))) => {
-            api_err(StatusCode::NOT_FOUND, format!("table `{t}` does not exist"))
+        Ok(Err(e @ (DbError::TableNotFound(_) | DbError::IndexNotFound(_, _)))) => {
+            api_err(StatusCode::NOT_FOUND, e.to_string())
         }
         Ok(Err(
             e @ (DbError::InvalidQuery(_)
             | DbError::TableAlreadyExists(_)
+            | DbError::IndexAlreadyExists(_, _)
             | DbError::DuplicatePrimaryKey(_)),
         )) => api_err(StatusCode::BAD_REQUEST, e.to_string()),
         Ok(Err(DbError::Meta(me))) => meta_err_resp(&st, me),
@@ -1318,12 +1330,14 @@ async fn handle_vdisk_barrier(
         return api_err(StatusCode::NOT_FOUND, "local VDisk slot not hosted on this node");
     };
     let res = tokio::task::spawn_blocking(move || {
-        store.collect_garbage_barrier(
+        let evicted = store.collect_garbage_barrier(
             req.project_id,
             req.owner_id,
             req.channel,
             req.up_to_generation,
-        )
+        )?;
+        let _ = store.compact_sealed_segments();
+        Ok::<usize, BlobError>(evicted)
     })
     .await;
     match res {

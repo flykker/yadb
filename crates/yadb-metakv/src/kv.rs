@@ -13,6 +13,18 @@ pub struct KvValue {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CasGuard {
+    pub key: String,
+    pub expected_version: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TxnOp {
+    Put { key: String, value: Vec<u8> },
+    Delete { key: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum KvCommand {
     Put {
         key: String,
@@ -29,6 +41,12 @@ pub enum KvCommand {
         expected_version: u64,
         new_value: Option<Vec<u8>>,
     },
+    /// Atomic multi-key Raft transaction: verifies all `guards` first; if all match,
+    /// applies every `Put`/`Delete` in `ops` atomically under a single cluster revision!
+    Txn {
+        guards: Vec<CasGuard>,
+        ops: Vec<TxnOp>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -37,6 +55,10 @@ pub enum KvResult {
     Deleted { existed: bool, revision: u64 },
     CasOk { revision: u64, version: u64 },
     CasConflict { current_version: u64 },
+    TxnOk {
+        revision: u64,
+        versions: BTreeMap<String, u64>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -179,6 +201,54 @@ impl MetaStateMachine {
                             version: 0,
                         }
                     }
+                }
+            }
+            KvCommand::Txn { guards, ops } => {
+                for g in &guards {
+                    let cur_ver = self.kv.get(&g.key).map_or(0, |v| v.version);
+                    if cur_ver != g.expected_version {
+                        return KvResult::CasConflict {
+                            current_version: cur_ver,
+                        };
+                    }
+                }
+                self.revision += 1;
+                let rev = self.revision;
+                let mut versions = BTreeMap::new();
+                for op in ops {
+                    match op {
+                        TxnOp::Put { key, value } => {
+                            let next_ver = self.kv.get(&key).map_or(1, |cur| cur.version + 1);
+                            self.kv.insert(
+                                key.clone(),
+                                KvValue {
+                                    value: value.clone(),
+                                    version: next_ver,
+                                    mod_revision: rev,
+                                },
+                            );
+                            versions.insert(key.clone(), next_ver);
+                            self.notify(WatchEvent::Put {
+                                key,
+                                value,
+                                version: next_ver,
+                                revision: rev,
+                            });
+                        }
+                        TxnOp::Delete { key } => {
+                            if self.kv.remove(&key).is_some() {
+                                self.notify(WatchEvent::Delete {
+                                    key: key.clone(),
+                                    revision: rev,
+                                });
+                            }
+                            versions.insert(key, 0);
+                        }
+                    }
+                }
+                KvResult::TxnOk {
+                    revision: rev,
+                    versions,
                 }
             }
         }

@@ -9,12 +9,12 @@
   - Each `StoragePool` chooses **either** `Mirror` (e.g. `3x` replicas) **or** systematic `ReedSolomon { k, m }` over $GF(2^8)$ (e.g. `4+2`).
   - Distributed `PoolSlot` (`Local` disk + `Remote` HTTP/TCP `/internal/vdisk/*` RPC) stripes fragments physically across cluster failure domains & nodes, supports degraded reads & degraded writes when a node dies, and runs an automatic **Self-Healing Scrubber** (`/v1/pools/scrub`, `yadbctl pool-scrub`).
 - **Raft Consensus + Ordered `MetaKV` (`yadb-metakv`):**
-  - Durable `RaftWal`, multi-node elections & quorum log replication (§5.4.2), CAS by per-key `version`, lexicographical prefix scans, and `Watch` streams.
+  - Durable `RaftWal`, automatic election timeouts & instant leader failover, transparent Follower-to-Leader write forwarding on every node, atomic multi-key `Txn` + CAS by `version`, lexicographical prefix scans, and `Watch` streams.
 - **Kubernetes-Style Declarative Control Plane & Zero-Hop Multi-Tenancy (`yadb-control`):**
   - Declarative `Cluster`, `StoragePool`, `Project`, `Database`, `ObjectStore`, and `BlockVolume` manifests reconciled via `yadbctl plan` / `yadbctl apply`.
   - Per-project RBAC (`readOnly`, `readWrite`, `admin`) cached locally in memory via `MetaKV` watches (`~0` network hops on the hot path).
 - **Three Pluggable Data Services over One Storage Kernel:**
-  1. **`yadb-db` (Sharded SQL & Tablets):** Dual-channel YDB-style `DataShardTablet` writing WALs to `walPool` (`Mirror-3`) and flushing sorted SSTables to `dataPool` (`ReedSolomon 4+2`) with CAS generation fencing.
+  1. **`yadb-db` (Distributed SQL & Tablets):** Dual-channel YDB-style `DataShardTablet` (`walPool` + `dataPool`) supporting cross-shard 2PC transactions (`BEGIN / COMMIT / ROLLBACK`), `UPDATE ... SET col = col +/- N`, secondary indexes (`CREATE INDEX`), `GROUP BY` + `COUNT / SUM / MIN / MAX / AVG`, and SSTable compaction (`COMPACT TABLE`) with cross-node VDisk GC barriers.
   2. **`yadb-s3` (Object Storage):** Multi-chunk S3 engine with strong read-after-write consistency, `Range` reads, and sorted prefix listing.
   3. **`yadb-block` (Virtual Disks):** Thin-provisioned Copy-on-Write 4 KiB block volumes.
 - **Zero-Dependency Embedded OKD-Style Web Console (`yadbd`):**

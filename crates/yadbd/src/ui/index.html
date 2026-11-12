@@ -556,10 +556,12 @@
           <label>Target Database:</label>
           <select id="sql-target-db" class="pf-select"></select>
           <button class="btn btn-secondary btn-sm" onclick="setSqlPreset('show')">SHOW TABLES</button>
-          <button class="btn btn-secondary btn-sm" onclick="setSqlPreset('create')">Sample CREATE</button>
+          <button class="btn btn-secondary btn-sm" onclick="setSqlPreset('create')">CREATE + INDEX</button>
           <button class="btn btn-secondary btn-sm" onclick="setSqlPreset('insert')">Sample UPSERT</button>
-          <button class="btn btn-secondary btn-sm" onclick="setSqlPreset('select')">Sample SELECT</button>
-          <button class="btn btn-secondary btn-sm" onclick="setSqlPreset('flush')">FLUSH TABLE</button>
+          <button class="btn btn-secondary btn-sm" onclick="setSqlPreset('tx')">2PC Tx Transfer</button>
+          <button class="btn btn-secondary btn-sm" onclick="setSqlPreset('agg')">GROUP BY Agg</button>
+          <button class="btn btn-secondary btn-sm" onclick="setSqlPreset('select')">SELECT *</button>
+          <button class="btn btn-secondary btn-sm" onclick="setSqlPreset('compact')">COMPACT + GC</button>
         </div>
         <textarea id="sql-input" class="code-editor sql-editor" spellcheck="false">SHOW TABLES;</textarea>
         <div class="toolbar">
@@ -924,10 +926,12 @@ function renderDatabases() {
 function setSqlPreset(kind) {
   const presets = {
     show: "SHOW TABLES;",
-    create: "CREATE TABLE IF NOT EXISTS accounts (id INT PRIMARY KEY, owner TEXT, balance INT, active BOOL);",
+    create: "CREATE TABLE IF NOT EXISTS accounts (id INT PRIMARY KEY, owner TEXT, balance INT, active BOOL);\nCREATE INDEX IF NOT EXISTS idx_owner ON accounts (owner);",
     insert: "UPSERT INTO accounts VALUES (101, 'alice', 5400, true), (102, 'bob', 2150, true), (103, 'carol', 8900, false);",
+    tx: "BEGIN;\nUPDATE accounts SET balance = balance - 500 WHERE id = 101;\nUPDATE accounts SET balance = balance + 500 WHERE id = 102;\nCOMMIT;\nSELECT id, owner, balance FROM accounts ORDER BY id;",
+    agg: "SELECT active, COUNT(*) AS cnt, SUM(balance) AS total_balance, MIN(balance), MAX(balance), AVG(balance)\nFROM accounts\nGROUP BY active\nORDER BY total_balance DESC;",
     select: "SELECT id, owner, balance, active FROM accounts ORDER BY balance DESC;",
-    flush: "FLUSH TABLE accounts;"
+    compact: "COMPACT TABLE accounts;"
   };
   document.getElementById("sql-input").value = presets[kind] || "";
 }

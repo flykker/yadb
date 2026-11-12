@@ -2,7 +2,7 @@ pub mod kv;
 pub mod raft;
 pub mod wal;
 
-pub use kv::{KvCommand, KvResult, KvValue, MetaStateMachine, WatchEvent};
+pub use kv::{CasGuard, KvCommand, KvResult, KvValue, MetaStateMachine, TxnOp, WatchEvent};
 pub use raft::{LocalMetaKv, LogEntry, OutboundMsg, RaftCore, RaftRpc, RoleState};
 pub use wal::RaftWal;
 
