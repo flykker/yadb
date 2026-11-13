@@ -119,8 +119,10 @@ or voters, accepts unknown Raft senders, and lacks exclusive WAL ownership and
 complete structural RPC validation. In particular, reopening a multi-voter WAL
 as a singleton can apply its uncommitted tail. These are blockers for using it
 as a multi-group runtime, not guarantees supplied by a group envelope. The
-experimental `multiraft` module currently validates configuration and message
-identity only; it does not open a WAL, authenticate peers, or dispatch RPCs.
+experimental `multiraft` module validates configuration and message identity and
+provides a separately provisioned identity descriptor. This descriptor is not
+bound to a WAL and requires externally provided exclusive ownership and durable
+directory provisioning; it does not open a WAL, authenticate peers, or dispatch RPCs.
 Before attaching a core, implement durable identity binding, exclusive ownership,
 membership and structural validation, fail-closed recovery, and bounded resource
 handling. The existing recovery can truncate a corrupt frame and does not prove
