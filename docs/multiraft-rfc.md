@@ -1,8 +1,18 @@
 # Multi-Raft for YADB: architecture and staged migration
 
-Status: design proposal, not implemented. This RFC specifies safety gates and
+Status: design proposal; production Multi-Raft is not implemented. This RFC specifies safety gates and
 an initial direction; open choices below require implementation-level designs and
 tests. Existing single-group behavior and protocol compatibility remain in force.
+
+The isolated experimental module contains group identities, a typed WAL and an
+incomplete deterministic memory-only core. The core is not connected to the WAL,
+daemon or client traffic; it must not be used as a production consensus engine.
+The selected production consensus dependency is OpenRaft 0.9.x. Its integration
+boundary is compile-tested, but its durable storage adapter, group transport and
+daemon lifecycle are not implemented yet. The OpenRaft storage contracts require
+persist-before-return for votes/logs, and YADB must satisfy those contracts rather
+than route OpenRaft through the experimental WAL/core. Envelope checks do not
+authenticate peers. The runtime and verification gates below remain future work.
 
 ## Goals and non-goals
 

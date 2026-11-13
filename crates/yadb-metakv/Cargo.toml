@@ -10,3 +10,4 @@ crc32fast.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+openraft.workspace = true
