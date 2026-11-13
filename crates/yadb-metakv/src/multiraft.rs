@@ -332,6 +332,13 @@ impl GroupRaftState {
                     if entry.index != index || entry.term == 0 || entry.term < previous_term || entry.term > self.term {
                         return Err(GroupWalError::Corrupt);
                     }
+                    if let Some(existing) = self.log.get(keep + offset) {
+                        // Log matching: the same (term,index) must never refer
+                        // to two different commands, even in an uncommitted suffix.
+                        if existing.term == entry.term && existing != entry {
+                            return Err(GroupWalError::Corrupt);
+                        }
+                    }
                     previous_term = entry.term;
                 }
                 self.log.truncate(keep);
@@ -624,6 +631,11 @@ mod tests {
         assert!(state.apply(&ReplaceSuffix { from_index: 1, entries: vec![entry(2, 1)] }, &identity).is_err());
         assert!(state.apply(&ReplaceSuffix { from_index: 1, entries: vec![entry(1, 2)] }, &identity).is_err());
         state.apply(&ReplaceSuffix { from_index: 1, entries: vec![entry(1, 1), entry(2, 1)] }, &identity).unwrap();
+        let different = crate::LogEntry { index: 2, term: 1,
+            cmd: crate::KvCommand::Put { key: "k".into(), value: vec![2] } };
+        assert!(state.apply(&ReplaceSuffix { from_index: 2, entries: vec![different] }, &identity).is_err());
+        assert_eq!(state.log[1], entry(2, 1));
+        state.apply(&ReplaceSuffix { from_index: 2, entries: vec![entry(2, 1)] }, &identity).unwrap();
         assert!(state.apply(&Commit { index: 3 }, &identity).is_err());
         state.apply(&Commit { index: 1 }, &identity).unwrap();
         assert!(state.apply(&ReplaceSuffix { from_index: 1, entries: vec![] }, &identity).is_err());
@@ -660,6 +672,33 @@ mod tests {
         assert_eq!(std::fs::read(dir.join(GROUP_WAL_FILE)).unwrap(), before);
         std::fs::remove_file(dir.join(GROUP_WAL_FILE)).unwrap();
         std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn typed_replay_rejects_same_term_index_with_different_command() {
+        use GroupRaftRecord::*;
+        let fs = SimFs::new(905);
+        fs.create_dir_all("g").unwrap();
+        bootstrap_empty_wal(&fs, "g", &replica()).unwrap();
+        let file = fs.open_rw("g/group.wal", false).unwrap();
+        let mut end = file.len().unwrap();
+        let entry = |value| crate::LogEntry { index: 1, term: 1,
+            cmd: crate::KvCommand::Put { key: "k".into(), value: vec![value] } };
+        for record in [HardState { term: 1, voted_for: Some(1) },
+            ReplaceSuffix { from_index: 1, entries: vec![entry(1)] },
+            ReplaceSuffix { from_index: 1, entries: vec![entry(2)] }] {
+            let frame = encode_group_frame(&serde_json::to_vec(&record).unwrap(), end).unwrap();
+            file.write_at(end, &frame).unwrap();
+            end += frame.len() as u64;
+        }
+        let (_, records) = replay_group_wal(&file, &replica()).unwrap();
+        let mut state = GroupRaftState::default();
+        for bytes in &records[..2] {
+            state.apply(&serde_json::from_slice(bytes).unwrap(), &replica()).unwrap();
+        }
+        assert!(state.apply(&serde_json::from_slice(&records[2]).unwrap(), &replica()).is_err());
+        assert_eq!(file.len().unwrap(), end);
+        assert_eq!(state.log[0], entry(1));
     }
 
     #[test]

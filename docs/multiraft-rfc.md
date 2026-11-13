@@ -133,7 +133,9 @@ bounded framed-log API can append and recover opaque records and fails closed on
 malformed frames without truncation. It does not validate Raft state transitions or
 connect to the legacy core. An experimental typed wrapper additionally checks
 term/vote monotonicity, log indices and committed-prefix replacement before append
-and on replay. It does not implement Raft quorum, prove commit decisions, apply
+and on replay. Overlapping entries with the same term and index must have identical
+commands; this local check does not prove Raft's log-matching property across
+replicas or across discarded historical suffixes. It does not implement Raft quorum, prove commit decisions, apply
 the state machine, or constitute a completed runtime.
 Before attaching a core, implement durable identity binding, exclusive ownership,
 membership and structural validation, fail-closed recovery, and bounded resource
