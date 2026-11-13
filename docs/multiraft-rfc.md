@@ -18,7 +18,8 @@ a YADB command. It does not test durable recovery, replication, quorum loss or
 snapshots; that store deliberately cannot satisfy production durability contracts.
 An additional in-process test runs three independent volatile stores: it checks
 replication, a follower catching up after isolation, and lack of a successful
-write while both followers are isolated. A timed-out write has an unknown outcome.
+write while both followers are isolated. After healing, it checks a new write on
+all nodes and duplicate delivery of non-empty AppendEntries. A timed-out write has an unknown outcome.
 This simulated partition is not a durability, snapshot, authenticated transport,
 message reordering, or exhaustive consensus-safety test.
 

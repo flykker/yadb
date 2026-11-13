@@ -143,6 +143,8 @@ async fn openraft_singleton_elects_and_applies_yadb_command_in_memory() {
 struct NetworkData {
     nodes: BTreeMap<u32, YadbRaft>,
     isolated: BTreeSet<u32>,
+    duplicate_append: bool,
+    duplicated: usize,
 }
 
 #[derive(Clone)]
@@ -173,6 +175,15 @@ impl RaftNetworkFactory<C> for TestNetwork {
 impl RaftNetwork<C> for TestNetwork {
     async fn append_entries(&mut self, rpc: AppendEntriesRequest<C>, _: RPCOption) -> Result<AppendEntriesResponse<u32>, RPCError<u32, BasicNode, RaftError<u32>>> {
         let peer = self.peer()?;
+        let duplicate = {
+            let mut network = self.shared.lock().unwrap();
+            let duplicate = network.duplicate_append && !rpc.entries.is_empty();
+            if duplicate { network.duplicated += 1; }
+            duplicate
+        };
+        if duplicate {
+            peer.append_entries(rpc.clone()).await.map_err(|e| RPCError::RemoteError(RemoteError::new(self.target, e)))?;
+        }
         peer.append_entries(rpc).await.map_err(|e| RPCError::RemoteError(RemoteError::new(self.target, e)))
     }
     async fn vote(&mut self, rpc: VoteRequest<u32>, _: RPCOption) -> Result<VoteResponse<u32>, RPCError<u32, BasicNode, RaftError<u32>>> {
@@ -234,6 +245,34 @@ async fn openraft_three_nodes_replicate_and_recover_a_partitioned_follower() {
             assert!(store.0.lock().unwrap().state.get("no-quorum").is_none());
         }
         shared.lock().unwrap().isolated.clear();
+
+        // Elections may have advanced during the partition. Do not assume the
+        // old leader remains leader, and retry only an idempotent test command:
+        // a timed-out client request may still be committed later.
+        let recovered_leader = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                for (id, raft) in &nodes {
+                    if matches!(tokio::time::timeout(Duration::from_millis(500),
+                        raft.client_write(write("after-recovery"))).await, Ok(Ok(_))) {
+                        return *id;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }).await.expect("cluster did not regain quorum");
+        for store in stores.values() { wait_value(store, "after-recovery", b"value").await; }
+
+        // Deliver the same non-empty AppendEntries twice and verify that the
+        // state machine sees the command exactly once on every replica.
+        let revisions: BTreeMap<_, _> = stores.iter().map(|(id, store)|
+            (*id, store.0.lock().unwrap().state.revision())).collect();
+        shared.lock().unwrap().duplicate_append = true;
+        nodes[&recovered_leader].client_write(write("duplicate-rpc")).await.unwrap();
+        for (id, store) in &stores {
+            wait_value(store, "duplicate-rpc", b"value").await;
+            assert_eq!(store.0.lock().unwrap().state.revision(), revisions[id] + 1);
+        }
+        assert!(shared.lock().unwrap().duplicated > 0, "no AppendEntries was duplicated");
 
         for raft in nodes.values() { raft.shutdown().await.unwrap(); }
         shared.lock().unwrap().nodes.clear();
