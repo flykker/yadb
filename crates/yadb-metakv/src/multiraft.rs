@@ -1,7 +1,7 @@
 //! Experimental identity, descriptor and envelope validation; not a Raft runtime.
 //!
-//! The descriptor is not yet bound to a WAL and its caller must provide exclusive
-//! ownership. This module does not authenticate senders, validate Raft log structure,
+//! An experimental empty WAL header binds identity but cannot store or replay records.
+//! This module does not authenticate senders, validate Raft log structure,
 //! or make `RaftCore` safe to expose to untrusted messages. It is deliberately
 //! disconnected from the daemon and existing metadata traffic.
 
@@ -125,6 +125,74 @@ fn descriptor_bytes(identity: &ReplicaIdentity) -> Vec<u8> {
     let crc = crc32fast::hash(&bytes);
     bytes.extend_from_slice(&crc.to_le_bytes());
     bytes
+}
+
+const GROUP_WAL_MAGIC: &[u8; 8] = b"YMRWAL01";
+const GROUP_WAL_FILE: &str = "group.wal";
+
+fn group_wal_header(identity: &ReplicaIdentity) -> Vec<u8> {
+    let mut bytes = descriptor_bytes(identity);
+    bytes[..8].copy_from_slice(GROUP_WAL_MAGIC);
+    let checksum_offset = bytes.len() - 4;
+    let checksum = crc32fast::hash(&bytes[..checksum_offset]);
+    bytes[checksum_offset..].copy_from_slice(&checksum.to_le_bytes());
+    bytes
+}
+
+fn group_wal_path(dir: &str) -> String {
+    if dir.is_empty() { GROUP_WAL_FILE.to_owned() } else {
+        format!("{}/{GROUP_WAL_FILE}", dir.trim_end_matches('/'))
+    }
+}
+
+/// Experimental OS-only ownership of a provisioned, empty, identity-bound WAL.
+/// It cannot append or replay records, and cannot be used by `RaftCore`. The
+/// directory and its parents must already be durable, and all access must respect
+/// the advisory lock and refrain from renaming/replacing the directory or file.
+pub struct LockedEmptyGroupWal {
+    _lock: OsDirectoryLock,
+}
+
+impl LockedEmptyGroupWal {
+    /// Explicit first provisioning only. An error has an unknown durability
+    /// outcome; never automatically retry bootstrap or delete existing files.
+    pub fn bootstrap(fs: &OsFs, dir: &str, identity: &ReplicaIdentity) -> Result<Self, DescriptorError> {
+        let lock = fs.try_lock_directory(dir)?;
+        bootstrap_empty_wal(fs, dir, identity)?;
+        Ok(Self { _lock: lock })
+    }
+
+    /// Never creates an absent WAL. Rejects any extra bytes, including records
+    /// in a future format, before any write or replay.
+    pub fn open(fs: &OsFs, dir: &str, identity: &ReplicaIdentity) -> Result<Self, DescriptorError> {
+        let lock = fs.try_lock_directory(dir)?;
+        verify_empty_wal(fs, dir, identity)?;
+        Ok(Self { _lock: lock })
+    }
+}
+
+fn bootstrap_empty_wal<FS: StorageFs>(fs: &FS, dir: &str, identity: &ReplicaIdentity) -> Result<(), DescriptorError> {
+    if !fs.list_files(dir)?.is_empty() || fs.exists(&group_wal_path(dir)) {
+        return Err(DescriptorError::DirectoryNotEmpty);
+    }
+    let file = fs.open_rw(&group_wal_path(dir), true)?;
+    file.write_at(0, &group_wal_header(identity))?;
+    file.sync_data()?;
+    fs.sync_dir(dir)?;
+    Ok(())
+}
+
+fn verify_empty_wal<FS: StorageFs>(fs: &FS, dir: &str, identity: &ReplicaIdentity) -> Result<(), DescriptorError> {
+    let file = fs.open_rw(&group_wal_path(dir), false)?;
+    let expected = group_wal_header(identity);
+    if file.len()? != expected.len() as u64 { return Err(DescriptorError::Mismatch); }
+    let mut actual = vec![0; expected.len()];
+    if file.read_at(0, &mut actual)? != actual.len() || actual != expected {
+        return Err(DescriptorError::Mismatch);
+    }
+    file.sync_data()?;
+    fs.sync_dir(dir)?;
+    Ok(())
 }
 
 fn descriptor_path(dir: &str) -> String {
@@ -280,6 +348,61 @@ mod tests {
         drop(second);
         std::fs::remove_file(dir.join(DESCRIPTOR_FILE)).unwrap();
         std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn wal_header_binds_full_identity_without_modifying_mismatches() {
+        let fs = SimFs::new(901);
+        fs.create_dir_all("g").unwrap();
+        bootstrap_empty_wal(&fs, "g", &replica()).unwrap();
+        fs.simulate_power_cut();
+        verify_empty_wal(&fs, "g", &replica()).unwrap();
+        let file = fs.open_rw("g/group.wal", false).unwrap();
+        let mut original = vec![0; file.len().unwrap() as usize];
+        file.read_at(0, &mut original).unwrap();
+        for wrong in [
+            ReplicaIdentity::new(GroupIdentity { cluster: [2; 16], ..group() }, 1, vec![1, 2, 3]).unwrap(),
+            ReplicaIdentity::new(GroupIdentity { group: 2, ..group() }, 1, vec![1, 2, 3]).unwrap(),
+            ReplicaIdentity::new(GroupIdentity { incarnation: 2, ..group() }, 1, vec![1, 2, 3]).unwrap(),
+            ReplicaIdentity::new(group(), 2, vec![1, 2, 3]).unwrap(),
+            ReplicaIdentity::new(group(), 1, vec![1]).unwrap(),
+        ] {
+            assert!(matches!(verify_empty_wal(&fs, "g", &wrong), Err(DescriptorError::Mismatch)));
+            let mut after = vec![0; original.len()];
+            file.read_at(0, &mut after).unwrap();
+            assert_eq!(after, original);
+        }
+        file.write_at(original.len() as u64, b"record").unwrap();
+        assert!(matches!(verify_empty_wal(&fs, "g", &replica()), Err(DescriptorError::Mismatch)));
+        assert_eq!(file.len().unwrap(), original.len() as u64 + 6);
+        fs.corrupt_byte("g/group.wal", 12).unwrap();
+        assert!(verify_empty_wal(&fs, "g", &replica()).is_err());
+    }
+
+    #[test]
+    fn wal_bootstrap_faults_never_trigger_implicit_creation() {
+        for (data_fault, dir_fault) in [
+            (SyncFault::BeforePersist, SyncFault::None),
+            (SyncFault::AfterPersist, SyncFault::None),
+            (SyncFault::None, SyncFault::BeforePersist),
+            (SyncFault::None, SyncFault::AfterPersist),
+        ] {
+            let fs = SimFs::new(902);
+            fs.create_dir_all("g").unwrap();
+            fs.set_faults(FaultConfig { sync_data_fault: data_fault, sync_dir_fault: dir_fault, ..Default::default() });
+            assert!(bootstrap_empty_wal(&fs, "g", &replica()).is_err());
+            fs.set_faults(FaultConfig::default());
+            assert!(matches!(bootstrap_empty_wal(&fs, "g", &replica()), Err(DescriptorError::DirectoryNotEmpty)));
+            fs.simulate_power_cut();
+            let opened = verify_empty_wal(&fs, "g", &replica());
+            if dir_fault == SyncFault::AfterPersist { opened.unwrap(); } else { assert!(opened.is_err()); }
+        }
+        let fs = SimFs::new(903);
+        fs.create_dir_all("g").unwrap();
+        let file = fs.open_rw("g/group.wal", true).unwrap();
+        file.write_at(0, b"YADBWAL1").unwrap();
+        assert!(matches!(verify_empty_wal(&fs, "g", &replica()), Err(DescriptorError::Mismatch)));
+        assert!(matches!(bootstrap_empty_wal(&fs, "g", &replica()), Err(DescriptorError::DirectoryNotEmpty)));
     }
 
     #[test]
