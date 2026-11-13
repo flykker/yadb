@@ -123,6 +123,15 @@ YADB uses ordinary filesystems; raw PDisk and NBD are not project goals.
 
 ## P1 — operations and cluster lifecycle
 
+- [x] Record the Multi-Raft dependency audit, safety invariants and migration
+  gates in [docs/multiraft-rfc.md](docs/multiraft-rfc.md). This is a proposal,
+  not an implementation or a commitment to unsupported transaction guarantees.
+- [ ] Implement an isolated Multi-Raft runtime with explicit group identities,
+  independent storage/elections and fixed membership; preserve existing traffic.
+- [ ] Design and test the directory, group lifecycle, cross-group transactions,
+  read visibility, safe allocation and coordinated migration before routing
+  existing SQL/S3/block data across independently replicated groups.
+
 - [ ] Add a tablet lifecycle manager: durable ownership, failure detection,
   generation fencing, recovery, observability and controlled migration.
 - [ ] Design and test Raft snapshots/log compaction and lagging-node recovery;
