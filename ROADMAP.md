@@ -134,6 +134,11 @@ YADB uses ordinary filesystems; raw PDisk and NBD are not project goals.
   duplicate after a newer write; arbitrary reordering and other scenarios remain open.
 - [ ] Build and audit OpenRaft durable storage, snapshots and serialized vote/log
   writes; run OpenRaft's storage suite and crash/fault tests before daemon use.
+  A `#[cfg(test)]` file-backed prototype now exercises serialized framed vote/log
+  writes, restart recovery, suffix replacement, lock ownership and fail-closed
+  corruption handling. It is not production storage: fault injection, stale-lock
+  policy, snapshots, state-machine persistence and OpenRaft storage-suite coverage
+  remain open.
 - [ ] Secure internal Raft RPC and client identity: separate listeners, authenticate
   peers (evaluate rustls/mTLS), bind node and group identity, and do not trust
   client-supplied subject headers. Existing deployment exposure must be audited.

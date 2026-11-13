@@ -1,6 +1,8 @@
 pub mod kv;
 pub mod multiraft;
 pub mod openraft_runtime;
+#[cfg(test)]
+mod openraft_storage;
 pub mod raft;
 pub mod wal;
 

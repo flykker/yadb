@@ -15,6 +15,7 @@ use openraft::{BasicNode, Entry, EntryPayload, ErrorSubject, ErrorVerb, LogId, L
 
 use super::{YadbRaft, YadbRaftTypeConfig as C};
 use crate::{KvCommand, KvResult, MetaStateMachine};
+use crate::openraft_storage::DurableOpenRaftLog;
 
 #[derive(Default)]
 struct Data {
@@ -137,6 +138,41 @@ async fn openraft_singleton_elects_and_applies_yadb_command_in_memory() {
     assert!(matches!(response.data, KvResult::PutOk { .. }));
     assert_eq!(memory.0.lock().unwrap().state.get("key").unwrap().value, b"value");
     tokio::time::timeout(Duration::from_secs(5), raft.shutdown()).await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn openraft_singleton_uses_durable_file_log_across_reopen() {
+    let dir = std::env::temp_dir().join(format!(
+        "yadb-openraft-smoke-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+    ));
+    let log = DurableOpenRaftLog::open(&dir).unwrap();
+    let state = Memory::default();
+    let config = Arc::new(openraft::Config {
+        snapshot_policy: openraft::SnapshotPolicy::Never,
+        ..Default::default()
+    }.validate().unwrap());
+    let raft = YadbRaft::new(1, config, NoNetwork, log.clone(), state.clone()).await.unwrap();
+    raft.initialize(BTreeMap::from([(1, BasicNode::new("node-1"))])).await.unwrap();
+    raft.wait(Some(Duration::from_secs(5))).current_leader(1, "durable singleton leader").await.unwrap();
+    let response = tokio::time::timeout(Duration::from_secs(5), raft.client_write(KvCommand::Put {
+        key: "durable".into(), value: b"value".to_vec(),
+    })).await.unwrap().unwrap();
+    assert!(matches!(response.data, KvResult::PutOk { .. }));
+    tokio::time::timeout(Duration::from_secs(5), raft.shutdown()).await.unwrap().unwrap();
+    drop(raft);
+    drop(log);
+
+    let reopened = DurableOpenRaftLog::open(&dir).unwrap();
+    let mut reader = reopened.clone();
+    let entries = reader.try_get_log_entries(0..u64::MAX).await.unwrap();
+    assert!(entries.iter().any(|entry| matches!(
+        &entry.payload,
+        EntryPayload::Normal(KvCommand::Put { key, value }) if key == "durable" && value == b"value"
+    )));
+    drop(reopened);
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[derive(Default)]
