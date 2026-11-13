@@ -724,6 +724,70 @@ mod tests {
     }
 
     #[test]
+    fn independent_typed_wals_keep_identity_and_state_separate() {
+        use GroupRaftRecord::*;
+        let base = std::env::var_os("YADB_TEST_TMPDIR").map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let root = base.join(format!("yadb-two-group-wals-{}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(root.join("a")).unwrap();
+        std::fs::create_dir(root.join("b")).unwrap();
+        let fs = OsFs::new(&root).unwrap();
+        let a = replica();
+        let b = ReplicaIdentity::new(GroupIdentity { group: 2, ..group() }, 1, vec![1, 2, 3]).unwrap();
+        drop(LockedEmptyGroupWal::bootstrap(&fs, "a", &a).unwrap());
+        drop(LockedEmptyGroupWal::bootstrap(&fs, "b", &b).unwrap());
+        let mut wa = TypedGroupWal::open(&fs, "a", &a).unwrap();
+        let mut wb = TypedGroupWal::open(&fs, "b", &b).unwrap();
+        for (wal, value, vote) in [(&mut wa, b'a', 1), (&mut wb, b'b', 2)] {
+            wal.append(&HardState { term: 1, voted_for: Some(vote) }).unwrap();
+            wal.append(&ReplaceSuffix { from_index: 1, entries: vec![crate::LogEntry {
+                index: 1, term: 1, cmd: crate::KvCommand::Put { key: "same".into(), value: vec![value] },
+            }] }).unwrap();
+            wal.append(&Commit { index: 1 }).unwrap();
+        }
+        drop(wa);
+        drop(wb);
+        assert!(matches!(TypedGroupWal::open(&fs, "a", &b), Err(GroupWalError::Corrupt)));
+        assert!(matches!(TypedGroupWal::open(&fs, "b", &a), Err(GroupWalError::Corrupt)));
+        let wa = TypedGroupWal::open(&fs, "a", &a).unwrap();
+        let mut wb = TypedGroupWal::open(&fs, "b", &b).unwrap();
+        assert_eq!(wa.state().voted_for, Some(1));
+        assert_eq!(wb.state().voted_for, Some(2));
+        assert_ne!(wa.state().log[0].cmd, wb.state().log[0].cmd);
+        assert_eq!(wa.state().commit_index, 1);
+        assert_eq!(wb.state().commit_index, 1);
+        // Reconstruct independent state machines from only each committed prefix.
+        let reconstruct = |state: &GroupRaftState| {
+            let mut sm = crate::MetaStateMachine::new();
+            for entry in state.log.iter().take(state.commit_index as usize) {
+                sm.apply(entry.cmd.clone());
+            }
+            sm
+        };
+        let sa = reconstruct(wa.state());
+        let sb = reconstruct(wb.state());
+        assert_eq!(sa.get("same").unwrap().value, b"a");
+        assert_eq!(sb.get("same").unwrap().value, b"b");
+        assert_eq!(sa.revision(), 1);
+        assert_eq!(sb.revision(), 1);
+        // A bad append in A does not stop B from making progress.
+        drop(wa);
+        let mut wa = TypedGroupWal::open(&fs, "a", &a).unwrap();
+        assert!(wa.append(&HardState { term: 1, voted_for: Some(3) }).is_err());
+        wb.append(&HardState { term: 2, voted_for: Some(3) }).unwrap();
+        assert_eq!(wb.state().term, 2);
+        assert_eq!(wa.state().term, 1);
+        drop(wa);
+        drop(wb);
+        std::fs::remove_file(root.join("a/group.wal")).unwrap();
+        std::fs::remove_file(root.join("b/group.wal")).unwrap();
+        std::fs::remove_dir(root.join("a")).unwrap();
+        std::fs::remove_dir(root.join("b")).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
     fn typed_replay_rejects_same_term_index_with_different_command() {
         use GroupRaftRecord::*;
         let fs = SimFs::new(905);
