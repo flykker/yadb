@@ -10,7 +10,7 @@ daemon or client traffic; it must not be used as a production consensus engine.
 The selected production consensus dependency is OpenRaft 0.9.x. Its integration
 boundary is compile-tested, but its durable storage adapter, group transport and
 daemon lifecycle are not implemented yet. The OpenRaft storage contracts require
-persist-before-return for votes/logs, and YADB must satisfy those contracts rather
+persist-before-return for votes and persist-before-callback for log appends; YADB must satisfy those contracts rather
 than route OpenRaft through the experimental WAL/core. Envelope checks do not
 authenticate peers. The runtime and verification gates below remain future work.
 
