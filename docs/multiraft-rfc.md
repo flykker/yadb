@@ -131,7 +131,10 @@ An experimental, separately provisioned group WAL header includes the full repli
 identity and fixed voters and is verified while holding that OS lock. A separate
 bounded framed-log API can append and recover opaque records and fails closed on
 malformed frames without truncation. It does not validate Raft state transitions or
-connect to the legacy core, and is not yet a usable Raft WAL or completed runtime.
+connect to the legacy core. An experimental typed wrapper additionally checks
+term/vote monotonicity, log indices and committed-prefix replacement before append
+and on replay. It does not implement Raft quorum, prove commit decisions, apply
+the state machine, or constitute a completed runtime.
 Before attaching a core, implement durable identity binding, exclusive ownership,
 membership and structural validation, fail-closed recovery, and bounded resource
 handling. The existing recovery can truncate a corrupt frame and does not prove

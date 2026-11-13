@@ -292,6 +292,91 @@ fn replay_group_wal<F: VirtualFile>(file: &F, identity: &ReplicaIdentity) -> Res
     Ok((pos, records))
 }
 
+/// Versioned experimental records; no snapshots, membership changes or Raft
+/// protocol are implemented. Commit is recorded explicitly before application.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub enum GroupRaftRecord {
+    HardState { term: u64, voted_for: Option<u32> },
+    ReplaceSuffix { from_index: u64, entries: Vec<crate::LogEntry> },
+    Commit { index: u64 },
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct GroupRaftState {
+    pub term: u64,
+    pub voted_for: Option<u32>,
+    pub log: Vec<crate::LogEntry>,
+    pub commit_index: u64,
+}
+
+impl GroupRaftState {
+    fn apply(&mut self, record: &GroupRaftRecord, identity: &ReplicaIdentity) -> Result<(), GroupWalError> {
+        match record {
+            GroupRaftRecord::HardState { term, voted_for } => {
+                if *term < self.term || (*term == 0 && voted_for.is_some())
+                    || voted_for.is_some_and(|v| identity.voters.binary_search(&v).is_err())
+                    || (*term == self.term && self.voted_for.is_some() && *voted_for != self.voted_for) {
+                    return Err(GroupWalError::Corrupt);
+                }
+                self.term = *term;
+                self.voted_for = *voted_for;
+            }
+            GroupRaftRecord::ReplaceSuffix { from_index, entries } => {
+                let keep = usize::try_from(from_index.checked_sub(1).ok_or(GroupWalError::Corrupt)?)
+                    .map_err(|_| GroupWalError::Corrupt)?;
+                if keep > self.log.len() || *from_index <= self.commit_index { return Err(GroupWalError::Corrupt); }
+                let mut previous_term = if keep == 0 { 0 } else { self.log[keep - 1].term };
+                for (offset, entry) in entries.iter().enumerate() {
+                    let index = from_index.checked_add(offset as u64).ok_or(GroupWalError::Corrupt)?;
+                    if entry.index != index || entry.term == 0 || entry.term < previous_term || entry.term > self.term {
+                        return Err(GroupWalError::Corrupt);
+                    }
+                    previous_term = entry.term;
+                }
+                self.log.truncate(keep);
+                self.log.extend_from_slice(entries);
+            }
+            GroupRaftRecord::Commit { index } => {
+                if *index < self.commit_index || *index > self.log.len() as u64 { return Err(GroupWalError::Corrupt); }
+                self.commit_index = *index;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Typed validation layer over the isolated WAL. It does not establish quorum,
+/// apply the state machine, or make a runnable Raft group.
+pub struct TypedGroupWal {
+    wal: LockedGroupWal,
+    identity: ReplicaIdentity,
+    state: GroupRaftState,
+}
+
+impl TypedGroupWal {
+    pub fn open(fs: &OsFs, dir: &str, identity: &ReplicaIdentity) -> Result<Self, GroupWalError> {
+        let (wal, records) = LockedGroupWal::open(fs, dir, identity)?;
+        let mut state = GroupRaftState::default();
+        for bytes in records {
+            let record: GroupRaftRecord = serde_json::from_slice(&bytes).map_err(|_| GroupWalError::Corrupt)?;
+            state.apply(&record, identity)?;
+        }
+        Ok(Self { wal, identity: identity.clone(), state })
+    }
+
+    pub fn state(&self) -> &GroupRaftState { &self.state }
+
+    pub fn append(&mut self, record: &GroupRaftRecord) -> Result<(), GroupWalError> {
+        let mut next = self.state.clone();
+        next.apply(record, &self.identity)?;
+        let bytes = serde_json::to_vec(record).map_err(|_| GroupWalError::Corrupt)?;
+        self.wal.append(&bytes)?;
+        self.state = next;
+        Ok(())
+    }
+}
+
 fn descriptor_path(dir: &str) -> String {
     if dir.is_empty() { DESCRIPTOR_FILE.to_owned() } else {
         format!("{}/{DESCRIPTOR_FILE}", dir.trim_end_matches('/'))
@@ -519,6 +604,60 @@ mod tests {
         let (wal, records) = LockedGroupWal::open(&fs, "", &replica()).unwrap();
         assert_eq!(records, vec![b"first".to_vec(), b"second".to_vec()]);
         drop(wal);
+        std::fs::remove_file(dir.join(GROUP_WAL_FILE)).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn typed_raft_records_enforce_vote_log_and_commit_invariants() {
+        use GroupRaftRecord::*;
+        let identity = replica();
+        let mut state = GroupRaftState::default();
+        let entry = |index, term| crate::LogEntry { index, term,
+            cmd: crate::KvCommand::Put { key: "k".into(), value: vec![1] } };
+        state.apply(&HardState { term: 1, voted_for: Some(1) }, &identity).unwrap();
+        assert!(state.apply(&HardState { term: 1, voted_for: Some(2) }, &identity).is_err());
+        assert!(state.apply(&HardState { term: 1, voted_for: None }, &identity).is_err());
+        assert!(state.apply(&HardState { term: 2, voted_for: Some(999) }, &identity).is_err());
+        assert!(state.apply(&ReplaceSuffix { from_index: 0, entries: vec![entry(0, 1)] }, &identity).is_err());
+        assert!(state.apply(&ReplaceSuffix { from_index: 2, entries: vec![entry(2, 1)] }, &identity).is_err());
+        assert!(state.apply(&ReplaceSuffix { from_index: 1, entries: vec![entry(2, 1)] }, &identity).is_err());
+        assert!(state.apply(&ReplaceSuffix { from_index: 1, entries: vec![entry(1, 2)] }, &identity).is_err());
+        state.apply(&ReplaceSuffix { from_index: 1, entries: vec![entry(1, 1), entry(2, 1)] }, &identity).unwrap();
+        assert!(state.apply(&Commit { index: 3 }, &identity).is_err());
+        state.apply(&Commit { index: 1 }, &identity).unwrap();
+        assert!(state.apply(&ReplaceSuffix { from_index: 1, entries: vec![] }, &identity).is_err());
+        assert!(state.apply(&Commit { index: 0 }, &identity).is_err());
+        state.apply(&HardState { term: 2, voted_for: None }, &identity).unwrap();
+        state.apply(&ReplaceSuffix { from_index: 2, entries: vec![entry(2, 2)] }, &identity).unwrap();
+        assert_eq!(state.log[1].term, 2);
+        assert_eq!(state.commit_index, 1);
+    }
+
+    #[test]
+    fn typed_wal_recovers_and_rejects_invalid_records_without_modification() {
+        use GroupRaftRecord::*;
+        let base = std::env::var_os("YADB_TEST_TMPDIR").map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let dir = base.join(format!("yadb-typed-wal-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let fs = OsFs::new(&dir).unwrap();
+        drop(LockedEmptyGroupWal::bootstrap(&fs, "", &replica()).unwrap());
+        let mut wal = TypedGroupWal::open(&fs, "", &replica()).unwrap();
+        wal.append(&HardState { term: 1, voted_for: Some(1) }).unwrap();
+        let before = std::fs::metadata(dir.join(GROUP_WAL_FILE)).unwrap().len();
+        assert!(wal.append(&HardState { term: 1, voted_for: Some(2) }).is_err());
+        assert_eq!(std::fs::metadata(dir.join(GROUP_WAL_FILE)).unwrap().len(), before);
+        drop(wal);
+        let wal = TypedGroupWal::open(&fs, "", &replica()).unwrap();
+        assert_eq!(wal.state().voted_for, Some(1));
+        drop(wal);
+        let (mut raw, _) = LockedGroupWal::open(&fs, "", &replica()).unwrap();
+        raw.append(&serde_json::to_vec(&HardState { term: 1, voted_for: Some(2) }).unwrap()).unwrap();
+        drop(raw);
+        let before = std::fs::read(dir.join(GROUP_WAL_FILE)).unwrap();
+        assert!(matches!(TypedGroupWal::open(&fs, "", &replica()), Err(GroupWalError::Corrupt)));
+        assert_eq!(std::fs::read(dir.join(GROUP_WAL_FILE)).unwrap(), before);
         std::fs::remove_file(dir.join(GROUP_WAL_FILE)).unwrap();
         std::fs::remove_dir(dir).unwrap();
     }
