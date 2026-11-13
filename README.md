@@ -173,6 +173,26 @@ upgrades/downgrades are unsupported.
 
 ### iSCSI block volumes and failover
 
+New block writes reserve a durable, project-wide 56-bit allocation in
+`/block-write-sequence/{project_id}` before any fragment PUT. Channel 5 separates
+these IDs from legacy channel-3 extents, SQL and S3; owner/generation encode the
+allocation and step identifies each touched block. Volume names/hashes, process
+restarts and deletion/recreation of extent maps cannot reuse the new IDs. Allocation
+exhaustion fails rather than wrapping; failed writes may consume allocations.
+Never delete/reset the sequence, and restore metadata and fragments together.
+Legacy extent maps remain readable and are migrated block-by-block on write, not
+rewritten in place. `generation` in a new extent map is allocation metadata, not a
+volume ownership or GC fence. Stopped, coordinated upgrades are required; mixed
+old/new block writers and downgrades are unsupported.
+
+Block RMW and UNMAP publish maps with modification-revision guards from the same
+metadata snapshot, rejecting stale publication after delete/recreate (ABA). Tests
+cover a concrete CRC32 volume-name collision, independent concurrent allocators,
+allocation rollover/exhaustion, legacy extents, fragment failures and ambiguous
+reservation/publication sync errors. Old and unpublished block fragments are retained;
+safe reclamation and cross-node reader retention are still open. This does not
+establish SQL transaction isolation or repair historical aliasing caused by old IDs.
+
 The iSCSI target implements CHAP, discovery, stable SCSI VPD page `0x83` identifiers,
 READ/WRITE, cache flush, capacity, and 4 KiB-aligned UNMAP. It is an **ERL=0** target;
 the initiator owns reconnect and path failover. For KVM/libvirt, expose all YADB portals

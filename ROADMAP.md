@@ -32,6 +32,12 @@ YADB uses ordinary filesystems; raw PDisk and NBD are not project goals.
   metadata commit; test torn writes, disk-full errors and corruption/repair.
 - [ ] Verify tablet generation fencing, concurrent old/new owners, recovery and
   transaction atomicity under failures; document ambiguous commit outcomes.
+- [x] Reproduce block fragment-ID collisions for two CRC32-colliding volume names
+  on independent engines, and stale extent publication after delete/recreate ABA.
+  Use durable project-wide allocations on channel 5 and revision-guarded RMW/UNMAP
+  from one metadata snapshot. Test concurrent reservation, rollover/exhaustion,
+  legacy reads, failed fragments, restart and ambiguous sync outcomes. Retain old
+  and unpublished fragments; SQL allocation/ABA/compaction still need correction.
 - [ ] Test transaction isolation, read-your-writes, conflicts and range/phantom
   behavior; state only the isolation guarantees actually established.
 - [ ] Prove GC and compaction do not remove live data, including during recovery,
