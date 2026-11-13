@@ -16,7 +16,7 @@ Development priorities, reliability work and future features: [ROADMAP.md](ROADM
   - Declarative `Cluster`, `StoragePool`, `Project`, `Database`, `ObjectStore`, and `BlockVolume` manifests reconciled via `yadbctl plan` / `yadbctl apply`.
   - Per-project RBAC (`readOnly`, `readWrite`, `admin`) cached locally in memory via `MetaKV` watches (`~0` network hops on the hot path).
 - **Three Pluggable Data Services over One Storage Kernel:**
-  1. **`yadb-db` (Distributed SQL & Tablets):** Dual-channel YDB-style `DataShardTablet` (`walPool` + `dataPool`) supporting cross-shard 2PC transactions (`BEGIN / COMMIT / ROLLBACK`), `UPDATE ... SET col = col +/- N`, secondary indexes (`CREATE INDEX`), `GROUP BY` + `COUNT / SUM / MIN / MAX / AVG`, and SSTable compaction (`COMPACT TABLE`) with cross-node VDisk GC barriers.
+   1. **`yadb-db` (Distributed SQL & Tablets):** Dual-channel YDB-style `DataShardTablet` (`walPool` + `dataPool`) with immutable WAL preparation and atomic cross-shard metadata publication (`BEGIN / COMMIT / ROLLBACK`), `UPDATE ... SET col = col +/- N`, secondary indexes (`CREATE INDEX`), `GROUP BY` + `COUNT / SUM / MIN / MAX / AVG`, and logical SSTable compaction (`COMPACT TABLE`). Old fragments are retained for readers; full transaction isolation is not established.
   2. **`yadb-s3` (Object Storage):** Multi-chunk S3 engine with strong read-after-write consistency, `Range` reads, and sorted prefix listing.
   3. **`yadb-block` (Virtual Disks):** Thin-provisioned Copy-on-Write 4 KiB block volumes.
 - **Zero-Dependency Embedded OKD-Style Web Console (`yadbd`):**
@@ -75,6 +75,35 @@ PGPASSWORD='replace-with-a-random-secret-at-least-12-chars' \
 For production use, terminate TLS with a sidecar/reverse proxy and restrict the listener
 with firewall rules. A transaction whose gateway node dies must be restarted on another
 portal; committed rows remain available through Raft and the replicated BlobStorage.
+
+#### SQL allocation, publication and compaction
+
+New SQL WAL/SST blobs use channels 6/7 and a durable project-wide 56-bit allocation
+in `/sql-blob-sequence/{project_id}`, reserved before fragment PUT. Physical IDs no
+longer depend on the CRC32 tablet owner, legacy generation/step, or whether a prior
+preparation was published. Do not delete/reset the sequence; restore metadata and
+fragments together. Legacy channel-1/2 references remain readable. Allocation,
+legacy generation and row-sequence exhaustion fail instead of wrapping/saturating.
+Upgrades require all nodes stopped and coordinated; mixed old/new SQL writers and
+downgrades are unsupported. Existing legacy ID aliasing is not repaired automatically.
+
+Takeover, WAL publication, flush, compaction and cross-shard publication use
+modification-revision guards; shard caches compare these revisions rather than
+per-key versions that can repeat after delete/recreate. Schema guards use revisions
+as well. A failed preparation can leave fragments; a failed publication can still
+commit. Neither is an automatic rollback or authorization for cleanup.
+
+`COMPACT TABLE` merges live rows into a new SST but no longer issues generation GC
+barriers or deletes old WAL/SST fragments. Old snapshots may still need those bytes,
+including on another node. Its `evicted_fragments` result is therefore zero. Tests
+cover old snapshots, legacy recovery, colliding owners, unpublished preparations,
+stale owners/ABA, concurrent allocation and modeled sync errors. Retention and disk
+growth remain unbounded until cross-node reader fencing and safe GC are implemented.
+
+These publication fences do **not** establish serializable or snapshot-isolated SQL
+transactions. In particular, cross-engine row-validation/preparation races and
+`CREATE INDEX` backfill versus concurrent DML remain open correctness work. Do not
+rely on concurrent index construction or general SQL isolation guarantees yet.
 
 ### AWS S3-compatible API
 

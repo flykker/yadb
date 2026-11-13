@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use yadb_blob::{BlobError, PoolStriper};
 use yadb_io::StorageFs;
-use yadb_metakv::{CasGuard, KvCommand, KvResult, LocalMetaKv, MetaError, TxnOp};
+use yadb_metakv::{KvCommand, KvResult, LocalMetaKv, MetaError, RevisionGuard, TxnOp};
 
 pub use sql::{
     parse_sql, parse_sql_script, script_has_writes, AggFunc, ArithOp, AssignExpr, CmpOp, ColumnDef,
@@ -19,6 +19,9 @@ pub use tablet::{CompactionReport, DataShardTablet, PreparedShardCommit, TabletM
 
 #[derive(Debug, Error)]
 pub enum DbError {
+    #[error("SQL blob allocation, generation or row sequence space exhausted")]
+    CounterExhausted,
+
     #[error("blob engine error: {0}")]
     Blob(#[from] BlobError),
 
@@ -237,7 +240,7 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
         crc32fast::hash(pk_bytes) % shard_count.max(1)
     }
 
-    fn load_schema_with_ver(
+    fn load_schema_with_revision(
         &self,
         project_id: u32,
         db: &str,
@@ -248,11 +251,11 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
             .meta
             .get(&key)
             .ok_or_else(|| DbError::TableNotFound(table.to_string()))?;
-        Ok((serde_json::from_slice(&kv.value)?, kv.version))
+        Ok((serde_json::from_slice(&kv.value)?, kv.mod_revision))
     }
 
     fn load_schema(&self, project_id: u32, db: &str, table: &str) -> Result<TableSchema, DbError> {
-        Ok(self.load_schema_with_ver(project_id, db, table)?.0)
+        Ok(self.load_schema_with_revision(project_id, db, table)?.0)
     }
 
     fn get_or_open_shard(
@@ -263,11 +266,11 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
         shard_idx: u32,
     ) -> Result<Arc<Mutex<DataShardTablet<FS>>>, DbError> {
         let mkey = Self::shard_meta_key(project_id, db, &schema.table, shard_idx);
-        let cur_meta_ver = self.meta.get(&mkey).map(|kv| kv.version).unwrap_or(0);
+        let current_revision = self.meta.get(&mkey).map(|kv| kv.mod_revision).unwrap_or(0);
         {
             let map = self.shards.lock().unwrap();
             if let Some(existing) = map.get(&mkey) {
-                if existing.lock().unwrap().manifest_version() == cur_meta_ver {
+                if existing.lock().unwrap().manifest_revision() == current_revision {
                     return Ok(existing.clone());
                 }
             }
@@ -304,13 +307,13 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
     ) -> Result<Option<Vec<SqlValue>>, DbError> {
         let shard_idx = Self::route_shard(pk_bytes, schema.shards);
         let mkey = Self::shard_meta_key(project_id, db, &schema.table, shard_idx);
-        let meta_ver = self.meta.get(&mkey).map(|kv| kv.version).unwrap_or(0);
-        if meta_ver == 0 {
+        let revision = self.meta.get(&mkey).map(|kv| kv.mod_revision).unwrap_or(0);
+        if revision == 0 {
             return Ok(None);
         }
         if let Some(existing) = self.shards.lock().unwrap().get(&mkey).cloned() {
             let guard = existing.lock().unwrap();
-            if guard.manifest_version() == meta_ver {
+            if guard.manifest_revision() == revision {
                 return guard.get_row(pk_bytes);
             }
         }
@@ -336,13 +339,13 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
         shard_idx: u32,
     ) -> Result<Vec<Vec<SqlValue>>, DbError> {
         let mkey = Self::shard_meta_key(project_id, db, &schema.table, shard_idx);
-        let meta_ver = self.meta.get(&mkey).map(|kv| kv.version).unwrap_or(0);
-        if meta_ver == 0 {
+        let revision = self.meta.get(&mkey).map(|kv| kv.mod_revision).unwrap_or(0);
+        if revision == 0 {
             return Ok(Vec::new());
         }
         if let Some(existing) = self.shards.lock().unwrap().get(&mkey).cloned() {
             let guard = existing.lock().unwrap();
-            if guard.manifest_version() == meta_ver {
+            if guard.manifest_revision() == revision {
                 return guard.scan_all_live_rows();
             }
         }
@@ -474,9 +477,9 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
     }
 
     /// Atomically commits a `TxBuffer` across ANY number of tables, shards, and secondary indexes
-    /// using 2-Phase Commit:
+    /// using immutable preparation followed by one atomic metadata transaction:
     /// - Phase 1: write immutable WAL batches to `walPool` for every touched shard;
-    /// - Phase 2: single atomic `KvCommand::Txn` sealing all shard manifests + secondary index keys!
+    /// - Phase 2: `RevisionTxn` sealing all shard manifests + secondary index keys.
     fn commit_tx_buffer(
         &self,
         project_id: u32,
@@ -497,7 +500,7 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
             if pk_map.is_empty() {
                 continue;
             }
-            let (schema, schema_ver) = self.load_schema_with_ver(project_id, db, &table)?;
+            let (schema, schema_revision) = self.load_schema_with_revision(project_id, db, &table)?;
             for (pk_bytes, (old_row, new_row)) in pk_map {
                 if self.read_committed_row(project_id, db, &schema, &pk_bytes)? != old_row {
                     return Err(DbError::InvalidQuery("transaction write conflict; restart transaction".into()));
@@ -540,7 +543,7 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
                     }
                 }
             }
-            schemas.insert(table, (schema, schema_ver));
+            schemas.insert(table, (schema, schema_revision));
         }
 
         if shard_batches.is_empty() {
@@ -557,16 +560,16 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
         }
 
         // Phase 1: Prepare immutable WAL blobs on every touched shard
-        let mut guards: Vec<CasGuard> = Vec::new();
+        let mut guards: Vec<RevisionGuard> = Vec::new();
         let mut ops: Vec<TxnOp> = Vec::new();
         let mut prepared_list: Vec<(Arc<Mutex<DataShardTablet<FS>>>, PreparedShardCommit)> =
             Vec::with_capacity(shard_handles.len());
 
-        // Guard table schema versions so concurrent DDL cannot invalidate secondary index layout
-        for (tbl, (_, s_ver)) in &schemas {
-            guards.push(CasGuard {
+        // Guard schema revisions so delete/recreate cannot satisfy a stale guard.
+        for (tbl, (_, revision)) in &schemas {
+            guards.push(RevisionGuard {
                 key: Self::schema_key(project_id, db, tbl),
-                expected_version: *s_ver,
+                expected_mod_revision: *revision,
             });
         }
 
@@ -576,9 +579,9 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
                 let guard = handle.lock().unwrap();
                 guard.prepare_batch(batch)?
             };
-            guards.push(CasGuard {
+            guards.push(RevisionGuard {
                 key: prep.meta_key.clone(),
-                expected_version: prep.expected_version,
+                expected_mod_revision: prep.expected_mod_revision,
             });
             ops.push(TxnOp::Put {
                 key: prep.meta_key.clone(),
@@ -590,8 +593,8 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
         ops.extend(index_ops);
 
         // Phase 2: Single atomic Raft transaction across all shard manifests & secondary indexes!
-        let versions = match self.meta.execute(KvCommand::Txn { guards, ops })? {
-            KvResult::TxnOk { versions, .. } => versions,
+        let revision = match self.meta.execute(KvCommand::RevisionTxn { guards, ops })? {
+            KvResult::TxnOk { revision, .. } => revision,
             KvResult::CasConflict { .. } => {
                 let first_owner = prepared_list
                     .first()
@@ -604,14 +607,10 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
             _ => unreachable!(),
         };
 
-        // Finalize in-memory MemTables & manifest versions
+        // Finalize in-memory MemTables & manifest revisions.
         for (handle, prep) in prepared_list {
-            let new_ver = versions
-                .get(&prep.meta_key)
-                .copied()
-                .unwrap_or(prep.expected_version + 1);
             let mut guard = handle.lock().unwrap();
-            guard.apply_prepared(prep, new_ver)?;
+            guard.apply_prepared(prep, revision)?;
         }
 
         Ok(())
@@ -877,7 +876,7 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
                         "CREATE INDEX cannot run inside an open transaction".into(),
                     ));
                 }
-                let (mut schema, schema_ver) = self.load_schema_with_ver(project_id, db, &table)?;
+                let (mut schema, schema_revision) = self.load_schema_with_revision(project_id, db, &table)?;
                 if schema
                     .indexes
                     .iter()
@@ -934,10 +933,10 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
                     value: serde_json::to_vec(&schema)?,
                 });
 
-                match self.meta.execute(KvCommand::Txn {
-                    guards: vec![CasGuard {
+                match self.meta.execute(KvCommand::RevisionTxn {
+                    guards: vec![RevisionGuard {
                         key: schema_key,
-                        expected_version: schema_ver,
+                        expected_mod_revision: schema_revision,
                     }],
                     ops,
                 })? {
@@ -963,7 +962,7 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
                         "DROP INDEX cannot run inside an open transaction".into(),
                     ));
                 }
-                let (mut schema, schema_ver) = self.load_schema_with_ver(project_id, db, &table)?;
+                let (mut schema, schema_revision) = self.load_schema_with_revision(project_id, db, &table)?;
                 let Some(pos) = schema
                     .indexes
                     .iter()
@@ -992,13 +991,18 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
                     value: serde_json::to_vec(&schema)?,
                 });
 
-                self.meta.execute(KvCommand::Txn {
-                    guards: vec![CasGuard {
+                match self.meta.execute(KvCommand::RevisionTxn {
+                    guards: vec![RevisionGuard {
                         key: schema_key,
-                        expected_version: schema_ver,
+                        expected_mod_revision: schema_revision,
                     }],
                     ops,
-                })?;
+                })? {
+                    KvResult::TxnOk { .. } => (),
+                    KvResult::CasConflict { .. } => return Err(DbError::InvalidQuery(
+                        "concurrent schema modification during DROP INDEX".into())),
+                    _ => unreachable!(),
+                }
 
                 Ok(QueryResult {
                     columns: Vec::new(),
@@ -1752,6 +1756,35 @@ mod tests {
     }
 
     #[test]
+    fn shard_cache_rejects_manifest_delete_recreate_aba() {
+        let fs = SimFs::new(9200);
+        let meta = LocalMetaKv::open_single_node(&fs, "meta", 1).unwrap();
+        let (wal, data) = make_pools(&fs);
+        let db = DatabaseEngine::new(meta.clone(), 1024);
+        db.register_pool("wal", wal);
+        db.register_pool("data", data);
+        db.execute_sql(1, "db", "wal", "data", 1,
+            "CREATE TABLE t (id INT PRIMARY KEY, v INT); INSERT INTO t VALUES (1,10);").unwrap();
+        let key = DatabaseEngine::<SimFs>::shard_meta_key(1, "db", "t", 0);
+        let old = meta.get(&key).unwrap();
+        let mut replacement: TabletManifest = serde_json::from_slice(&old.value).unwrap();
+        replacement.wal_blobs.clear();
+        replacement.sst_blobs.clear();
+        meta.execute(KvCommand::Delete { key: key.clone() }).unwrap();
+        for _ in 0..old.version {
+            meta.execute(KvCommand::Put { key: key.clone(), value: serde_json::to_vec(&replacement).unwrap() }).unwrap();
+        }
+        assert_eq!(meta.get(&key).unwrap().version, old.version);
+        assert_ne!(meta.get(&key).unwrap().mod_revision, old.mod_revision);
+        let schema = db.load_schema(1, "db", "t").unwrap();
+        let pk = SqlValue::Int(1).encode_order_preserving_key().unwrap();
+        assert!(db.read_committed_row(1, "db", &schema, &pk).unwrap().is_none());
+        assert!(db.scan_committed_shard_rows(1, "db", &schema, 0).unwrap().is_empty());
+        let handle = db.get_or_open_shard(1, "db", &schema, 0).unwrap();
+        assert!(handle.lock().unwrap().get_row(&pk).unwrap().is_none());
+    }
+
+    #[test]
     fn sharded_sql_wal_sstable_flush_and_crash_recovery_with_disk_loss() {
         let fs = SimFs::new(20261112);
 
@@ -2088,7 +2121,7 @@ mod tests {
             ]
         );
 
-        // 5. Multiple SSTable flushes + DELETE + COMPACT TABLE with GC barrier reclamation!
+        // 5. Multiple SSTable flushes + DELETE + logical COMPACT TABLE.
         db.execute_sql(1, "ledger", "wal-fast", "data-ec", 4, "FLUSH TABLE accounts;")
             .unwrap();
         db.execute_sql(
@@ -2107,6 +2140,6 @@ mod tests {
             .execute_sql(1, "ledger", "wal-fast", "data-ec", 4, "COMPACT TABLE accounts;")
             .unwrap();
         assert_eq!(comp.rows[0][2], SqlValue::Int(3)); // 3 live rows remain
-        assert!(matches!(comp.rows[0][3], SqlValue::Int(ev) if ev > 0)); // GC barrier evicted old SST/WAL fragments!
+        assert_eq!(comp.rows[0][3], SqlValue::Int(0)); // Retain fragments for old readers.
     }
 }

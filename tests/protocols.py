@@ -759,7 +759,20 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
             # INSERT is not retried; after convergence only 0 or 1 exact row is
             # acceptable, never a success for another command.
             old = json.loads(request(19002, "GET", "/raft/status")[2])["leader_id"]
-            recover = begin_ambiguous_write(old, "SQL")
+            def publishes_sql_manifest(rpc):
+                # Takeover/allocation precede WAL PUT. Fault actual publication,
+                # not a reservation that could fail before any SQL data exists.
+                for entry in rpc.get("AppendEntries", {}).get("entries", []):
+                    txn = entry.get("cmd", {}).get("RevisionTxn", {})
+                    if any("/shards/" in op.get("Put", {}).get("key", "")
+                           and op.get("Put", {}).get("key", "").startswith("/db/")
+                           for op in txn.get("ops", [])):
+                        # Takeover writes one manifest; commit also guards schema.
+                        if any("/tables/" in guard.get("key", "")
+                               for guard in txn.get("guards", [])):
+                            return True
+                return False
+            recover = begin_ambiguous_write(old, "SQL", publishes_sql_manifest)
             sql_fault = Pg(19100+old)
             sql_fault.s.settimeout(10)
             sql_fault.query("INSERT INTO wire VALUES (96,996);", fail=True)

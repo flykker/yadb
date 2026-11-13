@@ -37,7 +37,16 @@ YADB uses ordinary filesystems; raw PDisk and NBD are not project goals.
   Use durable project-wide allocations on channel 5 and revision-guarded RMW/UNMAP
   from one metadata snapshot. Test concurrent reservation, rollover/exhaustion,
   legacy reads, failed fragments, restart and ambiguous sync outcomes. Retain old
-  and unpublished fragments; SQL allocation/ABA/compaction still need correction.
+  and unpublished fragments; safe block GC remains open.
+- [x] Reproduce SQL unpublished-preparation ID reuse, colliding tablet owners,
+  stale publication after manifest delete/recreate and compaction breaking old
+  snapshots. Reserve durable project-wide channel-6/7 WAL/SST IDs; use revision
+  guards and revision-based shard-cache identity. Retain old/unpublished SQL
+  fragments and report zero physical evictions. Cover legacy recovery, stale
+  flush/compaction, boundaries, concurrent allocation and ambiguous sync outcomes.
+- [ ] Close SQL cross-engine row-validation/preparation races and CREATE INDEX
+  backfill versus concurrent DML. Revision guards alone do not establish isolation
+  or a consistent backfill; reproduce those schedules before claiming guarantees.
 - [ ] Test transaction isolation, read-your-writes, conflicts and range/phantom
   behavior; state only the isolation guarantees actually established.
 - [ ] Prove GC and compaction do not remove live data, including during recovery,
@@ -53,13 +62,15 @@ YADB uses ordinary filesystems; raw PDisk and NBD are not project goals.
   failed/torn fragment and publication writes, publish/abort races, and ID allocation.
 - [x] Add modification-revision transaction guards for S3 to reject per-key-version
   ABA after delete/recreate, including after WAL recovery. Keep old version-based
-  guards for existing callers; other engines still need their own ABA audit.
+  guards for existing callers; SQL/block publication and cache identity now also
+  use modification revisions. This is not a complete metadata/isolation audit.
 - [x] Serialize volume PUT validation/publication, tombstones, barriers and compaction;
   pin matching file/offset pairs for reads. Test conflicting PUTs, PUT/fence races,
   concurrent read/compaction, and payload bit-rot before later durable records.
 - [ ] Implement cross-node reader retention/fencing before reclaiming overwritten
-  or deleted S3 versions. Retired manifests/fragments and unknown historical blobs
-  are deliberately retained; do not infer garbage from absent current references.
+  or deleted S3 versions, SQL WAL/SSTs or old block extents. Retired/old fragments
+  and unknown historical blobs are deliberately retained; do not infer garbage
+  from absent current references.
 - [ ] Bound tombstone/retired metadata growth and validate real ENOSPC/sync errors,
   hardware power loss, pool-placement changes and mixed-version upgrade behavior.
 - [x] Inject sync EIO before/after full persistence; fail closed after WAL errors
