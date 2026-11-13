@@ -219,7 +219,11 @@ pub enum GroupWalError {
 /// external modification and arbitrary storage corruption are outside its model.
 pub struct LockedGroupWal {
     _lock: OsDirectoryLock,
-    file: <OsFs as StorageFs>::File,
+    inner: FramedGroupWal<<OsFs as StorageFs>::File>,
+}
+
+struct FramedGroupWal<F: VirtualFile> {
+    file: F,
     end: u64,
     records: usize,
     failed: bool,
@@ -235,12 +239,18 @@ impl LockedGroupWal {
         // Re-establish durability after a process-only restart before reuse.
         file.sync_data()?;
         fs.sync_dir(dir)?;
-        Ok((Self { _lock: lock, file, end, records: records.len(), failed: false }, records))
+        Ok((Self { _lock: lock, inner: FramedGroupWal { file, end, records: records.len(), failed: false } }, records))
     }
 
     /// An I/O error has an unknown outcome and poisons this handle. A complete
     /// recovered frame can survive; a partial frame makes reopen fail closed.
     pub fn append(&mut self, payload: &[u8]) -> Result<(), GroupWalError> {
+        self.inner.append(payload)
+    }
+}
+
+impl<F: VirtualFile> FramedGroupWal<F> {
+    fn append(&mut self, payload: &[u8]) -> Result<(), GroupWalError> {
         if self.failed { return Err(GroupWalError::Unavailable); }
         if self.records >= MAX_RECORDS { return Err(GroupWalError::Limit); }
         let frame = encode_group_frame(payload, self.end)?;
@@ -592,6 +602,45 @@ mod tests {
         assert!(matches!(replay_group_wal(&file, &replica()), Err(GroupWalError::Corrupt)));
         assert_eq!(file.len().unwrap(), len - 1);
         assert!(matches!(encode_group_frame(&vec![0; MAX_RECORD_BYTES + 1], offset), Err(GroupWalError::Limit)));
+    }
+
+    #[test]
+    fn framed_wal_faults_poison_writer_and_preserve_unknown_outcomes() {
+        for fault in [SyncFault::BeforePersist, SyncFault::AfterPersist] {
+            let fs = SimFs::new(906);
+            fs.create_dir_all("g").unwrap();
+            bootstrap_empty_wal(&fs, "g", &replica()).unwrap();
+            let file = fs.open_rw("g/group.wal", false).unwrap();
+            let mut wal = FramedGroupWal { end: file.len().unwrap(), file, records: 0, failed: false };
+            wal.append(b"committed").unwrap();
+            fs.set_faults(FaultConfig { sync_data_fault: fault, ..Default::default() });
+            assert!(matches!(wal.append(b"unknown"), Err(GroupWalError::Io(_))));
+            fs.set_faults(FaultConfig::default());
+            assert!(matches!(wal.append(b"forbidden"), Err(GroupWalError::Unavailable)));
+            drop(wal);
+            fs.simulate_power_cut();
+            let file = fs.open_rw("g/group.wal", false).unwrap();
+            let (_, records) = replay_group_wal(&file, &replica()).unwrap();
+            let expected = if fault == SyncFault::AfterPersist {
+                vec![b"committed".to_vec(), b"unknown".to_vec()]
+            } else { vec![b"committed".to_vec()] };
+            assert_eq!(records, expected);
+        }
+        for torn in [false, true] {
+            let fs = SimFs::new(907);
+            fs.create_dir_all("g").unwrap();
+            bootstrap_empty_wal(&fs, "g", &replica()).unwrap();
+            let file = fs.open_rw("g/group.wal", false).unwrap();
+            let mut wal = FramedGroupWal { end: file.len().unwrap(), file, records: 0, failed: false };
+            fs.set_faults(if torn { FaultConfig { torn_write_prob: 1.0, ..Default::default() } }
+                else { FaultConfig { write_eio_prob: 1.0, ..Default::default() } });
+            assert!(matches!(wal.append(b"entry"), Err(GroupWalError::Io(_))));
+            fs.set_faults(FaultConfig::default());
+            assert!(matches!(wal.append(b"forbidden"), Err(GroupWalError::Unavailable)));
+            let result = replay_group_wal(&wal.file, &replica());
+            if torn { assert!(matches!(result, Err(GroupWalError::Corrupt))); }
+            else { assert!(result.unwrap().1.is_empty()); }
+        }
     }
 
     #[test]
