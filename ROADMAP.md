@@ -40,10 +40,22 @@ YADB uses ordinary filesystems; raw PDisk and NBD are not project goals.
   is compacted and the node restarts. Compaction now carries barrier markers into
   the replacement segment; a regression test confirms old-generation writes remain
   fenced after recovery.
-- [ ] Add a safe S3 orphan-fragment collector. A failed fragment quorum can leave
-  an unreferenced immutable fragment after the manifest commit is skipped; current
-  scrub verifies referenced fragments but deliberately does not delete unknown
-  fragments.
+- [x] Add fenced cleanup for new S3 failed uploads: persist complete intents before
+  fragment PUT, allocate non-reused channel-4 IDs, require wall-clock + revision
+  grace, abort through consensus before deletion, and retain work until all physical
+  parts acknowledge exact tombstones. Tests cover interrupted cleanup/restart,
+  failed/torn fragment and publication writes, publish/abort races, and ID allocation.
+- [x] Add modification-revision transaction guards for S3 to reject per-key-version
+  ABA after delete/recreate, including after WAL recovery. Keep old version-based
+  guards for existing callers; other engines still need their own ABA audit.
+- [x] Serialize volume PUT validation/publication, tombstones, barriers and compaction;
+  pin matching file/offset pairs for reads. Test conflicting PUTs, PUT/fence races,
+  concurrent read/compaction, and payload bit-rot before later durable records.
+- [ ] Implement cross-node reader retention/fencing before reclaiming overwritten
+  or deleted S3 versions. Retired manifests/fragments and unknown historical blobs
+  are deliberately retained; do not infer garbage from absent current references.
+- [ ] Bound tombstone/retired metadata growth and validate real ENOSPC/sync errors,
+  hardware power loss, pool-placement changes and mixed-version upgrade behavior.
 - [ ] Run kernel open-iscsi + dm-multipath + KVM guest I/O on a Linux host; kill
   active targets, partition networks, restore paths and verify guest data integrity.
   This is blocked on this Android environment by missing KVM and device mapper.

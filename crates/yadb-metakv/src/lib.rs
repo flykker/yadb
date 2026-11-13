@@ -2,7 +2,7 @@ pub mod kv;
 pub mod raft;
 pub mod wal;
 
-pub use kv::{CasGuard, KvCommand, KvResult, KvValue, MetaStateMachine, TxnOp, WatchEvent};
+pub use kv::{CasGuard, KvCommand, KvResult, KvValue, MetaStateMachine, RevisionGuard, TxnOp, WatchEvent};
 pub use raft::{LocalMetaKv, LogEntry, OutboundMsg, RaftCore, RaftRpc, RoleState};
 pub use wal::RaftWal;
 
@@ -33,6 +33,33 @@ mod tests {
     use super::*;
     use std::collections::{BTreeMap, BTreeSet, VecDeque};
     use yadb_io::SimFs;
+
+    #[test]
+    fn revision_guards_reject_delete_recreate_aba_after_wal_recovery() {
+        let fs = SimFs::new(9001);
+        let meta = LocalMetaKv::open_single_node(&fs, "meta", 1).unwrap();
+        meta.execute(KvCommand::Put { key: "key".into(), value: b"old".to_vec() }).unwrap();
+        let old = meta.get("key").unwrap();
+        meta.execute(KvCommand::Delete { key: "key".into() }).unwrap();
+        meta.execute(KvCommand::Put { key: "key".into(), value: b"new".to_vec() }).unwrap();
+        let new = meta.get("key").unwrap();
+        assert_eq!(old.version, new.version); // ordinary version guards have ABA
+        assert_ne!(old.mod_revision, new.mod_revision);
+        drop(meta);
+        fs.simulate_power_cut();
+        let meta = LocalMetaKv::open_single_node(&fs, "meta", 1).unwrap();
+        let result = meta.execute(KvCommand::RevisionTxn {
+            guards: vec![RevisionGuard { key: "key".into(), expected_mod_revision: old.mod_revision }],
+            ops: vec![TxnOp::Delete { key: "key".into() }, TxnOp::Put { key: "retired".into(), value: b"old".to_vec() }],
+        }).unwrap();
+        assert!(matches!(result, KvResult::CasConflict { .. }));
+        assert_eq!(meta.get("key").unwrap().value, b"new");
+        assert!(meta.get("retired").is_none());
+        assert!(matches!(meta.execute(KvCommand::RevisionTxn {
+            guards: vec![RevisionGuard { key: "key".into(), expected_mod_revision: new.mod_revision }],
+            ops: vec![TxnOp::Delete { key: "key".into() }],
+        }).unwrap(), KvResult::TxnOk { .. }));
+    }
 
     /// Deterministic in-memory Raft network simulator supporting partitions & message delivery.
     struct SimCluster {

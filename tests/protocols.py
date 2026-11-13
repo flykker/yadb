@@ -468,6 +468,27 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
                 while "billing/ledger" not in json.loads(request(19000+i, "GET", "/v1/status")[2])["databases"]:
                     assert time.monotonic() < deadline, "control cache not replicated"
                     time.sleep(.05)
+            # Exercise the internal DELETE route on every actual VDisk host,
+            # using a reserved test project/channel unrelated to engine IDs.
+            vdisk_tombstones = []
+            health = json.loads(request(19002, "GET", "/v1/pools/health")[2])
+            for pool in health["pools"]:
+                for slot in pool["slots"]:
+                    blob = ((0xFFFFFFFE << 96) | (1 << 64) | (1 << 40)
+                            | ((slot["slot_index"]+1) << 16) | (250 << 8) | 1)
+                    path = f'/internal/vdisk/{pool["pool_name"]}/{slot["slot_index"]}/blob/{blob:032x}'
+                    port = 19000 + slot["node_id"]
+                    assert request(port, "PUT", path, b"orphan-fragment")[0] == 200
+                    result = request(port, "DELETE", path)
+                    assert result[0] == 200 and result[2] == b"deleted", result
+                    assert request(port, "GET", path)[0] == 404
+                    assert request(port, "DELETE", path)[2] == b"absent"
+                    assert request(port, "PUT", path, b"late-fragment")[0] == 412
+                    vdisk_tombstones.append((port, path))
+            scrub = json.loads(request(19002, "POST", "/v1/pools/scrub")[2])
+            assert scrub["orphan_collection_error"] is None, scrub
+            assert "orphan_blobs_collected" in scrub
+            print("PASS VDisk exact DELETE, idempotent tombstone and delayed PUT fencing")
             a, b = Pg(19102), Pg(19103)
             a.query("CREATE TABLE wire (id INT PRIMARY KEY, balance INT);")
             a.query("INSERT INTO wire VALUES (1,100), (2,200);")
@@ -661,6 +682,9 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
             assert restored.rows("SELECT balance FROM wire WHERE id=1;") == [["90"]]
             restored.close()
             assert signed(19203, "GET", "/invoices-2026/restart")[2] == b"durable object"
+            for port, path in vdisk_tombstones:
+                assert request(port, "PUT", path, b"late-after-restart")[0] == 412
+                assert request(port, "GET", path)[0] == 404
             disk = Iscsi(19303)
             assert disk.read(lba=4096) == b"R"*512
             disk.s.close()
@@ -669,15 +693,15 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
             def has_entries(rpc):
                 return bool(rpc.get("AppendEntries", {}).get("entries"))
 
-            def begin_ambiguous_write(old, label):
+            def begin_ambiguous_write(old, label, predicate=has_entries):
                 peers = [i for i in range(1, 4) if i != old]
                 delivered = peers[0]
                 blocked = peers[1]
                 # One follower durably receives the proposal but its reply is
                 # lost; the other follower never receives it. The client sees
                 # an error without this test retrying the command.
-                proxies[old, delivered].raft_reply_fault = has_entries
-                proxies[old, blocked].raft_request_fault = has_entries
+                proxies[old, delivered].raft_reply_fault = predicate
+                proxies[old, blocked].raft_request_fault = predicate
                 for peer in peers:
                     proxies[old, peer].dropped_raft_reply.clear()
 
@@ -713,7 +737,16 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
             # failed client request must never produce a different object value.
             old = json.loads(request(19002, "GET", "/raft/status")[2])["leader_id"]
             ambiguous_s3_key = "/invoices-2026/ambiguous-process-s3"
-            recover = begin_ambiguous_write(old, "S3")
+            def publishes_s3_manifest(rpc):
+                # Allocation and intent persistence now precede fragment PUT.
+                # Fault only publication, not those earlier Raft commands.
+                for entry in rpc.get("AppendEntries", {}).get("entries", []):
+                    txn = entry.get("cmd", {}).get("RevisionTxn", {})
+                    if any(op.get("Put", {}).get("key", "").startswith("/s3/")
+                           for op in txn.get("ops", [])):
+                        return True
+                return False
+            recover = begin_ambiguous_write(old, "S3", publishes_s3_manifest)
             s3_fault = signed(19200+old, "PUT", ambiguous_s3_key, b"ambiguous-s3")
             assert not 200 <= s3_fault[0] < 300, s3_fault
             recover()

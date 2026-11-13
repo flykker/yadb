@@ -18,6 +18,14 @@ pub struct CasGuard {
     pub expected_version: u64,
 }
 
+/// Unlike a per-key version, a modification revision cannot repeat after
+/// delete/recreate. Zero means the key must be absent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RevisionGuard {
+    pub key: String,
+    pub expected_mod_revision: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TxnOp {
     Put { key: String, value: Vec<u8> },
@@ -45,6 +53,11 @@ pub enum KvCommand {
     /// applies every `Put`/`Delete` in `ops` atomically under a single cluster revision!
     Txn {
         guards: Vec<CasGuard>,
+        ops: Vec<TxnOp>,
+    },
+    /// ABA-safe transaction, guarded by each value's global modification revision.
+    RevisionTxn {
+        guards: Vec<RevisionGuard>,
         ops: Vec<TxnOp>,
     },
 }
@@ -119,6 +132,17 @@ impl MetaStateMachine {
 
     pub fn apply(&mut self, cmd: KvCommand) -> KvResult {
         match cmd {
+            KvCommand::RevisionTxn { guards, ops } => {
+                for guard in guards {
+                    let current = self.kv.get(&guard.key);
+                    if current.map_or(0, |v| v.mod_revision) != guard.expected_mod_revision {
+                        return KvResult::CasConflict {
+                            current_version: current.map_or(0, |v| v.version),
+                        };
+                    }
+                }
+                self.apply(KvCommand::Txn { guards: Vec::new(), ops })
+            }
             KvCommand::Put { key, value } => {
                 self.revision += 1;
                 let rev = self.revision;

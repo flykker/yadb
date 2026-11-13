@@ -720,6 +720,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 seed: seed ^ 0xDEAD_BEEF,
                 torn_write_prob: 1.0,
                 read_eio_prob: 0.0,
+                write_eio_prob: 0.0,
             });
             let _ = striper.domains()[0].put(BlobId::new(1, 10, 1, 999, 2, 1), b"torn-tail-bytes");
             fs.set_faults(FaultConfig::default());

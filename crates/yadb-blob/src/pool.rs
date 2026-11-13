@@ -332,6 +332,33 @@ impl<FS: StorageFs> PoolSlot<FS> {
         }
     }
 
+    pub fn delete(&self, id: BlobId) -> Result<bool, BlobError> {
+        match &self.backend {
+            SlotBackend::Local(store) => store.delete(id),
+            SlotBackend::Remote {
+                pool_name,
+                slot_index,
+                peer_addr,
+            } => {
+                let path = format!("/internal/vdisk/{pool_name}/{slot_index}/blob/{}", id.to_hex());
+                match http_raw_request(peer_addr, "DELETE", &path, "application/octet-stream", &[]) {
+                    Ok((200, body)) if body == b"deleted" || body == b"absent" => {
+                        self.metrics.online.store(true, Ordering::Relaxed);
+                        Ok(body == b"deleted")
+                    }
+                    Ok((code, body)) => Err(BlobError::Io(std::io::Error::other(format!(
+                        "remote vdisk DELETE HTTP {code}: {}",
+                        String::from_utf8_lossy(&body)
+                    )))),
+                    Err(e) => {
+                        self.metrics.online.store(false, Ordering::Relaxed);
+                        Err(BlobError::Io(e))
+                    }
+                }
+            }
+        }
+    }
+
     pub fn probe_stats(&self, probe_remote: bool) -> (bool, VolumeStats) {
         match &self.backend {
             SlotBackend::Local(store) => {
@@ -526,6 +553,26 @@ impl<FS: StorageFs> PoolStriper<FS> {
                 available: ok_writes,
                 required: min_write,
             }))
+        }
+    }
+
+    /// Tombstones every physical fragment. Success requires every target,
+    /// unlike a data write quorum: an unavailable target must be retried so
+    /// its orphan cannot be forgotten.
+    pub fn delete(&self, logical_id: BlobId) -> Result<bool, BlobError> {
+        let mut deleted = false;
+        let mut error = None;
+        for idx in 0..self.codec.scheme().total_parts() {
+            let part_id = logical_id.with_part((idx + 1) as u8);
+            let slot_idx = self.select_slot(logical_id, idx);
+            match self.slots[slot_idx].delete(part_id) {
+                Ok(existed) => deleted |= existed,
+                Err(e) => error = Some(e),
+            }
+        }
+        match error {
+            Some(e) => Err(e),
+            None => Ok(deleted),
         }
     }
 

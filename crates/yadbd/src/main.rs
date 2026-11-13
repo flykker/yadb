@@ -97,6 +97,8 @@ struct ScrubSummary {
     pub blobs_repaired: usize,
     pub fragments_repaired: usize,
     pub blobs_unrecoverable: usize,
+    pub orphan_blobs_collected: usize,
+    pub orphan_collection_error: Option<String>,
     pub pools: Vec<PoolHealthSnapshot>,
 }
 
@@ -356,6 +358,10 @@ impl AppState {
         let mut blobs_repaired = 0usize;
         let mut fragments_repaired = 0usize;
         let mut blobs_unrecoverable = 0usize;
+        let (orphan_blobs_collected, orphan_collection_error) = match self.s3.collect_orphans_all() {
+            Ok(count) => (count, None),
+            Err(error) => (0, Some(error.to_string())),
+        };
 
         for (pool_name, blob_id) in live_blobs {
             let Some(striper) = pools_map.get(&pool_name) else {
@@ -385,6 +391,8 @@ impl AppState {
             blobs_repaired,
             fragments_repaired,
             blobs_unrecoverable,
+            orphan_blobs_collected,
+            orphan_collection_error,
             pools: pools_health,
         };
         *self.last_scrub.write().unwrap() = Some(summary.clone());
@@ -1335,6 +1343,9 @@ async fn handle_vdisk_put(
         Ok(Err(BlobError::FencedByBarrier { .. })) => {
             api_err(StatusCode::PRECONDITION_FAILED, "fenced by GC barrier")
         }
+        Ok(Err(BlobError::Tombstoned(_))) => {
+            api_err(StatusCode::PRECONDITION_FAILED, "immutable blob tombstoned")
+        }
         Ok(Err(e)) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
         Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
@@ -1377,6 +1388,24 @@ async fn handle_vdisk_stats(
     };
     match store.stats() {
         Ok(stats) => Json(stats).into_response(),
+        Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+async fn handle_vdisk_delete(
+    State(st): State<AppState>,
+    Path((pool, slot, blob_hex)): Path<(String, usize, String)>,
+) -> Response {
+    let Some(blob_id) = BlobId::from_hex(&blob_hex) else {
+        return api_err(StatusCode::BAD_REQUEST, "invalid 32-char hex BlobId");
+    };
+    let Some(store) = st.local_vdisks.read().unwrap().get(&(pool, slot)).cloned() else {
+        return api_err(StatusCode::NOT_FOUND, "local VDisk slot not hosted on this node");
+    };
+    match tokio::task::spawn_blocking(move || store.delete(blob_id)).await {
+        Ok(Ok(true)) => (StatusCode::OK, "deleted").into_response(),
+        Ok(Ok(false)) => (StatusCode::OK, "absent").into_response(),
+        Ok(Err(e)) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
         Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }
@@ -1574,7 +1603,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/pools/scrub", post(handle_pools_scrub))
         .route(
             "/internal/vdisk/{pool}/{slot}/blob/{blob_hex}",
-            put(handle_vdisk_put).get(handle_vdisk_get),
+            put(handle_vdisk_put).get(handle_vdisk_get).delete(handle_vdisk_delete),
         )
         .route(
             "/internal/vdisk/{pool}/{slot}/stats",

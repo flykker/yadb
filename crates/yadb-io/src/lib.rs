@@ -156,6 +156,9 @@ pub struct FaultConfig {
     pub torn_write_prob: f64,
     /// Probability (0.0..=1.0) that a `read_at` returns a transient I/O error.
     pub read_eio_prob: f64,
+    /// Probability (0.0..=1.0) that a `write_at` fails outright, simulating a
+    /// full disk / rejected write. The file content is left untouched.
+    pub write_eio_prob: f64,
 }
 
 #[derive(Clone, Default)]
@@ -262,6 +265,12 @@ impl VirtualFile for SimFile {
     fn write_at(&self, offset: u64, buf: &[u8]) -> IoResult<()> {
         let torn_len = {
             let mut st = self.fs.lock().unwrap();
+            if st.faults.write_eio_prob > 0.0 && st.next_f64() < st.faults.write_eio_prob {
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "simulated write failure (disk full)",
+                ));
+            }
             if st.faults.torn_write_prob > 0.0
                 && buf.len() > 1
                 && st.next_f64() < st.faults.torn_write_prob
@@ -469,5 +478,24 @@ mod tests {
         let mut buf = vec![0u8; 15];
         reopened.read_at(0, &mut buf).unwrap();
         assert_eq!(&buf, b"committed-block");
+    }
+
+    #[test]
+    fn rejected_write_changes_neither_volatile_nor_durable_bytes() {
+        let fs = SimFs::new(43);
+        let file = fs.open_rw("file", true).unwrap();
+        file.write_at(0, b"original").unwrap();
+        file.sync_data().unwrap();
+        fs.sync_dir("").unwrap();
+        fs.set_faults(FaultConfig { write_eio_prob: 1.0, ..Default::default() });
+        assert!(file.write_at(0, b"replacement-longer-than-original").is_err());
+        let mut buf = [0; 8];
+        file.read_at(0, &mut buf).unwrap();
+        assert_eq!(&buf, b"original");
+        fs.simulate_power_cut();
+        let recovered = fs.open_rw("file", false).unwrap();
+        assert_eq!(recovered.len().unwrap(), 8);
+        recovered.read_at(0, &mut buf).unwrap();
+        assert_eq!(&buf, b"original");
     }
 }

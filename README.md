@@ -11,7 +11,7 @@ Development priorities, reliability work and future features: [ROADMAP.md](ROADM
   - Each `StoragePool` chooses **either** `Mirror` (e.g. `3x` replicas) **or** systematic `ReedSolomon { k, m }` over $GF(2^8)$ (e.g. `4+2`).
   - Distributed `PoolSlot` (`Local` disk + `Remote` HTTP/TCP `/internal/vdisk/*` RPC) stripes fragments physically across cluster failure domains & nodes, supports degraded reads & degraded writes when a node dies, and runs an automatic **Self-Healing Scrubber** (`/v1/pools/scrub`, `yadbctl pool-scrub`).
 - **Raft Consensus + Ordered `MetaKV` (`yadb-metakv`):**
-  - Durable `RaftWal`, automatic election timeouts & instant leader failover, transparent Follower-to-Leader write forwarding on every node, atomic multi-key `Txn` + CAS by `version`, lexicographical prefix scans, and `Watch` streams.
+  - Durable `RaftWal`, automatic election timeouts & leader failover, transparent Follower-to-Leader write forwarding on every node, atomic multi-key transactions guarded by per-key version or global modification revision, lexicographical prefix scans, and `Watch` streams.
 - **Kubernetes-Style Declarative Control Plane & Zero-Hop Multi-Tenancy (`yadb-control`):**
   - Declarative `Cluster`, `StoragePool`, `Project`, `Database`, `ObjectStore`, and `BlockVolume` manifests reconciled via `yadbctl plan` / `yadbctl apply`.
   - Per-project RBAC (`readOnly`, `readWrite`, `admin`) cached locally in memory via `MetaKV` watches (`~0` network hops on the hot path).
@@ -103,6 +103,48 @@ an authenticated proxy in front if host-style virtual buckets are required. Conf
 AWS clients for path-style addressing. GET/Range responses are also limited to 16 MiB;
 presigned URLs, session tokens, native TLS, and a complete AWS S3 implementation are not
 provided yet. Credentials and object bytes require HTTPS termination or a trusted network.
+
+#### S3 failed-upload cleanup and retention
+
+New uploads reserve a durable per-project sequence and persist the complete chunk list
+in `/s3-intent/` **before** writing any fragments. New S3 blobs use channel 4, separate
+from legacy S3/SQL data and block extents. The allocator must never be deleted/reset;
+restore metadata and fragment data together, not from unrelated points in time.
+
+Publishing a manifest, retiring its previous version and removing the upload intent
+is one revision-guarded Raft transaction. Revision guards prevent a deleted/recreated
+key from accidentally satisfying an old per-key-version check (ABA). If publication
+fails or its outcome is unknown, the durable intent is not an immediate rollback.
+
+The pool scrubber reclaims failed uploads only after **both** a five-minute wall-clock
+grace and 32 metadata revisions. On an idle project/cluster, cleanup may wait for more
+metadata writes. A consensus-confirmed transition to `Aborted` fences publication;
+then exact, persistent tombstones fence every physical part, including absent parts,
+against delayed PUT/repair. Every target must acknowledge its tombstone, not merely a
+write quorum. Failed cleanup keeps the aborted intent for a later retry/restart.
+Clock changes can affect cleanup timing, but are not the publication safety fence.
+In clustered mode the leader runs scrub periodically; `/v1/pools/scrub` also requests it
+explicitly. `orphan_blobs_collected` counts logical blobs, not physical fragments;
+`orphan_collection_error` exposes cleanup failures (partial progress is not a total).
+
+**Retention is deliberately conservative:** overwritten/deleted manifests and their
+fragments remain stored because an in-flight reader on another node can hold an old
+immutable manifest. Cross-node reader retention/fencing is not implemented. Historical
+fragments without new-format intents, including legacy intents with collision-prone
+IDs, are never deleted just because a scan finds no current manifest. Segment compaction
+can reclaim tombstoned payload bytes in sealed segments, but retains fencing markers;
+tombstones/retired metadata are not yet bounded by a retention policy.
+
+Deterministic tests cover publication-versus-abort races, failed/torn fragment and
+metadata writes, interrupted cleanup/restart, concurrent ID allocation, immutable PUT
+conflicts, PUT-versus-GC fencing, compaction-versus-read, and payload bit-rot before later
+durable records. These simulations do not prove real ENOSPC, failed `fdatasync`, hardware
+power-loss behavior or all failure schedules. Compaction currently serializes writers
+per volume for correctness; latency under large compactions is not characterized.
+
+The new `RevisionTxn` Raft/WAL command and volume tombstone records are not understood
+by older binaries. Upgrade all nodes together while stopped; mixed-version rolling
+upgrades/downgrades are unsupported.
 
 ### iSCSI block volumes and failover
 

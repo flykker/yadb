@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Mutex, RwLock};
 
 use serde::{Deserialize, Serialize};
@@ -10,6 +10,7 @@ const VOLUME_MAGIC: &[u8; 8] = b"YADBVOL1";
 const RECORD_MAGIC: u32 = 0x5942_5243; // "YBRC"
 const REC_KIND_PUT: u8 = 1;
 const REC_KIND_BARRIER: u8 = 2;
+const REC_KIND_TOMBSTONE: u8 = 3;
 const RECORD_HEADER_LEN: usize = 33;
 
 #[derive(Debug, Clone, Copy)]
@@ -65,6 +66,7 @@ pub struct VolumeStore<FS: StorageFs> {
     cfg: VolumeConfig,
     index: RwLock<BTreeMap<BlobId, IndexEntry>>,
     barriers: RwLock<BTreeMap<(u32, u32, u8), u32>>,
+    tombstones: RwLock<BTreeSet<BlobId>>,
     segments: RwLock<BTreeMap<u32, FS::File>>,
     writer: Mutex<ActiveSegment<FS::File>>,
 }
@@ -76,6 +78,7 @@ impl<FS: StorageFs> VolumeStore<FS> {
 
         let mut index = BTreeMap::new();
         let mut barriers: BTreeMap<(u32, u32, u8), u32> = BTreeMap::new();
+        let mut tombstones: BTreeSet<BlobId> = BTreeSet::new();
         let mut segments = BTreeMap::new();
         let mut max_seg_id = 0u32;
 
@@ -89,7 +92,7 @@ impl<FS: StorageFs> VolumeStore<FS> {
                 max_seg_id = max_seg_id.max(seg_id);
                 let path = segment_path(&dir, seg_id);
                 let file = fs.open_rw(&path, false)?;
-                recover_segment(&file, seg_id, &mut index, &mut barriers)?;
+                recover_segment(&file, seg_id, &mut index, &mut barriers, &mut tombstones)?;
                 segments.insert(seg_id, file);
             }
         }
@@ -112,6 +115,7 @@ impl<FS: StorageFs> VolumeStore<FS> {
             cfg,
             index: RwLock::new(index),
             barriers: RwLock::new(barriers),
+            tombstones: RwLock::new(tombstones),
             segments: RwLock::new(segments),
             writer: Mutex::new(ActiveSegment {
                 seg_id: active_id,
@@ -121,7 +125,7 @@ impl<FS: StorageFs> VolumeStore<FS> {
         })
     }
 
-    /// Writes an immutable blob. Idempotent if the exact same `BlobId` and byte length already exist;
+    /// Writes an immutable blob. Idempotent if the same id and bytes already exist;
     /// rejects conflicting writes to an existing `BlobId` or writes older than a GC barrier.
     pub fn put(&self, id: BlobId, data: &[u8]) -> Result<(), BlobError> {
         if data.len() > self.cfg.max_blob_bytes {
@@ -129,6 +133,13 @@ impl<FS: StorageFs> VolumeStore<FS> {
                 size: data.len(),
                 max: self.cfg.max_blob_bytes,
             });
+        }
+
+        // Serialize validation, append and index publication with DELETE,
+        // barriers and compaction, not just the physical append.
+        let mut writer = self.writer.lock().unwrap();
+        if self.tombstones.read().unwrap().contains(&id) {
+            return Err(BlobError::Tombstoned(id));
         }
 
         // Enforce generation fencing barrier
@@ -150,17 +161,17 @@ impl<FS: StorageFs> VolumeStore<FS> {
 
         // Idempotency check for immutable blobs (also verifies on-disk CRC32 so Scrubber
         // can heal silent bit-rot by appending a fresh verified copy when on-disk bytes corrupted!)
-        if let Some(existing) = self.index.read().unwrap().get(&id).copied() {
+        let existing = self.index.read().unwrap().get(&id).copied();
+        if let Some(existing) = existing {
             if existing.data_len == data.len() as u32 && existing.data_crc == data_crc {
-                if self.get(id).is_ok() {
-                    return Ok(());
+                if let Ok(bytes) = self.get(id) {
+                    return if bytes == data { Ok(()) } else { Err(BlobError::ImmutableConflict(id)) };
                 }
             } else {
                 return Err(BlobError::ImmutableConflict(id));
             }
         }
 
-        let mut writer = self.writer.lock().unwrap();
         let rec_total = (RECORD_HEADER_LEN + data.len()) as u64;
         if writer.write_pos > VOLUME_MAGIC.len() as u64
             && writer.write_pos + rec_total > self.cfg.max_segment_bytes
@@ -194,8 +205,9 @@ impl<FS: StorageFs> VolumeStore<FS> {
         let data_offset = start_pos + RECORD_HEADER_LEN as u64;
         let seg_id = writer.seg_id;
         writer.write_pos = start_pos + frame.len() as u64;
-        drop(writer);
-
+        // Publish the in-memory index while still holding the append lock.
+        // Exact tombstone deletion uses the same lock; releasing it first
+        // would allow DELETE to be followed by a stale PUT index insertion.
         self.index.write().unwrap().insert(
             id,
             IndexEntry {
@@ -205,20 +217,43 @@ impl<FS: StorageFs> VolumeStore<FS> {
                 data_crc,
             },
         );
+        drop(writer);
         Ok(())
+    }
+
+    /// Durably removes one immutable blob and fences the exact id forever.
+    /// This is intentionally narrower than a generation barrier and is used
+    /// by the S3 orphan collector after metadata reachability has been proven.
+    pub fn delete(&self, id: BlobId) -> Result<bool, BlobError> {
+        let mut writer = self.writer.lock().unwrap();
+        if self.tombstones.read().unwrap().contains(&id) {
+            return Ok(false);
+        }
+        let hdr = encode_record_header(REC_KIND_TOMBSTONE, id, 0, 0);
+        let pos = writer.write_pos;
+        if let Err(error) = writer.file.write_at(pos, &hdr) {
+            let _ = writer.file.set_len(pos);
+            return Err(error.into());
+        }
+        // Deletion fencing must survive restart even for bulk-load volumes.
+        writer.file.sync_data()?;
+        writer.write_pos += RECORD_HEADER_LEN as u64;
+        self.tombstones.write().unwrap().insert(id);
+        Ok(self.index.write().unwrap().remove(&id).is_some())
     }
 
     /// Reads and verifies the full CRC32 of a blob.
     pub fn get(&self, id: BlobId) -> Result<Vec<u8>, BlobError> {
-        let entry = self
-            .index
-            .read()
-            .unwrap()
+        let index = self.index.read().unwrap();
+        let entry = index
             .get(&id)
             .copied()
             .ok_or(BlobError::NotFound(id))?;
 
         let segs = self.segments.read().unwrap();
+        // Pin the matching segment handle before allowing compaction to swap
+        // its file and offsets. Lock order is index -> segments everywhere.
+        drop(index);
         let file = segs
             .get(&entry.seg_id)
             .ok_or(BlobError::NotFound(id))?;
@@ -243,10 +278,8 @@ impl<FS: StorageFs> VolumeStore<FS> {
 
     /// Sub-blob range read (`offset..offset+len`) for DB SSTable pages or virtual block volumes.
     pub fn get_slice(&self, id: BlobId, offset: usize, len: usize) -> Result<Vec<u8>, BlobError> {
-        let entry = self
-            .index
-            .read()
-            .unwrap()
+        let index = self.index.read().unwrap();
+        let entry = index
             .get(&id)
             .copied()
             .ok_or(BlobError::NotFound(id))?;
@@ -261,6 +294,7 @@ impl<FS: StorageFs> VolumeStore<FS> {
         }
 
         let segs = self.segments.read().unwrap();
+        drop(index);
         let file = segs.get(&entry.seg_id).ok_or(BlobError::NotFound(id))?;
         let mut buf = vec![0u8; len];
         let n = file.read_at(entry.data_offset + offset as u64, &mut buf)?;
@@ -287,16 +321,15 @@ impl<FS: StorageFs> VolumeStore<FS> {
         up_to_generation: u32,
     ) -> Result<usize, BlobError> {
         let marker_id = BlobId::new(project_id, owner_id, up_to_generation, 0, channel, 0);
-        {
-            let mut writer = self.writer.lock().unwrap();
-            let hdr = encode_record_header(REC_KIND_BARRIER, marker_id, 0, 0);
-            let pos = writer.write_pos;
-            writer.file.write_at(pos, &hdr)?;
-            if self.cfg.sync_on_put {
-                writer.file.sync_data()?;
-            }
-            writer.write_pos += RECORD_HEADER_LEN as u64;
+        let mut writer = self.writer.lock().unwrap();
+        let hdr = encode_record_header(REC_KIND_BARRIER, marker_id, 0, 0);
+        let pos = writer.write_pos;
+        if let Err(error) = writer.file.write_at(pos, &hdr) {
+            let _ = writer.file.set_len(pos);
+            return Err(error.into());
         }
+        writer.file.sync_data()?;
+        writer.write_pos += RECORD_HEADER_LEN as u64;
 
         {
             let mut bmap = self.barriers.write().unwrap();
@@ -348,6 +381,9 @@ impl<FS: StorageFs> VolumeStore<FS> {
     }
 
     fn compact_single_segment(&self, seg_id: u32) -> Result<u64, BlobError> {
+        // Conservative serialization: prevent PUT/repair, barriers, tombstones
+        // and another compactor from invalidating the replacement snapshot.
+        let _writer = self.writer.lock().unwrap();
         let old_len = {
             let segs = self.segments.read().unwrap();
             match segs.get(&seg_id) {
@@ -380,6 +416,7 @@ impl<FS: StorageFs> VolumeStore<FS> {
                 BlobId::new(project_id, owner_id, generation, 0, channel, 0)
             })
             .collect();
+        let tombstone_markers: Vec<BlobId> = self.tombstones.read().unwrap().iter().copied().collect();
 
         let tmp_path = format!("{}.compact", segment_path(&self.dir, seg_id));
         let final_path = segment_path(&self.dir, seg_id);
@@ -413,17 +450,24 @@ impl<FS: StorageFs> VolumeStore<FS> {
             pos += RECORD_HEADER_LEN as u64;
         }
 
+        for marker_id in tombstone_markers {
+            let hdr = encode_record_header(REC_KIND_TOMBSTONE, marker_id, 0, 0);
+            tmp_file.write_at(pos, &hdr)?;
+            pos += RECORD_HEADER_LEN as u64;
+        }
+
         tmp_file.sync_data()?;
         drop(tmp_file);
 
-        self.fs.rename_atomic(&tmp_path, &final_path)?;
-        self.fs.sync_dir(&self.dir)?;
-
-        let reopened = self.fs.open_rw(&final_path, false)?;
+        // Open the replacement before rename: once rename succeeds, even a
+        // subsequent directory-sync error must not leave runtime reads using
+        // the old file while new opens use the replacement.
+        let reopened = self.fs.open_rw(&tmp_path, false)?;
         let new_len = reopened.len()?;
-        self.segments.write().unwrap().insert(seg_id, reopened);
-
+        self.fs.rename_atomic(&tmp_path, &final_path)?;
         let mut idx = self.index.write().unwrap();
+        let mut segs = self.segments.write().unwrap();
+        segs.insert(seg_id, reopened);
         for (id, updated) in new_offsets {
             if let Some(cur) = idx.get_mut(&id) {
                 if cur.seg_id == seg_id {
@@ -431,6 +475,8 @@ impl<FS: StorageFs> VolumeStore<FS> {
                 }
             }
         }
+
+        self.fs.sync_dir(&self.dir)?;
 
         Ok(old_len.saturating_sub(new_len))
     }
@@ -497,6 +543,7 @@ fn recover_segment<F: VirtualFile>(
     seg_id: u32,
     index: &mut BTreeMap<BlobId, IndexEntry>,
     barriers: &mut BTreeMap<(u32, u32, u8), u32>,
+    tombstones: &mut BTreeSet<BlobId>,
 ) -> Result<(), BlobError> {
     let file_len = file.len()?;
     if file_len < VOLUME_MAGIC.len() as u64 {
@@ -553,22 +600,25 @@ fn recover_segment<F: VirtualFile>(
 
         match kind {
             REC_KIND_PUT => {
-                let mut buf = vec![0u8; data_len as usize];
-                file.read_at(data_offset, &mut buf)?;
-                if crc32fast::hash(&buf) != data_crc {
-                    file.set_len(pos)?;
-                    file.sync_data()?;
-                    break;
+                // A complete record with a valid header but bad payload is
+                // bit-rot, not proof that the rest of the log is a torn tail.
+                // Keep its location so GET detects CRC failure and repair can
+                // rewrite it. Never truncate later durable data/fencing markers
+                // merely because this payload was corrupted.
+                let fenced = barriers
+                    .get(&(id.project_id(), id.owner_id(), id.channel()))
+                    .is_some_and(|generation| id.generation() <= *generation);
+                if !tombstones.contains(&id) && !fenced {
+                    index.insert(
+                        id,
+                        IndexEntry {
+                            seg_id,
+                            data_offset,
+                            data_len,
+                            data_crc,
+                        },
+                    );
                 }
-                index.insert(
-                    id,
-                    IndexEntry {
-                        seg_id,
-                        data_offset,
-                        data_len,
-                        data_crc,
-                    },
-                );
             }
             REC_KIND_BARRIER => {
                 let b_gen = id.generation();
@@ -581,6 +631,10 @@ fn recover_segment<F: VirtualFile>(
                         && k.channel() == id.channel()
                         && k.generation() <= b_gen)
                 });
+            }
+            REC_KIND_TOMBSTONE => {
+                tombstones.insert(id);
+                index.remove(&id);
             }
             _ => {
                 file.set_len(pos)?;
