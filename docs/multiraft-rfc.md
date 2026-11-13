@@ -17,6 +17,21 @@ An OpenRaft singleton smoke test runs with a test-only volatile store and applie
 a YADB command. It does not test durable recovery, replication, quorum loss or
 snapshots; that store deliberately cannot satisfy production durability contracts.
 
+### Revised implementation plan
+
+OpenRaft, not `DeterministicGroupCore`, is the intended consensus engine. The
+hand-written core remains an isolated experiment, not a candidate runtime. The
+next gates are: bounded three-node OpenRaft tests using a test-only in-process
+network; durable serialized vote/log storage and OpenRaft storage-suite plus crash
+tests; snapshots and recovery; authenticated, group-bound transport and lifecycle;
+then a separately designed offline migration. No existing client traffic moves
+until these gates and the cross-group semantics below are met.
+
+Separately evaluate mature HTTP, TLS, PostgreSQL wire, S3, YAML, SQL, erasure
+coding and iSCSI components as described in `ROADMAP.md`. Library selection does
+not itself prove wire or on-disk compatibility. Internal endpoints and client
+identity need explicit authentication boundaries even if TLS is adopted.
+
 ## Goals and non-goals
 
 Distribute independent metadata/data publications across independently elected

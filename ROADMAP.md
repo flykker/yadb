@@ -123,6 +123,21 @@ YADB uses ordinary filesystems; raw PDisk and NBD are not project goals.
 
 ## P1 — operations and cluster lifecycle
 
+- [x] Select OpenRaft 0.9.25 for the future Multi-Raft consensus engine; compile
+  offline and exercise a volatile singleton. This does not replace legacy Raft.
+- [ ] Stop development of the experimental hand-written group core. Its uncommitted
+  changes are not a production candidate; preserve them pending an explicit cleanup.
+- [ ] Exercise real OpenRaft in-process with three nodes: quorum loss, recovery,
+  lagging replicas and reordered/lost messages. Memory tests do not prove durability.
+- [ ] Build and audit OpenRaft durable storage, snapshots and serialized vote/log
+  writes; run OpenRaft's storage suite and crash/fault tests before daemon use.
+- [ ] Secure internal Raft RPC and client identity: separate listeners, authenticate
+  peers (evaluate rustls/mTLS), bind node and group identity, and do not trust
+  client-supplied subject headers. Existing deployment exposure must be audited.
+- [ ] Evaluate ready libraries before extending custom parsers: hyper/reqwest for
+  HTTP, ring/subtle for secret verification, pgwire, SQL/YAML parsers, S3/SigV4,
+  Reed–Solomon, and Linux LIO or SPDK for iSCSI. Check licenses, offline builds,
+  existing wire/disk compatibility and migration with golden/interop tests.
 - [x] Record the Multi-Raft dependency audit, safety invariants and migration
   gates in [docs/multiraft-rfc.md](docs/multiraft-rfc.md). This is a proposal,
   not an implementation or a commitment to unsupported transaction guarantees.
