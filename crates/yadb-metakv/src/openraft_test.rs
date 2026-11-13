@@ -1,12 +1,12 @@
-//! Volatile singleton smoke test only. Never use this store for real data.
-use std::collections::BTreeMap;
+//! Volatile in-process tests only. Never use this store or network for real data.
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Debug;
 use std::io::{self, Cursor};
 use std::ops::RangeBounds;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use openraft::error::{Fatal, RPCError, RaftError, ReplicationClosed, StreamingError, Unreachable};
+use openraft::error::{Fatal, RPCError, RaftError, RemoteError, ReplicationClosed, StreamingError, Unreachable};
 use openraft::network::RPCOption;
 use openraft::raft::{AppendEntriesRequest, AppendEntriesResponse, SnapshotResponse, VoteRequest, VoteResponse};
 use openraft::storage::{LogFlushed, RaftLogStorage, RaftStateMachine};
@@ -133,8 +133,109 @@ async fn openraft_singleton_elects_and_applies_yadb_command_in_memory() {
     let raft = YadbRaft::new(1, config, NoNetwork, memory.clone(), memory.clone()).await.unwrap();
     raft.initialize(BTreeMap::from([(1, BasicNode::new("node-1"))])).await.unwrap();
     raft.wait(Some(Duration::from_secs(5))).current_leader(1, "singleton leader").await.unwrap();
-    let response = raft.client_write(KvCommand::Put { key: "key".into(), value: b"value".to_vec() }).await.unwrap();
+    let response = tokio::time::timeout(Duration::from_secs(5), raft.client_write(KvCommand::Put { key: "key".into(), value: b"value".to_vec() })).await.unwrap().unwrap();
     assert!(matches!(response.data, KvResult::PutOk { .. }));
     assert_eq!(memory.0.lock().unwrap().state.get("key").unwrap().value, b"value");
-    raft.shutdown().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), raft.shutdown()).await.unwrap().unwrap();
+}
+
+#[derive(Default)]
+struct NetworkData {
+    nodes: BTreeMap<u32, YadbRaft>,
+    isolated: BTreeSet<u32>,
+}
+
+#[derive(Clone)]
+struct TestNetwork {
+    shared: Arc<Mutex<NetworkData>>,
+    source: u32,
+    target: u32,
+}
+
+impl TestNetwork {
+    fn peer(&self) -> Result<YadbRaft, Unreachable> {
+        let network = self.shared.lock().unwrap();
+        if network.isolated.contains(&self.source) || network.isolated.contains(&self.target) {
+            return Err(Unreachable::new(&io::Error::new(io::ErrorKind::NotConnected, "partition")));
+        }
+        network.nodes.get(&self.target).cloned().ok_or_else(||
+            Unreachable::new(&io::Error::new(io::ErrorKind::NotFound, "unknown node")))
+    }
+}
+
+impl RaftNetworkFactory<C> for TestNetwork {
+    type Network = Self;
+    async fn new_client(&mut self, target: u32, _: &BasicNode) -> Self {
+        Self { target, ..self.clone() }
+    }
+}
+
+impl RaftNetwork<C> for TestNetwork {
+    async fn append_entries(&mut self, rpc: AppendEntriesRequest<C>, _: RPCOption) -> Result<AppendEntriesResponse<u32>, RPCError<u32, BasicNode, RaftError<u32>>> {
+        let peer = self.peer()?;
+        peer.append_entries(rpc).await.map_err(|e| RPCError::RemoteError(RemoteError::new(self.target, e)))
+    }
+    async fn vote(&mut self, rpc: VoteRequest<u32>, _: RPCOption) -> Result<VoteResponse<u32>, RPCError<u32, BasicNode, RaftError<u32>>> {
+        let peer = self.peer()?;
+        peer.vote(rpc).await.map_err(|e| RPCError::RemoteError(RemoteError::new(self.target, e)))
+    }
+    async fn full_snapshot(&mut self, _: Vote<u32>, _: Snapshot<C>, _: impl std::future::Future<Output = ReplicationClosed> + Send + 'static, _: RPCOption)
+        -> Result<SnapshotResponse<u32>, StreamingError<C, Fatal<u32>>> {
+        Err(Unreachable::new(&io::Error::new(io::ErrorKind::Unsupported, "snapshots disabled")).into())
+    }
+}
+
+async fn wait_value(memory: &Memory, key: &str, value: &[u8]) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if memory.0.lock().unwrap().state.get(key).is_some_and(|v| v.value == value) { break; }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }).await.expect("replica did not apply value");
+}
+
+#[tokio::test]
+async fn openraft_three_nodes_replicate_and_recover_a_partitioned_follower() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let shared = Arc::new(Mutex::new(NetworkData::default()));
+        let config = Arc::new(openraft::Config { snapshot_policy: openraft::SnapshotPolicy::Never, ..Default::default() }.validate().unwrap());
+        let mut nodes = BTreeMap::new();
+        let mut stores = BTreeMap::new();
+        for id in 1..=3 {
+            let memory = Memory::default();
+            let network = TestNetwork { shared: shared.clone(), source: id, target: 0 };
+            let raft = YadbRaft::new(id, config.clone(), network, memory.clone(), memory.clone()).await.unwrap();
+            shared.lock().unwrap().nodes.insert(id, raft.clone());
+            stores.insert(id, memory);
+            nodes.insert(id, raft);
+        }
+        nodes[&1].initialize((1..=3).map(|id| (id, BasicNode::new(format!("node-{id}")))).collect::<BTreeMap<_, _>>()).await.unwrap();
+        let leader = nodes[&1].wait(Some(Duration::from_secs(5))).metrics(|m| m.current_leader.is_some(), "leader").await.unwrap().current_leader.unwrap();
+        let follower = (1..=3).find(|id| *id != leader).unwrap();
+        let write = |key: &str| KvCommand::Put { key: key.into(), value: b"value".to_vec() };
+        nodes[&leader].client_write(write("initial")).await.unwrap();
+        for store in stores.values() { wait_value(store, "initial", b"value").await; }
+
+        shared.lock().unwrap().isolated.insert(follower);
+        nodes[&leader].client_write(write("during-partition")).await.unwrap();
+        assert!(stores[&follower].0.lock().unwrap().state.get("during-partition").is_none());
+        shared.lock().unwrap().isolated.remove(&follower);
+        wait_value(&stores[&follower], "during-partition", b"value").await;
+
+        // Isolate both followers. A timed-out write has an unknown outcome: it
+        // may commit after connectivity returns, so never assert its rollback.
+        {
+            let mut network = shared.lock().unwrap();
+            network.isolated.extend((1..=3).filter(|id| *id != leader));
+        }
+        let result = tokio::time::timeout(Duration::from_millis(400), nodes[&leader].client_write(write("no-quorum"))).await;
+        assert!(!matches!(result, Ok(Ok(_))), "write committed without quorum");
+        for store in stores.values() {
+            assert!(store.0.lock().unwrap().state.get("no-quorum").is_none());
+        }
+        shared.lock().unwrap().isolated.clear();
+
+        for raft in nodes.values() { raft.shutdown().await.unwrap(); }
+        shared.lock().unwrap().nodes.clear();
+    }).await.expect("three-node test timed out");
 }
