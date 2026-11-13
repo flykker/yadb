@@ -5,10 +5,11 @@
 //! or make `RaftCore` safe to expose to untrusted messages. It is deliberately
 //! disconnected from the daemon and existing metadata traffic.
 
+use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 use yadb_io::{OsDirectoryLock, OsFs, StorageFs, VirtualFile};
 
-use crate::RaftRpc;
+use crate::{RaftRpc, RoleState};
 
 pub const PROTOCOL_VERSION: u16 = 1;
 
@@ -312,7 +313,7 @@ pub enum GroupRaftRecord {
     Commit { index: u64 },
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GroupRaftState {
     pub term: u64,
     pub voted_for: Option<u32>,
@@ -394,6 +395,151 @@ impl TypedGroupWal {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum GroupCoreError {
+    #[error("group identity rejected: {0:?}")]
+    Identity(IdentityError),
+    #[error("group protocol invariant rejected")]
+    Protocol,
+    #[error("group is not leader")]
+    NotLeader,
+}
+
+/// Deterministic, memory-only group core. It deliberately has no WAL, timer,
+/// network I/O or state-machine application. It is the testable protocol layer
+/// between the identity envelope and the later persistent runtime.
+pub struct DeterministicGroupCore {
+    identity: ReplicaIdentity,
+    role: RoleState,
+    term: u64,
+    voted_for: Option<u32>,
+    leader_id: Option<u32>,
+    state: GroupRaftState,
+    votes: BTreeSet<u32>,
+    next_index: BTreeMap<u32, u64>,
+}
+
+impl DeterministicGroupCore {
+    pub fn new(identity: ReplicaIdentity) -> Self {
+        Self {
+            identity, role: RoleState::Follower, term: 0, voted_for: None,
+            leader_id: None, state: GroupRaftState::default(), votes: BTreeSet::new(),
+            next_index: BTreeMap::new(),
+        }
+    }
+
+    pub fn identity(&self) -> &ReplicaIdentity { &self.identity }
+    pub fn role(&self) -> RoleState { self.role }
+    pub fn term(&self) -> u64 { self.term }
+    pub fn leader_id(&self) -> Option<u32> { self.leader_id }
+    pub fn state(&self) -> &GroupRaftState { &self.state }
+
+    fn envelope(&self, recipient: u32, rpc: RaftRpc) -> GroupEnvelope {
+        GroupEnvelope { version: PROTOCOL_VERSION, group: self.identity.group.clone(),
+            sender: self.identity.node, recipient, rpc }
+    }
+
+    fn quorum(&self) -> usize { self.identity.voters.len() / 2 + 1 }
+
+    pub fn start_election(&mut self) -> Result<Vec<GroupEnvelope>, GroupCoreError> {
+        self.term = self.term.checked_add(1).ok_or(GroupCoreError::Protocol)?;
+        self.state.term = self.term;
+        self.role = RoleState::Candidate;
+        self.voted_for = Some(self.identity.node);
+        self.leader_id = None;
+        self.votes.clear();
+        self.votes.insert(self.identity.node);
+        let last = self.state.log.last();
+        Ok(self.identity.voters.iter().filter(|&&id| id != self.identity.node).map(|&to| self.envelope(to,
+            RaftRpc::RequestVote { term: self.term, candidate_id: self.identity.node,
+                last_log_index: self.state.log.len() as u64,
+                last_log_term: last.map_or(0, |entry| entry.term) })).collect())
+    }
+
+    pub fn propose(&mut self, cmd: crate::KvCommand) -> Result<Vec<GroupEnvelope>, GroupCoreError> {
+        if self.role != RoleState::Leader { return Err(GroupCoreError::NotLeader); }
+        let index = self.state.log.len() as u64 + 1;
+        let entry = crate::LogEntry { index, term: self.term, cmd };
+        let mut next = self.state.clone();
+        next.apply(&GroupRaftRecord::ReplaceSuffix { from_index: index, entries: vec![entry.clone()] }, &self.identity)
+            .map_err(|_| GroupCoreError::Protocol)?;
+        self.state = next;
+        Ok(self.identity.voters.iter().filter(|&&id| id != self.identity.node).map(|&to| self.envelope(to,
+            RaftRpc::AppendEntries { term: self.term, leader_id: self.identity.node,
+                prev_log_index: index - 1,
+                prev_log_term: if index == 1 { 0 } else { self.state.log[index as usize - 2].term },
+                entries: vec![entry.clone()], leader_commit: self.state.commit_index })).collect())
+    }
+
+    /// Validate the envelope and peer binding before changing term, vote, log or
+    /// role. The caller supplies the transport peer identity in this simulator.
+    pub fn receive(&mut self, envelope: &GroupEnvelope, peer: u32) -> Result<Vec<GroupEnvelope>, GroupCoreError> {
+        self.identity.validate(envelope, peer).map_err(GroupCoreError::Identity)?;
+        match &envelope.rpc {
+            RaftRpc::RequestVote { term, candidate_id, last_log_index, last_log_term } => {
+                if *term < self.term { return Ok(vec![self.envelope(peer, RaftRpc::RequestVoteReply {
+                    from: self.identity.node, term: self.term, vote_granted: false })]); }
+                if *term > self.term {
+                    self.term = *term; self.state.term = *term; self.voted_for = None; self.state.voted_for = None;
+                    self.role = RoleState::Follower; self.leader_id = None;
+                }
+                let local = self.state.log.last();
+                let up_to_date = *last_log_term > local.map_or(0, |e| e.term)
+                    || (*last_log_term == local.map_or(0, |e| e.term) && *last_log_index >= self.state.log.len() as u64);
+                let grant = (*term == self.term) && up_to_date && (self.voted_for.is_none() || self.voted_for == Some(*candidate_id));
+                if grant { self.voted_for = Some(*candidate_id); self.state.voted_for = Some(*candidate_id); }
+                Ok(vec![self.envelope(peer, RaftRpc::RequestVoteReply { from: self.identity.node,
+                    term: self.term, vote_granted: grant })])
+            }
+            RaftRpc::RequestVoteReply { from: _, term, vote_granted } => {
+                if *term > self.term { self.term = *term; self.state.term = *term; self.role = RoleState::Follower;
+                    self.voted_for = None; self.state.voted_for = None; self.votes.clear(); return Ok(Vec::new()); }
+                if self.role != RoleState::Candidate || *term != self.term || !vote_granted { return Ok(Vec::new()); }
+                self.votes.insert(peer);
+                if self.votes.len() >= self.quorum() {
+                    self.role = RoleState::Leader; self.leader_id = Some(self.identity.node);
+                    self.next_index = self.identity.voters.iter().map(|&id| (id, self.state.log.len() as u64 + 1)).collect();
+                    return Ok(self.identity.voters.iter().filter(|&&id| id != self.identity.node).map(|&to| self.envelope(to,
+                        RaftRpc::AppendEntries { term: self.term, leader_id: self.identity.node,
+                            prev_log_index: self.state.log.len() as u64,
+                            prev_log_term: self.state.log.last().map_or(0, |e| e.term), entries: vec![],
+                            leader_commit: self.state.commit_index })).collect());
+                }
+                Ok(Vec::new())
+            }
+            RaftRpc::AppendEntries { term, leader_id, prev_log_index, prev_log_term, entries, leader_commit } => {
+                if *term < self.term { return Ok(vec![self.envelope(peer, RaftRpc::AppendEntriesReply {
+                    from: self.identity.node, term: self.term, success: false, match_index: self.state.log.len() as u64 })]); }
+                if *term > self.term { self.term = *term; self.state.term = *term; self.voted_for = None; self.state.voted_for = None; }
+                self.role = RoleState::Follower; self.leader_id = Some(*leader_id);
+                if *prev_log_index > self.state.log.len() as u64
+                    || (*prev_log_index > 0 && self.state.log[*prev_log_index as usize - 1].term != *prev_log_term) {
+                    return Ok(vec![self.envelope(peer, RaftRpc::AppendEntriesReply { from: self.identity.node,
+                        term: self.term, success: false, match_index: self.state.log.len() as u64 })]);
+                }
+                let from = prev_log_index + 1;
+                let mut next = self.state.clone();
+                next.apply(&GroupRaftRecord::ReplaceSuffix { from_index: from, entries: entries.clone() }, &self.identity)
+                    .map_err(|_| GroupCoreError::Protocol)?;
+                let target_commit = (*leader_commit).min(next.log.len() as u64);
+                if target_commit < next.commit_index { return Err(GroupCoreError::Protocol); }
+                next.commit_index = target_commit;
+                self.state = next;
+                Ok(vec![self.envelope(peer, RaftRpc::AppendEntriesReply { from: self.identity.node,
+                    term: self.term, success: true, match_index: self.state.log.len() as u64 })])
+            }
+            RaftRpc::AppendEntriesReply { from: _, term, success, match_index } => {
+                if *term > self.term { self.term = *term; self.state.term = *term; self.role = RoleState::Follower;
+                    self.voted_for = None; self.state.voted_for = None; self.leader_id = None; return Ok(Vec::new()); }
+                if self.role != RoleState::Leader || *term != self.term || !success || *match_index > self.state.log.len() as u64 {
+                    return Ok(Vec::new());
+                }
+                Ok(Vec::new())
+            }
+        }
+    }
+}
+
 fn descriptor_path(dir: &str) -> String {
     if dir.is_empty() { DESCRIPTOR_FILE.to_owned() } else {
         format!("{}/{DESCRIPTOR_FILE}", dir.trim_end_matches('/'))
@@ -449,9 +595,64 @@ mod tests {
 
     fn group() -> GroupIdentity { GroupIdentity { cluster: [1; 16], group: 1, incarnation: 1 } }
     fn replica() -> ReplicaIdentity { ReplicaIdentity::new(group(), 1, vec![1, 2, 3]).unwrap() }
+    fn replica_for(group_id: u64, node: u32) -> ReplicaIdentity {
+        ReplicaIdentity::new(GroupIdentity { group: group_id, ..group() }, node, vec![1, 2, 3]).unwrap()
+    }
     fn envelope() -> GroupEnvelope {
         GroupEnvelope { version: PROTOCOL_VERSION, group: group(), sender: 2, recipient: 1,
             rpc: RaftRpc::RequestVoteReply { from: 2, term: 1, vote_granted: true } }
+    }
+
+    #[test]
+    fn deterministic_cores_elect_independent_leaders_and_replicate() {
+        let mut a1 = DeterministicGroupCore::new(replica_for(1, 1));
+        let mut a2 = DeterministicGroupCore::new(replica_for(1, 2));
+        let mut a3 = DeterministicGroupCore::new(replica_for(1, 3));
+        let mut b1 = DeterministicGroupCore::new(replica_for(2, 1));
+        let mut b2 = DeterministicGroupCore::new(replica_for(2, 2));
+        let mut b3 = DeterministicGroupCore::new(replica_for(2, 3));
+
+        let a_votes = a1.start_election().unwrap();
+        let a_reply2 = a2.receive(&a_votes.iter().find(|e| e.recipient == 2).unwrap(), 1).unwrap();
+        let a_reply3 = a3.receive(&a_votes.iter().find(|e| e.recipient == 3).unwrap(), 1).unwrap();
+        a1.receive(&a_reply2[0], 2).unwrap();
+        a1.receive(&a_reply3[0], 3).unwrap();
+        assert_eq!(a1.role(), RoleState::Leader);
+
+        let b_votes = b2.start_election().unwrap();
+        let b_reply1 = b1.receive(&b_votes.iter().find(|e| e.recipient == 1).unwrap(), 2).unwrap();
+        let b_reply3 = b3.receive(&b_votes.iter().find(|e| e.recipient == 3).unwrap(), 2).unwrap();
+        b2.receive(&b_reply1[0], 1).unwrap();
+        b2.receive(&b_reply3[0], 3).unwrap();
+        assert_eq!(b2.role(), RoleState::Leader);
+        assert_eq!(a1.leader_id(), Some(1));
+        assert_eq!(b2.leader_id(), Some(2));
+
+        let a_append = a1.propose(crate::KvCommand::Put { key: "same".into(), value: vec![b'a'] }).unwrap();
+        let b_append = b2.propose(crate::KvCommand::Put { key: "same".into(), value: vec![b'b'] }).unwrap();
+        a2.receive(&a_append.iter().find(|e| e.recipient == 2).unwrap(), 1).unwrap();
+        b1.receive(&b_append.iter().find(|e| e.recipient == 1).unwrap(), 2).unwrap();
+        assert_eq!(a2.state().log[0].cmd, crate::KvCommand::Put { key: "same".into(), value: vec![b'a'] });
+        assert_eq!(b1.state().log[0].cmd, crate::KvCommand::Put { key: "same".into(), value: vec![b'b'] });
+    }
+
+    #[test]
+    fn deterministic_core_rejects_wrong_group_sender_and_recipient_without_mutation() {
+        let mut core = DeterministicGroupCore::new(replica_for(1, 1));
+        let before = (core.term(), core.role(), core.leader_id(), core.state().clone());
+        let mut wrong = envelope();
+        wrong.group.group = 99;
+        assert!(matches!(core.receive(&wrong, 2), Err(GroupCoreError::Identity(IdentityError::WrongGroup))));
+        let mut wrong = envelope();
+        wrong.recipient = 3;
+        assert!(matches!(core.receive(&wrong, 2), Err(GroupCoreError::Identity(IdentityError::WrongRecipient))));
+        let mut wrong = envelope();
+        wrong.sender = 999;
+        assert!(matches!(core.receive(&wrong, 999), Err(GroupCoreError::Identity(IdentityError::InvalidSender))));
+        let mut wrong = envelope();
+        wrong.rpc = RaftRpc::RequestVote { term: 9, candidate_id: 3, last_log_index: 0, last_log_term: 0 };
+        assert!(matches!(core.receive(&wrong, 2), Err(GroupCoreError::Identity(IdentityError::SenderMismatch))));
+        assert_eq!((core.term(), core.role(), core.leader_id(), core.state().clone()), before);
     }
 
     #[test]
