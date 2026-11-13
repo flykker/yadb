@@ -1,15 +1,16 @@
 //! Experimental, test-only file-backed OpenRaft log and vote prototype.
 //!
-//! Not suitable for production: locking, I/O error handling, group identity,
-//! recovery and the OpenRaft storage contracts need further work and testing.
+//! Not suitable for production: group identity, recovery, failure handling and
+//! the OpenRaft storage contracts need further work and testing.
 
 use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::ops::RangeBounds;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
+use yadb_io::OsDirectoryLock;
 
 use openraft::storage::{LogFlushed, RaftLogReader, RaftLogStorage};
 use openraft::{Entry, ErrorSubject, ErrorVerb, LogId, LogState, StorageError, Vote};
@@ -45,17 +46,16 @@ pub struct DurableOpenRaftLog {
 }
 
 struct Inner {
-    dir: PathBuf,
     file: File,
-    _lock: File,
+    _lock: OsDirectoryLock,
     state: State,
+    failed: bool,
+    #[cfg(test)]
+    fault: Option<Fault>,
 }
 
-impl Drop for Inner {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(self.dir.join("openraft.lock"));
-    }
-}
+#[derive(Clone, Copy)]
+enum Fault { WritePartial, SyncBefore, SyncAfter }
 
 fn storage_error(subject: ErrorSubject<u32>, verb: ErrorVerb, error: io::Error) -> StorageError<u32> {
     StorageError::from_io_error(subject, verb, error)
@@ -163,37 +163,56 @@ fn recover(file: &mut File) -> io::Result<State> {
 }
 
 impl DurableOpenRaftLog {
-    /// Opens one node's log directory and acquires an exclusive ordinary-file lock.
+    /// Opens one node's log directory and acquires a cooperative OS directory lock.
     pub fn open(dir: impl AsRef<Path>) -> io::Result<Self> {
         let dir = dir.as_ref().to_path_buf();
         fs::create_dir_all(&dir)?;
-        let lock_path = dir.join("openraft.lock");
-        let lock = OpenOptions::new().write(true).create_new(true).open(&lock_path)?;
+        let lock = OsDirectoryLock::try_acquire(&dir)?;
         let path = dir.join("openraft.log");
-        let mut file = OpenOptions::new().create(true).read(true).append(true).open(&path)?;
-        if file.metadata()?.len() == 0 {
+        let (mut file, created) = match OpenOptions::new().create_new(true).read(true).append(true).open(&path) {
+            Ok(file) => (file, true),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists =>
+                (OpenOptions::new().read(true).append(true).open(&path)?, false),
+            Err(e) => return Err(e),
+        };
+        if created {
             file.write_all(MAGIC)?;
             file.sync_data()?;
             File::open(&dir)?.sync_all()?;
         }
-        let state = match recover(&mut file) {
-            Ok(state) => state,
-            Err(error) => {
-                let _ = fs::remove_file(&lock_path);
-                return Err(error);
-            }
-        };
-        Ok(Self { inner: Arc::new(Mutex::new(Inner { dir, file, _lock: lock, state })) })
+        let state = recover(&mut file)?;
+        // A process-only restart may still see bytes whose previous sync failed.
+        file.sync_data()?;
+        File::open(&dir)?.sync_all()?;
+        Ok(Self { inner: Arc::new(Mutex::new(Inner { file, _lock: lock, state, failed: false, fault: None })) })
     }
 
     fn append_durable(&self, record: &Record) -> Result<(), StorageError<u32>> {
         let mut inner = self.inner.lock().unwrap();
+        if inner.failed {
+            return Err(storage_error(ErrorSubject::Store, ErrorVerb::Write, io::Error::other("storage requires recovery")));
+        }
         if let Record::Append(entries) = record {
             validate_append_state(&inner.state, entries)
                 .map_err(|error| storage_error(ErrorSubject::Logs, ErrorVerb::Write, error))?;
         }
-        append_frame(&mut inner.file, record)
-            .map_err(|error| storage_error(ErrorSubject::Logs, ErrorVerb::Write, error))?;
+        let result = match inner.fault.take() {
+            Some(Fault::WritePartial) => encode(record).and_then(|frame| {
+                inner.file.write_all(&frame[..frame.len() / 2])?;
+                Err(io::Error::other("simulated partial write"))
+            }),
+            Some(Fault::SyncBefore) => encode(record).and_then(|frame| {
+                inner.file.write_all(&frame)?;
+                Err(io::Error::other("simulated sync failure before persistence"))
+            }),
+            Some(Fault::SyncAfter) => append_frame(&mut inner.file, record)
+                .and_then(|_| Err(io::Error::other("simulated sync failure after persistence"))),
+            None => append_frame(&mut inner.file, record),
+        };
+        if let Err(error) = result {
+            inner.failed = true;
+            return Err(storage_error(ErrorSubject::Logs, ErrorVerb::Write, error));
+        }
         apply_record(&mut inner.state, record.clone())
             .map_err(|error| storage_error(ErrorSubject::Logs, ErrorVerb::Write, error))
     }
@@ -208,7 +227,9 @@ impl RaftLogReader<C> for DurableOpenRaftLog {
     async fn try_get_log_entries<R: RangeBounds<u64> + Clone + Debug + Send>(
         &mut self, range: R,
     ) -> Result<Vec<Entry<C>>, StorageError<u32>> {
-        Ok(self.inner.lock().unwrap().state.log.range(range).map(|(_, e)| e.clone()).collect())
+        let inner = self.inner.lock().unwrap();
+        if inner.failed { return Err(storage_error(ErrorSubject::Store, ErrorVerb::Read, io::Error::other("storage requires recovery"))); }
+        Ok(inner.state.log.range(range).map(|(_, e)| e.clone()).collect())
     }
 }
 
@@ -217,6 +238,7 @@ impl RaftLogStorage<C> for DurableOpenRaftLog {
 
     async fn get_log_state(&mut self) -> Result<LogState<C>, StorageError<u32>> {
         let inner = self.inner.lock().unwrap();
+        if inner.failed { return Err(storage_error(ErrorSubject::Store, ErrorVerb::Read, io::Error::other("storage requires recovery"))); }
         Ok(LogState {
             last_purged_log_id: inner.state.purged,
             last_log_id: inner.state.log.last_key_value().map(|(_, e)| e.log_id).or(inner.state.purged),
@@ -230,14 +252,16 @@ impl RaftLogStorage<C> for DurableOpenRaftLog {
     }
 
     async fn read_vote(&mut self) -> Result<Option<Vote<u32>>, StorageError<u32>> {
-        Ok(self.inner.lock().unwrap().state.vote)
+        let inner = self.inner.lock().unwrap();
+        if inner.failed { return Err(storage_error(ErrorSubject::Store, ErrorVerb::Read, io::Error::other("storage requires recovery"))); }
+        Ok(inner.state.vote)
     }
 
     async fn append<I>(&mut self, entries: I, callback: LogFlushed<C>) -> Result<(), StorageError<u32>>
     where I: IntoIterator<Item = Entry<C>> + Send, I::IntoIter: Send {
         let entries: Vec<_> = entries.into_iter().collect();
         validate_entries(&entries).map_err(|error| storage_error(ErrorSubject::Logs, ErrorVerb::Write, error))?;
-        if !entries.is_empty() { self.append_durable(&Record::Append(entries))?; }
+        self.append_durable(&Record::Append(entries))?;
         callback.log_io_completed(Ok(()));
         Ok(())
     }
@@ -256,6 +280,7 @@ mod tests {
     use super::*;
     use crate::KvCommand;
     use openraft::{CommittedLeaderId, EntryPayload};
+    use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     struct TempDir(PathBuf);
@@ -324,5 +349,44 @@ mod tests {
         assert!(DurableOpenRaftLog::open(&dir.0).is_err());
         drop(first);
         assert!(DurableOpenRaftLog::open(&dir.0).is_ok());
+    }
+
+    #[test]
+    fn partial_write_poisoned_until_reopen_which_fails_closed() {
+        let dir = TempDir::new();
+        let store = DurableOpenRaftLog::open(&dir.0).unwrap();
+        store.append_durable(&Record::Vote(Vote::new(1, 1))).unwrap();
+        store.inner.lock().unwrap().fault = Some(Fault::WritePartial);
+        assert!(store.append_durable(&Record::Vote(Vote::new(2, 1))).is_err());
+        assert!(store.append_durable(&Record::Vote(Vote::new(3, 1))).is_err());
+        drop(store);
+        let path = dir.0.join("openraft.log");
+        let before = fs::read(&path).unwrap();
+        assert!(DurableOpenRaftLog::open(&dir.0).is_err());
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn sync_errors_poison_writer_and_reopen_resyncs_visible_record() {
+        for fault in [Fault::SyncBefore, Fault::SyncAfter] {
+            let dir = TempDir::new();
+            let store = DurableOpenRaftLog::open(&dir.0).unwrap();
+            store.append_durable(&Record::Vote(Vote::new(1, 1))).unwrap();
+            store.inner.lock().unwrap().fault = Some(fault);
+            assert!(store.append_durable(&Record::Vote(Vote::new(2, 1))).is_err());
+            assert!(store.append_durable(&Record::Vote(Vote::new(3, 1))).is_err());
+            drop(store);
+            let mut reopened = DurableOpenRaftLog::open(&dir.0).unwrap();
+            assert_eq!(reopened.read_vote().await.unwrap(), Some(Vote::new(2, 1)));
+        }
+    }
+
+    #[test]
+    fn existing_empty_log_is_not_reinitialized() {
+        let dir = TempDir::new();
+        let path = dir.0.join("openraft.log");
+        File::create(&path).unwrap();
+        assert!(DurableOpenRaftLog::open(&dir.0).is_err());
+        assert_eq!(fs::metadata(path).unwrap().len(), 0);
     }
 }

@@ -26,11 +26,12 @@ This simulated partition is not a durability, snapshot, authenticated transport,
 message reordering, or exhaustive consensus-safety test.
 
 A test-only file-backed OpenRaft log/vote prototype now uses framed records with
-CRC, serialized writes, `sync_data()` before `LogFlushed`, restart replay, suffix
-replacement, exclusive lock ownership, and fail-closed malformed-tail handling.
+CRC, serialized writes, `sync_data()` before `LogFlushed`, reopen replay, suffix
+replacement, cooperative OS directory locking, and fail-closed malformed-tail handling.
 It is not production storage: it is not wired into the daemon, does not persist
-the state machine or snapshots, has no fault-injected I/O tests or stale-lock
-recovery policy, and has not passed OpenRaft's complete storage test suite.
+the state machine or snapshots, and has not passed OpenRaft's complete storage test
+suite. Simulated partial-write and sync errors poison the handle until reopen;
+these tests do not establish power-loss safety or group identity binding.
 
 ### Revised implementation plan
 
