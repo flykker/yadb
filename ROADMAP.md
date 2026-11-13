@@ -27,6 +27,11 @@ YADB uses ordinary filesystems; raw PDisk and NBD are not project goals.
   election, and verifies after convergence that each failed request is either
   absent or present with exactly its original value. It does not claim a client
   can determine which outcome occurred without a status/idempotency API.
+- [x] Repeat the native-client three-node recovery run with explicit confirmation
+  that SQL/S3 publication replies were dropped. After election and convergence,
+  record each ambiguous result and verify it survives a full SIGKILL/restart of
+  all nodes. This tests process failure with retained filesystem state, not
+  hardware power loss or arbitrary partial writeback.
 - [x] Investigate intermittent responses observed before fault injection while
   running the three-node E2E through local peer proxies. The failures were caused
   by the test proxy's default TCP listen backlog of 5: concurrent Raft/VDisk

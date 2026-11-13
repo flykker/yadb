@@ -742,6 +742,8 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
                     proxies[old, peer].dropped_raft_reply.clear()
 
                 def recover():
+                    assert proxies[old, delivered].dropped_raft_reply.is_set(), (
+                        f"{label}: publication response fault did not trigger")
                     proxies[old, delivered].raft_reply_fault = None
                     proxies[old, blocked].raft_request_fault = None
                     for peer in peers:
@@ -765,7 +767,6 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
                             break
                         assert time.monotonic() < deadline, statuses
                         time.sleep(.1)
-                    print(f"PASS ambiguous {label} write: error did not imply rollback")
 
                 return recover
 
@@ -790,6 +791,8 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
             assert s3_check[0] in (200, 404), s3_check
             if s3_check[0] == 200:
                 assert s3_check[2] == b"ambiguous-s3", s3_check
+            s3_outcome = (s3_check[0], s3_check[2])
+            print("PASS ambiguous S3 write: error did not imply rollback")
 
             # SQL: same transport fault at the metadata commit boundary. The
             # INSERT is not retried; after convergence only 0 or 1 exact row is
@@ -815,8 +818,31 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
             sql_fault.close()
             recover()
             sql_check = Pg(19100+old)
-            assert sql_check.rows("SELECT balance FROM wire WHERE id=96;") in ([], [["996"]])
+            sql_outcome = sql_check.rows("SELECT balance FROM wire WHERE id=96;")
+            assert sql_outcome in ([], [["996"]])
             sql_check.close()
+            print("PASS ambiguous SQL write: error did not imply rollback")
+
+            # Once the new leader has converged, neither accepted outcome may
+            # change across a full process restart of the same storage files.
+            for node in nodes:
+                node.kill()
+            for node in nodes:
+                node.wait(timeout=10)
+            nodes[:] = [start_node(i) for i in range(1, 4)]
+            for i in range(1, 4):
+                wait(19000+i)
+                deadline = time.monotonic()+20
+                while "billing/ledger" not in json.loads(request(19000+i, "GET", "/v1/status")[2])["databases"]:
+                    assert time.monotonic() < deadline, "control cache not recovered after ambiguous writes"
+                    time.sleep(.05)
+            restart_s3 = signed(19202, "GET", ambiguous_s3_key)
+            assert (restart_s3[0], restart_s3[2]) == s3_outcome, (s3_outcome, restart_s3)
+            restart_sql = Pg(19102)
+            assert restart_sql.rows("SELECT balance FROM wire WHERE id=96;") == sql_outcome
+            assert restart_sql.rows("SELECT balance FROM wire WHERE id=1;") == [["90"]]
+            restart_sql.close()
+            print("PASS ambiguous SQL/S3 outcomes preserved through full cluster restart")
 
             # Leave the current leader alive but remove both voting peers. A
             # rejected or timed-out write may still commit after recovery, so do
