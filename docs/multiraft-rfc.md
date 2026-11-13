@@ -31,7 +31,9 @@ replacement, cooperative OS directory locking, and fail-closed malformed-tail ha
 It is not production storage: it is not wired into the daemon, does not persist
 the state machine or snapshots, and has not passed OpenRaft's complete storage test
 suite. Simulated partial-write and sync errors poison the handle until reopen;
-these tests do not establish power-loss safety or group identity binding.
+these tests do not establish power-loss safety. The experimental log header binds
+cluster, group, incarnation and node, not the mutable OpenRaft membership; creation
+and reopening are separate and identity mismatch is rejected without modifying data.
 
 ### Revised implementation plan
 

@@ -137,7 +137,8 @@ YADB uses ordinary filesystems; raw PDisk and NBD are not project goals.
   A `#[cfg(test)]` file-backed prototype now exercises serialized framed vote/log
   writes, reopen, suffix replacement, OS directory lock ownership and fail-closed
   corruption handling. Simulated partial writes and sync errors poison the handle;
-  these tests do not simulate power loss. Group identity, broader fault injection,
+  these tests do not simulate power loss. The test log binds cluster/group/incarnation
+  and node identity, with separate create/open paths; broader fault injection,
   snapshots, state-machine persistence and OpenRaft storage-suite coverage remain open.
 - [ ] Secure internal Raft RPC and client identity: separate listeners, authenticate
   peers (evaluate rustls/mTLS), bind node and group identity, and do not trust

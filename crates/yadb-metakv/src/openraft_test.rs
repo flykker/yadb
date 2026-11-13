@@ -147,7 +147,8 @@ async fn openraft_singleton_uses_durable_file_log_across_reopen() {
         std::process::id(),
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
     ));
-    let log = DurableOpenRaftLog::open(&dir).unwrap();
+    let identity = crate::multiraft::ReplicaIdentity::new(crate::multiraft::GroupIdentity { cluster: [1; 16], group: 1, incarnation: 1 }, 1, vec![1]).unwrap();
+    let log = DurableOpenRaftLog::create(&dir, &identity).unwrap();
     let state = Memory::default();
     let config = Arc::new(openraft::Config {
         snapshot_policy: openraft::SnapshotPolicy::Never,
@@ -164,7 +165,7 @@ async fn openraft_singleton_uses_durable_file_log_across_reopen() {
     drop(raft);
     drop(log);
 
-    let reopened = DurableOpenRaftLog::open(&dir).unwrap();
+    let reopened = DurableOpenRaftLog::open(&dir, &identity).unwrap();
     let mut reader = reopened.clone();
     let entries = reader.try_get_log_entries(0..u64::MAX).await.unwrap();
     assert!(entries.iter().any(|entry| matches!(

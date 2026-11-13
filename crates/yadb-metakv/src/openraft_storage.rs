@@ -17,8 +17,10 @@ use openraft::{Entry, ErrorSubject, ErrorVerb, LogId, LogState, StorageError, Vo
 use serde::{Deserialize, Serialize};
 
 use crate::openraft_runtime::YadbRaftTypeConfig as C;
+use crate::multiraft::ReplicaIdentity;
 
-const MAGIC: &[u8; 8] = b"YORLOG01";
+const MAGIC: &[u8; 8] = b"YORLOG02";
+const IDENTITY_LEN: usize = 44;
 const FRAME_MAGIC: &[u8; 4] = b"YORF";
 const FRAME_HEADER_LEN: usize = 12;
 const MAX_FRAME_PAYLOAD: usize = 16 * 1024 * 1024;
@@ -130,16 +132,28 @@ fn apply_record(state: &mut State, record: Record) -> io::Result<()> {
     Ok(())
 }
 
-fn recover(file: &mut File) -> io::Result<State> {
+fn header(identity: &ReplicaIdentity) -> Vec<u8> {
+    let mut result = Vec::with_capacity(IDENTITY_LEN + 8);
+    result.extend_from_slice(MAGIC);
+    result.extend_from_slice(&identity.group().cluster);
+    result.extend_from_slice(&identity.group().group.to_le_bytes());
+    result.extend_from_slice(&identity.group().incarnation.to_le_bytes());
+    result.extend_from_slice(&identity.node().to_le_bytes());
+    result.extend_from_slice(&crc32fast::hash(&result).to_le_bytes());
+    result
+}
+
+fn recover(file: &mut File, identity: &ReplicaIdentity) -> io::Result<State> {
     let mut bytes = Vec::new();
     file.seek(SeekFrom::Start(0))?;
     file.read_to_end(&mut bytes)?;
-    if bytes.len() < MAGIC.len() || &bytes[..MAGIC.len()] != MAGIC {
-        return Err(invalid("invalid OpenRaft log magic"));
+    let expected = header(identity);
+    if bytes.len() < expected.len() || bytes[..expected.len()] != expected {
+        return Err(invalid("invalid OpenRaft log header or replica identity"));
     }
 
     let mut state = State::default();
-    let mut pos = MAGIC.len();
+    let mut pos = expected.len();
     while pos < bytes.len() {
         if bytes.len() - pos < FRAME_HEADER_LEN || &bytes[pos..pos + 4] != FRAME_MAGIC {
             return Err(invalid("truncated or invalid OpenRaft log frame"));
@@ -163,24 +177,25 @@ fn recover(file: &mut File) -> io::Result<State> {
 }
 
 impl DurableOpenRaftLog {
-    /// Opens one node's log directory and acquires a cooperative OS directory lock.
-    pub fn open(dir: impl AsRef<Path>) -> io::Result<Self> {
+    /// Explicitly create a new test log. Existing files are never overwritten.
+    pub fn create(dir: impl AsRef<Path>, identity: &ReplicaIdentity) -> io::Result<Self> {
         let dir = dir.as_ref().to_path_buf();
         fs::create_dir_all(&dir)?;
         let lock = OsDirectoryLock::try_acquire(&dir)?;
         let path = dir.join("openraft.log");
-        let (mut file, created) = match OpenOptions::new().create_new(true).read(true).append(true).open(&path) {
-            Ok(file) => (file, true),
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists =>
-                (OpenOptions::new().read(true).append(true).open(&path)?, false),
-            Err(e) => return Err(e),
-        };
-        if created {
-            file.write_all(MAGIC)?;
-            file.sync_data()?;
-            File::open(&dir)?.sync_all()?;
-        }
-        let state = recover(&mut file)?;
+        let mut file = OpenOptions::new().create_new(true).read(true).append(true).open(&path)?;
+        file.write_all(&header(identity))?;
+        file.sync_data()?;
+        File::open(&dir)?.sync_all()?;
+        Ok(Self { inner: Arc::new(Mutex::new(Inner { file, _lock: lock, state: State::default(), failed: false, fault: None })) })
+    }
+
+    /// Reopen only an existing log for the same group incarnation and node.
+    pub fn open(dir: impl AsRef<Path>, identity: &ReplicaIdentity) -> io::Result<Self> {
+        let dir = dir.as_ref();
+        let lock = OsDirectoryLock::try_acquire(dir)?;
+        let mut file = OpenOptions::new().read(true).append(true).open(dir.join("openraft.log"))?;
+        let state = recover(&mut file, identity)?;
         // A process-only restart may still see bytes whose previous sync failed.
         file.sync_data()?;
         File::open(&dir)?.sync_all()?;
@@ -294,6 +309,10 @@ mod tests {
     }
     impl Drop for TempDir { fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); } }
 
+    fn identity() -> ReplicaIdentity {
+        ReplicaIdentity::new(crate::multiraft::GroupIdentity { cluster: [1; 16], group: 1, incarnation: 1 }, 1, vec![1]).unwrap()
+    }
+
     fn entry(index: u64) -> Entry<C> {
         Entry { log_id: LogId::new(CommittedLeaderId::new(1, 1), index), payload: EntryPayload::Normal(KvCommand::Put {
             key: format!("k{index}"), value: vec![index as u8],
@@ -303,12 +322,12 @@ mod tests {
     #[tokio::test]
     async fn vote_and_log_survive_restart_and_suffix_replacement() {
         let dir = TempDir::new();
-        let store = DurableOpenRaftLog::open(&dir.0).unwrap();
+        let store = DurableOpenRaftLog::create(&dir.0, &identity()).unwrap();
         store.append_durable(&Record::Vote(Vote::new(4, 2))).unwrap();
         store.append_durable(&Record::Append(vec![entry(0), entry(1), entry(2), entry(3)])).unwrap();
         store.append_durable(&Record::Append(vec![entry(2)])).unwrap();
         drop(store);
-        let reopened = DurableOpenRaftLog::open(&dir.0).unwrap();
+        let reopened = DurableOpenRaftLog::open(&dir.0, &identity()).unwrap();
         let mut reopened_reader = reopened.clone();
         assert_eq!(reopened_reader.read_vote().await.unwrap(), Some(Vote::new(4, 2)));
         let entries = reopened.read_entries(1, 4);
@@ -320,41 +339,41 @@ mod tests {
     #[test]
     fn truncated_or_corrupt_tail_fails_closed() {
         let dir = TempDir::new();
-        let store = DurableOpenRaftLog::open(&dir.0).unwrap();
+        let store = DurableOpenRaftLog::create(&dir.0, &identity()).unwrap();
         store.append_durable(&Record::Vote(Vote::new(1, 1))).unwrap();
         drop(store);
         let path = dir.0.join("openraft.log");
         let mut file = OpenOptions::new().append(true).open(&path).unwrap();
         file.write_all(b"YORF\x08\x00").unwrap();
         drop(file);
-        assert!(DurableOpenRaftLog::open(&dir.0).is_err());
+        assert!(DurableOpenRaftLog::open(&dir.0, &identity()).is_err());
     }
 
     #[test]
     fn append_with_a_hole_is_rejected_without_changing_memory() {
         let dir = TempDir::new();
-        let store = DurableOpenRaftLog::open(&dir.0).unwrap();
+        let store = DurableOpenRaftLog::create(&dir.0, &identity()).unwrap();
         store.append_durable(&Record::Append(vec![entry(0), entry(1)])).unwrap();
         assert!(store.append_durable(&Record::Append(vec![entry(3)] )).is_err());
         assert_eq!(store.read_entries(1, 4).len(), 1);
         drop(store);
-        let reopened = DurableOpenRaftLog::open(&dir.0).unwrap();
+        let reopened = DurableOpenRaftLog::open(&dir.0, &identity()).unwrap();
         assert_eq!(reopened.read_entries(1, 4).len(), 1);
     }
 
     #[test]
     fn second_open_is_rejected_while_first_handle_is_alive() {
         let dir = TempDir::new();
-        let first = DurableOpenRaftLog::open(&dir.0).unwrap();
-        assert!(DurableOpenRaftLog::open(&dir.0).is_err());
+        let first = DurableOpenRaftLog::create(&dir.0, &identity()).unwrap();
+        assert!(DurableOpenRaftLog::open(&dir.0, &identity()).is_err());
         drop(first);
-        assert!(DurableOpenRaftLog::open(&dir.0).is_ok());
+        assert!(DurableOpenRaftLog::open(&dir.0, &identity()).is_ok());
     }
 
     #[test]
     fn partial_write_poisoned_until_reopen_which_fails_closed() {
         let dir = TempDir::new();
-        let store = DurableOpenRaftLog::open(&dir.0).unwrap();
+        let store = DurableOpenRaftLog::create(&dir.0, &identity()).unwrap();
         store.append_durable(&Record::Vote(Vote::new(1, 1))).unwrap();
         store.inner.lock().unwrap().fault = Some(Fault::WritePartial);
         assert!(store.append_durable(&Record::Vote(Vote::new(2, 1))).is_err());
@@ -362,7 +381,7 @@ mod tests {
         drop(store);
         let path = dir.0.join("openraft.log");
         let before = fs::read(&path).unwrap();
-        assert!(DurableOpenRaftLog::open(&dir.0).is_err());
+        assert!(DurableOpenRaftLog::open(&dir.0, &identity()).is_err());
         assert_eq!(fs::read(&path).unwrap(), before);
     }
 
@@ -370,13 +389,13 @@ mod tests {
     async fn sync_errors_poison_writer_and_reopen_resyncs_visible_record() {
         for fault in [Fault::SyncBefore, Fault::SyncAfter] {
             let dir = TempDir::new();
-            let store = DurableOpenRaftLog::open(&dir.0).unwrap();
+            let store = DurableOpenRaftLog::create(&dir.0, &identity()).unwrap();
             store.append_durable(&Record::Vote(Vote::new(1, 1))).unwrap();
             store.inner.lock().unwrap().fault = Some(fault);
             assert!(store.append_durable(&Record::Vote(Vote::new(2, 1))).is_err());
             assert!(store.append_durable(&Record::Vote(Vote::new(3, 1))).is_err());
             drop(store);
-            let mut reopened = DurableOpenRaftLog::open(&dir.0).unwrap();
+            let mut reopened = DurableOpenRaftLog::open(&dir.0, &identity()).unwrap();
             assert_eq!(reopened.read_vote().await.unwrap(), Some(Vote::new(2, 1)));
         }
     }
@@ -386,7 +405,32 @@ mod tests {
         let dir = TempDir::new();
         let path = dir.0.join("openraft.log");
         File::create(&path).unwrap();
-        assert!(DurableOpenRaftLog::open(&dir.0).is_err());
+        assert!(DurableOpenRaftLog::open(&dir.0, &identity()).is_err());
         assert_eq!(fs::metadata(path).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn wrong_identity_and_missing_log_never_modify_data() {
+        let dir = TempDir::new();
+        assert!(DurableOpenRaftLog::open(&dir.0, &identity()).is_err());
+        let store = DurableOpenRaftLog::create(&dir.0, &identity()).unwrap();
+        store.append_durable(&Record::Vote(Vote::new(1, 1))).unwrap();
+        drop(store);
+        let path = dir.0.join("openraft.log");
+        let before = fs::read(&path).unwrap();
+        let base = identity().group().clone();
+        let variants = [
+            ReplicaIdentity::new(crate::multiraft::GroupIdentity { cluster: [2; 16], ..base.clone() }, 1, vec![1]).unwrap(),
+            ReplicaIdentity::new(crate::multiraft::GroupIdentity { group: 2, ..base.clone() }, 1, vec![1]).unwrap(),
+            ReplicaIdentity::new(crate::multiraft::GroupIdentity { incarnation: 2, ..base.clone() }, 1, vec![1]).unwrap(),
+            ReplicaIdentity::new(base, 2, vec![2]).unwrap(),
+        ];
+        for other in variants {
+            assert!(DurableOpenRaftLog::open(&dir.0, &other).is_err());
+            assert_eq!(fs::read(&path).unwrap(), before);
+        }
+        assert!(DurableOpenRaftLog::create(&dir.0, &identity()).is_err());
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert!(DurableOpenRaftLog::open(&dir.0, &identity()).is_ok());
     }
 }
