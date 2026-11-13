@@ -41,11 +41,40 @@ pub struct OsFs {
     root: PathBuf,
 }
 
+/// Advisory exclusive lock on an existing directory inode, held until dropped.
+/// All owners must cooperate and lock the same directory. The directory must not
+/// be renamed, removed or replaced while in use; network filesystems and hostile
+/// filesystem mutation are outside this primitive's contract. This does not
+/// create or sync directories and does not lock legacy users of `OsFs`.
+pub struct OsDirectoryLock {
+    _directory: File,
+}
+
+impl OsDirectoryLock {
+    pub fn try_acquire(path: impl AsRef<Path>) -> IoResult<Self> {
+        let directory = File::open(path)?;
+        if !directory.metadata()?.is_dir() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "lock target is not a directory"));
+        }
+        directory.try_lock()?;
+        Ok(Self { _directory: directory })
+    }
+}
+
 impl OsFs {
     pub fn new(root: impl AsRef<Path>) -> IoResult<Self> {
         let root = root.as_ref().to_path_buf();
         fs::create_dir_all(&root)?;
         Ok(Self { root })
+    }
+
+    /// Lock an existing directory under this filesystem root. Callers must use a
+    /// trusted, normalized relative path; do not accept `..` from remote input.
+    pub fn try_lock_directory(&self, dir: &str) -> IoResult<OsDirectoryLock> {
+        if Path::new(dir).components().any(|c| !matches!(c, std::path::Component::Normal(_))) && !dir.is_empty() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "directory path must be relative and normalized"));
+        }
+        OsDirectoryLock::try_acquire(self.resolve(dir))
     }
 
     fn resolve(&self, rel: &str) -> PathBuf {
@@ -487,6 +516,32 @@ impl StorageFs for SimFs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn directory_lock_child() {
+        if let Some(path) = std::env::var_os("YADB_DIRECTORY_LOCK_TEST") {
+            assert!(OsDirectoryLock::try_acquire(path).is_err());
+        }
+    }
+
+    #[test]
+    fn directory_lock_excludes_other_handles_and_processes() {
+        let base = std::env::var_os("YADB_TEST_TMPDIR")
+            .map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
+        let dir = base.join(format!("yadb-directory-lock-{}", std::process::id()));
+        fs::create_dir(&dir).unwrap();
+        let lock = OsDirectoryLock::try_acquire(&dir).unwrap();
+        assert!(OsDirectoryLock::try_acquire(&dir).is_err());
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "tests::directory_lock_child"])
+            .env("YADB_DIRECTORY_LOCK_TEST", &dir)
+            .status().unwrap();
+        assert!(status.success());
+        drop(lock);
+        let reacquired = OsDirectoryLock::try_acquire(&dir).unwrap();
+        drop(reacquired);
+        fs::remove_dir(&dir).unwrap();
+    }
 
     #[test]
     fn sync_data_error_does_not_imply_persistence_or_rollback() {

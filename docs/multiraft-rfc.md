@@ -123,6 +123,10 @@ experimental `multiraft` module validates configuration and message identity and
 provides a separately provisioned identity descriptor. This descriptor is not
 bound to a WAL and requires externally provided exclusive ownership and durable
 directory provisioning; it does not open a WAL, authenticate peers, or dispatch RPCs.
+An experimental OS directory lock and locked descriptor wrapper exist, but are
+not wired to a group runtime. The lock is advisory and assumes cooperating
+processes and a directory that is not renamed or replaced during use. It provides
+no exclusion against legacy code that does not acquire it.
 Before attaching a core, implement durable identity binding, exclusive ownership,
 membership and structural validation, fail-closed recovery, and bounded resource
 handling. The existing recovery can truncate a corrupt frame and does not prove

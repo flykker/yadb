@@ -6,7 +6,7 @@
 //! disconnected from the daemon and existing metadata traffic.
 
 use serde::{Deserialize, Serialize};
-use yadb_io::{StorageFs, VirtualFile};
+use yadb_io::{OsDirectoryLock, OsFs, StorageFs, VirtualFile};
 
 use crate::RaftRpc;
 
@@ -90,6 +90,27 @@ pub enum DescriptorError {
     Mismatch,
     #[error("replica identity I/O: {0}")]
     Io(#[from] std::io::Error),
+}
+
+/// OS-only experimental descriptor owner. Holds an advisory directory lock for
+/// its lifetime; all users must cooperate and must not replace the directory.
+/// This does not provide WAL ownership, replay, or a runnable replica.
+pub struct LockedDescriptor {
+    _lock: OsDirectoryLock,
+}
+
+impl LockedDescriptor {
+    pub fn bootstrap(fs: &OsFs, dir: &str, identity: &ReplicaIdentity) -> Result<Self, DescriptorError> {
+        let lock = fs.try_lock_directory(dir)?;
+        bootstrap_descriptor(fs, dir, identity)?;
+        Ok(Self { _lock: lock })
+    }
+
+    pub fn open(fs: &OsFs, dir: &str, identity: &ReplicaIdentity) -> Result<Self, DescriptorError> {
+        let lock = fs.try_lock_directory(dir)?;
+        verify_descriptor(fs, dir, identity)?;
+        Ok(Self { _lock: lock })
+    }
 }
 
 fn descriptor_bytes(identity: &ReplicaIdentity) -> Vec<u8> {
@@ -243,6 +264,22 @@ mod tests {
         fs.open_rw("group/raft.wal", true).unwrap().write_at(0, b"YADBWAL1").unwrap();
         assert!(matches!(bootstrap_descriptor(&fs, "group", &replica()), Err(DescriptorError::DirectoryNotEmpty)));
         assert!(matches!(verify_descriptor(&fs, "group", &replica()), Err(DescriptorError::Io(_))));
+    }
+
+    #[test]
+    fn os_descriptor_owner_excludes_second_owner() {
+        let base = std::env::var_os("YADB_TEST_TMPDIR").map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let dir = base.join(format!("yadb-descriptor-lock-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let fs = OsFs::new(&dir).unwrap();
+        let first = LockedDescriptor::bootstrap(&fs, "", &replica()).unwrap();
+        assert!(LockedDescriptor::open(&fs, "", &replica()).is_err());
+        drop(first);
+        let second = LockedDescriptor::open(&fs, "", &replica()).unwrap();
+        drop(second);
+        std::fs::remove_file(dir.join(DESCRIPTOR_FILE)).unwrap();
+        std::fs::remove_dir(dir).unwrap();
     }
 
     #[test]
