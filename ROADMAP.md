@@ -8,6 +8,11 @@ YADB uses ordinary filesystems; raw PDisk and NBD are not project goals.
 - [ ] Finish the protocol review: SCSI allocation lengths and residuals, PostgreSQL
   transaction errors, and S3 conditional/concurrent reads. Reproduce suspected bugs
   and add regression tests before claiming fixes.
+- [x] Exercise pgwire failed-transaction handling after duplicate-key DML: confirm
+  25P02 for subsequent statements, ROLLBACK and connection reuse with no buffered
+  changes committed. Exercise iSCSI INQUIRY zero/exact/short responses and residual
+  flags alongside existing allocation-length checks for other SCSI commands. This is
+  targeted coverage, not a complete protocol or SQLSTATE compatibility audit.
 - [ ] Build a repeatable fault-injection suite covering process crashes at write and
   commit boundaries, complete cluster restart, node loss and recovery, network
   partitions, quorum loss, and a stale leader returning.

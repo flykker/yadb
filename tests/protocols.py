@@ -508,6 +508,18 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
             assert a.query("INVALID SQL;", fail=True)[-1] == (b"Z", b"E")
             assert a.query("ROLLBACK;")[-1] == (b"Z", b"I")
             assert b.rows("SELECT balance FROM wire WHERE id=1;") == [["90"]]
+            # A valid but failing DML aborts the transaction, rejects later
+            # statements with 25P02, and leaves the connection usable on rollback.
+            a.query("BEGIN; UPDATE wire SET balance=0 WHERE id=1;")
+            failed = a.query("INSERT INTO wire VALUES (2,999);", fail=True)
+            assert failed[-1] == (b"Z", b"E"), failed
+            blocked = a.query("UPDATE wire SET balance=5 WHERE id=2;", fail=True)
+            assert blocked[-1] == (b"Z", b"E") and any(
+                kind == b"E" and b"C25P02\0" in data for kind, data in blocked), blocked
+            rolled_back = a.query("ROLLBACK;")
+            assert (b"C", b"ROLLBACK\0") in rolled_back and rolled_back[-1] == (b"Z", b"I"), rolled_back
+            assert a.rows("SELECT balance FROM wire ORDER BY id;") == [["90"], ["200"]]
+            assert b.rows("SELECT balance FROM wire ORDER BY id;") == [["90"], ["200"]]
             a.query("CREATE INDEX by_balance ON wire (balance);")
             assert b.rows("SELECT id FROM wire WHERE balance=90;") == [["1"]]
             b.query("UPDATE wire SET balance=201 WHERE id=2;")
@@ -630,6 +642,21 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
                 assert r[0] == 0x25 and r[1] & 1 and r[3] == 0, (cdb, r)
                 assert len(data) == allocated, (cdb, len(data))
                 assert r[1] & 2 and int.from_bytes(r[44:48], "big") == 32-allocated, (cdb, r)
+            # INQUIRY: exact transfer, and a larger allocation/expected length
+            # than the 36-byte standard response. Inspect the final iSCSI flags
+            # and residual rather than merely checking the returned payload.
+            for allocation, expected, length, residual in [(4, 4, 4, 0), (64, 64, 36, 28)]:
+                x.itt += 1
+                h = x.header(1, 0xc1)
+                h[20:24] = expected.to_bytes(4, "big")
+                h[32:38] = bytes([0x12, 0, 0, 0, allocation, 0])
+                x.send(h)
+                x.cmd += 1
+                r, data = x.recv()
+                assert r[0] == 0x25 and r[1] & 1 and r[3] == 0, r
+                assert len(data) == length and data[2] == 6, (r, data)
+                assert bool(r[1] & 2) == bool(residual), r
+                assert not r[1] & 4 and int.from_bytes(r[44:48], "big") == residual, r
             x.write(b"A"*512)
             assert y.read() == b"A"*512
             x.write(b"B"*4096, immediate=False)
