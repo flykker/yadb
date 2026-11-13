@@ -13,6 +13,9 @@ daemon lifecycle are not implemented yet. The OpenRaft storage contracts require
 persist-before-return for votes and persist-before-callback for log appends; YADB must satisfy those contracts rather
 than route OpenRaft through the experimental WAL/core. Envelope checks do not
 authenticate peers. The runtime and verification gates below remain future work.
+An OpenRaft singleton smoke test runs with a test-only volatile store and applies
+a YADB command. It does not test durable recovery, replication, quorum loss or
+snapshots; that store deliberately cannot satisfy production durability contracts.
 
 ## Goals and non-goals
 

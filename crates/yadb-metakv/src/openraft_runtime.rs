@@ -83,3 +83,7 @@ mod tests {
         spec.validate().unwrap();
     }
 }
+
+#[cfg(test)]
+#[path = "openraft_test.rs"]
+mod runtime_tests;
