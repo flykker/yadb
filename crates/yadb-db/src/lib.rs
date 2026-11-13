@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use yadb_blob::{BlobError, PoolStriper};
 use yadb_io::StorageFs;
-use yadb_metakv::{KvCommand, KvResult, LocalMetaKv, MetaError, RevisionGuard, TxnOp};
+use yadb_metakv::{KvCommand, KvResult, LocalMetaKv, MetaError, MetaSnapshot, RevisionGuard, TxnOp};
 
 pub use sql::{
     parse_sql, parse_sql_script, script_has_writes, AggFunc, ArithOp, AssignExpr, CmpOp, ColumnDef,
@@ -424,16 +424,6 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
         }
     }
 
-    fn scan_committed_shard_rows(
-        &self,
-        project_id: u32,
-        db: &str,
-        schema: &TableSchema,
-        shard_idx: u32,
-    ) -> Result<Vec<Vec<SqlValue>>, DbError> {
-        Ok(self.scan_committed_shard_rows_with_revision(project_id, db, schema, shard_idx)?.0)
-    }
-
     // Return the identity of the exact immutable view used by the scan. This is
     // essential for index publication: reading metadata after scanning could
     // pair old rows with a newer revision and accept an incomplete backfill.
@@ -515,37 +505,65 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
         after_shard_scan: impl FnMut(u32),
         after_index_scan: impl FnOnce(),
     ) -> Result<Vec<Vec<SqlValue>>, DbError> {
-        // All applied metadata changes advance this local monotonic revision.
-        // Checking it around the WHOLE collection covers index hits, row loads,
-        // absent shards and schema together without claiming a Raft read barrier.
-        let revision = self.meta.revision();
-        if self.load_schema(project_id, db, &schema.table)? != *schema {
+        // Copy schema, shard references and candidate index entries under one local
+        // Raft-apply mutex. Never hold that mutex across fragment/network reads.
+        let schema_key = Self::schema_key(project_id, db, &schema.table);
+        let mut keys = vec![schema_key.clone()];
+        let mut prefixes = Vec::new();
+        let pk_predicate = resolved_preds.iter().find(|(col_i, pred)| {
+            *col_i == schema.pk_index && pred.op == CmpOp::Eq
+                && pred.value.check_type(schema.columns[*col_i].col_type, false)
+        });
+        if let Some((_, pred)) = pk_predicate {
+            let pk = pred.value.encode_order_preserving_key()?;
+            keys.push(Self::shard_meta_key(project_id, db, &schema.table,
+                Self::route_shard(&pk, schema.shards)));
+        } else {
+            prefixes.push(format!("/db/{project_id}/{db}/shards/{}/", schema.table));
+            let has_overlay = tx.and_then(|buf| buf.writes.get(&schema.table))
+                .is_some_and(|rows| !rows.is_empty());
+            if !has_overlay {
+                for (col_i, pred) in resolved_preds {
+                    if pred.op == CmpOp::Eq {
+                        if let Some(index) = schema.indexes.iter().find(|ix| ix.col_index == *col_i) {
+                            prefixes.push(Self::index_prefix_value(
+                                project_id, db, &schema.table, &index.name, &pred.value,
+                            )?);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        let snapshot = self.meta.snapshot(&keys, &prefixes);
+        let schema_value = snapshot.get(&schema_key)
+            .ok_or_else(|| DbError::TableNotFound(schema.table.clone()))?;
+        let snapshot_schema: TableSchema = serde_json::from_slice(&schema_value.value)?;
+        if snapshot_schema != *schema {
             return Err(DbError::InvalidQuery(
                 "schema changed before row collection; retry statement".into(),
             ));
         }
-        let rows = self.collect_table_rows_unchecked(
-            project_id, db, schema, resolved_preds, tx, after_shard_scan, after_index_scan,
-        )?;
-        if self.meta.revision() != revision {
-            return Err(DbError::InvalidQuery(
-                "metadata changed during row collection; retry statement".into(),
-            ));
-        }
-        Ok(rows)
+        self.collect_table_rows_from_snapshot(
+            project_id, db, schema, resolved_preds, tx, &snapshot,
+            after_shard_scan, after_index_scan,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn collect_table_rows_unchecked(
+    fn collect_table_rows_from_snapshot(
         &self,
         project_id: u32,
         db: &str,
         schema: &TableSchema,
         resolved_preds: &[(usize, Predicate)],
         tx: Option<&TxBuffer>,
+        snapshot: &MetaSnapshot,
         mut after_shard_scan: impl FnMut(u32),
         after_index_scan: impl FnOnce(),
     ) -> Result<Vec<Vec<SqlValue>>, DbError> {
+        // Only these read-only views are used below, never live shard caches.
+        let mut tablets = BTreeMap::new();
         // 1. Exact PK equality fast path
         for (col_i, pred) in resolved_preds {
             if *col_i == schema.pk_index
@@ -554,7 +572,16 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
             {
                 let pk_bytes = pred.value.encode_order_preserving_key()?;
                 let mut out = Vec::new();
-                if let Some(row) = self.read_row_in_tx(project_id, db, schema, &pk_bytes, tx)? {
+                let overlay = tx.and_then(|buf| buf.writes.get(&schema.table))
+                    .and_then(|rows| rows.get(&pk_bytes));
+                let row = if let Some((_, row)) = overlay {
+                    row.clone()
+                } else {
+                    let shard_idx = Self::route_shard(&pk_bytes, schema.shards);
+                    self.snapshot_tablet(project_id, db, schema, snapshot, &mut tablets, shard_idx)?
+                        .map(|tablet| tablet.get_row(&pk_bytes)).transpose()?.flatten()
+                };
+                if let Some(row) = row {
                     if resolved_preds.iter().all(|(ci, p)| p.eval(&row[*ci])) {
                         out.push(row);
                     }
@@ -578,13 +605,15 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
                             &idx_def.name,
                             &pred.value,
                         )?;
-                        let idx_hits = self.meta.scan_prefix(&prefix);
+                        let idx_hits = snapshot.scan_prefix(&prefix);
                         after_index_scan();
                         let mut out = Vec::with_capacity(idx_hits.len());
                         for (_, kv) in idx_hits {
-                            if let Some(row) =
-                                self.read_committed_row(project_id, db, schema, &kv.value)?
-                            {
+                            let shard_idx = Self::route_shard(&kv.value, schema.shards);
+                            let row = self.snapshot_tablet(project_id, db, schema, snapshot,
+                                &mut tablets, shard_idx)?
+                                .map(|tablet| tablet.get_row(&kv.value)).transpose()?.flatten();
+                            if let Some(row) = row {
                                 if resolved_preds.iter().all(|(ci, p)| p.eval(&row[*ci])) {
                                     out.push(row);
                                 }
@@ -601,9 +630,13 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
         // 3. Full shard scan + uncommitted transaction overlay
         let mut by_pk: BTreeMap<Vec<u8>, Vec<SqlValue>> = BTreeMap::new();
         for shard_idx in 0..schema.shards {
-            for row in self.scan_committed_shard_rows(project_id, db, schema, shard_idx)? {
-                let pk = row[schema.pk_index].encode_order_preserving_key()?;
-                by_pk.insert(pk, row);
+            if let Some(tablet) = self.snapshot_tablet(
+                project_id, db, schema, snapshot, &mut tablets, shard_idx,
+            )? {
+                for row in tablet.scan_all_live_rows()? {
+                    let pk = row[schema.pk_index].encode_order_preserving_key()?;
+                    by_pk.insert(pk, row);
+                }
             }
             after_shard_scan(shard_idx);
         }
@@ -629,6 +662,30 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
         let pk_i = schema.pk_index;
         rows.sort_by(|a, b| a[pk_i].sql_cmp(&b[pk_i]).unwrap_or(Ordering::Equal));
         Ok(rows)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn snapshot_tablet<'a>(
+        &self,
+        project_id: u32,
+        db: &str,
+        schema: &TableSchema,
+        snapshot: &MetaSnapshot,
+        tablets: &'a mut BTreeMap<u32, Option<DataShardTablet<FS>>>,
+        shard_idx: u32,
+    ) -> Result<Option<&'a DataShardTablet<FS>>, DbError> {
+        if let std::collections::btree_map::Entry::Vacant(entry) = tablets.entry(shard_idx) {
+            let key = Self::shard_meta_key(project_id, db, &schema.table, shard_idx);
+            let tablet = match snapshot.get(&key) {
+                Some(value) => Some(DataShardTablet::open_snapshot_value(
+                    self.meta.clone(), key, value,
+                    self.get_pool(&schema.wal_pool)?, self.get_pool(&schema.data_pool)?,
+                )?),
+                None => None,
+            };
+            entry.insert(tablet);
+        }
+        Ok(tablets.get(&shard_idx).unwrap().as_ref())
     }
 
     /// Atomically commits a `TxBuffer` across ANY number of tables, shards, and secondary indexes
@@ -1926,8 +1983,11 @@ mod tests {
                 |shard| { if !indexed && shard == 0 { update(); } },
                 || { if indexed { update(); } },
             );
-            assert!(matches!(result, Err(DbError::InvalidQuery(_))),
-                "mixed collection (indexed={indexed}) was accepted: {result:?}");
+            let mut expected_old = vec![vec![SqlValue::Int(a), SqlValue::Int(10)]];
+            if !indexed { expected_old.push(vec![SqlValue::Int(b), SqlValue::Int(10)]); }
+            expected_old.sort_by(|a, b| a[0].sql_cmp(&b[0]).unwrap());
+            assert_eq!(result.unwrap(), expected_old,
+                "collection must preserve its pinned state (indexed={indexed})");
             let rows = run(&first, "SELECT v FROM t ORDER BY id;").rows;
             if indexed {
                 assert_eq!(run(&first, "SELECT id FROM t WHERE v=10;").rows, vec![vec![SqlValue::Int(b)]]);
@@ -1956,7 +2016,56 @@ mod tests {
     }
 
     #[test]
-    fn row_collection_detects_range_phantom_and_schema_change() {
+    fn pinned_collection_keeps_old_manifests_indexes_and_absence_after_maintenance() {
+        let fs = SimFs::new(9503);
+        let meta = LocalMetaKv::open_single_node(&fs, "meta", 1).unwrap();
+        let (wal, data) = make_pools(&fs);
+        let engine = DatabaseEngine::new(meta.clone(), 1024);
+        engine.register_pool("wal", wal);
+        engine.register_pool("data", data);
+        let run = |sql: &str| engine.execute_sql(1, "db", "wal", "data", 4, sql).unwrap();
+        let pk = |id| SqlValue::Int(id).encode_order_preserving_key().unwrap();
+        let id_in = |shard| (1..100).find(|id|
+            DatabaseEngine::<SimFs>::route_shard(&pk(*id), 4) == shard).unwrap();
+        let (a, b) = (id_in(0), id_in(3));
+        run(&format!("CREATE TABLE t (id INT PRIMARY KEY, v INT); INSERT INTO t VALUES ({a},10); FLUSH TABLE t; CREATE INDEX by_v ON t (v);"));
+        let schema = engine.load_schema(1, "db", "t").unwrap();
+        let snapshot = meta.snapshot(
+            &[DatabaseEngine::<SimFs>::schema_key(1, "db", "t")],
+            &["/db/1/db/shards/t/".into(), "/db/1/db/idx/t/".into()],
+        );
+        run(&format!("UPDATE t SET v=20 WHERE id={a}; INSERT INTO t VALUES ({b},30); COMPACT TABLE t; DROP INDEX by_v ON t;"));
+        let revision = meta.revision();
+        for predicates in [
+            vec![],
+            vec![(0, Predicate { column: "id".into(), op: CmpOp::Eq, value: SqlValue::Int(a) })],
+            vec![(1, Predicate { column: "v".into(), op: CmpOp::Eq, value: SqlValue::Int(10) })],
+        ] {
+            let rows = engine.collect_table_rows_from_snapshot(
+                1, "db", &schema, &predicates, None, &snapshot, |_| {}, || {},
+            ).unwrap();
+            assert_eq!(rows, vec![vec![SqlValue::Int(a), SqlValue::Int(10)]]);
+        }
+        let mut overlay = TxBuffer::default();
+        overlay.record_mutation("t", pk(a), Some(vec![SqlValue::Int(a), SqlValue::Int(10)]), None);
+        overlay.record_mutation("t", pk(b), None, Some(vec![SqlValue::Int(b), SqlValue::Int(40)]));
+        let expected = vec![vec![SqlValue::Int(b), SqlValue::Int(40)]];
+        for predicates in [vec![], vec![(1, Predicate {
+            column: "v".into(), op: CmpOp::Eq, value: SqlValue::Int(40),
+        })], vec![(0, Predicate {
+            column: "id".into(), op: CmpOp::Eq, value: SqlValue::Int(b),
+        })]] {
+            assert_eq!(engine.collect_table_rows_from_snapshot(
+                1, "db", &schema, &predicates, Some(&overlay), &snapshot, |_| {}, || {},
+            ).unwrap(), expected);
+        }
+        assert_eq!(meta.revision(), revision);
+        assert_eq!(run(&format!("SELECT v FROM t WHERE id={a};")).rows, vec![vec![SqlValue::Int(20)]]);
+        assert_eq!(run(&format!("SELECT v FROM t WHERE id={b};")).rows, vec![vec![SqlValue::Int(30)]]);
+    }
+
+    #[test]
+    fn row_snapshot_survives_range_phantom_schema_and_unrelated_changes() {
         for change in ["phantom", "schema", "unrelated"] {
             let fs = SimFs::new(9501);
             let meta = LocalMetaKv::open_single_node(&fs, "meta", 1).unwrap();
@@ -1989,7 +2098,7 @@ mod tests {
                     }
                 }, || {},
             );
-            assert!(matches!(result, Err(DbError::InvalidQuery(_))), "accepted {change}: {result:?}");
+            assert!(result.unwrap().is_empty(), "snapshot changed after {change}");
             // Stable collection succeeds, even if the preceding write was to
             // unrelated metadata. No retries/hidden write side effects here.
             let revision = meta.revision();
@@ -1998,7 +2107,7 @@ mod tests {
             assert_eq!(meta.revision(), revision);
             if change == "schema" {
                 // Predicates/column positions resolved with stale schema are
-                // rejected even if it changed before the revision window.
+                // rejected if schema changed before snapshot capture.
                 assert!(matches!(first.collect_table_rows(1, "db", &schema, &predicates, None),
                     Err(DbError::InvalidQuery(_))));
             }
@@ -2470,7 +2579,7 @@ mod tests {
         let schema = db.load_schema(1, "db", "t").unwrap();
         let pk = SqlValue::Int(1).encode_order_preserving_key().unwrap();
         assert!(db.read_committed_row(1, "db", &schema, &pk).unwrap().is_none());
-        assert!(db.scan_committed_shard_rows(1, "db", &schema, 0).unwrap().is_empty());
+        assert!(db.scan_committed_shard_rows_with_revision(1, "db", &schema, 0).unwrap().0.is_empty());
         let handle = db.get_or_open_shard(1, "db", &schema, 0).unwrap();
         assert!(handle.lock().unwrap().get_row(&pk).unwrap().is_none());
     }

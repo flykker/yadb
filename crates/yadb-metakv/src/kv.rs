@@ -12,6 +12,32 @@ pub struct KvValue {
     pub mod_revision: u64,
 }
 
+/// Owned copy of selected metadata from one locally applied state. Missing keys
+/// stay missing. This is not a quorum read barrier or a transaction-wide snapshot.
+#[derive(Debug, Clone)]
+pub struct MetaSnapshot {
+    pub(crate) revision: u64,
+    pub(crate) values: BTreeMap<String, KvValue>,
+}
+
+impl MetaSnapshot {
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    pub fn get(&self, key: &str) -> Option<KvValue> {
+        self.values.get(key).cloned()
+    }
+
+    pub fn scan_prefix(&self, prefix: &str) -> Vec<(String, KvValue)> {
+        self.values
+            .range(prefix.to_string()..)
+            .take_while(|(key, _)| key.starts_with(prefix))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CasGuard {
     pub key: String,

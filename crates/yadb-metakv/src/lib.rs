@@ -2,7 +2,7 @@ pub mod kv;
 pub mod raft;
 pub mod wal;
 
-pub use kv::{CasGuard, KvCommand, KvResult, KvValue, MetaStateMachine, RevisionGuard, TxnOp, WatchEvent};
+pub use kv::{CasGuard, KvCommand, KvResult, KvValue, MetaSnapshot, MetaStateMachine, RevisionGuard, TxnOp, WatchEvent};
 pub use raft::{LocalMetaKv, LogEntry, OutboundMsg, RaftCore, RaftRpc, RoleState};
 pub use wal::RaftWal;
 
@@ -36,6 +36,52 @@ mod tests {
     use super::*;
     use std::collections::{BTreeMap, BTreeSet, VecDeque};
     use yadb_io::{FaultConfig, SimFs, SyncFault};
+
+    #[test]
+    fn selected_snapshot_is_owned_atomic_and_does_not_write_metadata() {
+        let fs = SimFs::new(9020);
+        let meta = LocalMetaKv::open_single_node(&fs, "meta", 1).unwrap();
+        let publish = |n: u64| KvCommand::RevisionTxn {
+            guards: vec![],
+            ops: ["schema", "shards/a", "idx/a"].into_iter().map(|key| TxnOp::Put {
+                key: key.into(), value: n.to_le_bytes().to_vec(),
+            }).collect(),
+        };
+        meta.execute(publish(0)).unwrap();
+        let keys = vec!["schema".into(), "absent".into()];
+        let prefixes = vec!["shards/".into(), "idx/".into(), "idx/".into()];
+        let initial_revision = meta.revision();
+        let pinned = meta.snapshot(&keys, &prefixes);
+        assert_eq!(meta.revision(), initial_revision);
+        assert_eq!(pinned.revision(), initial_revision);
+        let writer = meta.clone();
+        let thread = std::thread::spawn(move || {
+            for n in 1..65 { writer.execute(publish(n)).unwrap(); }
+            writer.execute(KvCommand::Put { key: "absent".into(), value: vec![1] }).unwrap();
+        });
+        for _ in 0..128 {
+            let snapshot = meta.snapshot(&keys, &prefixes);
+            let schema = snapshot.get("schema").unwrap();
+            for key in ["shards/a", "idx/a"] {
+                let row = snapshot.get(key).unwrap();
+                assert_eq!(row.value, schema.value);
+                assert_eq!(row.mod_revision, schema.mod_revision);
+                assert!(row.mod_revision <= snapshot.revision());
+            }
+            assert_eq!(snapshot.scan_prefix("idx/").len(), 1);
+        }
+        thread.join().unwrap();
+        assert_eq!(pinned.get("schema").unwrap().value, 0u64.to_le_bytes());
+        assert!(pinned.get("absent").is_none());
+        meta.execute(KvCommand::Delete { key: "idx/a".into() }).unwrap();
+        assert_eq!(pinned.scan_prefix("idx/").len(), 1);
+        drop(meta);
+        fs.simulate_power_cut();
+        let recovered = LocalMetaKv::open_single_node(&fs, "meta", 1).unwrap();
+        assert_eq!(recovered.snapshot(&keys, &prefixes).get("schema").unwrap().value, 64u64.to_le_bytes());
+        // A snapshot is an owned in-memory value, not a persistent reader lease.
+        assert_eq!(pinned.get("schema").unwrap().value, 0u64.to_le_bytes());
+    }
 
     #[test]
     fn process_only_reopen_syncs_recovered_wal_before_matching_log_ack() {

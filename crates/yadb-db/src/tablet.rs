@@ -663,6 +663,20 @@ impl<FS: StorageFs> DataShardTablet<FS> {
         let Some(kv) = meta.get(&meta_key) else {
             return Ok(None);
         };
+        Ok(Some(Self::open_snapshot_value(
+            meta, meta_key, kv, wal_striper, data_striper,
+        )?))
+    }
+
+    /// Read only the supplied immutable manifest value; never reload metadata.
+    /// Old fragments must remain retained for the lifetime of this view.
+    pub(crate) fn open_snapshot_value(
+        meta: LocalMetaKv<FS>,
+        meta_key: String,
+        kv: yadb_metakv::KvValue,
+        wal_striper: Arc<PoolStriper<FS>>,
+        data_striper: Arc<PoolStriper<FS>>,
+    ) -> Result<Self, DbError> {
         let manifest: TabletManifest = serde_json::from_slice(&kv.value)?;
         let mut memtable = BTreeMap::new();
         for &wal_id in &manifest.wal_blobs {
@@ -672,7 +686,7 @@ impl<FS: StorageFs> DataShardTablet<FS> {
                 memtable.insert(pk, entry);
             }
         }
-        Ok(Some(Self {
+        Ok(Self {
             meta_key,
             manifest_revision: kv.mod_revision,
             manifest,
@@ -681,7 +695,7 @@ impl<FS: StorageFs> DataShardTablet<FS> {
             data_striper,
             memtable,
             flush_threshold_rows: usize::MAX,
-        }))
+        })
     }
 
     pub fn sst_count(&self) -> usize {

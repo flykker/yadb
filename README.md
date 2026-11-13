@@ -127,26 +127,34 @@ an atomically published schema and backfill, not a partial index.
 
 #### SQL read consistency and isolation limits
 
-Row collection checks the local applied metadata revision before and after loading
-schema, index hits and rows. A revision change rejects the collection rather than
-returning a mixture of pre/post-commit shards or old index hits with new rows.
-The supplied schema must also match the current schema before collecting rows.
-This covers SELECT's buffered rows (including aggregation inputs), and the row
-collection used by UPDATE/DELETE. Projection/aggregation runs on those buffered
-rows after validation. No automatic retry or read-side metadata write is performed.
+Row collection copies selected metadata under the local Raft-apply mutex: schema,
+shard manifests and candidate index hits come from one applied state. Primary-key
+lookups copy only their shard reference; other paths copy the table's shard
+references and, if used, the matching index-value range, not every project's data.
+After releasing the mutex, read-only tablets load WAL/SSTs from those exact copied
+manifests, never from newer metadata or a mutable live shard cache. Old fragments
+remain retained, so later updates/compaction cannot change this query's view.
+An absent shard stays absent for this collection even if a writer creates it.
 
-This deliberately conservative check can conflict on **any** applied metadata
-change, including unrelated projects, blob allocation and shard maintenance. A
-reported collection conflict requires retrying the statement; inside a transaction
-the existing error handling aborts the transaction, so retry it as a whole. Sustained
-writes can prevent reads from making progress. This is a local consistency check,
-not a quorum read barrier: a follower/isolated node may return stale committed data.
-It does not promise linearizable reads or read-your-writes across SQL portals.
+This replaces global-revision conflict checks: unrelated writes, later schema/index
+changes and shard maintenance no longer abort an already captured collection.
+The snapshot schema must match the schema used to resolve the statement before
+capture; otherwise the statement reports a schema conflict. Inside a transaction
+an error still aborts the transaction, so retry the transaction as a whole. This
+covers SELECT's buffered rows (including aggregation inputs) and collection used
+by UPDATE/DELETE; it is not a snapshot of every later DML validation step. No read-
+side metadata writes or automatic retries are performed.
 
-Deterministic independent-engine tests reproduce and reject mixed cross-shard
-reads, old index hits combined with new rows, range inserts into an already scanned
-absent shard and schema changes during collection. Stable subsequent collections
-succeed. Within BEGIN, separate statements may see newer committed values and
+Snapshots are owned metadata copies, not persistent reader leases or safe-GC
+authorization. They add copying under the apply mutex and replay WALs in query-local
+tablets; large tables/index hit sets can increase memory, CPU and apply latency.
+This is not a quorum read barrier: a follower/isolated node may return stale committed
+data. Linearizable reads and cross-portal read-your-writes are not promised.
+
+Deterministic independent-engine tests preserve the complete pre-commit state
+through cross-shard writes and index-hit swaps. They cover absent shards, schema
+changes, unrelated writes, compaction, dropped indexes and own-write overlays.
+Within BEGIN, separate statements may see newer committed values and
 new rows; the transaction preserves its own buffered writes as an overlay, not a
 snapshot of committed data. Nonrepeatable reads and phantoms between statements
 are explicitly demonstrated, not prevented.
@@ -155,7 +163,7 @@ These checks do **not** establish serializable or snapshot-isolated SQL transact
 DML original-row checks compare values, so intervening changes that restore equal
 values are not detected as transaction-level row ABA. There is no full transaction
 read-set/range validation or general serializability guarantee. The guarded index
-backfill and per-collection checks do not change those limits.
+backfill and per-collection snapshots do not change those limits.
 
 ### AWS S3-compatible API
 

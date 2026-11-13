@@ -63,9 +63,13 @@ YADB uses ordinary filesystems; raw PDisk and NBD are not project goals.
   mixed data. Cover indexed lookups, range inserts into absent shards and schema
   changes. Check new commits/phantoms between statements and own-write overlays
   inside BEGIN; document these as limits, not snapshot/serializable isolation.
-- [ ] Implement finer-grained or pinned read snapshots without global-revision
-  false conflicts; establish quorum freshness/read barriers separately. Current
-  reads may be stale and unrelated metadata changes can abort row collection.
+- [x] Replace global-revision read conflicts with owned selected-metadata snapshots
+  captured under the local apply mutex. Use exact copied manifests for query-local
+  read-only tablets, including absent shards and index hits. Test concurrent writes,
+  dropped indexes, compaction, own overlays and atomic metadata snapshot copies.
+  Copying/replay overhead remains; snapshots are not persistent GC reader leases.
+- [ ] Establish quorum freshness/read barriers separately. Per-collection snapshots
+  are locally consistent but follower/isolated-node reads can still be stale.
 - [ ] Define/test transaction-wide read-set/range validation, write skew and
   serializability before claiming stronger transaction isolation.
 - [ ] Prove GC and compaction do not remove live data, including during recovery,

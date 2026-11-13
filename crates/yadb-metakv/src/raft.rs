@@ -10,7 +10,7 @@ use yadb_io::StorageFs;
 
 use crate::kv::{KvCommand, KvResult, MetaStateMachine, WatchEvent};
 use crate::wal::{RaftWal, WalRecord};
-use crate::{KvValue, MetaError};
+use crate::{KvValue, MetaError, MetaSnapshot};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RoleState {
@@ -751,6 +751,26 @@ impl<FS: StorageFs> LocalMetaKv<FS> {
 
     pub fn get(&self, key: &str) -> Option<KvValue> {
         self.inner.lock().unwrap().get(key)
+    }
+
+    /// Copies selected keys/ranges while holding the same mutex as Raft apply.
+    /// Release it before reading blobs/network I/O; later writes cannot change
+    /// the owned values. Unselected keys are not available in this snapshot.
+    pub fn snapshot(&self, keys: &[String], prefixes: &[String]) -> MetaSnapshot {
+        let guard = self.inner.lock().unwrap();
+        let mut values = BTreeMap::new();
+        for key in keys {
+            if let Some(value) = guard.get(key) {
+                values.insert(key.clone(), value);
+            }
+        }
+        for prefix in prefixes {
+            values.extend(guard.scan_prefix(prefix));
+        }
+        MetaSnapshot {
+            revision: guard.revision(),
+            values,
+        }
     }
 
     pub fn scan_prefix(&self, prefix: &str) -> Vec<(String, KvValue)> {
