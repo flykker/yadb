@@ -486,6 +486,19 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
         db: &str,
         tx: TxBuffer,
     ) -> Result<(), DbError> {
+        self.commit_tx_buffer_at_boundaries(project_id, db, tx, || {}, || {})
+    }
+
+    // Private scheduling boundaries let tests run a real independent engine at
+    // the validation/preparation and preparation/publication gaps, without sleeps.
+    fn commit_tx_buffer_at_boundaries(
+        &self,
+        project_id: u32,
+        db: &str,
+        tx: TxBuffer,
+        after_validation: impl FnOnce(),
+        after_preparation: impl FnOnce(),
+    ) -> Result<(), DbError> {
         if tx.is_empty() {
             return Ok(());
         }
@@ -493,6 +506,9 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
         let mut schemas: BTreeMap<String, (TableSchema, u64)> = BTreeMap::new();
         #[allow(clippy::type_complexity)]
         let mut shard_batches: BTreeMap<(String, u32), Vec<(Vec<u8>, Option<Vec<SqlValue>>)>> =
+            BTreeMap::new();
+        #[allow(clippy::type_complexity)]
+        let mut expected_rows: BTreeMap<(String, u32), Vec<(Vec<u8>, Option<Vec<SqlValue>>)>> =
             BTreeMap::new();
         let mut index_ops: Vec<TxnOp> = Vec::new();
 
@@ -505,10 +521,14 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
                 if self.read_committed_row(project_id, db, &schema, &pk_bytes)? != old_row {
                     return Err(DbError::InvalidQuery("transaction write conflict; restart transaction".into()));
                 }
+                let shard_idx = Self::route_shard(&pk_bytes, schema.shards);
+                expected_rows
+                    .entry((table.clone(), shard_idx))
+                    .or_default()
+                    .push((pk_bytes.clone(), old_row.clone()));
                 if old_row == new_row {
                     continue;
                 }
-                let shard_idx = Self::route_shard(&pk_bytes, schema.shards);
                 shard_batches
                     .entry((table.clone(), shard_idx))
                     .or_default()
@@ -546,14 +566,16 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
             schemas.insert(table, (schema, schema_revision));
         }
 
-        if shard_batches.is_empty() {
+        if expected_rows.is_empty() {
             return Ok(());
         }
 
+        after_validation();
+
         // Open all participating shards in deterministic `(table, shard_idx)` order to prevent deadlocks
         let mut shard_handles: Vec<((String, u32), Arc<Mutex<DataShardTablet<FS>>>)> =
-            Vec::with_capacity(shard_batches.len());
-        for (tbl, shard_idx) in shard_batches.keys() {
+            Vec::with_capacity(expected_rows.len());
+        for (tbl, shard_idx) in expected_rows.keys() {
             let (schema, _) = &schemas[tbl];
             let handle = self.get_or_open_shard(project_id, db, schema, *shard_idx)?;
             shard_handles.push(((tbl.clone(), *shard_idx), handle));
@@ -574,9 +596,29 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
         }
 
         for (key_pair, handle) in shard_handles {
-            let batch = shard_batches.remove(&key_pair).unwrap();
+            let batch = shard_batches.remove(&key_pair).unwrap_or_default();
             let prep = {
                 let guard = handle.lock().unwrap();
+                // The early check is only a fast rejection. Takeover may have
+                // loaded newer data since then. Validate and prepare against
+                // one immutable tablet view under the same local mutex; the
+                // revision below fences changes by independent engines/nodes.
+                for (pk, expected) in expected_rows.remove(&key_pair).unwrap() {
+                    if guard.get_row(&pk)? != expected {
+                        return Err(DbError::InvalidQuery(
+                            "transaction write conflict; restart transaction".into(),
+                        ));
+                    }
+                }
+                if batch.is_empty() {
+                    // No-op writes still validated a row. Guard that view at
+                    // commit even though no WAL or manifest update is needed.
+                    guards.push(RevisionGuard {
+                        key: Self::shard_meta_key(project_id, db, &key_pair.0, key_pair.1),
+                        expected_mod_revision: guard.manifest_revision(),
+                    });
+                    continue;
+                }
                 guard.prepare_batch(batch)?
             };
             guards.push(RevisionGuard {
@@ -591,6 +633,8 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
         }
 
         ops.extend(index_ops);
+
+        after_preparation();
 
         // Phase 2: Single atomic Raft transaction across all shard manifests & secondary indexes!
         let revision = match self.meta.execute(KvCommand::RevisionTxn { guards, ops })? {
@@ -1753,6 +1797,165 @@ mod tests {
         );
 
         (wal, data)
+    }
+
+    #[test]
+    fn independent_writer_between_validation_and_preparation_must_conflict() {
+        for stage in ["before-prepare", "after-prepare"] {
+            for operation in [
+                "update", "insert", "delete", "delete-update", "multi-shard",
+                "noop", "noop-multi-shard",
+            ] {
+                let fs = SimFs::new(9300);
+                let meta = LocalMetaKv::open_single_node(&fs, "meta", 1).unwrap();
+                let (wal, data) = make_pools(&fs);
+                let first = DatabaseEngine::new(meta.clone(), 1024);
+                let second = DatabaseEngine::new(meta.clone(), 1024);
+                for engine in [&first, &second] {
+                    engine.register_pool("wal", wal.clone());
+                    engine.register_pool("data", data.clone());
+                }
+                let run = |engine: &DatabaseEngine<SimFs>, sql: &str| {
+                    engine.execute_sql(1, "db", "wal", "data", 4, sql).unwrap()
+                };
+                run(&first, "CREATE TABLE t (id INT PRIMARY KEY, v INT);");
+                // Pick two PKs routed to distinct shards deterministically.
+                let a = 1;
+                let shard_a = DatabaseEngine::<SimFs>::route_shard(&SqlValue::Int(a).encode_order_preserving_key().unwrap(), 4);
+                let b = (2..100).find(|id| DatabaseEngine::<SimFs>::route_shard(&SqlValue::Int(*id).encode_order_preserving_key().unwrap(), 4) != shard_a).unwrap();
+                if operation != "insert" {
+                    run(&first, &format!("INSERT INTO t VALUES ({a},10);"));
+                }
+                run(&first, &format!("INSERT INTO t VALUES ({b},100);"));
+                run(&first, "CREATE INDEX by_v ON t (v);");
+                let pk = SqlValue::Int(a).encode_order_preserving_key().unwrap();
+                let old = if operation == "insert" { None } else { Some(vec![SqlValue::Int(a), SqlValue::Int(10)]) };
+                let new = if operation == "delete" { None } else if operation.starts_with("noop") { old.clone() }
+                    else { Some(vec![SqlValue::Int(a), SqlValue::Int(11)]) };
+                let mut tx = TxBuffer::default();
+                tx.record_mutation("t", pk, old, new);
+                if operation == "multi-shard" || operation == "noop-multi-shard" {
+                    tx.record_mutation("t", SqlValue::Int(b).encode_order_preserving_key().unwrap(),
+                        Some(vec![SqlValue::Int(b), SqlValue::Int(100)]), Some(vec![SqlValue::Int(b), SqlValue::Int(101)]));
+                }
+                let concurrent_sql = match operation {
+                    "insert" => format!("INSERT INTO t VALUES ({a},20);"),
+                    "delete-update" => format!("DELETE FROM t WHERE id={a};"),
+                    _ => format!("UPDATE t SET v=20 WHERE id={a};"),
+                };
+                let result = first.commit_tx_buffer_at_boundaries(1, "db", tx,
+                    || { if stage == "before-prepare" { run(&second, &concurrent_sql); } },
+                    || { if stage == "after-prepare" { run(&second, &concurrent_sql); } });
+                assert!(matches!(result, Err(DbError::InvalidQuery(_)) | Err(DbError::StaleTabletGeneration { .. })),
+                    "stale {operation} at {stage} was not rejected: {result:?}");
+                let expected_a = if operation == "delete-update" { vec![] } else { vec![vec![SqlValue::Int(20)]] };
+                assert_eq!(run(&second, &format!("SELECT v FROM t WHERE id={a};")).rows, expected_a);
+                assert_eq!(run(&second, &format!("SELECT v FROM t WHERE id={b};")).rows, vec![vec![SqlValue::Int(100)]]);
+                let schema = second.load_schema(1, "db", "t").unwrap();
+                let prefix = DatabaseEngine::<SimFs>::index_prefix_all(1, "db", "t", "by_v");
+                let actual = meta.scan_prefix(&prefix).into_iter().map(|(key, _)| key).collect::<BTreeSet<_>>();
+                let mut expected = BTreeSet::new();
+                for row in second.collect_table_rows(1, "db", &schema, &[], None).unwrap() {
+                    expected.insert(DatabaseEngine::<SimFs>::index_entry_key(1, "db", "t", "by_v", &row[1],
+                        &row[0].encode_order_preserving_key().unwrap()).unwrap());
+                }
+                assert_eq!(actual, expected, "index diverged for {operation} at {stage}");
+                drop(first);
+                drop(second);
+                drop(meta);
+                drop(wal);
+                drop(data);
+                fs.simulate_power_cut();
+                let recovered_meta = LocalMetaKv::open_single_node(&fs, "meta", 1).unwrap();
+                let (wal, data) = make_pools(&fs);
+                let recovered = DatabaseEngine::new(recovered_meta.clone(), 1024);
+                recovered.register_pool("wal", wal);
+                recovered.register_pool("data", data);
+                assert_eq!(run(&recovered, &format!("SELECT v FROM t WHERE id={a};")).rows, expected_a);
+                assert_eq!(run(&recovered, &format!("SELECT v FROM t WHERE id={b};")).rows, vec![vec![SqlValue::Int(100)]]);
+                assert_eq!(recovered_meta.scan_prefix(&prefix).into_iter().map(|(key, _)| key).collect::<BTreeSet<_>>(), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn mixed_noop_and_mutation_commit_without_rewriting_noop_shard() {
+        for shards in [1, 4] {
+            let fs = SimFs::new(9302);
+            let meta = LocalMetaKv::open_single_node(&fs, "meta", 1).unwrap();
+            let (wal, data) = make_pools(&fs);
+            let engine = DatabaseEngine::new(meta.clone(), 1024);
+            engine.register_pool("wal", wal);
+            engine.register_pool("data", data);
+            let run = |sql: &str| {
+                engine.execute_sql(1, "db", "wal", "data", shards, sql).unwrap()
+            };
+            let pk = |id| SqlValue::Int(id).encode_order_preserving_key().unwrap();
+            let a = 1;
+            let shard_a = DatabaseEngine::<SimFs>::route_shard(&pk(a), shards);
+            let b = (2..100).find(|id| shards == 1 ||
+                DatabaseEngine::<SimFs>::route_shard(&pk(*id), shards) != shard_a).unwrap();
+            run(&format!("CREATE TABLE t (id INT PRIMARY KEY, v INT); INSERT INTO t VALUES ({a},10),({b},100); CREATE INDEX by_v ON t (v);"));
+            let key = DatabaseEngine::<SimFs>::shard_meta_key(1, "db", "t", shard_a);
+            let before = meta.get(&key).unwrap();
+            let mut tx = TxBuffer::default();
+            let row_a = Some(vec![SqlValue::Int(a), SqlValue::Int(10)]);
+            tx.record_mutation("t", pk(a), row_a.clone(), row_a);
+            tx.record_mutation("t", pk(b),
+                Some(vec![SqlValue::Int(b), SqlValue::Int(100)]),
+                Some(vec![SqlValue::Int(b), SqlValue::Int(101)]));
+            engine.commit_tx_buffer(1, "db", tx).unwrap();
+            assert_eq!(run("SELECT v FROM t ORDER BY id;").rows,
+                vec![vec![SqlValue::Int(10)], vec![SqlValue::Int(101)]]);
+            assert_eq!(run("SELECT id FROM t WHERE v=10;").rows, vec![vec![SqlValue::Int(a)]]);
+            assert_eq!(run("SELECT id FROM t WHERE v=101;").rows, vec![vec![SqlValue::Int(b)]]);
+            assert!(run("SELECT id FROM t WHERE v=100;").rows.is_empty());
+            if shards > 1 {
+                let after = meta.get(&key).unwrap();
+                assert_eq!(after.mod_revision, before.mod_revision);
+                assert_eq!(after.value, before.value);
+            }
+            // A successful no-op-only commit checks guards but allocates no WAL
+            // and must not replace the cached tablet's manifest revision.
+            let before_noop = meta.get(&key).unwrap();
+            let allocation = meta.get("/sql-blob-sequence/1").unwrap();
+            let row_a = Some(vec![SqlValue::Int(a), SqlValue::Int(10)]);
+            let mut noop = TxBuffer::default();
+            noop.record_mutation("t", pk(a), row_a.clone(), row_a);
+            engine.commit_tx_buffer(1, "db", noop).unwrap();
+            assert_eq!(meta.get(&key).unwrap().mod_revision, before_noop.mod_revision);
+            assert_eq!(meta.get(&key).unwrap().value, before_noop.value);
+            assert_eq!(meta.get("/sql-blob-sequence/1").unwrap().mod_revision,
+                allocation.mod_revision);
+        }
+    }
+
+    #[test]
+    fn validation_allows_unrelated_change_before_preparation() {
+        let fs = SimFs::new(9301);
+        let meta = LocalMetaKv::open_single_node(&fs, "meta", 1).unwrap();
+        let (wal, data) = make_pools(&fs);
+        let first = DatabaseEngine::new(meta.clone(), 1024);
+        let second = DatabaseEngine::new(meta.clone(), 1024);
+        for engine in [&first, &second] {
+            engine.register_pool("wal", wal.clone());
+            engine.register_pool("data", data.clone());
+        }
+        let run = |engine: &DatabaseEngine<SimFs>, sql: &str| {
+            engine.execute_sql(1, "db", "wal", "data", 1, sql).unwrap()
+        };
+        run(&first, "CREATE TABLE t (id INT PRIMARY KEY, v INT); INSERT INTO t VALUES (1,10),(2,100); CREATE INDEX by_v ON t (v);");
+        let mut tx = TxBuffer::default();
+        tx.record_mutation("t", SqlValue::Int(1).encode_order_preserving_key().unwrap(),
+            Some(vec![SqlValue::Int(1), SqlValue::Int(10)]), Some(vec![SqlValue::Int(1), SqlValue::Int(11)]));
+        first.commit_tx_buffer_at_boundaries(1, "db", tx,
+            || { run(&second, "UPDATE t SET v=200 WHERE id=2;"); }, || {}).unwrap();
+        assert_eq!(run(&second, "SELECT v FROM t ORDER BY id;").rows,
+            vec![vec![SqlValue::Int(11)], vec![SqlValue::Int(200)]]);
+        assert_eq!(run(&second, "SELECT id FROM t WHERE v=11;").rows, vec![vec![SqlValue::Int(1)]]);
+        assert_eq!(run(&second, "SELECT id FROM t WHERE v=200;").rows, vec![vec![SqlValue::Int(2)]]);
+        assert!(run(&second, "SELECT id FROM t WHERE v=10;").rows.is_empty());
+        assert!(run(&second, "SELECT id FROM t WHERE v=100;").rows.is_empty());
     }
 
     #[test]

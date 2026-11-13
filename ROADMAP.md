@@ -44,9 +44,15 @@ YADB uses ordinary filesystems; raw PDisk and NBD are not project goals.
   guards and revision-based shard-cache identity. Retain old/unpublished SQL
   fragments and report zero physical evictions. Cover legacy recovery, stale
   flush/compaction, boundaries, concurrent allocation and ambiguous sync outcomes.
-- [ ] Close SQL cross-engine row-validation/preparation races and CREATE INDEX
-  backfill versus concurrent DML. Revision guards alone do not establish isolation
-  or a consistent backfill; reproduce those schedules before claiming guarantees.
+- [x] Reproduce a lost update between cross-engine row validation and WAL
+  preparation. Revalidate buffered original rows in the tablet view used for
+  preparation and revision-guard publication, including no-op-only and mixed
+  no-op/mutating shards. Deterministic tests cover both scheduling boundaries,
+  update/insert/delete, index contents, cross-shard rejection and simulated
+  power-cut recovery; unrelated row changes before preparation can survive.
+- [ ] Close CREATE INDEX backfill versus concurrent DML. Guard all scanned shard
+  revisions, including absent shards, before publication; reproduce conflicting
+  schedules before claiming a consistent backfill.
 - [ ] Test transaction isolation, read-your-writes, conflicts and range/phantom
   behavior; state only the isolation guarantees actually established.
 - [ ] Prove GC and compaction do not remove live data, including during recovery,

@@ -100,10 +100,21 @@ cover old snapshots, legacy recovery, colliding owners, unpublished preparations
 stale owners/ABA, concurrent allocation and modeled sync errors. Retention and disk
 growth remain unbounded until cross-node reader fencing and safe GC are implemented.
 
-These publication fences do **not** establish serializable or snapshot-isolated SQL
-transactions. In particular, cross-engine row-validation/preparation races and
-`CREATE INDEX` backfill versus concurrent DML remain open correctness work. Do not
-rely on concurrent index construction or general SQL isolation guarantees yet.
+Before WAL preparation, commits revalidate their buffered original row values
+under the same tablet mutex/view used for preparation. Manifest revision guards
+then reject changes after preparation. No-op writes also validate rows and guard
+their shard view, including when another shard has actual mutations. Deterministic
+independent-engine tests cover update/insert/delete conflicts at both boundaries,
+exact secondary-index contents, rejection of mixed-shard commits and recovery
+after a simulated power cut. An unrelated row change before preparation can be
+preserved alongside the committing update.
+
+These checks do **not** establish serializable or snapshot-isolated SQL transactions.
+They compare row values, so intervening changes that restore equal values are not
+detected as transaction-level row ABA. Full read-set/range validation, phantom
+behavior and consistent cross-shard reads remain unproven. `CREATE INDEX` backfill
+versus concurrent DML also remains open correctness work. Do not rely on concurrent
+index construction or general SQL isolation guarantees yet.
 
 ### AWS S3-compatible API
 
