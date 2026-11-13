@@ -301,6 +301,29 @@ async fn openraft_three_nodes_replicate_and_recover_a_partitioned_follower() {
         assert_eq!((data.state.revision(), data.applied, data.log.last_key_value().map(|(_, e)| e.log_id)), before);
         drop(data);
 
+        // The majority must elect another leader and make progress while the
+        // former leader is unreachable, then bring that node up to date.
+        shared.lock().unwrap().isolated.insert(recovered_leader);
+        let new_leader = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                for (id, raft) in &nodes {
+                    if *id == recovered_leader { continue; }
+                    if matches!(tokio::time::timeout(Duration::from_millis(500),
+                        raft.client_write(write("new-leader"))).await, Ok(Ok(_))) {
+                        return *id;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }).await.expect("majority did not elect a leader and commit");
+        assert_ne!(new_leader, recovered_leader);
+        for (id, store) in &stores {
+            if *id != recovered_leader { wait_value(store, "new-leader", b"value").await; }
+        }
+        assert!(stores[&recovered_leader].0.lock().unwrap().state.get("new-leader").is_none());
+        shared.lock().unwrap().isolated.remove(&recovered_leader);
+        wait_value(&stores[&recovered_leader], "new-leader", b"value").await;
+
         for raft in nodes.values() { raft.shutdown().await.unwrap(); }
         shared.lock().unwrap().nodes.clear();
     }).await.expect("three-node test timed out");

@@ -20,7 +20,8 @@ An additional in-process test runs three independent volatile stores: it checks
 replication, a follower catching up after isolation, and lack of a successful
 write while both followers are isolated. After healing, it checks a new write on
 all nodes, duplicate delivery of non-empty AppendEntries, and replay of a delayed
-duplicate after a newer write. A timed-out write has an unknown outcome.
+duplicate after a newer write. It also isolates the former leader, commits through
+the new majority, and catches the old leader up after healing. A timed-out write has an unknown outcome.
 This simulated partition is not a durability, snapshot, authenticated transport,
 message reordering, or exhaustive consensus-safety test.
 
