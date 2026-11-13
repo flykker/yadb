@@ -68,6 +68,11 @@ YADB uses ordinary filesystems; raw PDisk and NBD are not project goals.
   read-only tablets, including absent shards and index hits. Test concurrent writes,
   dropped indexes, compaction, own overlays and atomic metadata snapshot copies.
   Copying/replay overhead remains; snapshots are not persistent GC reader leases.
+- [x] Fence UPDATE/DELETE against changes between row collection and buffering:
+  retain the collected row as the original value instead of rereading it. For PK
+  changes preserve the observed absence of the target. Independent-engine tests
+  cover update, delete, PK move and concurrent target insert. Value-equal ABA and
+  transaction-wide read/range validation remain outside this protection.
 - [ ] Establish quorum freshness/read barriers separately. Per-collection snapshots
   are locally consistent but follower/isolated-node reads can still be stale.
 - [ ] Define/test transaction-wide read-set/range validation, write skew and

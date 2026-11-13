@@ -109,6 +109,12 @@ exact secondary-index contents, rejection of mixed-shard commits and recovery
 after a simulated power cut. An unrelated row change before preparation can be
 preserved alongside the committing update.
 
+UPDATE and DELETE buffer the original row obtained during their collection,
+rather than rereading it after collection. A concurrent change before buffering
+therefore conflicts at commit. A primary-key move also preserves the observed
+absence of its target so a later concurrent insert cannot become an overwrite.
+These remain value comparisons, not protection against equal-value ABA.
+
 `CREATE INDEX` backfill records the modification revision of each exact scanned
 tablet view, including revision-zero guards for absent shards. Index entries and
 schema are published in one transaction guarded by those revisions and the schema

@@ -11,6 +11,20 @@ use yadb_blob::{BlobError, PoolStriper};
 use yadb_io::StorageFs;
 use yadb_metakv::{KvCommand, KvResult, LocalMetaKv, MetaError, MetaSnapshot, RevisionGuard, TxnOp};
 
+#[cfg(test)]
+thread_local! {
+    static AFTER_DML_COLLECTION: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+    static AFTER_DML_TARGET_CHECK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+fn after_dml_collection() {
+    let hook = AFTER_DML_COLLECTION.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook { hook(); }
+}
+
 pub use sql::{
     parse_sql, parse_sql_script, script_has_writes, AggFunc, ArithOp, AssignExpr, CmpOp, ColumnDef,
     ColumnType, Predicate, Projection, SelectItem, SqlStmt, SqlValue,
@@ -1318,6 +1332,8 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
                     &resolved_preds,
                     Some(&working_tx),
                 )?;
+                #[cfg(test)]
+                after_dml_collection();
                 let mut updated_count = 0u64;
 
                 for old_row in matched_rows {
@@ -1338,8 +1354,7 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
 
                     let new_pk = new_row[schema.pk_index].encode_order_preserving_key()?;
                     if new_pk == old_pk {
-                        let base = self.read_committed_row(project_id, db, &schema, &old_pk)?;
-                        working_tx.record_mutation(&table, old_pk, base, Some(new_row));
+                        working_tx.record_mutation(&table, old_pk, Some(old_row), Some(new_row));
                     } else {
                         // Primary key changed: ensure target PK does not collide, delete old PK & insert new PK
                         if self
@@ -1348,12 +1363,16 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
                         {
                             return Err(DbError::DuplicatePrimaryKey(table));
                         }
-                        let old_base =
-                            self.read_committed_row(project_id, db, &schema, &old_pk)?;
-                        let new_base =
-                            self.read_committed_row(project_id, db, &schema, &new_pk)?;
-                        working_tx.record_mutation(&table, old_pk, old_base, None);
-                        working_tx.record_mutation(&table, new_pk, new_base, Some(new_row));
+                        #[cfg(test)]
+                        {
+                            let hook = AFTER_DML_TARGET_CHECK.with(|slot| slot.borrow_mut().take());
+                            if let Some(hook) = hook { hook(); }
+                        }
+                        // The target was observed absent above. Do not reread it:
+                        // a concurrent insert must conflict at commit, not become
+                        // the baseline for overwriting the new row.
+                        working_tx.record_mutation(&table, old_pk, Some(old_row), None);
+                        working_tx.record_mutation(&table, new_pk, None, Some(new_row));
                     }
                     updated_count += 1;
                 }
@@ -1504,12 +1523,13 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
                     &resolved_preds,
                     Some(&working_tx),
                 )?;
+                #[cfg(test)]
+                after_dml_collection();
                 let mut deleted = 0u64;
 
                 for row in matched {
                     let pk_bytes = row[schema.pk_index].encode_order_preserving_key()?;
-                    let base = self.read_committed_row(project_id, db, &schema, &pk_bytes)?;
-                    working_tx.record_mutation(&table, pk_bytes, base, None);
+                    working_tx.record_mutation(&table, pk_bytes, Some(row), None);
                     deleted += 1;
                 }
 
@@ -2013,6 +2033,57 @@ mod tests {
                     vec![vec![SqlValue::Int(b)]]);
             }
         }
+    }
+
+    #[test]
+    fn dml_rejects_change_between_collection_and_buffering() {
+        for statement in ["UPDATE t SET v=11 WHERE id=1", "DELETE FROM t WHERE id=1", "UPDATE t SET id=2 WHERE id=1"] {
+            let fs = SimFs::new(9510);
+            let meta = LocalMetaKv::open_single_node(&fs, "meta", 1).unwrap();
+            let (wal, data) = make_pools(&fs);
+            let first = DatabaseEngine::new(meta.clone(), 1024);
+            let second = std::sync::Arc::new(DatabaseEngine::new(meta.clone(), 1024));
+            for engine in [&first, second.as_ref()] {
+                engine.register_pool("wal", wal.clone());
+                engine.register_pool("data", data.clone());
+            }
+            first.execute_sql(1, "db", "wal", "data", 4,
+                "CREATE TABLE t (id INT PRIMARY KEY, v INT); INSERT INTO t VALUES (1,10); CREATE INDEX by_v ON t (v);").unwrap();
+            let writer = second.clone();
+            AFTER_DML_COLLECTION.with(|slot| *slot.borrow_mut() = Some(Box::new(move || {
+                writer.execute_sql(1, "db", "wal", "data", 4,
+                    "UPDATE t SET v=20 WHERE id=1;").unwrap();
+            })));
+            let result = first.execute_sql(1, "db", "wal", "data", 4, statement);
+            assert!(matches!(result, Err(DbError::InvalidQuery(ref message)) if message.contains("transaction write conflict")), "{statement}: {result:?}");
+            assert_eq!(second.execute_sql(1, "db", "wal", "data", 4,
+                "SELECT id FROM t WHERE v=20;").unwrap().rows, vec![vec![SqlValue::Int(1)]]);
+            assert!(second.execute_sql(1, "db", "wal", "data", 4,
+                "SELECT id FROM t WHERE v=11;").unwrap().rows.is_empty());
+        }
+    }
+
+    #[test]
+    fn primary_key_update_does_not_overwrite_concurrent_target_insert() {
+        let fs = SimFs::new(9511);
+        let meta = LocalMetaKv::open_single_node(&fs, "meta", 1).unwrap();
+        let (wal, data) = make_pools(&fs);
+        let first = DatabaseEngine::new(meta.clone(), 1024);
+        let second = Arc::new(DatabaseEngine::new(meta, 1024));
+        for engine in [&first, second.as_ref()] {
+            engine.register_pool("wal", wal.clone());
+            engine.register_pool("data", data.clone());
+        }
+        first.execute_sql(1, "db", "wal", "data", 4,
+            "CREATE TABLE t (id INT PRIMARY KEY, v INT); INSERT INTO t VALUES (1,10);").unwrap();
+        let writer = second.clone();
+        AFTER_DML_TARGET_CHECK.with(|slot| *slot.borrow_mut() = Some(Box::new(move || {
+            writer.execute_sql(1, "db", "wal", "data", 4, "INSERT INTO t VALUES (2,20);").unwrap();
+        })));
+        let result = first.execute_sql(1, "db", "wal", "data", 4, "UPDATE t SET id=2 WHERE id=1;");
+        assert!(matches!(result, Err(DbError::InvalidQuery(ref message)) if message.contains("transaction write conflict")), "{result:?}");
+        assert_eq!(second.execute_sql(1, "db", "wal", "data", 4, "SELECT * FROM t ORDER BY id;").unwrap().rows,
+            vec![vec![SqlValue::Int(1), SqlValue::Int(10)], vec![SqlValue::Int(2), SqlValue::Int(20)]]);
     }
 
     #[test]
