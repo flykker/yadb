@@ -114,6 +114,18 @@ restore or a cloned cluster must not silently reuse a live namespace.
 
 ## Staged implementation and acceptance gates
 
+Independent review found that the legacy core does not bind its WAL to identity
+or voters, accepts unknown Raft senders, and lacks exclusive WAL ownership and
+complete structural RPC validation. In particular, reopening a multi-voter WAL
+as a singleton can apply its uncommitted tail. These are blockers for using it
+as a multi-group runtime, not guarantees supplied by a group envelope. The
+experimental `multiraft` module currently validates configuration and message
+identity only; it does not open a WAL, authenticate peers, or dispatch RPCs.
+Before attaching a core, implement durable identity binding, exclusive ownership,
+membership and structural validation, fail-closed recovery, and bounded resource
+handling. The existing recovery can truncate a corrupt frame and does not prove
+safety for arbitrary durable corruption. Legacy behavior is unchanged.
+
 0. **RFC / dependency audit.** Inventory atomic transactions, revision domains,
    allocators, readers, watchers, and compatibility. Design before switching data.
 1. **Isolated runtime.** Test-only/opt-in groups, fixed membership; independent

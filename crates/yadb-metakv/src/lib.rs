@@ -1,4 +1,5 @@
 pub mod kv;
+pub mod multiraft;
 pub mod raft;
 pub mod wal;
 
