@@ -130,7 +130,8 @@ YADB uses ordinary filesystems; raw PDisk and NBD are not project goals.
 - [ ] Exercise real OpenRaft in-process with three nodes: quorum loss, recovery,
   lagging replicas and reordered/lost messages. Memory tests do not prove durability.
   A volatile three-node test covers replication, follower catch-up, quorum loss
-  and recovery, plus duplicate AppendEntries; remaining scenarios are open.
+  and recovery, duplicate AppendEntries and replay of a delayed duplicate after a
+  newer write; arbitrary reordering and other scenarios remain open.
 - [ ] Build and audit OpenRaft durable storage, snapshots and serialized vote/log
   writes; run OpenRaft's storage suite and crash/fault tests before daemon use.
 - [ ] Secure internal Raft RPC and client identity: separate listeners, authenticate

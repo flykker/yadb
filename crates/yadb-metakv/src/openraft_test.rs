@@ -145,6 +145,7 @@ struct NetworkData {
     isolated: BTreeSet<u32>,
     duplicate_append: bool,
     duplicated: usize,
+    captured_append: Option<(u32, AppendEntriesRequest<C>)>,
 }
 
 #[derive(Clone)]
@@ -178,7 +179,12 @@ impl RaftNetwork<C> for TestNetwork {
         let duplicate = {
             let mut network = self.shared.lock().unwrap();
             let duplicate = network.duplicate_append && !rpc.entries.is_empty();
-            if duplicate { network.duplicated += 1; }
+            if duplicate {
+                network.duplicated += 1;
+                if network.captured_append.is_none() {
+                    network.captured_append = Some((self.target, rpc.clone()));
+                }
+            }
             duplicate
         };
         if duplicate {
@@ -273,6 +279,27 @@ async fn openraft_three_nodes_replicate_and_recover_a_partitioned_follower() {
             assert_eq!(store.0.lock().unwrap().state.revision(), revisions[id] + 1);
         }
         assert!(shared.lock().unwrap().duplicated > 0, "no AppendEntries was duplicated");
+
+        // Replay an actual earlier request after a newer value has been applied.
+        // This models a delayed duplicate, not arbitrary transport reordering.
+        let (target, old_rpc) = {
+            let mut network = shared.lock().unwrap();
+            network.duplicate_append = false;
+            network.captured_append.take().expect("no non-empty AppendEntries captured")
+        };
+        nodes[&recovered_leader].client_write(KvCommand::Put {
+            key: "duplicate-rpc".into(), value: b"newer".to_vec(),
+        }).await.unwrap();
+        for store in stores.values() { wait_value(store, "duplicate-rpc", b"newer").await; }
+        let before = {
+            let data = stores[&target].0.lock().unwrap();
+            (data.state.revision(), data.applied, data.log.last_key_value().map(|(_, e)| e.log_id))
+        };
+        nodes[&target].append_entries(old_rpc).await.unwrap();
+        let data = stores[&target].0.lock().unwrap();
+        assert_eq!(data.state.get("duplicate-rpc").unwrap().value, b"newer");
+        assert_eq!((data.state.revision(), data.applied, data.log.last_key_value().map(|(_, e)| e.log_id)), before);
+        drop(data);
 
         for raft in nodes.values() { raft.shutdown().await.unwrap(); }
         shared.lock().unwrap().nodes.clear();
