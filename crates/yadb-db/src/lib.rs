@@ -63,7 +63,7 @@ pub struct IndexDef {
     pub col_index: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TableSchema {
     pub table: String,
     pub columns: Vec<ColumnDef>,
@@ -499,6 +499,53 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
         resolved_preds: &[(usize, Predicate)],
         tx: Option<&TxBuffer>,
     ) -> Result<Vec<Vec<SqlValue>>, DbError> {
+        self.collect_table_rows_at_boundaries(
+            project_id, db, schema, resolved_preds, tx, |_| {}, || {},
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn collect_table_rows_at_boundaries(
+        &self,
+        project_id: u32,
+        db: &str,
+        schema: &TableSchema,
+        resolved_preds: &[(usize, Predicate)],
+        tx: Option<&TxBuffer>,
+        after_shard_scan: impl FnMut(u32),
+        after_index_scan: impl FnOnce(),
+    ) -> Result<Vec<Vec<SqlValue>>, DbError> {
+        // All applied metadata changes advance this local monotonic revision.
+        // Checking it around the WHOLE collection covers index hits, row loads,
+        // absent shards and schema together without claiming a Raft read barrier.
+        let revision = self.meta.revision();
+        if self.load_schema(project_id, db, &schema.table)? != *schema {
+            return Err(DbError::InvalidQuery(
+                "schema changed before row collection; retry statement".into(),
+            ));
+        }
+        let rows = self.collect_table_rows_unchecked(
+            project_id, db, schema, resolved_preds, tx, after_shard_scan, after_index_scan,
+        )?;
+        if self.meta.revision() != revision {
+            return Err(DbError::InvalidQuery(
+                "metadata changed during row collection; retry statement".into(),
+            ));
+        }
+        Ok(rows)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn collect_table_rows_unchecked(
+        &self,
+        project_id: u32,
+        db: &str,
+        schema: &TableSchema,
+        resolved_preds: &[(usize, Predicate)],
+        tx: Option<&TxBuffer>,
+        mut after_shard_scan: impl FnMut(u32),
+        after_index_scan: impl FnOnce(),
+    ) -> Result<Vec<Vec<SqlValue>>, DbError> {
         // 1. Exact PK equality fast path
         for (col_i, pred) in resolved_preds {
             if *col_i == schema.pk_index
@@ -532,6 +579,7 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
                             &pred.value,
                         )?;
                         let idx_hits = self.meta.scan_prefix(&prefix);
+                        after_index_scan();
                         let mut out = Vec::with_capacity(idx_hits.len());
                         for (_, kv) in idx_hits {
                             if let Some(row) =
@@ -557,6 +605,7 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
                 let pk = row[schema.pk_index].encode_order_preserving_key()?;
                 by_pk.insert(pk, row);
             }
+            after_shard_scan(shard_idx);
         }
         if let Some(buf) = tx {
             if let Some(tbl_map) = buf.writes.get(&schema.table) {
@@ -1833,6 +1882,163 @@ mod tests {
         );
 
         (wal, data)
+    }
+
+    #[test]
+    fn one_collection_never_returns_a_mixed_cross_shard_commit() {
+        for indexed in [false, true] {
+            let fs = SimFs::new(9500);
+            let meta = LocalMetaKv::open_single_node(&fs, "meta", 1).unwrap();
+            let (wal, data) = make_pools(&fs);
+            let first = DatabaseEngine::new(meta.clone(), 1024);
+            let second = DatabaseEngine::new(meta.clone(), 1024);
+            for engine in [&first, &second] {
+                engine.register_pool("wal", wal.clone());
+                engine.register_pool("data", data.clone());
+            }
+            let run = |engine: &DatabaseEngine<SimFs>, sql: &str| {
+                engine.execute_sql(1, "db", "wal", "data", 4, sql).unwrap()
+            };
+            let id_in = |shard| (1..100).find(|id| DatabaseEngine::<SimFs>::route_shard(
+                &SqlValue::Int(*id).encode_order_preserving_key().unwrap(), 4) == shard).unwrap();
+            let (a, b) = (id_in(0), id_in(3));
+            run(&first, &format!("CREATE TABLE t (id INT PRIMARY KEY, v INT); INSERT INTO t VALUES ({a},10),({b},10);"));
+            if indexed {
+                run(&first, &format!("UPDATE t SET v=20 WHERE id={b}; CREATE INDEX by_v ON t (v);"));
+            }
+            let schema = first.load_schema(1, "db", "t").unwrap();
+            let predicates = if indexed {
+                vec![(1, Predicate { column: "v".into(), op: CmpOp::Eq, value: SqlValue::Int(10) })]
+            } else { vec![] };
+            // One atomic commit changes both shards. A scan must not return
+            // old a/new b; an index lookup must not combine old hits/new rows.
+            let update = || {
+                if indexed {
+                    // Each committed state has exactly one v=10 hit. Old index
+                    // hits combined with new rows would incorrectly return none.
+                    run(&second, &format!("BEGIN; UPDATE t SET v=20 WHERE id={a}; UPDATE t SET v=10 WHERE id={b}; COMMIT;"));
+                } else {
+                    run(&second, "UPDATE t SET v=20;");
+                }
+            };
+            let result = first.collect_table_rows_at_boundaries(
+                1, "db", &schema, &predicates, None,
+                |shard| { if !indexed && shard == 0 { update(); } },
+                || { if indexed { update(); } },
+            );
+            assert!(matches!(result, Err(DbError::InvalidQuery(_))),
+                "mixed collection (indexed={indexed}) was accepted: {result:?}");
+            let rows = run(&first, "SELECT v FROM t ORDER BY id;").rows;
+            if indexed {
+                assert_eq!(run(&first, "SELECT id FROM t WHERE v=10;").rows, vec![vec![SqlValue::Int(b)]]);
+                assert_eq!(run(&first, "SELECT id FROM t WHERE v=20;").rows, vec![vec![SqlValue::Int(a)]]);
+            } else {
+                assert_eq!(rows, vec![vec![SqlValue::Int(20)], vec![SqlValue::Int(20)]]);
+            }
+            let expected = run(&first, "SELECT * FROM t ORDER BY id;").rows;
+            drop(first);
+            drop(second);
+            drop(meta);
+            drop(wal);
+            drop(data);
+            fs.simulate_power_cut();
+            let meta = LocalMetaKv::open_single_node(&fs, "meta", 1).unwrap();
+            let (wal, data) = make_pools(&fs);
+            let recovered = DatabaseEngine::new(meta, 1024);
+            recovered.register_pool("wal", wal);
+            recovered.register_pool("data", data);
+            assert_eq!(run(&recovered, "SELECT * FROM t ORDER BY id;").rows, expected);
+            if indexed {
+                assert_eq!(run(&recovered, "SELECT id FROM t WHERE v=10;").rows,
+                    vec![vec![SqlValue::Int(b)]]);
+            }
+        }
+    }
+
+    #[test]
+    fn row_collection_detects_range_phantom_and_schema_change() {
+        for change in ["phantom", "schema", "unrelated"] {
+            let fs = SimFs::new(9501);
+            let meta = LocalMetaKv::open_single_node(&fs, "meta", 1).unwrap();
+            let (wal, data) = make_pools(&fs);
+            let first = DatabaseEngine::new(meta.clone(), 1024);
+            let second = DatabaseEngine::new(meta.clone(), 1024);
+            for engine in [&first, &second] {
+                engine.register_pool("wal", wal.clone());
+                engine.register_pool("data", data.clone());
+            }
+            let run = |engine: &DatabaseEngine<SimFs>, sql: &str| {
+                engine.execute_sql(1, "db", "wal", "data", 4, sql).unwrap()
+            };
+            run(&first, "CREATE TABLE t (id INT PRIMARY KEY, v INT);");
+            let schema = first.load_schema(1, "db", "t").unwrap();
+            let id = (1..100).find(|id| DatabaseEngine::<SimFs>::route_shard(
+                &SqlValue::Int(*id).encode_order_preserving_key().unwrap(), 4) == 0).unwrap();
+            let predicates = vec![(1, Predicate {
+                column: "v".into(), op: CmpOp::Ge, value: SqlValue::Int(10),
+            })];
+            let result = first.collect_table_rows_at_boundaries(
+                1, "db", &schema, &predicates, None,
+                |shard| {
+                    if shard == 0 {
+                        match change {
+                            "phantom" => { run(&second, &format!("INSERT INTO t VALUES ({id},20);")); }
+                            "schema" => { run(&second, "CREATE INDEX by_v ON t (v);"); }
+                            _ => { meta.execute(KvCommand::Put { key: "/unrelated".into(), value: vec![] }).unwrap(); }
+                        }
+                    }
+                }, || {},
+            );
+            assert!(matches!(result, Err(DbError::InvalidQuery(_))), "accepted {change}: {result:?}");
+            // Stable collection succeeds, even if the preceding write was to
+            // unrelated metadata. No retries/hidden write side effects here.
+            let revision = meta.revision();
+            let rows = run(&first, "SELECT id FROM t WHERE v>=10;").rows;
+            assert_eq!(rows.len(), usize::from(change == "phantom"));
+            assert_eq!(meta.revision(), revision);
+            if change == "schema" {
+                // Predicates/column positions resolved with stale schema are
+                // rejected even if it changed before the revision window.
+                assert!(matches!(first.collect_table_rows(1, "db", &schema, &predicates, None),
+                    Err(DbError::InvalidQuery(_))));
+            }
+        }
+    }
+
+    #[test]
+    fn separate_statements_observe_new_commits_and_preserve_own_overlay() {
+        let fs = SimFs::new(9502);
+        let meta = LocalMetaKv::open_single_node(&fs, "meta", 1).unwrap();
+        let (wal, data) = make_pools(&fs);
+        let first = DatabaseEngine::new(meta.clone(), 1024);
+        let second = DatabaseEngine::new(meta.clone(), 1024);
+        for engine in [&first, &second] {
+            engine.register_pool("wal", wal.clone());
+            engine.register_pool("data", data.clone());
+        }
+        let run = |engine: &DatabaseEngine<SimFs>, sql: &str| {
+            engine.execute_sql(1, "db", "wal", "data", 4, sql).unwrap()
+        };
+        let session = |sql: &str| first.execute_sql_with_session(
+            1, "db", "wal", "data", 4, Some("reader"), sql,
+        ).unwrap();
+        run(&first, "CREATE TABLE t (id INT PRIMARY KEY, v INT); INSERT INTO t VALUES (1,10),(2,20); CREATE INDEX by_v ON t (v);");
+        session("BEGIN;");
+        assert_eq!(session("SELECT v FROM t WHERE id=1;").rows, vec![vec![SqlValue::Int(10)]]);
+        run(&second, "UPDATE t SET v=11 WHERE id=1; INSERT INTO t VALUES (3,30);");
+        // Nonrepeatable reads and phantoms BETWEEN statements are deliberately
+        // not prevented: BEGIN holds an overlay, not a committed read snapshot.
+        assert_eq!(session("SELECT v FROM t WHERE id=1;").rows, vec![vec![SqlValue::Int(11)]]);
+        assert_eq!(session("SELECT id FROM t WHERE v>=10;").rows.len(), 3);
+        session("UPDATE t SET v=12 WHERE id=1;");
+        assert_eq!(session("SELECT id FROM t WHERE v=12;").rows, vec![vec![SqlValue::Int(1)]]);
+        assert!(session("SELECT id FROM t WHERE v=11;").rows.is_empty());
+        run(&second, "UPDATE t SET v=21 WHERE id=2;");
+        assert_eq!(session("SELECT v FROM t ORDER BY id;").rows,
+            vec![vec![SqlValue::Int(12)], vec![SqlValue::Int(21)], vec![SqlValue::Int(30)]]);
+        session("COMMIT;");
+        assert_eq!(run(&second, "SELECT v FROM t ORDER BY id;").rows,
+            vec![vec![SqlValue::Int(12)], vec![SqlValue::Int(21)], vec![SqlValue::Int(30)]]);
     }
 
     #[test]

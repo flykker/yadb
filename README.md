@@ -125,11 +125,37 @@ manifest/schema ABA, DML prepared before index publication, exact index contents
 retry and recovery. Modeled publication sync errors recover as an absent index or
 an atomically published schema and backfill, not a partial index.
 
+#### SQL read consistency and isolation limits
+
+Row collection checks the local applied metadata revision before and after loading
+schema, index hits and rows. A revision change rejects the collection rather than
+returning a mixture of pre/post-commit shards or old index hits with new rows.
+The supplied schema must also match the current schema before collecting rows.
+This covers SELECT's buffered rows (including aggregation inputs), and the row
+collection used by UPDATE/DELETE. Projection/aggregation runs on those buffered
+rows after validation. No automatic retry or read-side metadata write is performed.
+
+This deliberately conservative check can conflict on **any** applied metadata
+change, including unrelated projects, blob allocation and shard maintenance. A
+reported collection conflict requires retrying the statement; inside a transaction
+the existing error handling aborts the transaction, so retry it as a whole. Sustained
+writes can prevent reads from making progress. This is a local consistency check,
+not a quorum read barrier: a follower/isolated node may return stale committed data.
+It does not promise linearizable reads or read-your-writes across SQL portals.
+
+Deterministic independent-engine tests reproduce and reject mixed cross-shard
+reads, old index hits combined with new rows, range inserts into an already scanned
+absent shard and schema changes during collection. Stable subsequent collections
+succeed. Within BEGIN, separate statements may see newer committed values and
+new rows; the transaction preserves its own buffered writes as an overlay, not a
+snapshot of committed data. Nonrepeatable reads and phantoms between statements
+are explicitly demonstrated, not prevented.
+
 These checks do **not** establish serializable or snapshot-isolated SQL transactions.
 DML original-row checks compare values, so intervening changes that restore equal
-values are not detected as transaction-level row ABA. Full read-set/range validation, phantom
-behavior and consistent cross-shard reads remain unproven. The guarded index
-backfill does not establish general SQL isolation guarantees.
+values are not detected as transaction-level row ABA. There is no full transaction
+read-set/range validation or general serializability guarantee. The guarded index
+backfill and per-collection checks do not change those limits.
 
 ### AWS S3-compatible API
 

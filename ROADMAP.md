@@ -57,8 +57,17 @@ YADB uses ordinary filesystems; raw PDisk and NBD are not project goals.
   accepted changes before a shard's scan, retry, power-cut recovery and both modeled
   publication sync outcomes. This conservative full-buffered backfill may conflict
   under writes/maintenance and does not provide nonblocking online index building.
-- [ ] Test transaction isolation, read-your-writes, conflicts and range/phantom
-  behavior; state only the isolation guarantees actually established.
+- [x] Reproduce a single row collection mixing shards from before/after one
+  atomic commit. Validate the local applied metadata revision around complete
+  collection (schema/index hits/rows), rejecting changes rather than returning
+  mixed data. Cover indexed lookups, range inserts into absent shards and schema
+  changes. Check new commits/phantoms between statements and own-write overlays
+  inside BEGIN; document these as limits, not snapshot/serializable isolation.
+- [ ] Implement finer-grained or pinned read snapshots without global-revision
+  false conflicts; establish quorum freshness/read barriers separately. Current
+  reads may be stale and unrelated metadata changes can abort row collection.
+- [ ] Define/test transaction-wide read-set/range validation, write skew and
+  serializability before claiming stronger transaction isolation.
 - [ ] Prove GC and compaction do not remove live data, including during recovery,
   concurrent operations and failed commits; reclaim unreferenced block fragments.
 - [x] Reproduce and fix loss of a durable GC barrier when a sealed volume segment
