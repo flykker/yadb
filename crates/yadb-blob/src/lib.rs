@@ -15,6 +15,9 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum BlobError {
+    #[error("volume storage failed; restart and recover before further mutations")]
+    StorageUnavailable,
+
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
@@ -57,7 +60,163 @@ pub enum BlobError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use yadb_io::{FaultConfig, SimFs, StorageFs};
+    use yadb_io::{FaultConfig, SimFs, StorageFs, SyncFault};
+
+    #[test]
+    fn process_only_reopen_must_sync_recovered_records_before_idempotent_ack() {
+        for operation in ["put", "delete", "barrier"] {
+            let fs = SimFs::new(1253);
+            let cfg = VolumeConfig::default();
+            let store = VolumeStore::open(fs.clone(), "reopen", cfg).unwrap();
+            let id = BlobId::new(1, 1, 1, 1, 4, 0);
+            if operation != "put" { store.put(id, b"payload").unwrap(); }
+            fs.set_faults(FaultConfig { sync_data_fault: SyncFault::BeforePersist, ..Default::default() });
+            match operation {
+                "put" => assert!(store.put(id, b"payload").is_err()),
+                "delete" => assert!(store.delete(id).is_err()),
+                _ => assert!(store.collect_garbage_barrier(1, 1, 4, 1).is_err()),
+            }
+            drop(store);
+            // Recovery must not expose the page-cache record while sync is
+            // still failing, nor discard it as though failure meant rollback.
+            assert!(VolumeStore::open(fs.clone(), "reopen", cfg).is_err());
+            fs.set_faults(FaultConfig::default());
+            // Process restart, not power loss: page cache still contains the
+            // unconfirmed record. Recovered bytes alone are not a sync proof.
+            let reopened = VolumeStore::open(fs.clone(), "reopen", cfg).unwrap();
+            if operation == "put" {
+                reopened.put(id, b"payload").unwrap(); // idempotent acknowledgement
+            } else if operation == "delete" {
+                assert!(!reopened.delete(id).unwrap()); // idempotent tombstone acknowledgement
+            } else {
+                assert!(matches!(reopened.put(id, b"payload"), Err(BlobError::FencedByBarrier { .. })));
+            }
+            drop(reopened);
+            fs.simulate_power_cut();
+            let durable = VolumeStore::open(fs, "reopen", cfg).unwrap();
+            if operation == "put" {
+                assert_eq!(durable.get(id).unwrap(), b"payload");
+            } else {
+                assert!(!durable.contains(id));
+                assert!(durable.put(id, b"payload").is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn failed_sync_blocks_mutations_and_preserves_unknown_outcome_until_recovery() {
+        for fault in [SyncFault::BeforePersist, SyncFault::AfterPersist] {
+            for operation in ["put", "delete", "barrier"] {
+                let fs = SimFs::new(1250);
+                let cfg = VolumeConfig::default();
+                let store = VolumeStore::open(fs.clone(), "sync", cfg).unwrap();
+                let old = BlobId::new(1, 1, 1, 1, 4, 0);
+                let unknown = BlobId::new(1, 1, 2, 1, 4, 0);
+                store.put(old, b"old").unwrap();
+                fs.set_faults(FaultConfig { sync_data_fault: fault, ..Default::default() });
+                let result = match operation {
+                    "put" => store.put(unknown, b"unknown"),
+                    "delete" => store.delete(old).map(|_| ()),
+                    _ => store.collect_garbage_barrier(1, 1, 4, 1).map(|_| ()),
+                };
+                assert!(matches!(result, Err(BlobError::Io(_))));
+                fs.set_faults(FaultConfig::default());
+                // Even an idempotent PUT/DELETE must not acknowledge from the
+                // pre-error view or overwrite the ambiguous record's offset.
+                assert!(matches!(store.put(old, b"old"), Err(BlobError::StorageUnavailable)));
+                assert!(matches!(store.put(unknown, b"unknown"), Err(BlobError::StorageUnavailable)));
+                assert!(matches!(store.delete(old), Err(BlobError::StorageUnavailable)));
+                assert!(matches!(store.collect_garbage_barrier(1, 1, 4, 1), Err(BlobError::StorageUnavailable)));
+                assert!(matches!(store.compact_sealed_segments(), Err(BlobError::StorageUnavailable)));
+                drop(store);
+                fs.simulate_power_cut();
+                let recovered = VolumeStore::open(fs.clone(), "sync", cfg).unwrap();
+                let persisted = fault == SyncFault::AfterPersist;
+                if operation == "put" {
+                    assert_eq!(recovered.get(old).unwrap(), b"old");
+                    assert_eq!(recovered.contains(unknown), persisted);
+                    if persisted { assert_eq!(recovered.get(unknown).unwrap(), b"unknown"); }
+                } else {
+                    assert_eq!(recovered.contains(old), !persisted);
+                    if persisted {
+                        assert!(recovered.put(old, b"old").is_err());
+                    } else {
+                        recovered.put(old, b"old").unwrap();
+                    }
+                }
+                let next = BlobId::new(1, 1, 3, 1, 4, 0);
+                recovered.put(next, b"next").unwrap();
+                drop(recovered);
+                fs.simulate_power_cut();
+                let again = VolumeStore::open(fs, "sync", cfg).unwrap();
+                assert_eq!(again.get(next).unwrap(), b"next");
+            }
+        }
+    }
+
+    #[test]
+    fn rollover_sync_failure_never_reinitializes_ambiguous_segment_in_process() {
+        for directory in [false, true] {
+            for fault in [SyncFault::BeforePersist, SyncFault::AfterPersist] {
+                let fs = SimFs::new(1251);
+                let cfg = VolumeConfig { max_segment_bytes: 80, ..Default::default() };
+                let store = VolumeStore::open(fs.clone(), "roll", cfg).unwrap();
+                let old = BlobId::new(1, 1, 1, 1, 4, 0);
+                let next = BlobId::new(1, 1, 1, 2, 4, 0);
+                store.put(old, &[b'o'; 30]).unwrap();
+                fs.set_faults(if directory {
+                    FaultConfig { sync_dir_fault: fault, ..Default::default() }
+                } else {
+                    FaultConfig { sync_data_fault: fault, ..Default::default() }
+                });
+                assert!(matches!(store.put(next, b"next"), Err(BlobError::Io(_))));
+                fs.set_faults(FaultConfig::default());
+                assert!(matches!(store.put(next, b"next"), Err(BlobError::StorageUnavailable)));
+                assert_eq!(store.get(old).unwrap(), vec![b'o'; 30]);
+                drop(store);
+                fs.simulate_power_cut();
+                let recovered = VolumeStore::open(fs, "roll", cfg).unwrap();
+                assert_eq!(recovered.get(old).unwrap(), vec![b'o'; 30]);
+                assert!(!recovered.contains(next));
+                recovered.put(next, b"next").unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn compaction_sync_errors_keep_runtime_and_recovered_reads_consistent() {
+        for directory in [false, true] {
+            for fault in [SyncFault::BeforePersist, SyncFault::AfterPersist] {
+                let fs = SimFs::new(1252);
+                let cfg = VolumeConfig { max_segment_bytes: 220, ..Default::default() };
+                let store = VolumeStore::open(fs.clone(), "compact_sync", cfg).unwrap();
+                let dead = BlobId::new(1, 1, 1, 1, 4, 0);
+                let live = BlobId::new(1, 1, 1, 2, 4, 0);
+                let next = BlobId::new(1, 1, 1, 3, 4, 0);
+                store.put(dead, &[b'd'; 60]).unwrap();
+                store.put(live, &[b'l'; 60]).unwrap();
+                store.put(next, &[b'n'; 60]).unwrap(); // seal first segment
+                store.delete(dead).unwrap();
+                fs.set_faults(if directory {
+                    FaultConfig { sync_dir_fault: fault, ..Default::default() }
+                } else {
+                    FaultConfig { sync_data_fault: fault, ..Default::default() }
+                });
+                assert!(store.compact_sealed_segments().is_err());
+                assert_eq!(store.get(live).unwrap(), vec![b'l'; 60]);
+                assert_eq!(store.get_slice(live, 10, 20).unwrap(), vec![b'l'; 20]);
+                assert!(!store.contains(dead));
+                drop(store);
+                fs.set_faults(FaultConfig::default());
+                fs.simulate_power_cut();
+                let recovered = VolumeStore::open(fs, "compact_sync", cfg).unwrap();
+                assert_eq!(recovered.get(live).unwrap(), vec![b'l'; 60]);
+                assert_eq!(recovered.get(next).unwrap(), vec![b'n'; 60]);
+                assert!(matches!(recovered.put(dead, &[b'd'; 60]), Err(BlobError::Tombstoned(_))));
+                recovered.compact_sealed_segments().unwrap();
+            }
+        }
+    }
 
     #[test]
     fn reed_solomon_recovers_any_two_lost_fragments() {
@@ -100,6 +259,7 @@ mod tests {
             torn_write_prob: 1.0,
             read_eio_prob: 0.0,
             write_eio_prob: 0.0,
+            ..Default::default()
         });
         let b3 = BlobId::new(1, 100, 1, 3, 0, 0);
         assert!(store.put(b3, b"half-written-payload-during-crash").is_err());

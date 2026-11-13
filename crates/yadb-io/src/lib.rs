@@ -148,6 +148,17 @@ impl StorageFs for OsFs {
 // Deterministic Fault-Injecting Simulator (`SimFs`)
 // ============================================================================
 
+/// A failed sync has an unknown persistence outcome, not rollback semantics.
+/// These endpoints exercise both no persistence and full persistence before EIO;
+/// they do not model arbitrary partial writeback or real device behavior.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SyncFault {
+    #[default]
+    None,
+    BeforePersist,
+    AfterPersist,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct FaultConfig {
     /// Deterministic PRNG state (SplitMix64).
@@ -159,6 +170,10 @@ pub struct FaultConfig {
     /// Probability (0.0..=1.0) that a `write_at` fails outright, simulating a
     /// full disk / rejected write. The file content is left untouched.
     pub write_eio_prob: f64,
+    /// Persistent fault mode for every file-data sync until configuration changes.
+    pub sync_data_fault: SyncFault,
+    /// Persistent fault mode for directory-entry sync (including rename/create).
+    pub sync_dir_fault: SyncFault,
 }
 
 #[derive(Clone, Default)]
@@ -333,8 +348,15 @@ impl VirtualFile for SimFile {
     }
 
     fn sync_data(&self) -> IoResult<()> {
+        let fault = self.fs.lock().unwrap().faults.sync_data_fault;
+        if fault == SyncFault::BeforePersist {
+            return Err(io::Error::other("simulated sync_data failure before persistence"));
+        }
         let mut inode = self.inode.lock().unwrap();
         inode.durable = inode.page_cache.clone();
+        if fault == SyncFault::AfterPersist {
+            return Err(io::Error::other("simulated sync_data failure after persistence"));
+        }
         Ok(())
     }
 }
@@ -427,6 +449,10 @@ impl StorageFs for SimFs {
     fn sync_dir(&self, dir: &str) -> IoResult<()> {
         let norm_dir = normalize_path(dir);
         let mut st = self.inner.lock().unwrap();
+        let fault = st.faults.sync_dir_fault;
+        if fault == SyncFault::BeforePersist {
+            return Err(io::Error::other("simulated sync_dir failure before persistence"));
+        }
         // Persist directory entries belonging to `norm_dir`
         let durable_keys: Vec<String> = st
             .durable_dir
@@ -446,6 +472,9 @@ impl StorageFs for SimFs {
         for (k, v) in current_entries {
             st.durable_dir.insert(k, v);
         }
+        if fault == SyncFault::AfterPersist {
+            return Err(io::Error::other("simulated sync_dir failure after persistence"));
+        }
         Ok(())
     }
 
@@ -458,6 +487,42 @@ impl StorageFs for SimFs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sync_data_error_does_not_imply_persistence_or_rollback() {
+        for fault in [SyncFault::BeforePersist, SyncFault::AfterPersist] {
+            let fs = SimFs::new(44);
+            let file = fs.open_rw("file", true).unwrap();
+            file.write_at(0, b"old").unwrap();
+            file.sync_data().unwrap();
+            fs.sync_dir("").unwrap();
+            file.write_at(0, b"new").unwrap();
+            fs.set_faults(FaultConfig { sync_data_fault: fault, ..Default::default() });
+            assert!(file.sync_data().is_err());
+            fs.simulate_power_cut();
+            let recovered = fs.open_rw("file", false).unwrap();
+            let mut bytes = [0; 3];
+            recovered.read_at(0, &mut bytes).unwrap();
+            assert_eq!(&bytes, if fault == SyncFault::AfterPersist { b"new" } else { b"old" });
+        }
+    }
+
+    #[test]
+    fn sync_dir_error_can_leave_either_side_of_rename_durable() {
+        for fault in [SyncFault::BeforePersist, SyncFault::AfterPersist] {
+            let fs = SimFs::new(45);
+            let file = fs.open_rw("old", true).unwrap();
+            file.write_at(0, b"data").unwrap();
+            file.sync_data().unwrap();
+            fs.sync_dir("").unwrap();
+            fs.rename_atomic("old", "new").unwrap();
+            fs.set_faults(FaultConfig { sync_dir_fault: fault, ..Default::default() });
+            assert!(fs.sync_dir("").is_err());
+            fs.simulate_power_cut();
+            assert_eq!(fs.exists("new"), fault == SyncFault::AfterPersist);
+            assert_eq!(fs.exists("old"), fault == SyncFault::BeforePersist);
+        }
+    }
 
     #[test]
     fn simfs_discards_unsynced_writes_on_power_cut() {

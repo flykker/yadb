@@ -56,6 +56,12 @@ YADB uses ordinary filesystems; raw PDisk and NBD are not project goals.
   are deliberately retained; do not infer garbage from absent current references.
 - [ ] Bound tombstone/retired metadata growth and validate real ENOSPC/sync errors,
   hardware power loss, pool-placement changes and mixed-version upgrade behavior.
+- [x] Inject sync EIO before/after full persistence; fail closed after WAL errors
+  and active-volume sync failures. Reproduce follower retry acknowledgement of
+  memory-only entries and process-only reopen acknowledgement of unsynced records;
+  sync recovered files/directories before serving. Cover S3 publication/tombstones,
+  rollover and compaction in simulation. Arbitrary partial writeback and real sync
+  errors remain unverified; recovery requires restart, not automatic re-enablement.
 - [ ] Run kernel open-iscsi + dm-multipath + KVM guest I/O on a Linux host; kill
   active targets, partition networks, restore paths and verify guest data integrity.
   This is blocked on this Android environment by missing KVM and device mapper.

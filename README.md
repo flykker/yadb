@@ -142,6 +142,31 @@ durable records. These simulations do not prove real ENOSPC, failed `fdatasync`,
 power-loss behavior or all failure schedules. Compaction currently serializes writers
 per volume for correctness; latency under large compactions is not characterized.
 
+#### Sync errors and recovery
+
+A failed write or sync is not evidence of rollback. After a WAL write/sync error,
+the node rejects further Raft proposals, RPCs and elections and emits no new
+replication broadcasts until restart/recovery. This prevents a retry from acknowledging
+an in-memory follower entry whose WAL persistence was never confirmed. A volume with
+an active-record sync error, failed tail rollback or failed segment activation rejects
+further mutations and compaction until reopened. Reads can still use its last
+published in-memory index; this is not a read-after-failed-write/status guarantee.
+
+Recovery syncs existing volume segments and the WAL (in durable mode), and syncs their
+directory entries before exposing recovered state. A process restart alone does not
+clear page cache: a valid recovered record must not receive an idempotent success
+response until its durability is established. If recovery sync fails, opening fails.
+An operation that returned an error may appear after recovery, including a deletion
+or S3 publication; clients still need unknown-outcome handling.
+
+`SimFs` tests inject `sync_data` and directory-sync EIO both before persistence and
+after full persistence, including WAL retries, process-only restart followed by power
+loss, S3 publication/cleanup, segment rollover and compaction. These are two modeled
+endpoints, not arbitrary partial/reordered device writeback, real ENOSPC or hardware
+power-loss validation. Temporary compaction sync errors do not poison the active writer:
+the original file remains in use before rename, and after rename the replacement
+file/offsets are installed together even if directory sync fails.
+
 The new `RevisionTxn` Raft/WAL command and volume tombstone records are not understood
 by older binaries. Upgrade all nodes together while stopped; mixed-version rolling
 upgrades/downgrades are unsupported.

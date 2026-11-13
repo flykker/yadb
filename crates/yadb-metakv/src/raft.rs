@@ -175,6 +175,7 @@ impl<FS: StorageFs> RaftCore<FS> {
 
     /// Triggers an election timeout on this node: transitions to `Candidate` (or directly `Leader` if N=1).
     pub fn start_election(&mut self) -> Result<Vec<OutboundMsg>, MetaError> {
+        self.wal.ensure_healthy()?;
         self.current_term += 1;
         self.role = RoleState::Candidate;
         self.voted_for = Some(self.node_id);
@@ -237,6 +238,7 @@ impl<FS: StorageFs> RaftCore<FS> {
     /// Proposes a KV mutation on the Leader, appends to local WAL, and returns replication RPCs
     /// (for N=1 single-node mode, commits and applies immediately).
     pub fn propose(&mut self, cmd: KvCommand) -> Result<(u64, Vec<OutboundMsg>), MetaError> {
+        self.wal.ensure_healthy()?;
         if self.role != RoleState::Leader {
             return Err(MetaError::NotLeader {
                 leader: self.leader_id,
@@ -265,7 +267,7 @@ impl<FS: StorageFs> RaftCore<FS> {
     }
 
     pub fn broadcast_append_entries(&self) -> Vec<OutboundMsg> {
-        if self.role != RoleState::Leader {
+        if self.wal.ensure_healthy().is_err() || self.role != RoleState::Leader {
             return Vec::new();
         }
         let mut out = Vec::new();
@@ -298,6 +300,7 @@ impl<FS: StorageFs> RaftCore<FS> {
     }
 
     pub fn step(&mut self, rpc: RaftRpc) -> Result<Vec<OutboundMsg>, MetaError> {
+        self.wal.ensure_healthy()?;
         match rpc {
             RaftRpc::RequestVote {
                 term,

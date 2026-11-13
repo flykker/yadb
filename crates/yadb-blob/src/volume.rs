@@ -45,6 +45,26 @@ struct ActiveSegment<F: VirtualFile> {
     seg_id: u32,
     file: F,
     write_pos: u64,
+    failed: bool,
+}
+
+impl<F: VirtualFile> ActiveSegment<F> {
+    fn ensure_healthy(&self) -> Result<(), BlobError> {
+        if self.failed {
+            return Err(BlobError::StorageUnavailable);
+        }
+        Ok(())
+    }
+
+    fn sync_data(&mut self) -> Result<(), BlobError> {
+        if let Err(error) = self.file.sync_data() {
+            // The record may already be durable. Never overwrite this offset
+            // or acknowledge an idempotent retry from the old in-memory view.
+            self.failed = true;
+            return Err(error.into());
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
@@ -93,6 +113,10 @@ impl<FS: StorageFs> VolumeStore<FS> {
                 let path = segment_path(&dir, seg_id);
                 let file = fs.open_rw(&path, false)?;
                 recover_segment(&file, seg_id, &mut index, &mut barriers, &mut tombstones)?;
+                // Recovery can see unsynced page-cache records after a process
+                // restart. Sync before serving idempotent PUT/DELETE acks or
+                // relying on recovered fences, even on bulk-load volumes.
+                file.sync_data()?;
                 segments.insert(seg_id, file);
             }
         }
@@ -108,6 +132,7 @@ impl<FS: StorageFs> VolumeStore<FS> {
             f
         };
         let write_pos = active_file.len()?;
+        fs.sync_dir(&dir)?;
 
         Ok(Self {
             fs,
@@ -121,6 +146,7 @@ impl<FS: StorageFs> VolumeStore<FS> {
                 seg_id: active_id,
                 file: active_file,
                 write_pos,
+                failed: false,
             }),
         })
     }
@@ -138,6 +164,7 @@ impl<FS: StorageFs> VolumeStore<FS> {
         // Serialize validation, append and index publication with DELETE,
         // barriers and compaction, not just the physical append.
         let mut writer = self.writer.lock().unwrap();
+        writer.ensure_healthy()?;
         if self.tombstones.read().unwrap().contains(&id) {
             return Err(BlobError::Tombstoned(id));
         }
@@ -177,13 +204,26 @@ impl<FS: StorageFs> VolumeStore<FS> {
             && writer.write_pos + rec_total > self.cfg.max_segment_bytes
         {
             let next_id = writer.seg_id + 1;
-            let new_file = init_new_segment(&self.fs, &self.dir, next_id)?;
-            let read_handle = self.fs.open_rw(&segment_path(&self.dir, next_id), false)?;
+            let new_file = match init_new_segment(&self.fs, &self.dir, next_id) {
+                Ok(file) => file,
+                Err(error) => {
+                    writer.failed = true;
+                    return Err(error);
+                }
+            };
+            let read_handle = match self.fs.open_rw(&segment_path(&self.dir, next_id), false) {
+                Ok(file) => file,
+                Err(error) => {
+                    writer.failed = true;
+                    return Err(error.into());
+                }
+            };
             self.segments.write().unwrap().insert(next_id, read_handle);
             *writer = ActiveSegment {
                 seg_id: next_id,
                 file: new_file,
                 write_pos: VOLUME_MAGIC.len() as u64,
+                failed: false,
             };
         }
 
@@ -195,11 +235,13 @@ impl<FS: StorageFs> VolumeStore<FS> {
         let start_pos = writer.write_pos;
         if let Err(e) = writer.file.write_at(start_pos, &frame) {
             // Roll back partial/torn tail immediately so next write stays aligned
-            let _ = writer.file.set_len(start_pos);
+            if writer.file.set_len(start_pos).is_err() {
+                writer.failed = true;
+            }
             return Err(BlobError::Io(e));
         }
         if self.cfg.sync_on_put {
-            writer.file.sync_data()?;
+            writer.sync_data()?;
         }
 
         let data_offset = start_pos + RECORD_HEADER_LEN as u64;
@@ -226,17 +268,20 @@ impl<FS: StorageFs> VolumeStore<FS> {
     /// by the S3 orphan collector after metadata reachability has been proven.
     pub fn delete(&self, id: BlobId) -> Result<bool, BlobError> {
         let mut writer = self.writer.lock().unwrap();
+        writer.ensure_healthy()?;
         if self.tombstones.read().unwrap().contains(&id) {
             return Ok(false);
         }
         let hdr = encode_record_header(REC_KIND_TOMBSTONE, id, 0, 0);
         let pos = writer.write_pos;
         if let Err(error) = writer.file.write_at(pos, &hdr) {
-            let _ = writer.file.set_len(pos);
+            if writer.file.set_len(pos).is_err() {
+                writer.failed = true;
+            }
             return Err(error.into());
         }
         // Deletion fencing must survive restart even for bulk-load volumes.
-        writer.file.sync_data()?;
+        writer.sync_data()?;
         writer.write_pos += RECORD_HEADER_LEN as u64;
         self.tombstones.write().unwrap().insert(id);
         Ok(self.index.write().unwrap().remove(&id).is_some())
@@ -322,13 +367,16 @@ impl<FS: StorageFs> VolumeStore<FS> {
     ) -> Result<usize, BlobError> {
         let marker_id = BlobId::new(project_id, owner_id, up_to_generation, 0, channel, 0);
         let mut writer = self.writer.lock().unwrap();
+        writer.ensure_healthy()?;
         let hdr = encode_record_header(REC_KIND_BARRIER, marker_id, 0, 0);
         let pos = writer.write_pos;
         if let Err(error) = writer.file.write_at(pos, &hdr) {
-            let _ = writer.file.set_len(pos);
+            if writer.file.set_len(pos).is_err() {
+                writer.failed = true;
+            }
             return Err(error.into());
         }
-        writer.file.sync_data()?;
+        writer.sync_data()?;
         writer.write_pos += RECORD_HEADER_LEN as u64;
 
         {
@@ -363,7 +411,11 @@ impl<FS: StorageFs> VolumeStore<FS> {
     /// Compacts a sealed (non-active) segment by copying only live blobs into a replacement file
     /// and atomically renaming it into place. Reclaims disk space from barrier-deleted blobs.
     pub fn compact_sealed_segments(&self) -> Result<u64, BlobError> {
-        let active_seg = self.writer.lock().unwrap().seg_id;
+        let active_seg = {
+            let writer = self.writer.lock().unwrap();
+            writer.ensure_healthy()?;
+            writer.seg_id
+        };
         let seg_ids: Vec<u32> = self
             .segments
             .read()
@@ -383,7 +435,8 @@ impl<FS: StorageFs> VolumeStore<FS> {
     fn compact_single_segment(&self, seg_id: u32) -> Result<u64, BlobError> {
         // Conservative serialization: prevent PUT/repair, barriers, tombstones
         // and another compactor from invalidating the replacement snapshot.
-        let _writer = self.writer.lock().unwrap();
+        let writer = self.writer.lock().unwrap();
+        writer.ensure_healthy()?;
         let old_len = {
             let segs = self.segments.read().unwrap();
             match segs.get(&seg_id) {

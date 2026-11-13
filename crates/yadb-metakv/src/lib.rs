@@ -10,6 +10,9 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum MetaError {
+    #[error("metadata storage failed; restart and recover before participating in Raft")]
+    StorageUnavailable,
+
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
@@ -32,7 +35,120 @@ pub enum MetaError {
 mod tests {
     use super::*;
     use std::collections::{BTreeMap, BTreeSet, VecDeque};
-    use yadb_io::SimFs;
+    use yadb_io::{FaultConfig, SimFs, SyncFault};
+
+    #[test]
+    fn process_only_reopen_syncs_recovered_wal_before_matching_log_ack() {
+        let fs = SimFs::new(9013);
+        let mut follower = RaftCore::open(&fs, "meta", 2, vec![1, 2, 3], true).unwrap();
+        follower.step(RaftRpc::AppendEntries {
+            term: 1, leader_id: 1, prev_log_index: 0, prev_log_term: 0,
+            entries: vec![], leader_commit: 0,
+        }).unwrap();
+        let rpc = RaftRpc::AppendEntries {
+            term: 1, leader_id: 1, prev_log_index: 0, prev_log_term: 0,
+            entries: vec![LogEntry { index: 1, term: 1,
+                cmd: KvCommand::Put { key: "key".into(), value: b"value".to_vec() } }],
+            leader_commit: 1,
+        };
+        fs.set_faults(FaultConfig { sync_data_fault: SyncFault::BeforePersist, ..Default::default() });
+        assert!(follower.step(rpc.clone()).is_err());
+        drop(follower);
+        assert!(RaftCore::open(&fs, "meta", 2, vec![1, 2, 3], true).is_err());
+        fs.set_faults(FaultConfig::default());
+        let mut reopened = RaftCore::open(&fs, "meta", 2, vec![1, 2, 3], true).unwrap();
+        let replies = reopened.step(rpc).unwrap();
+        assert!(replies.iter().any(|reply| matches!(reply.rpc,
+            RaftRpc::AppendEntriesReply { success: true, match_index: 1, .. })));
+        drop(reopened);
+        fs.simulate_power_cut();
+        let durable = RaftCore::open(&fs, "meta", 2, vec![1, 2, 3], true).unwrap();
+        assert_eq!(durable.last_log_index(), 1);
+    }
+
+    #[test]
+    fn follower_never_acknowledges_memory_only_log_after_wal_failure() {
+        for faults in [
+            FaultConfig { write_eio_prob: 1.0, ..Default::default() },
+            FaultConfig { torn_write_prob: 1.0, ..Default::default() },
+            FaultConfig { sync_data_fault: SyncFault::BeforePersist, ..Default::default() },
+            FaultConfig { sync_data_fault: SyncFault::AfterPersist, ..Default::default() },
+        ] {
+            let fs = SimFs::new(9010);
+            let mut follower = RaftCore::open(&fs, "meta", 2, vec![1, 2, 3], true).unwrap();
+            let heartbeat = RaftRpc::AppendEntries {
+                term: 1, leader_id: 1, prev_log_index: 0, prev_log_term: 0,
+                entries: vec![], leader_commit: 0,
+            };
+            follower.step(heartbeat).unwrap(); // persist term before faulting log
+            let rpc = RaftRpc::AppendEntries {
+                term: 1, leader_id: 1, prev_log_index: 0, prev_log_term: 0,
+                entries: vec![LogEntry { index: 1, term: 1,
+                    cmd: KvCommand::Put { key: "key".into(), value: b"value".to_vec() } }],
+                leader_commit: 1,
+            };
+            fs.set_faults(faults);
+            assert!(matches!(follower.step(rpc.clone()), Err(MetaError::Io(_))));
+            assert_eq!(follower.commit_index(), 0);
+            fs.set_faults(FaultConfig::default());
+            // Matching in-memory entries are NOT evidence of durability.
+            assert!(matches!(follower.step(rpc.clone()), Err(MetaError::StorageUnavailable)));
+            assert!(matches!(follower.start_election(), Err(MetaError::StorageUnavailable)));
+            assert!(follower.broadcast_append_entries().is_empty());
+            assert!(follower.get("key").is_none());
+            drop(follower);
+            fs.simulate_power_cut();
+            let mut recovered = RaftCore::open(&fs, "meta", 2, vec![1, 2, 3], true).unwrap();
+            let replies = recovered.step(rpc).unwrap();
+            assert!(replies.iter().any(|reply| matches!(reply.rpc,
+                RaftRpc::AppendEntriesReply { success: true, match_index: 1, .. })));
+            assert_eq!(recovered.get("key").unwrap().value, b"value");
+        }
+    }
+
+    #[test]
+    fn failed_hard_state_sync_blocks_votes_and_heartbeats_until_recovery() {
+        for fault in [SyncFault::BeforePersist, SyncFault::AfterPersist] {
+            let fs = SimFs::new(9011);
+            let mut follower = RaftCore::open(&fs, "meta", 2, vec![1, 2, 3], true).unwrap();
+            let vote = RaftRpc::RequestVote {
+                term: 1, candidate_id: 1, last_log_index: 0, last_log_term: 0,
+            };
+            fs.set_faults(FaultConfig { sync_data_fault: fault, ..Default::default() });
+            assert!(matches!(follower.step(vote.clone()), Err(MetaError::Io(_))));
+            fs.set_faults(FaultConfig::default());
+            assert!(matches!(follower.step(vote.clone()), Err(MetaError::StorageUnavailable)));
+            assert!(matches!(follower.step(RaftRpc::AppendEntries {
+                term: 1, leader_id: 1, prev_log_index: 0, prev_log_term: 0,
+                entries: vec![], leader_commit: 0,
+            }), Err(MetaError::StorageUnavailable)));
+            drop(follower);
+            fs.simulate_power_cut();
+            let mut recovered = RaftCore::open(&fs, "meta", 2, vec![1, 2, 3], true).unwrap();
+            let replies = recovered.step(vote).unwrap();
+            assert!(replies.iter().any(|reply| matches!(reply.rpc,
+                RaftRpc::RequestVoteReply { vote_granted: true, .. })));
+        }
+    }
+
+    #[test]
+    fn leader_sync_failure_is_unknown_outcome_and_blocks_further_proposals() {
+        for fault in [SyncFault::BeforePersist, SyncFault::AfterPersist] {
+            let fs = SimFs::new(9012);
+            let meta = LocalMetaKv::open_single_node(&fs, "meta", 1).unwrap();
+            fs.set_faults(FaultConfig { sync_data_fault: fault, ..Default::default() });
+            let cmd = KvCommand::Put { key: "key".into(), value: b"unknown".to_vec() };
+            assert!(matches!(meta.execute(cmd.clone()), Err(MetaError::Io(_))));
+            fs.set_faults(FaultConfig::default());
+            assert!(matches!(meta.execute(cmd), Err(MetaError::StorageUnavailable)));
+            assert!(meta.get("key").is_none());
+            drop(meta);
+            fs.simulate_power_cut();
+            let recovered = LocalMetaKv::open_single_node(&fs, "meta", 1).unwrap();
+            assert_eq!(recovered.get("key").is_some(), fault == SyncFault::AfterPersist);
+            recovered.execute(KvCommand::Put { key: "next".into(), value: b"durable".to_vec() }).unwrap();
+        }
+    }
 
     #[test]
     fn revision_guards_reject_delete_recreate_aba_after_wal_recovery() {

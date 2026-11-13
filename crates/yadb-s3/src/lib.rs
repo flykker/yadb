@@ -568,7 +568,70 @@ impl<FS: StorageFs> ObjectStoreEngine<FS> {
 mod tests {
     use super::*;
     use yadb_blob::{ErasureScheme, VolumeConfig, VolumeStore};
-    use yadb_io::{FaultConfig, SimFs};
+    use yadb_io::{FaultConfig, SimFs, SyncFault};
+
+    #[test]
+    fn publication_sync_error_recovers_as_published_or_collectible_not_rollback() {
+        for fault in [SyncFault::BeforePersist, SyncFault::AfterPersist] {
+            let meta_fs = SimFs::new(6310);
+            let disks = [SimFs::new(6311), SimFs::new(6312), SimFs::new(6313)];
+            let s3 = engine(&meta_fs, &disks);
+            let (key, _, manifest) = prepared(&s3);
+            let id = manifest.chunks[0].blob_id;
+            s3.get_pool("pool").unwrap().put_blob(id, b"payload").unwrap();
+            meta_fs.set_faults(FaultConfig { sync_data_fault: fault, ..Default::default() });
+            assert!(matches!(s3.publish_upload(1, "store", &manifest, &key), Err(S3Error::Meta(MetaError::Io(_)))));
+            meta_fs.set_faults(FaultConfig::default());
+            assert!(matches!(s3.publish_upload(1, "store", &manifest, &key),
+                Err(S3Error::Meta(MetaError::StorageUnavailable))));
+            drop(s3);
+            meta_fs.simulate_power_cut();
+            for disk in &disks { disk.simulate_power_cut(); }
+            let recovered = engine(&meta_fs, &disks);
+            advance_revisions(&recovered);
+            if fault == SyncFault::AfterPersist {
+                assert!(recovered.meta.get(&key).is_none());
+                assert_eq!(recovered.collect_orphans_at(1, 1001).unwrap(), 0);
+                assert_eq!(recovered.get_object(1, "store", "bucket", "key").unwrap().1, b"payload");
+            } else {
+                assert!(recovered.head_object(1, "store", "bucket", "key").is_err());
+                assert_eq!(recovered.collect_orphans_at(1, 1001).unwrap(), 1);
+                assert!(recovered.meta.get(&key).is_none());
+                assert!(recovered.get_pool("pool").unwrap().put_blob(id, b"payload").is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn tombstone_sync_error_keeps_aborted_cleanup_until_target_recovery() {
+        for fault in [SyncFault::BeforePersist, SyncFault::AfterPersist] {
+            let meta_fs = SimFs::new(6320);
+            let disks = [SimFs::new(6321), SimFs::new(6322), SimFs::new(6323)];
+            let s3 = engine(&meta_fs, &disks);
+            let (key, _, manifest) = prepared(&s3);
+            let id = manifest.chunks[0].blob_id;
+            s3.get_pool("pool").unwrap().put_blob(id, b"payload").unwrap();
+            advance_revisions(&s3);
+            disks[1].set_faults(FaultConfig { sync_data_fault: fault, ..Default::default() });
+            assert!(s3.collect_orphans_at(1, 1001).is_err());
+            let intent: UploadIntent = serde_json::from_slice(&s3.meta.get(&key).unwrap().value).unwrap();
+            assert_eq!(intent.state, UploadState::Aborted);
+            disks[1].set_faults(FaultConfig::default());
+            // Clearing injected EIO is not enough: target runtime state remains
+            // suspect, and the collector must not forget an unconfirmed fence.
+            assert!(s3.collect_orphans_at(1, 1001).is_err());
+            assert!(s3.meta.get(&key).is_some());
+            assert!(s3.publish_upload(1, "store", &manifest, &key).is_err());
+            drop(s3);
+            meta_fs.simulate_power_cut();
+            for disk in &disks { disk.simulate_power_cut(); }
+            let recovered = engine(&meta_fs, &disks);
+            assert_eq!(recovered.collect_orphans_all().unwrap(),
+                if fault == SyncFault::BeforePersist { 1 } else { 0 });
+            assert!(recovered.meta.get(&key).is_none());
+            assert!(recovered.get_pool("pool").unwrap().put_blob(id, b"payload").is_err());
+        }
+    }
 
     fn engine(meta_fs: &SimFs, disks: &[SimFs]) -> ObjectStoreEngine<SimFs> {
         let meta = LocalMetaKv::open_single_node(meta_fs, "meta", 1).unwrap();
@@ -987,6 +1050,7 @@ mod tests {
             torn_write_prob: 0.5,
             read_eio_prob: 0.0,
             write_eio_prob: 0.0,
+            ..Default::default()
         });
         let result = s3.put_object(
             1,

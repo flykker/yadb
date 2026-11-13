@@ -31,6 +31,7 @@ pub struct RaftWal<FS: StorageFs> {
     file: FS::File,
     write_pos: u64,
     sync_writes: bool,
+    failed: bool,
 }
 
 impl<FS: StorageFs> RaftWal<FS> {
@@ -56,23 +57,40 @@ impl<FS: StorageFs> RaftWal<FS> {
                     file,
                     write_pos: WAL_MAGIC.len() as u64,
                     sync_writes,
+                    failed: false,
                 },
                 RecoveredWal::default(),
             ));
         }
 
         let (recovered, valid_end) = replay_wal(&file)?;
+        if sync_writes {
+            // A process-only restart retains page cache, including records
+            // whose previous sync failed. Reading valid bytes is not evidence
+            // of durability. Establish it before Raft can acknowledge matches.
+            file.sync_data()?;
+            fs.sync_dir(dir)?;
+        }
         Ok((
             Self {
                 file,
                 write_pos: valid_end,
                 sync_writes,
+                failed: false,
             },
             recovered,
         ))
     }
 
+    pub fn ensure_healthy(&self) -> Result<(), MetaError> {
+        if self.failed {
+            return Err(MetaError::StorageUnavailable);
+        }
+        Ok(())
+    }
+
     pub fn append(&mut self, record: &WalRecord) -> Result<(), MetaError> {
+        self.ensure_healthy()?;
         let payload = serde_json::to_vec(record)?;
         let crc = crc32fast::hash(&payload);
         let mut frame = Vec::with_capacity(FRAME_HDR_LEN + payload.len());
@@ -83,11 +101,17 @@ impl<FS: StorageFs> RaftWal<FS> {
 
         let pos = self.write_pos;
         if let Err(e) = self.file.write_at(pos, &frame) {
+            // Raft may already have changed its in-memory term/vote/log. Do
+            // not let a retry acknowledge that state without durable evidence.
+            self.failed = true;
             let _ = self.file.set_len(pos);
             return Err(MetaError::Io(e));
         }
         if self.sync_writes {
-            self.file.sync_data()?;
+            if let Err(e) = self.file.sync_data() {
+                self.failed = true;
+                return Err(e.into());
+            }
         }
         self.write_pos = pos + frame.len() as u64;
         Ok(())
