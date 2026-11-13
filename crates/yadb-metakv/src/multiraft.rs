@@ -1,6 +1,6 @@
 //! Experimental identity, descriptor and envelope validation; not a Raft runtime.
 //!
-//! An experimental empty WAL header binds identity but cannot store or replay records.
+//! An experimental framed WAL binds identity but does not interpret Raft records.
 //! This module does not authenticate senders, validate Raft log structure,
 //! or make `RaftCore` safe to expose to untrusted messages. It is deliberately
 //! disconnected from the daemon and existing metadata traffic.
@@ -195,6 +195,103 @@ fn verify_empty_wal<FS: StorageFs>(fs: &FS, dir: &str, identity: &ReplicaIdentit
     Ok(())
 }
 
+const FRAME_MAGIC: &[u8; 4] = b"YMF1";
+const FRAME_HEADER: usize = 12;
+const MAX_RECORD_BYTES: usize = 1024 * 1024;
+const MAX_WAL_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_RECORDS: usize = 65_536;
+
+#[derive(Debug, thiserror::Error)]
+pub enum GroupWalError {
+    #[error("group WAL identity mismatch or malformed frame")]
+    Corrupt,
+    #[error("group WAL size limit exceeded")]
+    Limit,
+    #[error("group WAL unavailable after an I/O error; reopen required")]
+    Unavailable,
+    #[error("group WAL I/O: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+/// A bounded experimental framed log, not a Raft WAL implementation. Records
+/// are opaque: callers cannot assume Raft term, vote, index or commit validation.
+/// All cooperating users must respect the advisory lock; directory replacement,
+/// external modification and arbitrary storage corruption are outside its model.
+pub struct LockedGroupWal {
+    _lock: OsDirectoryLock,
+    file: <OsFs as StorageFs>::File,
+    end: u64,
+    records: usize,
+    failed: bool,
+}
+
+impl LockedGroupWal {
+    /// Opens an existing provisioned WAL only; never bootstraps on failure.
+    /// The recovered records are untrusted bytes, not applied Raft state.
+    pub fn open(fs: &OsFs, dir: &str, identity: &ReplicaIdentity) -> Result<(Self, Vec<Vec<u8>>), GroupWalError> {
+        let lock = fs.try_lock_directory(dir)?;
+        let file = fs.open_rw(&group_wal_path(dir), false)?;
+        let (end, records) = replay_group_wal(&file, identity)?;
+        // Re-establish durability after a process-only restart before reuse.
+        file.sync_data()?;
+        fs.sync_dir(dir)?;
+        Ok((Self { _lock: lock, file, end, records: records.len(), failed: false }, records))
+    }
+
+    /// An I/O error has an unknown outcome and poisons this handle. A complete
+    /// recovered frame can survive; a partial frame makes reopen fail closed.
+    pub fn append(&mut self, payload: &[u8]) -> Result<(), GroupWalError> {
+        if self.failed { return Err(GroupWalError::Unavailable); }
+        if self.records >= MAX_RECORDS { return Err(GroupWalError::Limit); }
+        let frame = encode_group_frame(payload, self.end)?;
+        if let Err(e) = self.file.write_at(self.end, &frame).and_then(|_| self.file.sync_data()) {
+            self.failed = true;
+            return Err(e.into());
+        }
+        self.end += frame.len() as u64;
+        self.records += 1;
+        Ok(())
+    }
+}
+
+fn encode_group_frame(payload: &[u8], end: u64) -> Result<Vec<u8>, GroupWalError> {
+    if payload.len() > MAX_RECORD_BYTES || end.checked_add(FRAME_HEADER as u64 + payload.len() as u64)
+        .filter(|&n| n <= MAX_WAL_BYTES).is_none() { return Err(GroupWalError::Limit); }
+    let mut frame = Vec::with_capacity(FRAME_HEADER + payload.len());
+    frame.extend_from_slice(FRAME_MAGIC);
+    frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    frame.extend_from_slice(&crc32fast::hash(payload).to_le_bytes());
+    frame.extend_from_slice(payload);
+    Ok(frame)
+}
+
+fn replay_group_wal<F: VirtualFile>(file: &F, identity: &ReplicaIdentity) -> Result<(u64, Vec<Vec<u8>>), GroupWalError> {
+    let len = file.len()?;
+    if len > MAX_WAL_BYTES { return Err(GroupWalError::Limit); }
+    let expected = group_wal_header(identity);
+    if len < expected.len() as u64 { return Err(GroupWalError::Corrupt); }
+    let mut header = vec![0; expected.len()];
+    if file.read_at(0, &mut header)? != header.len() || header != expected { return Err(GroupWalError::Corrupt); }
+    let mut pos = expected.len() as u64;
+    let mut records = Vec::new();
+    while pos < len {
+        if records.len() >= MAX_RECORDS { return Err(GroupWalError::Limit); }
+        if len - pos < FRAME_HEADER as u64 { return Err(GroupWalError::Corrupt); }
+        let mut hdr = [0u8; FRAME_HEADER];
+        if file.read_at(pos, &mut hdr)? != hdr.len() || &hdr[..4] != FRAME_MAGIC { return Err(GroupWalError::Corrupt); }
+        let size = u32::from_le_bytes(hdr[4..8].try_into().unwrap()) as usize;
+        if size > MAX_RECORD_BYTES || size as u64 > len - pos - FRAME_HEADER as u64 { return Err(GroupWalError::Corrupt); }
+        let mut payload = vec![0; size];
+        if file.read_at(pos + FRAME_HEADER as u64, &mut payload)? != size
+            || crc32fast::hash(&payload) != u32::from_le_bytes(hdr[8..12].try_into().unwrap()) {
+            return Err(GroupWalError::Corrupt);
+        }
+        records.push(payload);
+        pos += FRAME_HEADER as u64 + size as u64;
+    }
+    Ok((pos, records))
+}
+
 fn descriptor_path(dir: &str) -> String {
     if dir.is_empty() { DESCRIPTOR_FILE.to_owned() } else {
         format!("{}/{DESCRIPTOR_FILE}", dir.trim_end_matches('/'))
@@ -377,6 +474,53 @@ mod tests {
         assert_eq!(file.len().unwrap(), original.len() as u64 + 6);
         fs.corrupt_byte("g/group.wal", 12).unwrap();
         assert!(verify_empty_wal(&fs, "g", &replica()).is_err());
+    }
+
+    #[test]
+    fn framed_wal_fails_closed_on_truncation_and_corruption() {
+        let fs = SimFs::new(904);
+        fs.create_dir_all("g").unwrap();
+        bootstrap_empty_wal(&fs, "g", &replica()).unwrap();
+        let file = fs.open_rw("g/group.wal", false).unwrap();
+        let offset = file.len().unwrap();
+        let first = encode_group_frame(b"one", offset).unwrap();
+        let second = encode_group_frame(b"two", offset + first.len() as u64).unwrap();
+        file.write_at(offset, &first).unwrap();
+        file.write_at(offset + first.len() as u64, &second).unwrap();
+        file.sync_data().unwrap();
+        let (_, records) = replay_group_wal(&file, &replica()).unwrap();
+        assert_eq!(records, vec![b"one".to_vec(), b"two".to_vec()]);
+        assert!(replay_group_wal(&file, &ReplicaIdentity::new(group(), 1, vec![1]).unwrap()).is_err());
+        let len = file.len().unwrap();
+        fs.corrupt_byte("g/group.wal", (offset + FRAME_HEADER as u64) as usize).unwrap();
+        assert!(matches!(replay_group_wal(&file, &replica()), Err(GroupWalError::Corrupt)));
+        assert_eq!(file.len().unwrap(), len);
+        fs.corrupt_byte("g/group.wal", (offset + FRAME_HEADER as u64) as usize).unwrap();
+        file.set_len(len - 1).unwrap();
+        assert!(matches!(replay_group_wal(&file, &replica()), Err(GroupWalError::Corrupt)));
+        assert_eq!(file.len().unwrap(), len - 1);
+        assert!(matches!(encode_group_frame(&vec![0; MAX_RECORD_BYTES + 1], offset), Err(GroupWalError::Limit)));
+    }
+
+    #[test]
+    fn os_framed_wal_recovers_records_and_holds_lock() {
+        let base = std::env::var_os("YADB_TEST_TMPDIR").map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let dir = base.join(format!("yadb-group-wal-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let fs = OsFs::new(&dir).unwrap();
+        drop(LockedEmptyGroupWal::bootstrap(&fs, "", &replica()).unwrap());
+        let (mut wal, records) = LockedGroupWal::open(&fs, "", &replica()).unwrap();
+        assert!(records.is_empty());
+        wal.append(b"first").unwrap();
+        wal.append(b"second").unwrap();
+        assert!(LockedGroupWal::open(&fs, "", &replica()).is_err());
+        drop(wal);
+        let (wal, records) = LockedGroupWal::open(&fs, "", &replica()).unwrap();
+        assert_eq!(records, vec![b"first".to_vec(), b"second".to_vec()]);
+        drop(wal);
+        std::fs::remove_file(dir.join(GROUP_WAL_FILE)).unwrap();
+        std::fs::remove_dir(dir).unwrap();
     }
 
     #[test]

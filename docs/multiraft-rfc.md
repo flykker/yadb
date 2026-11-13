@@ -127,10 +127,11 @@ An experimental OS directory lock and locked descriptor wrapper exist, but are
 not wired to a group runtime. The lock is advisory and assumes cooperating
 processes and a directory that is not renamed or replaced during use. It provides
 no exclusion against legacy code that does not acquire it.
-An experimental, separately provisioned empty group WAL header includes the full
-replica identity and fixed voters and is verified while holding that OS lock. It
-cannot append or replay records, rejects extra bytes, and is not connected to the
-legacy core. It is not yet a usable Raft WAL or a completed runtime.
+An experimental, separately provisioned group WAL header includes the full replica
+identity and fixed voters and is verified while holding that OS lock. A separate
+bounded framed-log API can append and recover opaque records and fails closed on
+malformed frames without truncation. It does not validate Raft state transitions or
+connect to the legacy core, and is not yet a usable Raft WAL or completed runtime.
 Before attaching a core, implement durable identity binding, exclusive ownership,
 membership and structural validation, fail-closed recovery, and bounded resource
 handling. The existing recovery can truncate a corrupt frame and does not prove
