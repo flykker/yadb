@@ -508,8 +508,14 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
             assert a.query("INVALID SQL;", fail=True)[-1] == (b"Z", b"E")
             assert a.query("ROLLBACK;")[-1] == (b"Z", b"I")
             assert b.rows("SELECT balance FROM wire WHERE id=1;") == [["90"]]
+            a.query("CREATE INDEX by_balance ON wire (balance);")
+            assert b.rows("SELECT id FROM wire WHERE balance=90;") == [["1"]]
+            b.query("UPDATE wire SET balance=201 WHERE id=2;")
+            assert a.rows("SELECT id FROM wire WHERE balance=201;") == [["2"]]
+            assert a.rows("SELECT id FROM wire WHERE balance=200;") == []
             a.close()
             print("PASS pgwire password, result framing, multi-statements, session isolation, rollback")
+            print("PASS pgwire index backfill and cross-portal indexed DML")
 
             key = "/invoices-2026/dir/a%20%2B%26.txt"
             assert signed(19202, "PUT", key, b"hello aws")[0] == 200
@@ -680,6 +686,9 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
                     time.sleep(.05)
             restored = Pg(19102)
             assert restored.rows("SELECT balance FROM wire WHERE id=1;") == [["90"]]
+            assert restored.rows("SELECT id FROM wire WHERE balance=90;") == [["1"]]
+            assert restored.rows("SELECT id FROM wire WHERE balance=201;") == [["2"]]
+            assert restored.rows("SELECT id FROM wire WHERE balance=200;") == []
             restored.close()
             assert signed(19203, "GET", "/invoices-2026/restart")[2] == b"durable object"
             for port, path in vdisk_tombstones:

@@ -50,9 +50,13 @@ YADB uses ordinary filesystems; raw PDisk and NBD are not project goals.
   no-op/mutating shards. Deterministic tests cover both scheduling boundaries,
   update/insert/delete, index contents, cross-shard rejection and simulated
   power-cut recovery; unrelated row changes before preparation can survive.
-- [ ] Close CREATE INDEX backfill versus concurrent DML. Guard all scanned shard
-  revisions, including absent shards, before publication; reproduce conflicting
-  schedules before claiming a consistent backfill.
+- [x] Reproduce CREATE INDEX publishing stale backfill after independent-engine
+  DML. Guard the exact scanned shard revisions, including absent shards, and schema
+  revision in one atomic index/schema publication. Test update/delete/insert at
+  scan/publication boundaries, manifest/schema ABA, old-schema prepared DML,
+  accepted changes before a shard's scan, retry, power-cut recovery and both modeled
+  publication sync outcomes. This conservative full-buffered backfill may conflict
+  under writes/maintenance and does not provide nonblocking online index building.
 - [ ] Test transaction isolation, read-your-writes, conflicts and range/phantom
   behavior; state only the isolation guarantees actually established.
 - [ ] Prove GC and compaction do not remove live data, including during recovery,

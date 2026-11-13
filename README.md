@@ -109,12 +109,27 @@ exact secondary-index contents, rejection of mixed-shard commits and recovery
 after a simulated power cut. An unrelated row change before preparation can be
 preserved alongside the committing update.
 
+`CREATE INDEX` backfill records the modification revision of each exact scanned
+tablet view, including revision-zero guards for absent shards. Index entries and
+schema are published in one transaction guarded by those revisions and the schema
+revision. A change to an already scanned shard rejects the whole publication; retry
+the statement after a confirmed conflict. A change to a not-yet-scanned shard can
+be included in the later scan. Takeover, flush and compaction also change revisions
+and can conservatively cause conflicts. This is not a nonblocking online-index
+builder: sustained writes can prevent progress, and the full backfill is buffered
+and published in one metadata transaction. Errors with an unknown commit outcome
+still require checking recovered schema; they do not prove rollback.
+
+Deterministic tests cover concurrent update/delete/insert, absent/empty shards,
+manifest/schema ABA, DML prepared before index publication, exact index contents,
+retry and recovery. Modeled publication sync errors recover as an absent index or
+an atomically published schema and backfill, not a partial index.
+
 These checks do **not** establish serializable or snapshot-isolated SQL transactions.
-They compare row values, so intervening changes that restore equal values are not
-detected as transaction-level row ABA. Full read-set/range validation, phantom
-behavior and consistent cross-shard reads remain unproven. `CREATE INDEX` backfill
-versus concurrent DML also remains open correctness work. Do not rely on concurrent
-index construction or general SQL isolation guarantees yet.
+DML original-row checks compare values, so intervening changes that restore equal
+values are not detected as transaction-level row ABA. Full read-set/range validation, phantom
+behavior and consistent cross-shard reads remain unproven. The guarded index
+backfill does not establish general SQL isolation guarantees.
 
 ### AWS S3-compatible API
 
