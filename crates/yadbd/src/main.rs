@@ -918,7 +918,15 @@ fn meta_err_resp(st: &AppState, err: MetaError) -> Response {
 }
 
 fn meta_err_response(err: MetaError, peer_addr: impl FnOnce(u32) -> Option<String>) -> Response {
-    if matches!(err, MetaError::OpenRaftWriteUnknown(_)) {
+    // A write whose commit outcome the node cannot determine must not be reported
+    // as a definite failure. `UncommittedIndex` means exactly that on the legacy
+    // path: the proposal may still commit, or a later leader may have replaced it.
+    // Answering 500 made "unknown" indistinguishable from "rejected", which is how
+    // a client ends up retrying a mutation that already happened.
+    if matches!(
+        err,
+        MetaError::OpenRaftWriteUnknown(_) | MetaError::UncommittedIndex(_)
+    ) {
         return forward_error_response(err.to_string(), Some("unknown"));
     }
     match err {
@@ -4520,6 +4528,34 @@ mod security_tests {
         assert_eq!(mapped.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(mapped.headers()["x-yadb-write-outcome"], "unknown");
         assert_eq!(mapped.headers()["x-yadb-retry"], "do-not-retry");
+    }
+
+    // S7: the legacy path has the same ambiguity as the OpenRaft bridge, but its
+    // error was mapped to a plain 500, so a client could not tell "unknown" from
+    // "rejected" and would retry a mutation that may already have committed.
+    #[test]
+    fn legacy_uncommitted_proposal_is_reported_as_unknown_not_failed() {
+        let mapped = meta_err_response(MetaError::UncommittedIndex(42), |_| None);
+        assert_eq!(mapped.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(mapped.headers()["x-yadb-write-outcome"], "unknown");
+        assert_eq!(mapped.headers()["x-yadb-retry"], "do-not-retry");
+    }
+
+    // The distinction must survive for errors that really are definite: a client
+    // that treats every 5xx as "unknown" would stop retrying a plain rejection.
+    #[test]
+    fn definite_meta_errors_stay_500_without_an_outcome_header() {
+        for err in [
+            MetaError::CorruptWal("bad record"),
+            MetaError::Io(std::io::Error::other("disk")),
+        ] {
+            let mapped = meta_err_response(err, |_| None);
+            assert_eq!(mapped.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            assert!(
+                !mapped.headers().contains_key("x-yadb-write-outcome"),
+                "a definite failure must not claim an unknown outcome"
+            );
+        }
     }
 
     #[test]
