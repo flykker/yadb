@@ -111,6 +111,22 @@ deployment cannot reach the unauthenticated branch.
 * Internal VDisk RPCs are peer traffic, not client traffic: they require the
   `--raft-token`, and the token is the credential that protects `DELETE` and
   `barrier` on a hosted slot. See "Internal VDisk RPCs" above.
+* A keyed block UNMAP records its outcome in the project's own group under
+  `/idempotency/<project-id>/<sha256(subject)>/<sha256(key)>`, and its admission
+  counter is group-scoped at `/idempotency/g<group-id>/_usage`. Both halves are
+  hashed for the same reason as control: a group image and a Raft snapshot are
+  readable by anyone who can inspect storage, and a record must not disclose which
+  keys or subjects a project used. Authorization differs from control by design —
+  `resolve` for a project record needs `readWrite` on that project, not the admin
+  allowlist, because the record exists only because that identity was allowed to
+  mutate the project. Projects that share a Raft group share one counter, so one
+  project can exhaust the record budget of another in the same group; that is the
+  intended consequence of the counter having to live in the group it bounds.
+* `POST /v1/pools/scrub` mutates (it collects orphan blobs, rewrites fragments and
+  records a summary) and therefore requires the same signed, allowlisted admin
+  subject as `/v1/apply`. A legacy deployment with no `--admin-subject` keeps its
+  historical unauthenticated behaviour; configuring the allowlist opts the route
+  into the check.
 
 ## Current rotation procedure: coordinated offline restart only
 

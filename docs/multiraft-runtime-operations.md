@@ -244,12 +244,24 @@ filesystem/hardware durability qualification remain tracked in
 `multiraft-idempotency-design.md` (idempotency and the read barrier) and
 `multiraft-backup-restore-design.md` (backup/restore design; nothing implemented).
 
-Idempotency is implemented for `POST /v1/apply` only. A keyed apply commits its
-outcome record in the same `RevisionTxn` as the control-state mutation, so a lost
-response is resolvable with `POST /v1/idempotency/resolve` rather than by
-retrying. SQL, S3 and block reject a key with 501. Admission is bounded by a
-replicated counter (`/sys/idempotency/_usage`, `10_000` records or `8 MiB`,
-committed in the same `RevisionTxn`), which refuses with `429` before planning.
+Idempotency is implemented for `POST /v1/apply` and, at project scope, for block
+UNMAP (`POST /block/{project}/{volume}/unmap`). A keyed apply commits its outcome
+record in the same `RevisionTxn` as the control-state mutation, so a lost response
+is resolvable with `POST /v1/idempotency/resolve` rather than by retrying. A
+keyed UNMAP does the same with the extent-map publication: `unmap_at_with` appends
+the record and the admission counter to the map's guarded transaction, so there is
+no state in which the map advanced without the record or the record exists without
+the map. Its record is project-scoped (`/idempotency/<project-id>/…`) and its
+counter is group-scoped (`/idempotency/g<group-id>/_usage`), because a transaction
+cannot span groups; projects sharing a group therefore share one budget. Resolve
+takes `{"scope":"control","key":…}` or
+`{"scope":"project","project":…,"key":…}`; a control resolve needs an admin
+subject, a project resolve needs `readWrite` on that project. SQL, S3 and block PUT
+reject a key with 501, as does every keyed write on the legacy runtime.
+Admission for control is bounded by a replicated counter
+(`/sys/idempotency/_usage`, `10_000` records or `8 MiB`, committed in the same
+`RevisionTxn`), which refuses with `429` before planning; the project counter has
+the same limits and refuses before the map is read.
 The read barrier is consumed by OpenRaft block reads with `consistent=true`
 (including iSCSI): the extent map comes from a quorum-confirmed snapshot on the
 project-group leader and a missing blob is a `503`, never zeros. SQL, S3 and

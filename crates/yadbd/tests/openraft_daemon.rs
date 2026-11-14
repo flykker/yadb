@@ -639,6 +639,198 @@ spec: {pool: data, sizeBytes: 8192}
         "Idempotency-Key: unsupported\r\n",
     );
     assert_eq!(status, 501);
+    // Give both volumes real content first: "reads back as zeros" is also true
+    // for a volume that was never written, so without this the UNMAP assertion
+    // would not prove the discard happened.
+    let pattern: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8 + 1).collect();
+    for project in ["alpha", "beta"] {
+        ok(
+            public,
+            "PUT",
+            &format!("/block/{project}/disk?offset=0"),
+            &pattern,
+            "application/octet-stream",
+        );
+        assert_eq!(
+            ok(
+                public,
+                "GET",
+                &format!("/block/{project}/disk?offset=0&len=4096&consistent=true"),
+                b"",
+                "application/json",
+            ),
+            pattern,
+            "{project}: the seeded block is not readable before UNMAP"
+        );
+    }
+    // Keyed UNMAP is the first project-scope keyed mutation: it has no staging,
+    // so the extent-map publication and the record commit in one guarded
+    // transaction. The map below is a single node, so every group leader is
+    // local and this exercises the commit path, not forwarding.
+    let unmap_body =
+        |offset: u64, len: u64| serde_json::to_vec(&json!({"offset":offset,"len":len})).unwrap();
+    let keyed_unmap = |project: &str, body: &[u8], key: &str| {
+        request_extra(
+            public,
+            "POST",
+            &format!("/block/{project}/disk/unmap"),
+            body,
+            "application/json",
+            &format!("Idempotency-Key: {key}\r\n"),
+        )
+    };
+    let resolve_scope = |project: Option<&str>, key: &str| -> (u16, Value) {
+        let payload = match project {
+            Some(project) => json!({"scope":"project","project":project,"key":key}),
+            None => json!({"scope":"control","key":key}),
+        };
+        let (status, _, body) = request_extra(
+            public,
+            "POST",
+            "/v1/idempotency/resolve",
+            &serde_json::to_vec(&payload).unwrap(),
+            "application/json",
+            "",
+        );
+        (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
+    };
+    let block_zeros = |project: &str, len: usize| -> Vec<u8> {
+        ok(
+            public,
+            "GET",
+            &format!("/block/{project}/disk?offset=0&len={len}&consistent=true"),
+            b"",
+            "application/json",
+        )
+    };
+    // An unproven identity has no idempotency scope: the record is keyed by
+    // subject, so "anonymous" must not be a shared keyspace.
+    let (status, _, _) = request_with_identity(
+        public,
+        "POST",
+        "/block/alpha/disk/unmap",
+        &unmap_body(0, 4096),
+        "application/json",
+        "",
+        "Idempotency-Key: no-identity\r\n",
+    );
+    assert_eq!(status, 401);
+    // A verified subject that is not a project member is refused, and nothing is
+    // recorded for it.
+    let (status, _, _) = request_with_identity(
+        public,
+        "POST",
+        "/block/alpha/disk/unmap",
+        &unmap_body(0, 4096),
+        "application/json",
+        &format!(
+            "x-yadb-subject: outsider\r\nx-yadb-subject-signature: {}\r\n",
+            subject_signature("outsider")
+        ),
+        "Idempotency-Key: outsider\r\n",
+    );
+    assert_eq!(status, 403);
+    // Resolve is authorized for the project too, so an outsider cannot use it to
+    // probe or fence another project's keys.
+    let (status, _, body) = request_with_identity(
+        public,
+        "POST",
+        "/v1/idempotency/resolve",
+        &serde_json::to_vec(&json!({"scope":"project","project":"alpha","key":"outsider"}))
+            .unwrap(),
+        "application/json",
+        &format!(
+            "x-yadb-subject: outsider\r\nx-yadb-subject-signature: {}\r\n",
+            subject_signature("outsider")
+        ),
+        "",
+    );
+    assert_eq!(status, 403, "{}", String::from_utf8_lossy(&body));
+    // And the refused mutation left no record behind: a member resolving the same
+    // key finds nothing and fences it, rather than observing a record the 403
+    // attempt could not have committed.
+    let (status, resolved) = resolve_scope(Some("alpha"), "outsider");
+    assert_eq!(
+        (status, resolved["outcome"].as_str()),
+        (200, Some("not_committed"))
+    );
+
+    // The same key in two projects must be two independent records: project
+    // scope, not cluster scope.
+    for project in ["alpha", "beta"] {
+        let (status, _, body) = keyed_unmap(project, &unmap_body(0, 4096), "unmap-one");
+        assert_eq!(status, 200, "{project}: {}", String::from_utf8_lossy(&body));
+        // The discard is visible through the quorum-confirmed read path.
+        assert_eq!(block_zeros(project, 4096), vec![0u8; 4096]);
+    }
+    // Replay returns the recorded response and changes nothing: a second UNMAP of
+    // the same range is a no-op anyway, so the observable proof is that the same
+    // key never turns into a conflict or an error.
+    let (status, _, body) = keyed_unmap("alpha", &unmap_body(0, 4096), "unmap-one");
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(block_zeros("alpha", 4096), vec![0u8; 4096]);
+    // Same key, different request: a different range must not replay the first
+    // response.
+    let (status, _, body) = keyed_unmap("alpha", &unmap_body(0, 8192), "unmap-one");
+    assert_eq!(status, 409, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body).unwrap()["error"],
+        "idempotency_key_conflict"
+    );
+    // A byte-identical body that differs only in JSON formatting must fingerprint
+    // differently, because the fingerprint is over the received bytes.
+    let reformatted = br#"{"offset": 0, "len": 4096}"#;
+    let (status, _, body) = keyed_unmap("alpha", reformatted, "unmap-one");
+    assert_eq!(status, 409, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body).unwrap()["error"],
+        "idempotency_key_conflict"
+    );
+    // The record is project-scoped: resolving the same key for beta must not
+    // observe alpha's record.
+    let (status, resolved) = resolve_scope(Some("alpha"), "unmap-one");
+    assert_eq!(
+        (status, resolved["outcome"].as_str()),
+        (200, Some("committed"))
+    );
+    assert_eq!(resolved["response"]["status"], 200);
+    let (status, resolved) = resolve_scope(Some("beta"), "unmap-one");
+    assert_eq!(
+        (status, resolved["outcome"].as_str()),
+        (200, Some("committed"))
+    );
+    // A fence on a fresh key is a permanent not_committed, and a later keyed
+    // mutation of that key must lose to it rather than run.
+    let (status, resolved) = resolve_scope(Some("alpha"), "unmap-fenced");
+    assert_eq!(
+        (status, resolved["outcome"].as_str()),
+        (200, Some("not_committed"))
+    );
+    assert_eq!(resolved["reason"], "fenced");
+    let (status, _, body) = keyed_unmap("alpha", &unmap_body(0, 4096), "unmap-fenced");
+    assert_eq!(status, 409, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body).unwrap()["error"],
+        "idempotency_key_fenced"
+    );
+    // Control resolve still rejects a project payload and vice versa instead of
+    // resolving against a guessed keyspace.
+    for payload in [
+        json!({"scope":"control","key":"unmap-one","project":"alpha"}),
+        json!({"scope":"project","key":"unmap-one"}),
+        json!({"scope":"project","project":"","key":"unmap-one"}),
+        json!({"scope":"cluster","key":"unmap-one"}),
+    ] {
+        let (status, _, _) = request_extra(
+            public,
+            "POST",
+            "/v1/idempotency/resolve",
+            &serde_json::to_vec(&payload).unwrap(),
+            "application/json",
+            "",
+        );
+        assert_eq!(status, 400, "{payload}");
+    }
     let (status, _, body) = request_extra(
         public,
         "GET",
@@ -1516,6 +1708,26 @@ spec: {quotas: {maxStorageBytes: 100000000, maxIops: 1000}, members: [{subject: 
         serde_json::from_slice(&ok(public, "GET", "/v1/status", b"", "application/json")).unwrap();
     assert_eq!(state["generation"], 1);
     assert!(!state["projects"]["alpha"].is_null());
+
+    // The legacy runtime has no record store, so a keyed mutation is refused
+    // rather than silently running unkeyed. This must hold even though the
+    // request is otherwise well-formed: the refusal is about the runtime, not
+    // the payload.
+    let (status, _, response) = request_with_identity(
+        public,
+        "POST",
+        "/block/alpha/disk/unmap",
+        br#"{"offset":0,"len":4096}"#,
+        "application/json",
+        &signed("admin"),
+        "Idempotency-Key: legacy\r\n",
+    );
+    assert_eq!(
+        status,
+        501,
+        "keyed unmap on legacy: {}",
+        String::from_utf8_lossy(&response)
+    );
 
     daemon.interrupt();
 }

@@ -19,7 +19,7 @@ use yadb_blob::{
     VolumeConfig, VolumeStore,
 };
 use yadb_block::{BlockError, BlockVolumeEngine, VolumeExtentMap, DEFAULT_BLOCK_SIZE};
-use yadb_control::{parse_manifests, ControlPlaneState, DiffOp, Role};
+use yadb_control::{parse_manifests, ControlError, ControlPlaneState, DiffOp, Role};
 use yadb_db::{parse_sql_script, script_has_writes, DatabaseEngine, DbError, TabletManifest};
 use yadb_io::OsFs;
 use yadb_metakv::{KvCommand, LocalMetaKv, MetaError, RaftRpc, RoleState, WatchEvent};
@@ -1907,10 +1907,25 @@ fn idempotency_quota_response() -> Response {
     )
 }
 
+/// Refusal for `resolve` when the fence record itself cannot be admitted.
+///
+/// `resolve` promises exactly three answer shapes and one of them is
+/// `unknown` with a reason; `capacity_exhausted` is a reason, not a status.
+/// A `429` here would be unclassifiable for a client that parses `outcome`, and
+/// worse, it could be read as "the write did not happen", which the fence
+/// failed to establish either way.
+fn resolve_capacity_exhausted() -> Response {
+    resolve_unknown("capacity_exhausted")
+}
+
 #[derive(Deserialize)]
 struct ResolvePayload {
     scope: String,
     key: String,
+    /// Project name, required for `scope = "project"` and rejected for control so
+    /// one request cannot name two different record keyspaces.
+    #[serde(default)]
+    project: Option<String>,
 }
 
 fn valid_idempotency_key(key: &[u8]) -> bool {
@@ -2024,6 +2039,150 @@ fn unsupported_idempotency() -> Response {
         StatusCode::NOT_IMPLEMENTED,
         "idempotency is not supported on this endpoint",
     )
+}
+
+/// Keys that scope one keyed project mutation.
+///
+/// The record is project-scoped so two projects sharing a Raft group keep
+/// separate keyspaces, and the admission counter is group-scoped because the
+/// limit it enforces is the group's state image. Both route to the same group,
+/// which is the precondition for guarding them in one transaction.
+struct ProjectIdempotencyScope {
+    /// Record namespace, `/idempotency/<project-id>/`, trailing slash included.
+    records: String,
+    /// Admission counter, `/idempotency/g<group-id>/_usage`.
+    usage_key: String,
+}
+
+async fn project_idempotency_scope(
+    st: &AppState,
+    project_id: u32,
+) -> Result<ProjectIdempotencyScope, Response> {
+    let meta = st.meta.clone();
+    let id = project_id.to_string();
+    let resolved = tokio::task::spawn_blocking(move || meta.project_idempotency_scope(&id))
+        .await
+        .map_err(|e| api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    resolved
+        .map(|(records, usage_key)| ProjectIdempotencyScope { records, usage_key })
+        .map_err(|e| meta_err_resp(st, e))
+}
+
+/// Record key for a project-scope idempotency key.
+///
+/// Both halves are hashed: a group image is readable by anyone who can inspect
+/// storage or a snapshot, and a record must not disclose which keys or subjects
+/// a project used. Hashing also keeps one subject's keys from colliding with
+/// another's inside the shared project namespace.
+fn project_record_key(records: &str, subject: &str, key: &str) -> String {
+    format!(
+        "{records}{}/{}",
+        sha256_hex(subject.as_bytes()),
+        sha256_hex(key.as_bytes())
+    )
+}
+
+/// Fingerprint of a keyed block UNMAP.
+///
+/// The target is named by immutable project id plus volume name, and the body is
+/// hashed exactly as received. Re-serializing `offset`/`len` would let two
+/// different requests that happen to parse to the same struct share a
+/// fingerprint, which is precisely the collision the fingerprint exists to
+/// prevent.
+fn block_unmap_fingerprint(project_id: u32, volume: &str, body: &[u8]) -> String {
+    let project = project_id.to_string();
+    let mut encoded = Vec::new();
+    for field in [
+        b"yadb-project-idempotency-v1".as_slice(),
+        b"POST".as_slice(),
+        b"block-unmap".as_slice(),
+        project.as_bytes(),
+        volume.as_bytes(),
+        body,
+    ] {
+        encoded.extend_from_slice(&(field.len() as u64).to_be_bytes());
+        encoded.extend_from_slice(field);
+    }
+    sha256_hex(&encoded)
+}
+
+/// The record and admission counter for one project group, read in a single
+/// quorum-confirmed snapshot.
+///
+/// They must come from the same moment for the same reason the control pair
+/// does: admitting against a counter read at another revision would let two
+/// writers both pass admission and then both commit.
+struct ProjectApplySnapshot {
+    record: Option<IdempotencyRecord>,
+    usage: IdempotencyUsage,
+    usage_revision: u64,
+}
+
+fn read_project_apply_snapshot(
+    meta: &yadb_metakv::LocalMetaKv<OsFs>,
+    record_key: &str,
+    usage_key: &str,
+) -> Result<ProjectApplySnapshot, String> {
+    let snapshot = meta
+        .try_linearizable_snapshot(&[record_key.to_owned(), usage_key.to_owned()], &[])
+        .map_err(|e| e.to_string())?;
+    let record = match snapshot.get(record_key) {
+        Some(kv) => Some(
+            serde_json::from_slice::<IdempotencyRecord>(&kv.value).map_err(|e| e.to_string())?,
+        ),
+        None => None,
+    };
+    // No scan fallback here, unlike control: project-scope records did not exist
+    // before this counter did, so an absent counter is genuinely zero. The
+    // control path needs its scan because records there predate the counter.
+    let (usage, usage_revision) = match snapshot.get(usage_key) {
+        Some(kv) => (decode_usage(&kv.value)?, kv.mod_revision),
+        None => (
+            IdempotencyUsage {
+                version: 1,
+                ..IdempotencyUsage::default()
+            },
+            0,
+        ),
+    };
+    Ok(ProjectApplySnapshot {
+        record,
+        usage,
+        usage_revision,
+    })
+}
+
+/// The two writes that admit one record, or the refusal that replaces them.
+///
+/// Admission and the record are built together so the caller cannot submit one
+/// without the other: a record that committed without charging the counter would
+/// let the group image grow past the limit the counter exists to enforce.
+fn admission_writes(
+    usage: &IdempotencyUsage,
+    usage_key: &str,
+    record_key: &str,
+    encoded: &[u8],
+) -> Result<(yadb_metakv::TxnOp, yadb_metakv::TxnOp), Response> {
+    if !usage.admits(encoded.len()) {
+        return Err(idempotency_quota_response());
+    }
+    let next_usage = IdempotencyUsage {
+        version: 1,
+        records: usage.records.saturating_add(1),
+        bytes: usage.bytes.saturating_add(encoded.len() as u64),
+    };
+    let usage_value = serde_json::to_vec(&next_usage)
+        .map_err(|e| api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok((
+        yadb_metakv::TxnOp::Put {
+            key: record_key.to_owned(),
+            value: encoded.to_vec(),
+        },
+        yadb_metakv::TxnOp::Put {
+            key: usage_key.to_owned(),
+            value: usage_value,
+        },
+    ))
 }
 
 async fn s3_wire_dispatch(
@@ -2290,8 +2449,57 @@ fn resolve_result(record: IdempotencyRecord) -> Response {
 async fn handle_resolve(State(st): State<AppState>, req: axum::extract::Request) -> Response {
     use axum::extract::FromRequest;
     let headers = req.headers().clone();
+    let (parts, body) = req.into_parts();
+    let body = match axum::body::to_bytes(body, 2 * 1024 * 1024).await {
+        Ok(b) => b,
+        Err(e) => return api_err(StatusCode::BAD_REQUEST, e.to_string()),
+    };
+    let rebuilt = axum::http::Request::from_parts(parts, axum::body::Body::from(body.clone()));
+    let Json(payload) = match Json::<ResolvePayload>::from_request(rebuilt, &st).await {
+        Ok(p) => p,
+        Err(e) => return e.into_response(),
+    };
+    // The body is parsed before authorization because the scope in the body
+    // selects the credential: a control resolve is an admin operation, a project
+    // resolve is a `readWrite` project operation. The consequence is that a
+    // malformed body on this route is 400 before an unauthenticated caller is
+    // told 401. That is deliberate and bounded: the parse reveals nothing about
+    // stored records, and no record is read or fenced until the scope-specific
+    // check has passed.
+    if !valid_idempotency_key(payload.key.as_bytes()) {
+        return api_err(StatusCode::BAD_REQUEST, "invalid idempotency scope or key");
+    }
+    // The scope decides both the keyspace and the credential: control is an
+    // admin operation, while a project record belongs to whoever may write that
+    // project. A request that names both scopes, or a project scope with no
+    // project, is rejected rather than resolved against a guess.
+    match payload.scope.as_str() {
+        "control" if payload.project.is_none() => {
+            resolve_control(&st, &headers, &payload.key, body).await
+        }
+        "project" => match payload.project.as_deref() {
+            Some(project) if !project.is_empty() => {
+                resolve_project(&st, &headers, project, &payload.key, body).await
+            }
+            _ => api_err(StatusCode::BAD_REQUEST, "invalid idempotency scope or key"),
+        },
+        _ => api_err(StatusCode::BAD_REQUEST, "invalid idempotency scope or key"),
+    }
+}
+
+/// Control-scope resolve.
+///
+/// The caller must be a proven admin, exactly as `/v1/apply` requires: fencing a
+/// key is a permanent, non-reversible state change, so the identity that may
+/// commit an apply is also the identity that may fence one.
+async fn resolve_control(
+    st: &AppState,
+    headers: &HeaderMap,
+    requested_key: &str,
+    body: Bytes,
+) -> Response {
     let subject = match require_admin(
-        &headers,
+        headers,
         st.subject_secret.as_deref(),
         &st.admin_subjects,
         st.meta.is_openraft(),
@@ -2299,19 +2507,6 @@ async fn handle_resolve(State(st): State<AppState>, req: axum::extract::Request)
         Ok(subject) => subject,
         Err(e) => return e.into_response(),
     };
-    let (parts, body) = req.into_parts();
-    let body = match axum::body::to_bytes(body, 2 * 1024 * 1024).await {
-        Ok(b) => b,
-        Err(e) => return api_err(StatusCode::BAD_REQUEST, e.to_string()),
-    };
-    let req = axum::http::Request::from_parts(parts, axum::body::Body::from(body.clone()));
-    let Json(payload) = match Json::<ResolvePayload>::from_request(req, &st).await {
-        Ok(p) => p,
-        Err(e) => return e.into_response(),
-    };
-    if payload.scope != "control" || !valid_idempotency_key(payload.key.as_bytes()) {
-        return api_err(StatusCode::BAD_REQUEST, "invalid idempotency scope or key");
-    }
     if !st.meta.is_openraft() {
         return unsupported_idempotency();
     }
@@ -2319,8 +2514,8 @@ async fn handle_resolve(State(st): State<AppState>, req: axum::extract::Request)
         return ControlAdminError::Unverified.into_response();
     };
     if let Some(response) = maybe_forward_write(
-        &st,
-        &headers,
+        st,
+        headers,
         None,
         "POST",
         "/v1/idempotency/resolve".into(),
@@ -2334,8 +2529,8 @@ async fn handle_resolve(State(st): State<AppState>, req: axum::extract::Request)
         }
         return response;
     }
-    let key = record_key(&subject, &payload.key);
-    match read_record(&st, &key).await {
+    let key = record_key(&subject, requested_key);
+    match read_record(st, &key).await {
         Ok(Some(record)) => return resolve_result(record),
         Ok(None) => {}
         Err(_) => return resolve_unknown("quorum_unavailable"),
@@ -2348,16 +2543,18 @@ async fn handle_resolve(State(st): State<AppState>, req: axum::extract::Request)
     };
     let encoded = serde_json::to_vec(&record).unwrap();
     // Fencing a fresh key is a new permanent record, so it draws from the same
-    // budget as a committed apply. A full quota must be a clean refusal: the
-    // alternative is a committed record that cannot be applied, which stops the
-    // control group instead of rejecting one request.
+    // budget as a committed apply. Exhaustion here must not be reported as a
+    // refusal with an outcome the client cannot classify: `resolve` promises
+    // exactly three shapes, and "the fence could not be committed" is `unknown`,
+    // never `not_committed` and never a bare 429. `429` stays on `/v1/apply`,
+    // where it is the documented refusal for a new key.
     for attempt in 1..=3 {
-        let (usage, usage_revision) = match idempotency_usage(&st).await {
+        let (usage, usage_revision) = match idempotency_usage(st).await {
             Ok(v) => v,
             Err(_) => return resolve_unknown("quorum_unavailable"),
         };
         if !usage.admits(encoded.len()) {
-            return idempotency_quota_response();
+            return resolve_capacity_exhausted();
         }
         let next_usage = IdempotencyUsage {
             version: 1,
@@ -2408,11 +2605,132 @@ async fn handle_resolve(State(st): State<AppState>, req: axum::extract::Request)
                 }
             }
             Ok(Ok(yadb_metakv::KvResult::CasConflict { .. })) => {
-                return match read_record(&st, &key).await {
+                return match read_record(st, &key).await {
                     Ok(Some(record)) => resolve_result(record),
                     _ => resolve_unknown("quorum_unavailable"),
                 }
             }
+            _ => return resolve_unknown("fence_outcome_unknown"),
+        }
+    }
+    unreachable!("at least one attempt is made")
+}
+
+/// Project-scope resolve.
+///
+/// The caller needs write access to the project, not admin: a record exists only
+/// because that identity was allowed to mutate the project, and revealing it
+/// needs no more authority than creating it did. The fence is committed in the
+/// project's own group, guarding the absent record and the group's admission
+/// counter in one transaction — the same two keys a keyed mutation guards, which
+/// is what makes "fence wins" and "mutation wins" mutually exclusive.
+async fn resolve_project(
+    st: &AppState,
+    headers: &HeaderMap,
+    project: &str,
+    requested_key: &str,
+    body: Bytes,
+) -> Response {
+    if !st.meta.is_openraft() {
+        return unsupported_idempotency();
+    }
+    let Some(subject) = verified_subject(headers, st.subject_secret.as_deref()) else {
+        return ControlAdminError::Unverified.into_response();
+    };
+    if let Some(response) = maybe_forward_write(
+        st,
+        headers,
+        Some(project),
+        "POST",
+        "/v1/idempotency/resolve".into(),
+        "application/json".into(),
+        body,
+    )
+    .await
+    {
+        if response.status() == StatusCode::SERVICE_UNAVAILABLE {
+            return resolve_unknown("leader_unavailable");
+        }
+        return response;
+    }
+    let pid = {
+        let cp = match st.control_for_authorization_async().await {
+            Ok(cp) => cp,
+            Err(e) => return e.into_response(),
+        };
+        match cp.authorize(project, &subject, Role::ReadWrite) {
+            Ok(pid) => pid,
+            Err(ControlError::Validation(_)) => {
+                return api_err(
+                    StatusCode::NOT_FOUND,
+                    format!("unknown project `{project}`"),
+                )
+            }
+            Err(e) => return api_err(StatusCode::FORBIDDEN, e.to_string()),
+        }
+    };
+    let scope = match project_idempotency_scope(st, pid).await {
+        Ok(scope) => scope,
+        Err(resp) => return resp,
+    };
+    let record_key = project_record_key(&scope.records, &subject, requested_key);
+    let record = IdempotencyRecord {
+        version: 1,
+        fingerprint: String::new(),
+        outcome: "fenced".into(),
+        response: None,
+    };
+    let encoded = serde_json::to_vec(&record).unwrap();
+    for attempt in 1..=3 {
+        let pre = {
+            let meta = st.meta.clone();
+            let record_key = record_key.clone();
+            let usage_key = scope.usage_key.clone();
+            match tokio::task::spawn_blocking(move || {
+                read_project_apply_snapshot(&meta, &record_key, &usage_key)
+            })
+            .await
+            {
+                Ok(Ok(snapshot)) => snapshot,
+                _ => return resolve_unknown("quorum_unavailable"),
+            }
+        };
+        if let Some(record) = pre.record {
+            return resolve_result(record);
+        }
+        // A fence that cannot be admitted is `unknown`, never `not_committed`:
+        // the client cannot tell "no mutation won" from "the fence never ran".
+        let (record_op, usage_op) =
+            match admission_writes(&pre.usage, &scope.usage_key, &record_key, &encoded) {
+                Ok(ops) => ops,
+                Err(_) => return resolve_capacity_exhausted(),
+            };
+        let usage_revision = pre.usage_revision;
+        let meta = st.meta.clone();
+        let record_key_in = record_key.clone();
+        let usage_key_in = scope.usage_key.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            meta.execute(KvCommand::RevisionTxn {
+                guards: vec![
+                    yadb_metakv::RevisionGuard {
+                        key: record_key_in,
+                        expected_mod_revision: 0,
+                    },
+                    yadb_metakv::RevisionGuard {
+                        key: usage_key_in,
+                        expected_mod_revision: usage_revision,
+                    },
+                ],
+                ops: vec![record_op, usage_op],
+            })
+        })
+        .await;
+        match result {
+            Ok(Ok(yadb_metakv::KvResult::TxnOk { .. })) => return resolve_result(record),
+            // A definite non-commit: another writer moved the counter, or another
+            // resolve fenced this key. Re-read rather than guess which, and never
+            // retry a submission whose outcome is unknown.
+            Ok(Ok(yadb_metakv::KvResult::CasConflict { .. })) if attempt < 3 => continue,
             _ => return resolve_unknown("fence_outcome_unknown"),
         }
     }
@@ -2934,14 +3252,46 @@ async fn handle_block_read(
 
 async fn handle_block_unmap(
     State(st): State<AppState>,
-    headers: HeaderMap,
     Path((project, volume)): Path<(String, String)>,
-    Json(req): Json<UnmapPayload>,
+    req: axum::extract::Request,
 ) -> Response {
-    if headers.contains_key("idempotency-key") {
+    use axum::extract::FromRequest;
+    let headers = req.headers().clone();
+    let keyed = headers.contains_key("idempotency-key");
+    // A legacy runtime has no record store, so the key is refused before the body
+    // is even parsed: whether the request happens to be well-formed must not
+    // change a 501 into a 400.
+    if keyed && !st.meta.is_openraft() {
         return unsupported_idempotency();
     }
-    let body = Bytes::from(serde_json::to_vec(&req).unwrap());
+    let (parts, body) = req.into_parts();
+    let body = match axum::body::to_bytes(body, 2 * 1024 * 1024).await {
+        Ok(body) => body,
+        Err(e) => return api_err(StatusCode::PAYLOAD_TOO_LARGE, e.to_string()),
+    };
+    // One parse path for both modes, but the bytes are kept: a keyed request must
+    // fingerprint exactly what the client sent, and forwarding must not re-encode
+    // a body whose meaning depends on its original bytes.
+    let rebuilt = axum::http::Request::from_parts(parts, axum::body::Body::from(body.clone()));
+    let Json(payload) = match Json::<UnmapPayload>::from_request(rebuilt, &st).await {
+        Ok(json) => json,
+        Err(e) => return e.into_response(),
+    };
+    if !keyed {
+        return block_unmap_legacy(&st, &headers, &project, &volume, &payload, body).await;
+    }
+    let key = match idempotency_header(&headers) {
+        Ok(Some(key)) => key,
+        Ok(None) => unreachable!("keyed is derived from the same header"),
+        Err(e) => return e,
+    };
+    // A project record is keyed by subject, so an identity that cannot be proven
+    // has no scope to be idempotent in. `extract_subject` would fall back to
+    // "anonymous", which would silently share one keyspace across unauthenticated
+    // callers.
+    let Some(subject) = verified_subject(&headers, st.subject_secret.as_deref()) else {
+        return ControlAdminError::Unverified.into_response();
+    };
     if let Some(resp) = maybe_forward_write(
         &st,
         &headers,
@@ -2949,19 +3299,43 @@ async fn handle_block_unmap(
         "POST",
         format!("{}/unmap", block_path(&project, &volume)),
         "application/json".into(),
+        body.clone(),
+    )
+    .await
+    {
+        return resp;
+    }
+    keyed_block_unmap(&st, &project, &volume, &subject, &key, &payload, &body).await
+}
+
+async fn block_unmap_legacy(
+    st: &AppState,
+    headers: &HeaderMap,
+    project: &str,
+    volume: &str,
+    req: &UnmapPayload,
+    body: Bytes,
+) -> Response {
+    if let Some(resp) = maybe_forward_write(
+        st,
+        headers,
+        Some(project),
+        "POST",
+        format!("{}/unmap", block_path(project, volume)),
+        "application/json".into(),
         body,
     )
     .await
     {
         return resp;
     }
-    let subject = extract_subject(&headers, st.subject_secret.as_deref());
+    let subject = extract_subject(headers, st.subject_secret.as_deref());
     let (pid, _, size) = {
         let cp = match st.control_for_authorization_async().await {
             Ok(cp) => cp,
             Err(e) => return e.into_response(),
         };
-        match resolve_block_target(&cp, &project, &volume, &subject, Role::ReadWrite) {
+        match resolve_block_target(&cp, project, volume, &subject, Role::ReadWrite) {
             Ok(v) => v,
             Err(r) => return r,
         }
@@ -2970,17 +3344,225 @@ async fn handle_block_unmap(
         return api_err(StatusCode::BAD_REQUEST, "UNMAP must be 4 KiB aligned");
     }
     let block = st.block.clone();
-    match tokio::task::spawn_blocking(move || {
-        block.unmap_at(pid, &volume, size, req.offset, req.len)
-    })
-    .await
+    let volume = volume.to_owned();
+    let offset = req.offset;
+    let len = req.len;
+    match tokio::task::spawn_blocking(move || block.unmap_at(pid, &volume, size, offset, len)).await
     {
         Ok(Ok(())) => StatusCode::OK.into_response(),
         Ok(Err(e @ BlockError::OutOfBounds { .. })) => {
             api_err(StatusCode::RANGE_NOT_SATISFIABLE, e.to_string())
         }
-        Ok(Err(BlockError::Meta(e))) => meta_err_resp(&st, e),
+        Ok(Err(BlockError::Meta(e))) => meta_err_resp(st, e),
         _ => api_err(StatusCode::SERVICE_UNAVAILABLE, "UNMAP failed"),
+    }
+}
+
+/// Keyed UNMAP: the extent-map publication and the idempotency record commit in
+/// one guarded `RevisionTxn`.
+///
+/// UNMAP is the first project-scope keyed mutation because it needs no staging:
+/// it changes only the map, so the mutation and its record can share the single
+/// transaction that `unmap_at_with` builds. Nothing else here may be split into a
+/// second transaction — a record that commits without the map, or the map without
+/// the record, is exactly the ambiguity the key exists to remove.
+async fn keyed_block_unmap(
+    st: &AppState,
+    project: &str,
+    volume: &str,
+    subject: &str,
+    key: &str,
+    payload: &UnmapPayload,
+    body: &[u8],
+) -> Response {
+    let (pid, _, size) = {
+        let cp = match st.control_for_authorization_async().await {
+            Ok(cp) => cp,
+            Err(e) => return e.into_response(),
+        };
+        match resolve_block_target(&cp, project, volume, subject, Role::ReadWrite) {
+            Ok(v) => v,
+            Err(r) => return r,
+        }
+    };
+    if payload.offset % DEFAULT_BLOCK_SIZE as u64 != 0
+        || payload.len % DEFAULT_BLOCK_SIZE as u64 != 0
+    {
+        return api_err(StatusCode::BAD_REQUEST, "UNMAP must be 4 KiB aligned");
+    }
+    let scope = match project_idempotency_scope(st, pid).await {
+        Ok(scope) => scope,
+        Err(resp) => return resp,
+    };
+    let record_key = project_record_key(&scope.records, subject, key);
+    let fingerprint = block_unmap_fingerprint(pid, volume, body);
+    // Fast path: an existing record replays without reading or touching the map.
+    let pre = {
+        let meta = st.meta.clone();
+        let record_key = record_key.clone();
+        let usage_key = scope.usage_key.clone();
+        match tokio::task::spawn_blocking(move || {
+            read_project_apply_snapshot(&meta, &record_key, &usage_key)
+        })
+        .await
+        {
+            Ok(Ok(snapshot)) => snapshot,
+            Ok(Err(e)) => return api_err(StatusCode::SERVICE_UNAVAILABLE, e),
+            Err(e) => return api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        }
+    };
+    if let Some(record) = pre.record {
+        return replay_record(record, &fingerprint);
+    }
+    if pre.usage.records >= MAX_IDEMPOTENCY_RECORDS {
+        // The cheap refusal: the exact byte budget is only checkable once the
+        // record is serialized, which happens inside the map transaction. This
+        // one keeps a full group from even reading the extent map.
+        return idempotency_quota_response();
+    }
+    let record = IdempotencyRecord {
+        version: 1,
+        fingerprint: fingerprint.clone(),
+        outcome: "committed".into(),
+        response: Some(RecordedResponse {
+            status: StatusCode::OK.as_u16(),
+            headers: BTreeMap::new(),
+            body_base64: String::new(),
+        }),
+    };
+    let encoded = match serde_json::to_vec(&record) {
+        Ok(encoded) => encoded,
+        Err(e) => return api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+    // The engine retries a guard conflict up to its own bound. It cannot tell
+    // which guard failed, so the closure re-reads the record and the counter on
+    // every attempt: retrying a stale counter revision would only spin, and a
+    // record that appeared means a concurrent attempt already won this key.
+    //
+    // Every refusal here returns `Err` from `prepare`, which propagates out of
+    // `unmap_at_with` immediately without another attempt, and the captured
+    // response is what the handler returns. That matters for a quota rejection:
+    // expressing it as an unsatisfiable guard would burn all 32 attempts before
+    // reporting a mere conflict. `Conflict` is used only because the engine
+    // needs *an* error to propagate; the outer match takes the captured response
+    // before it ever treats it as a map conflict.
+    let abort: std::sync::Arc<std::sync::Mutex<Option<Response>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
+    let abort_in = abort.clone();
+    let block = st.block.clone();
+    let meta = st.meta.clone();
+    let volume_owned = volume.to_owned();
+    let record_key_in = record_key.clone();
+    let usage_key_in = scope.usage_key.clone();
+    let fingerprint_in = fingerprint.clone();
+    let offset = payload.offset;
+    let len = payload.len;
+    let res = tokio::task::spawn_blocking(move || {
+        block.unmap_at_with(
+            pid,
+            &volume_owned,
+            size,
+            offset,
+            len,
+            |_map: &yadb_block::VolumeExtentMap| {
+                let snapshot = match meta
+                    .try_linearizable_snapshot(&[record_key_in.clone(), usage_key_in.clone()], &[])
+                {
+                    Ok(snapshot) => snapshot,
+                    Err(e) => {
+                        *abort_in.lock().unwrap() =
+                            Some(api_err(StatusCode::SERVICE_UNAVAILABLE, e.to_string()));
+                        return Err(BlockError::Conflict);
+                    }
+                };
+                if let Some(kv) = snapshot.get(&record_key_in) {
+                    let response = match serde_json::from_slice::<IdempotencyRecord>(&kv.value) {
+                        Ok(record) => replay_record(record, &fingerprint_in),
+                        Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+                    };
+                    *abort_in.lock().unwrap() = Some(response);
+                    return Err(BlockError::Conflict);
+                }
+                let (usage, usage_revision) = match snapshot.get(&usage_key_in) {
+                    Some(kv) => match decode_usage(&kv.value) {
+                        Ok(usage) => (usage, kv.mod_revision),
+                        Err(e) => {
+                            *abort_in.lock().unwrap() =
+                                Some(api_err(StatusCode::INTERNAL_SERVER_ERROR, e));
+                            return Err(BlockError::Conflict);
+                        }
+                    },
+                    None => (
+                        IdempotencyUsage {
+                            version: 1,
+                            ..IdempotencyUsage::default()
+                        },
+                        0,
+                    ),
+                };
+                let (record_op, usage_op) =
+                    match admission_writes(&usage, &usage_key_in, &record_key_in, &encoded) {
+                        Ok(ops) => ops,
+                        Err(response) => {
+                            *abort_in.lock().unwrap() = Some(response);
+                            return Err(BlockError::Conflict);
+                        }
+                    };
+                Ok(yadb_block::MapPublication {
+                    guards: vec![
+                        yadb_metakv::RevisionGuard {
+                            key: record_key_in.clone(),
+                            expected_mod_revision: 0,
+                        },
+                        yadb_metakv::RevisionGuard {
+                            key: usage_key_in.clone(),
+                            expected_mod_revision: usage_revision,
+                        },
+                    ],
+                    ops: vec![record_op, usage_op],
+                })
+            },
+        )
+    })
+    .await;
+    match res {
+        Ok(Ok(())) => StatusCode::OK.into_response(),
+        Ok(Err(BlockError::Conflict)) => {
+            if let Some(response) = abort.lock().unwrap().take() {
+                return response;
+            }
+            // The loop exhausted its attempts without the caller aborting: a
+            // definite non-commit, so re-read the record to tell "a concurrent
+            // attempt committed this key" from "the map moved under us". Never
+            // retry blindly.
+            let meta = st.meta.clone();
+            let record_key_in = record_key.clone();
+            let record_key_read = record_key.clone();
+            match tokio::task::spawn_blocking(move || {
+                meta.try_linearizable_snapshot(&[record_key_in], &[])
+                    .map_err(|e| e.to_string())
+            })
+            .await
+            {
+                Ok(Ok(snapshot)) => match snapshot.get(&record_key_read) {
+                    Some(kv) => match serde_json::from_slice::<IdempotencyRecord>(&kv.value) {
+                        Ok(record) => replay_record(record, &fingerprint),
+                        Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+                    },
+                    None => api_err(
+                        StatusCode::CONFLICT,
+                        "block map changed; re-read the volume and retry",
+                    ),
+                },
+                _ => api_err(StatusCode::SERVICE_UNAVAILABLE, "quorum unavailable"),
+            }
+        }
+        Ok(Err(e @ BlockError::OutOfBounds { .. })) => {
+            api_err(StatusCode::RANGE_NOT_SATISFIABLE, e.to_string())
+        }
+        Ok(Err(BlockError::Meta(e))) => meta_err_resp(st, e),
+        Ok(Err(e)) => api_err(StatusCode::SERVICE_UNAVAILABLE, e.to_string()),
+        Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }
 
@@ -3455,7 +4037,21 @@ async fn handle_pools_health(State(st): State<AppState>) -> Response {
     }
 }
 
-async fn handle_pools_scrub(State(st): State<AppState>) -> Response {
+async fn handle_pools_scrub(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    // Scrub is not a read: in legacy mode it collects orphan blobs, rewrites
+    // fragments and records the summary. Any client that can reach the port must
+    // not be able to start it. The check mirrors `/v1/apply` exactly so a legacy
+    // deployment with no `--admin-subject` keeps working unchanged: an empty
+    // allowlist is the historical no-auth mode, a configured allowlist requires a
+    // signed admin subject.
+    if let Err(e) = require_admin(
+        &headers,
+        st.subject_secret.as_deref(),
+        &st.admin_subjects,
+        st.meta.is_openraft(),
+    ) {
+        return e.into_response();
+    }
     let st_clone = st.clone();
     let res = tokio::task::spawn_blocking(move || st_clone.scrub_all_pools()).await;
     match res {
@@ -4059,6 +4655,15 @@ mod security_tests {
     }
 
     #[test]
+    fn resolve_refuses_capacity_as_unknown_not_as_a_quota_status() {
+        // `resolve` must never answer with something a client cannot classify:
+        // the three documented shapes are committed / not_committed / unknown,
+        // and a fence that cannot be admitted did not establish either outcome.
+        let response = resolve_capacity_exhausted();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
     fn idempotency_usage_admits_until_both_limits() {
         let empty = IdempotencyUsage {
             version: 1,
@@ -4265,6 +4870,156 @@ mod security_tests {
         );
         drop(st);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn project_records_are_scoped_by_project_subject_and_key() {
+        // A group image and a Raft snapshot are readable by anyone who can
+        // inspect storage, so a record must not disclose which keys or subjects a
+        // project used: both halves are hashed.
+        let records = "/idempotency/7/";
+        let a = project_record_key(records, "tester", "k1");
+        assert!(a.starts_with(records));
+        assert!(!a.contains("tester"));
+        assert!(!a.contains("k1"));
+        assert_eq!(a, project_record_key(records, "tester", "k1"));
+        // Same key, different subject or project: a different record.
+        assert_ne!(a, project_record_key(records, "other", "k1"));
+        assert_ne!(a, project_record_key("/idempotency/8/", "tester", "k1"));
+        assert_ne!(a, project_record_key(records, "tester", "k2"));
+    }
+
+    #[test]
+    fn block_unmap_fingerprint_covers_the_received_bytes() {
+        let one = br#"{"offset":0,"len":4096}"#;
+        let reformatted = br#"{"offset": 0, "len": 4096}"#;
+        // The fingerprint is over the bytes the client sent. Two bodies that
+        // parse to the same struct are different requests, and replaying one for
+        // the other would return a response for a request that was never made.
+        assert_ne!(
+            block_unmap_fingerprint(7, "disk", one),
+            block_unmap_fingerprint(7, "disk", reformatted)
+        );
+        // The target is part of the fingerprint: the same key and body against a
+        // different volume or project is a conflict, not a replay.
+        assert_ne!(
+            block_unmap_fingerprint(7, "disk", one),
+            block_unmap_fingerprint(7, "other", one)
+        );
+        assert_ne!(
+            block_unmap_fingerprint(7, "disk", one),
+            block_unmap_fingerprint(8, "disk", one)
+        );
+        assert_eq!(
+            block_unmap_fingerprint(7, "disk", one),
+            block_unmap_fingerprint(7, "disk", one)
+        );
+    }
+
+    #[test]
+    fn admission_writes_refuse_at_the_record_ceiling() {
+        let usage = IdempotencyUsage {
+            version: 1,
+            records: MAX_IDEMPOTENCY_RECORDS,
+            bytes: 0,
+        };
+        let refusal = admission_writes(&usage, "/idempotency/g2/_usage", "/idempotency/1/r", b"x")
+            .expect_err("a full counter must not admit another record");
+        assert_eq!(refusal.status(), StatusCode::TOO_MANY_REQUESTS);
+        // At capacity the record and the counter are returned together, never
+        // one without the other: a record that committed without charging the
+        // counter would let the group image grow past the limit it enforces.
+        let usage = IdempotencyUsage {
+            version: 1,
+            records: 1,
+            bytes: 10,
+        };
+        let (record, counter) =
+            admission_writes(&usage, "/idempotency/g2/_usage", "/idempotency/1/r", b"abc").unwrap();
+        match (record, counter) {
+            (
+                yadb_metakv::TxnOp::Put { key, .. },
+                yadb_metakv::TxnOp::Put {
+                    key: counter_key,
+                    value,
+                },
+            ) => {
+                assert_eq!(key, "/idempotency/1/r");
+                assert_eq!(counter_key, "/idempotency/g2/_usage");
+                let next = decode_usage(&value).unwrap();
+                assert_eq!((next.records, next.bytes), (2, 13));
+            }
+            _ => panic!("admission must produce two puts"),
+        }
+        // The byte ceiling is the binding one.
+        let usage = IdempotencyUsage {
+            version: 1,
+            records: 0,
+            bytes: MAX_IDEMPOTENCY_BYTES,
+        };
+        assert!(
+            admission_writes(&usage, "/idempotency/g2/_usage", "/idempotency/1/r", b"x").is_err(),
+            "a full byte budget must refuse another record"
+        );
+    }
+
+    #[test]
+    fn scrub_requires_a_signed_admin_when_an_allowlist_is_configured() {
+        // Scrub mutates: it collects orphan blobs, rewrites fragments and records
+        // a summary. The route must not be reachable without the same credential
+        // `/v1/apply` requires. An empty allowlist is the historical legacy mode
+        // and stays open, so this asserts both halves.
+        let secret = "subject-secret";
+        let admins = vec!["operator".to_string()];
+        let signed = headers_with(&[
+            ("x-yadb-subject", "operator"),
+            (
+                "x-yadb-subject-signature",
+                &subject_signature(secret, "operator"),
+            ),
+        ]);
+        assert_eq!(
+            require_admin(&signed, Some(secret), &admins, true).unwrap(),
+            Some("operator".to_string())
+        );
+
+        // No credential at all: unverified, so the handler refuses before scrubbing.
+        assert!(matches!(
+            require_admin(&HeaderMap::new(), Some(secret), &admins, true),
+            Err(ControlAdminError::Unverified)
+        ));
+        // A forged signature is not an identity.
+        let forged = headers_with(&[
+            ("x-yadb-subject", "operator"),
+            ("x-yadb-subject-signature", "deadbeef"),
+        ]);
+        assert!(matches!(
+            require_admin(&forged, Some(secret), &admins, true),
+            Err(ControlAdminError::Unverified)
+        ));
+        // A verified but non-admin subject is a different refusal.
+        let other = headers_with(&[
+            ("x-yadb-subject", "intruder"),
+            (
+                "x-yadb-subject-signature",
+                &subject_signature(secret, "intruder"),
+            ),
+        ]);
+        assert!(matches!(
+            require_admin(&other, Some(secret), &admins, true),
+            Err(ControlAdminError::NotAdmin)
+        ));
+        // Legacy: no allowlist means the historical no-auth mode is preserved.
+        assert_eq!(
+            require_admin(&HeaderMap::new(), None, &[], false).unwrap(),
+            None
+        );
+        // But an OpenRaft daemon never reaches that branch: it cannot start
+        // without an allowlist, and an empty one is a hard refusal here too.
+        assert!(matches!(
+            require_admin(&HeaderMap::new(), Some(secret), &[], true),
+            Err(ControlAdminError::NotConfigured)
+        ));
     }
 
     #[test]

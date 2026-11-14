@@ -62,6 +62,10 @@ enum Command {
         /// Must match the subject used for apply
         #[arg(long, default_value = "yadbctl")]
         subject: String,
+        /// Resolve a project-scope record (block UNMAP) instead of a control one.
+        /// The subject must be allowed to write that project.
+        #[arg(long)]
+        project: Option<String>,
         /// Print the daemon response verbatim
         #[arg(long)]
         json: bool,
@@ -251,8 +255,30 @@ fn resolve_request(
     subject: &str,
     secret: Option<&str>,
 ) -> Result<(u16, Vec<u8>), Box<dyn std::error::Error>> {
+    resolve_request_scoped(srv, key, subject, secret, None)
+}
+
+/// Resolve a record in the control scope, or in a project's scope when
+/// `project` is given.
+///
+/// The scope is part of the request because it selects the keyspace *and* the
+/// credential: a control resolve is an admin operation, while a project record
+/// belongs to whoever may write that project. Sending the wrong one would either
+/// fence a key nobody meant to fence or fail authorization.
+fn resolve_request_scoped(
+    srv: &str,
+    key: &str,
+    subject: &str,
+    secret: Option<&str>,
+    project: Option<&str>,
+) -> Result<(u16, Vec<u8>), Box<dyn std::error::Error>> {
     validate_idempotency_key(key)?;
-    let payload = serde_json::to_vec(&serde_json::json!({"scope": "control", "key": key}))?;
+    let payload = match project {
+        Some(project) => serde_json::to_vec(
+            &serde_json::json!({"scope": "project", "project": project, "key": key}),
+        )?,
+        None => serde_json::to_vec(&serde_json::json!({"scope": "control", "key": key}))?,
+    };
     http_subject_request(
         srv,
         "POST",
@@ -637,11 +663,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 print_ops(&ops);
             }
         }
-        Command::Resolve { key, subject, json } => {
+        Command::Resolve {
+            key,
+            subject,
+            project,
+            json,
+        } => {
             let srv = cli.server.as_deref().ok_or(
                 "resolve requires --server; resolving an unused key permanently fences it",
             )?;
-            let (code, body) = resolve_request(srv, &key, &subject, cli.subject_secret.as_deref())?;
+            let (code, body) = resolve_request_scoped(
+                srv,
+                &key,
+                &subject,
+                cli.subject_secret.as_deref(),
+                project.as_deref(),
+            )?;
             if code != 200 && code != 503 {
                 eprintln!(
                     "Resolve failed ({code}): {}",
@@ -1076,8 +1113,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_request, decode_base64, resolve_request, resolve_success, subject_headers,
-        subject_signature, validate_idempotency_key,
+        apply_request, decode_base64, resolve_request, resolve_request_scoped, resolve_success,
+        subject_headers, subject_signature, validate_idempotency_key,
     };
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -1158,6 +1195,30 @@ mod tests {
             "x-yadb-subject-signature: {}\r\n",
             subject_signature("secret", "alice")
         )));
+        let body = request.split_once("\r\n\r\n").unwrap().1;
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(body).unwrap(),
+            serde_json::json!({"scope":"control", "key":"key-1"})
+        );
+    }
+
+    #[test]
+    fn resolve_sends_project_scope_when_a_project_is_named() {
+        // The scope selects both the keyspace and the credential, so the CLI must
+        // never send a control resolve for a project key (that would fence a
+        // control record nobody meant to fence) or omit the project name.
+        let request = capture_request(|srv| {
+            resolve_request_scoped(srv, "key-1", "alice", Some("secret"), Some("billing")).unwrap();
+        });
+        let body = request.split_once("\r\n\r\n").unwrap().1;
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(body).unwrap(),
+            serde_json::json!({"scope":"project", "project":"billing", "key":"key-1"})
+        );
+        // Without a project the payload stays byte-identical to the control form.
+        let request = capture_request(|srv| {
+            resolve_request_scoped(srv, "key-1", "alice", Some("secret"), None).unwrap();
+        });
         let body = request.split_once("\r\n\r\n").unwrap().1;
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(body).unwrap(),

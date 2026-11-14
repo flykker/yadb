@@ -265,19 +265,24 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   implemented (`Idempotency-Key`, the outcome record committed in the same
   `RevisionTxn` as the mutation, `POST /v1/idempotency/resolve`, and a replicated
   `10_000`-record / `8 MiB` admission counter at `/sys/idempotency/_usage` that
-  refuses with `429` before planning); every other mutating endpoint still rejects
-  a key with 501. Reads mostly still serve the locally applied state:
+  refuses with `429` before planning). Keyed block UNMAP is implemented too: the
+  record is project-scoped (`/idempotency/<project-id>/…`), the counter is
+  group-scoped (`/idempotency/g<group-id>/_usage`) because a transaction cannot
+  span groups, and both join the extent-map publication in one `RevisionTxn`
+  (`BlockVolumeEngine::unmap_at_with`). `resolve` accepts a project scope and
+  fences in the project group. SQL, S3 object PUT/DELETE and block PUT still
+  reject a key with 501. Reads mostly still serve the locally applied state:
   `LocalMetaKv::try_linearizable_snapshot` is consumed only by OpenRaft block
   reads with `consistent=true` (and the iSCSI read path), which forward to the
   project-group leader and fail rather than return a stale or partially collected
   volume.
   `docs/multiraft-idempotency-design.md` holds the full contract and the blockers
-  that prevent the remaining scopes: `GroupRouter::group_id` now routes a
-  project-scoped `/idempotency/<project-id>/…` namespace and
-  `idempotency_namespace` fails closed for unmapped projects, so the routing
-  prerequisite exists, but no endpoint writes or reads such a record; SQL/S3/block
-  still cannot publish all visible effects and a bounded response in one guarded
-  transaction, and a linearizable read needs one pinned snapshot per read path.
+  that prevent the remaining scopes: SQL/S3/block PUT still cannot publish all
+  visible effects and a bounded response in one guarded transaction (they stage
+  before publishing), and a linearizable read needs one pinned snapshot per read
+  path. The group-scoped counter also means projects that share a group share one
+  budget, which is intended but not yet exercised with a real second project on
+  the same group.
 - [ ] Consistent backup and restore. Nothing is implemented.
   `docs/multiraft-backup-restore-design.md` designs a whole-deployment artifact
   and a restore into a new root, and records why raw `cp -a` of live data, a

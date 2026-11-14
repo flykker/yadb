@@ -1001,6 +1001,33 @@ impl<FS: StorageFs> LocalMetaKv<FS> {
         ))
     }
 
+    /// Record namespace and admission-counter key for a project's idempotency
+    /// records.
+    ///
+    /// The record is project-scoped (`/idempotency/<project-id>/…`) so two
+    /// projects that share a Raft group keep separate keyspaces; the counter is
+    /// group-scoped (`/idempotency/g<group>/_usage`) because the limit it
+    /// enforces is the group's state image, not the project's. Both keys route to
+    /// the same group, which is what lets one `RevisionTxn` guard them together
+    /// with the mutation they record.
+    ///
+    /// `project` is the canonical decimal project id, not its name: the router
+    /// resolves it against its immutable mapping and fails closed for an unmapped
+    /// or non-canonical value. A fallback to control would put the record in a
+    /// group that never resolves it back to the project.
+    pub fn project_idempotency_scope(&self, project: &str) -> Result<(String, String), MetaError> {
+        #[cfg(any(test, feature = "experimental-openraft-storage"))]
+        if let Some(client) = &self.openraft {
+            let records = client.idempotency_namespace(Some(project))?;
+            let group = client.group_id_for_project(Some(project))?;
+            return Ok((records, client.group_idempotency_usage_key(group)?));
+        }
+        let _ = project;
+        Err(MetaError::Routing(
+            "project idempotency requires OpenRaft".into(),
+        ))
+    }
+
     pub fn scan_prefix(&self, prefix: &str) -> Vec<(String, KvValue)> {
         #[cfg(any(test, feature = "experimental-openraft-storage"))]
         if let Some(client) = &self.openraft {

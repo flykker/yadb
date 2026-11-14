@@ -307,7 +307,7 @@ impl<FS: StorageFs> BlockVolumeEngine<FS> {
         len: u64,
     ) -> Result<(), BlockError> {
         self.unmap_at_with(pid, volume, size, offset, len, |_| {
-            MapPublication::default()
+            Ok(MapPublication::default())
         })
     }
 
@@ -335,6 +335,13 @@ impl<FS: StorageFs> BlockVolumeEngine<FS> {
     /// `BlockError::Conflict` after the loop, which still means "not
     /// committed"; it must re-read its own record to tell "a concurrent attempt
     /// committed this request" from "state moved past us".
+    ///
+    /// `prepare` returns a `Result` so a caller can refuse *without* a guard:
+    /// an admission check that fails (quota exhausted, record unreadable) is
+    /// not a conflict, and expressing it as an unsatisfiable guard would spin
+    /// through every attempt before reporting a mere conflict. An `Err` is
+    /// returned immediately and nothing was submitted in that attempt, so it is
+    /// a definite non-commit, like a conflict and unlike a storage error.
     pub fn unmap_at_with<F>(
         &self,
         pid: u32,
@@ -345,7 +352,7 @@ impl<FS: StorageFs> BlockVolumeEngine<FS> {
         mut prepare: F,
     ) -> Result<(), BlockError>
     where
-        F: FnMut(&VolumeExtentMap) -> MapPublication,
+        F: FnMut(&VolumeExtentMap) -> Result<MapPublication, BlockError>,
     {
         if offset.checked_add(len).is_none_or(|end| end > size) {
             return Err(BlockError::OutOfBounds {
@@ -367,7 +374,7 @@ impl<FS: StorageFs> BlockVolumeEngine<FS> {
             // Prepared only once the request is known to be publishable, and
             // with the post-discard map: the caller's guards/ops join this
             // attempt's transaction and nothing else.
-            let extra = prepare(&map);
+            let extra = prepare(&map)?;
             if self.publish_map_with(key.clone(), revision, &map, extra)? {
                 return Ok(());
             }
@@ -1048,7 +1055,9 @@ mod tests {
         }
         engine.unmap_at(1, "legacy", 12288, 4096, 4096).unwrap();
         engine
-            .unmap_at_with(1, "entry", 12288, 4096, 4096, |_| MapPublication::default())
+            .unmap_at_with(1, "entry", 12288, 4096, 4096, |_| {
+                Ok(MapPublication::default())
+            })
             .unwrap();
         let legacy = engine.load_map(1, "legacy").unwrap();
         let entry = engine.load_map(1, "entry").unwrap();
@@ -1078,7 +1087,7 @@ mod tests {
         engine
             .unmap_at_with(1, "disk", 16384, 0, 4096, |map| {
                 seen = Some(map.clone());
-                MapPublication {
+                Ok(MapPublication {
                     guards: vec![RevisionGuard {
                         key: record.clone(),
                         expected_mod_revision: 0,
@@ -1087,7 +1096,7 @@ mod tests {
                         key: record.clone(),
                         value: b"done".to_vec(),
                     }],
-                }
+                })
             })
             .unwrap();
 
@@ -1124,15 +1133,17 @@ mod tests {
         let map_key = BlockVolumeEngine::<SimFs>::meta_key(1, "disk");
         let before = meta.get(&map_key).unwrap();
         let record = "/block-unmap/1/disk/never".to_string();
-        let result = engine.unmap_at_with(1, "disk", 16384, 0, 8192, |_| MapPublication {
-            guards: vec![RevisionGuard {
-                key: record.clone(),
-                expected_mod_revision: 1,
-            }],
-            ops: vec![TxnOp::Put {
-                key: record.clone(),
-                value: b"done".to_vec(),
-            }],
+        let result = engine.unmap_at_with(1, "disk", 16384, 0, 8192, |_| {
+            Ok(MapPublication {
+                guards: vec![RevisionGuard {
+                    key: record.clone(),
+                    expected_mod_revision: 1,
+                }],
+                ops: vec![TxnOp::Put {
+                    key: record.clone(),
+                    value: b"done".to_vec(),
+                }],
+            })
         });
         assert!(
             matches!(&result, Err(BlockError::Conflict)),
@@ -1174,7 +1185,7 @@ mod tests {
         engine
             .unmap_at_with(1, "disk", 16384, 0, 4096, |_| {
                 attempts += 1;
-                if attempts == 1 {
+                Ok(if attempts == 1 {
                     MapPublication {
                         guards: vec![
                             RevisionGuard {
@@ -1202,7 +1213,7 @@ mod tests {
                             value: b"second".to_vec(),
                         }],
                     }
-                }
+                })
             })
             .unwrap();
         assert_eq!(
@@ -1212,6 +1223,41 @@ mod tests {
         assert_eq!(meta.get(&record).unwrap().value, b"second");
         let map = engine.load_map(1, "disk").unwrap();
         assert_eq!(map.blocks.keys().copied().collect::<Vec<_>>(), vec![1, 2]);
+    }
+
+    // A refusal is not a conflict: `prepare` returns `Err`, the engine must
+    // propagate it on the first attempt (no retries) and commit nothing. Quota
+    // exhaustion uses exactly this path.
+    #[test]
+    fn prepare_refusal_is_reported_without_retrying_or_committing() {
+        let fs = SimFs::new(8821);
+        let meta = LocalMetaKv::open_single_node(&fs, "meta", 1).unwrap();
+        let engine = BlockVolumeEngine::new(meta.clone(), 4096);
+        engine.register_pool("data", pool(&fs));
+        engine
+            .write_at(1, "disk", "data", 16384, 0, &vec![6u8; 12288])
+            .unwrap();
+        let map_key = BlockVolumeEngine::<SimFs>::meta_key(1, "disk");
+        let before = meta.get(&map_key).unwrap();
+        let mut attempts = 0u32;
+        let result = engine.unmap_at_with(1, "disk", 16384, 0, 8192, |_| {
+            attempts += 1;
+            Err(BlockError::PoolNotMounted("refused".into()))
+        });
+        assert!(
+            matches!(result, Err(BlockError::PoolNotMounted(_))),
+            "a caller refusal must be reported verbatim, got {result:?}"
+        );
+        assert_eq!(
+            attempts, 1,
+            "a refusal is a definite non-commit, not a conflict to retry"
+        );
+        let after = meta.get(&map_key).unwrap();
+        assert_eq!(
+            after.mod_revision, before.mod_revision,
+            "map advanced although the caller refused"
+        );
+        assert_eq!(after.value, before.value);
     }
 
     // Range and alignment rejections happen before `prepare` runs and before
@@ -1228,7 +1274,7 @@ mod tests {
             let entry = engine
                 .unmap_at_with(1, "disk", size, offset, len, |_| {
                     prepared += 1;
-                    MapPublication::default()
+                    Ok(MapPublication::default())
                 })
                 .unwrap_err();
             assert!(matches!(legacy, BlockError::OutOfBounds { .. }));
@@ -1239,7 +1285,7 @@ mod tests {
         let entry = engine
             .unmap_at_with(1, "disk", 8192, 512, 4096, |_| {
                 prepared += 1;
-                MapPublication::default()
+                Ok(MapPublication::default())
             })
             .unwrap_err();
         assert!(matches!(legacy, BlockError::Conflict));

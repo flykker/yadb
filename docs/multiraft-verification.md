@@ -182,6 +182,23 @@ unchanged; `POST /v1/idempotency/resolve` returned `committed` for the used key 
 establish: no response-loss injection, no leader kill during a keyed apply, no
 follower-forwarded keyed apply, and no quota behaviour, because no quota exists.
 
+Project-scope idempotency exists for block UNMAP only, and its live and
+integration evidence is narrower than the control scope's. The integration test
+`three_daemons_forward_http_to_different_group_leaders` drives it through the
+real daemon: an unproven identity gets 401 and a verified non-member 403 before
+any record exists; the same key in two projects produces two independent records;
+a replay returns 200 and the recorded response; the same key with a different
+range or a byte-different JSON body of the same range returns 409
+`idempotency_key_conflict`; `resolve` with `scope: project` returns `committed`
+from the project group; a fenced key returns `not_committed` and a later keyed
+UNMAP with it returns 409 `idempotency_key_fenced`; a control payload carrying
+`project`, a project payload without it, and an unknown scope all return 400. The
+legacy runtime refuses a keyed UNMAP with 501. What this does not establish: no
+crash between map publication and record (they are one transaction by
+construction, but no fault injection proves it), no concurrent same-key race
+across two nodes, no leader loss during the publication, and no quota exhaustion
+on a real project group — the counter's ceiling is covered by unit tests only.
+
 
 Evidence for the fix is a `SIGSTOP`/`SIGCONT` experiment on the live cluster:
 pausing the control leader for about 1.2 s (below the 1500 ms preferred election
