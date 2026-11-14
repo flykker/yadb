@@ -60,6 +60,7 @@ pub enum BlobError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::Ordering;
     use std::sync::Arc;
     use yadb_io::{FaultConfig, SimFs, StorageFs, SyncFault};
 
@@ -735,41 +736,118 @@ mod tests {
         }
     }
 
-    /// Mock VDisk that answers a fixed script of responses, one per request, and
-    /// reports the request lines it saw. Used to drive a slot that fails and then
-    /// recovers, which `SimFs` faults cannot model: a write fault poisons the
-    /// volume until reopen, and a transient peer failure must not require that.
-    fn scripted_vdisk(
-        responses: Vec<&'static str>,
-    ) -> (String, std::thread::JoinHandle<Vec<String>>) {
-        use std::io::{Read, Write};
-        use std::net::TcpListener;
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap().to_string();
-        let handle = std::thread::spawn(move || {
-            let mut seen = Vec::new();
-            for response in responses {
-                let (mut stream, _) = listener.accept().unwrap();
+    /// In-memory VDisk for the S6 tests: a real fragment store plus a switchable
+    /// PUT failure, so a slot can be failed and then recover without reopening.
+    ///
+    /// This answers by method and path rather than from a fixed script. A scripted
+    /// server couples the test to the client's connection order, and the client
+    /// has its own connect/read timeouts and fetches fragments in parallel, so
+    /// under load the responses could be paired with the wrong requests and the
+    /// test would fail for a reason unrelated to the code under test.
+    struct MockVdisk {
+        addr: String,
+        store: Arc<std::sync::Mutex<std::collections::BTreeMap<String, Vec<u8>>>>,
+        fail_puts: Arc<std::sync::atomic::AtomicBool>,
+        seen: Arc<std::sync::Mutex<Vec<String>>>,
+        server: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl MockVdisk {
+        fn start() -> Self {
+            use std::io::{Read, Write};
+            use std::net::TcpListener;
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap().to_string();
+            let store = Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
+            let fail_puts = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let (store_c, fail_c, seen_c) = (store.clone(), fail_puts.clone(), seen.clone());
+            let server = std::thread::spawn(move || loop {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(pair) => pair,
+                    Err(_) => return,
+                };
                 let mut raw = Vec::new();
-                let mut buf = [0u8; 1024];
-                loop {
-                    let n = stream.read(&mut buf).unwrap();
-                    if n == 0 {
-                        break;
-                    }
+                let mut buf = [0u8; 4096];
+                let (head, mut body) = loop {
+                    let n = match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => n,
+                    };
                     raw.extend_from_slice(&buf[..n]);
-                    if raw.windows(4).any(|w| w == b"\r\n\r\n") {
-                        break;
+                    if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&raw[..pos]).to_string();
+                        let rest = raw[pos + 4..].to_vec();
+                        break (head, rest);
+                    }
+                };
+                let mut lines = head.lines();
+                let request_line = lines.next().unwrap_or("").to_string();
+                let mut parts = request_line.split_whitespace();
+                let method = parts.next().unwrap_or("").to_string();
+                let path = parts.next().unwrap_or("").to_string();
+                let want: usize = lines
+                    .find(|l| l.to_ascii_lowercase().starts_with("content-length:"))
+                    .and_then(|l| l.split(':').nth(1))
+                    .and_then(|v| v.trim().parse().ok())
+                    .unwrap_or(0);
+                while body.len() < want {
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => body.extend_from_slice(&buf[..n]),
                     }
                 }
-                let text = String::from_utf8_lossy(&raw).to_string();
-                seen.push(text.lines().next().unwrap_or("").to_string());
-                stream.write_all(response.as_bytes()).unwrap();
-                stream.flush().unwrap();
+                seen_c.lock().unwrap().push(request_line);
+
+                let response: Vec<u8> = match method.as_str() {
+                    "PUT" if fail_c.load(Ordering::Relaxed) => {
+                        b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
+                    }
+                    "PUT" => {
+                        store_c.lock().unwrap().insert(path.to_string(), body);
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_vec()
+                    }
+                    "GET" => match store_c.lock().unwrap().get(&path) {
+                        Some(bytes) => {
+                            let mut out = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                bytes.len()
+                            )
+                            .into_bytes();
+                            out.extend_from_slice(bytes);
+                            out
+                        }
+                        None => b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_vec(),
+                    },
+                    _ => b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        .to_vec(),
+                };
+                let _ = stream.write_all(&response);
+                let _ = stream.flush();
+            });
+            Self {
+                addr,
+                store,
+                fail_puts,
+                seen,
+                server: Some(server),
             }
-            seen
-        });
-        (addr, handle)
+        }
+
+        fn requests(&self) -> Vec<String> {
+            self.seen.lock().unwrap().clone()
+        }
+
+        /// Stops the accept loop and joins it, so a leaked listener cannot keep
+        /// serving into the next test.
+        fn stop(mut self) {
+            let _ = std::net::TcpStream::connect(&self.addr);
+            if let Some(server) = self.server.take() {
+                let _ = server.join();
+            }
+        }
     }
 
     // S6: `put_blob` acked with fewer than all fragments and dropped the failures,
@@ -777,14 +855,9 @@ mod tests {
     // and nothing recorded which blobs needed healing.
     #[test]
     fn short_write_is_reported_as_degraded_and_queued_for_repair() {
-        let (addr, server) = scripted_vdisk(vec![
-            // put_blob: the fragment does not land.
-            "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-            // repair_blob: the fragment is absent, so it must be rewritten.
-            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-            // repair_blob: the rewrite lands.
-            "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-        ]);
+        let vdisk = MockVdisk::start();
+        vdisk.fail_puts.store(true, Ordering::Relaxed);
+        let addr = vdisk.addr.clone();
         let fs = SimFs::new(7001);
         let mut slots = Vec::new();
         for i in 0..5 {
@@ -808,29 +881,38 @@ mod tests {
         assert_eq!(health.degraded_puts, 1);
         assert_eq!(health.pending_repairs, 1);
 
+        // The peer comes back, and the next scrub pass restores redundancy.
+        vdisk.fail_puts.store(false, Ordering::Relaxed);
         let sweep = striper.repair_pending(16);
         assert_eq!(sweep.attempted, 1);
         assert_eq!(sweep.repaired_parts, 1);
         assert_eq!(sweep.unrecoverable, 0);
         assert_eq!(sweep.still_pending, 0);
         assert_eq!(striper.pending_repair_count(), 0);
-
-        let seen = server.join().unwrap();
-        assert_eq!(seen.len(), 3);
-        assert!(seen[0].starts_with("PUT /internal/vdisk/pool/5/blob/"));
-        assert!(seen[1].starts_with("GET /internal/vdisk/pool/5/blob/"));
-        assert!(seen[2].starts_with("PUT /internal/vdisk/pool/5/blob/"));
+        // The fragment really is on the peer now, and the blob is whole.
+        assert_eq!(vdisk.store.lock().unwrap().len(), 1);
+        let seen = vdisk.requests();
+        let put = seen
+            .iter()
+            .filter(|r| r.starts_with("PUT /internal/vdisk/pool/5/blob/"))
+            .count();
+        let get = seen
+            .iter()
+            .filter(|r| r.starts_with("GET /internal/vdisk/pool/5/blob/"))
+            .count();
+        assert_eq!(put, 2, "one failed write, one repair rewrite: {seen:?}");
+        assert_eq!(get, 1, "the repair must read the fragment first: {seen:?}");
+        assert_eq!(striper.repair_blob(id).unwrap().intact_parts, 6);
+        vdisk.stop();
     }
 
     // The other half: a repair that cannot rewrite the fragment must not be
     // reported as success, and the blob must stay queued rather than be forgotten.
     #[test]
     fn unrepairable_degraded_write_stays_queued() {
-        let (addr, server) = scripted_vdisk(vec![
-            "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-            "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-        ]);
+        let vdisk = MockVdisk::start();
+        vdisk.fail_puts.store(true, Ordering::Relaxed);
+        let addr = vdisk.addr.clone();
         let fs = SimFs::new(7002);
         let mut slots = Vec::new();
         for i in 0..5 {
@@ -847,13 +929,21 @@ mod tests {
         let id = BlobId::new(11, 2, 1, 1, 2, 0);
         let payload = b"Multi-tenant erasure-coded tablet SSTable block #0001";
         striper.put_blob(id, payload).unwrap();
+        // The peer is still refusing writes, so the rewrite cannot land.
         let sweep = striper.repair_pending(16);
         assert_eq!(sweep.attempted, 1);
         assert_eq!(sweep.repaired_parts, 0);
         assert_eq!(sweep.unrecoverable, 1);
         assert_eq!(sweep.still_pending, 1);
         assert_eq!(striper.pending_repair_count(), 1);
-        server.join().unwrap();
+
+        // Once the peer accepts writes again, the next pass closes the queue.
+        vdisk.fail_puts.store(false, Ordering::Relaxed);
+        let sweep = striper.repair_pending(16);
+        assert_eq!(sweep.repaired_parts, 1);
+        assert_eq!(sweep.still_pending, 0);
+        assert_eq!(striper.pending_repair_count(), 0);
+        vdisk.stop();
     }
 
     // A fully redundant write must not enter the queue, or the queue would grow
