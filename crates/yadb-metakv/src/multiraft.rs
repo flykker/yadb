@@ -1,12 +1,12 @@
-//! Experimental identity, descriptor and envelope validation; not a Raft runtime.
+//! Experimental group identity, typed WAL and incomplete deterministic core.
 //!
-//! An experimental framed WAL binds identity but does not interpret Raft records.
-//! This module does not authenticate senders, validate Raft log structure,
-//! or make `RaftCore` safe to expose to untrusted messages. It is deliberately
-//! disconnected from the daemon and existing metadata traffic.
+//! The core is memory-only and disconnected from the WAL and daemon. It lacks
+//! quorum commit, follower catch-up and durable transitions and is not a safe
+//! Raft runtime. Envelope validation does not authenticate transport peers or
+//! make either Raft implementation safe to expose to untrusted messages.
 
-use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
 use yadb_io::{OsDirectoryLock, OsFs, StorageFs, VirtualFile};
 
 use crate::{RaftRpc, RoleState};
@@ -46,27 +46,46 @@ impl ReplicaIdentity {
         if group.cluster == [0; 16] || group.group == 0 || group.incarnation == 0 || node == 0 {
             return Err(IdentityError::InvalidIdentity);
         }
-        if voters.is_empty() || voters.len() > 1024 || voters.iter().any(|&id| id == 0)
+        if voters.is_empty()
+            || voters.len() > 1024
+            || voters.iter().any(|&id| id == 0)
             || voters.windows(2).any(|pair| pair[0] >= pair[1])
             || voters.binary_search(&node).is_err()
         {
             return Err(IdentityError::InvalidVoters);
         }
-        Ok(Self { group, node, voters })
+        Ok(Self {
+            group,
+            node,
+            voters,
+        })
     }
 
-    pub fn voters(&self) -> &[u32] { &self.voters }
-    pub fn group(&self) -> &GroupIdentity { &self.group }
-    pub fn node(&self) -> u32 { self.node }
+    pub fn voters(&self) -> &[u32] {
+        &self.voters
+    }
+    pub fn group(&self) -> &GroupIdentity {
+        &self.group
+    }
+    pub fn node(&self) -> u32 {
+        self.node
+    }
 
     /// Validate routing on a trusted transport before any Raft state mutation.
     /// This alone is insufficient to authorize calling `RaftCore::step`.
     /// A transport must also bind the peer connection to `envelope.sender`.
     pub fn validate(&self, envelope: &GroupEnvelope, peer: u32) -> Result<(), IdentityError> {
-        if envelope.version != PROTOCOL_VERSION { return Err(IdentityError::WrongVersion); }
-        if envelope.group != self.group { return Err(IdentityError::WrongGroup); }
-        if envelope.recipient != self.node { return Err(IdentityError::WrongRecipient); }
-        if peer != envelope.sender || peer == self.node || self.voters.binary_search(&peer).is_err() {
+        if envelope.version != PROTOCOL_VERSION {
+            return Err(IdentityError::WrongVersion);
+        }
+        if envelope.group != self.group {
+            return Err(IdentityError::WrongGroup);
+        }
+        if envelope.recipient != self.node {
+            return Err(IdentityError::WrongRecipient);
+        }
+        if peer != envelope.sender || peer == self.node || self.voters.binary_search(&peer).is_err()
+        {
             return Err(IdentityError::InvalidSender);
         }
         let claimed = match &envelope.rpc {
@@ -75,7 +94,9 @@ impl ReplicaIdentity {
             RaftRpc::AppendEntries { leader_id, .. } => *leader_id,
             RaftRpc::AppendEntriesReply { from, .. } => *from,
         };
-        if claimed != peer { return Err(IdentityError::SenderMismatch); }
+        if claimed != peer {
+            return Err(IdentityError::SenderMismatch);
+        }
         Ok(())
     }
 }
@@ -101,7 +122,11 @@ pub struct LockedDescriptor {
 }
 
 impl LockedDescriptor {
-    pub fn bootstrap(fs: &OsFs, dir: &str, identity: &ReplicaIdentity) -> Result<Self, DescriptorError> {
+    pub fn bootstrap(
+        fs: &OsFs,
+        dir: &str,
+        identity: &ReplicaIdentity,
+    ) -> Result<Self, DescriptorError> {
         let lock = fs.try_lock_directory(dir)?;
         bootstrap_descriptor(fs, dir, identity)?;
         Ok(Self { _lock: lock })
@@ -122,7 +147,9 @@ fn descriptor_bytes(identity: &ReplicaIdentity) -> Vec<u8> {
     bytes.extend_from_slice(&identity.group.incarnation.to_le_bytes());
     bytes.extend_from_slice(&identity.node.to_le_bytes());
     bytes.extend_from_slice(&(identity.voters.len() as u32).to_le_bytes());
-    for voter in &identity.voters { bytes.extend_from_slice(&voter.to_le_bytes()); }
+    for voter in &identity.voters {
+        bytes.extend_from_slice(&voter.to_le_bytes());
+    }
     let crc = crc32fast::hash(&bytes);
     bytes.extend_from_slice(&crc.to_le_bytes());
     bytes
@@ -141,7 +168,9 @@ fn group_wal_header(identity: &ReplicaIdentity) -> Vec<u8> {
 }
 
 fn group_wal_path(dir: &str) -> String {
-    if dir.is_empty() { GROUP_WAL_FILE.to_owned() } else {
+    if dir.is_empty() {
+        GROUP_WAL_FILE.to_owned()
+    } else {
         format!("{}/{GROUP_WAL_FILE}", dir.trim_end_matches('/'))
     }
 }
@@ -157,7 +186,11 @@ pub struct LockedEmptyGroupWal {
 impl LockedEmptyGroupWal {
     /// Explicit first provisioning only. An error has an unknown durability
     /// outcome; never automatically retry bootstrap or delete existing files.
-    pub fn bootstrap(fs: &OsFs, dir: &str, identity: &ReplicaIdentity) -> Result<Self, DescriptorError> {
+    pub fn bootstrap(
+        fs: &OsFs,
+        dir: &str,
+        identity: &ReplicaIdentity,
+    ) -> Result<Self, DescriptorError> {
         let lock = fs.try_lock_directory(dir)?;
         bootstrap_empty_wal(fs, dir, identity)?;
         Ok(Self { _lock: lock })
@@ -172,7 +205,11 @@ impl LockedEmptyGroupWal {
     }
 }
 
-fn bootstrap_empty_wal<FS: StorageFs>(fs: &FS, dir: &str, identity: &ReplicaIdentity) -> Result<(), DescriptorError> {
+fn bootstrap_empty_wal<FS: StorageFs>(
+    fs: &FS,
+    dir: &str,
+    identity: &ReplicaIdentity,
+) -> Result<(), DescriptorError> {
     if !fs.list_files(dir)?.is_empty() || fs.exists(&group_wal_path(dir)) {
         return Err(DescriptorError::DirectoryNotEmpty);
     }
@@ -183,10 +220,16 @@ fn bootstrap_empty_wal<FS: StorageFs>(fs: &FS, dir: &str, identity: &ReplicaIden
     Ok(())
 }
 
-fn verify_empty_wal<FS: StorageFs>(fs: &FS, dir: &str, identity: &ReplicaIdentity) -> Result<(), DescriptorError> {
+fn verify_empty_wal<FS: StorageFs>(
+    fs: &FS,
+    dir: &str,
+    identity: &ReplicaIdentity,
+) -> Result<(), DescriptorError> {
     let file = fs.open_rw(&group_wal_path(dir), false)?;
     let expected = group_wal_header(identity);
-    if file.len()? != expected.len() as u64 { return Err(DescriptorError::Mismatch); }
+    if file.len()? != expected.len() as u64 {
+        return Err(DescriptorError::Mismatch);
+    }
     let mut actual = vec![0; expected.len()];
     if file.read_at(0, &mut actual)? != actual.len() || actual != expected {
         return Err(DescriptorError::Mismatch);
@@ -233,14 +276,29 @@ struct FramedGroupWal<F: VirtualFile> {
 impl LockedGroupWal {
     /// Opens an existing provisioned WAL only; never bootstraps on failure.
     /// The recovered records are untrusted bytes, not applied Raft state.
-    pub fn open(fs: &OsFs, dir: &str, identity: &ReplicaIdentity) -> Result<(Self, Vec<Vec<u8>>), GroupWalError> {
+    pub fn open(
+        fs: &OsFs,
+        dir: &str,
+        identity: &ReplicaIdentity,
+    ) -> Result<(Self, Vec<Vec<u8>>), GroupWalError> {
         let lock = fs.try_lock_directory(dir)?;
         let file = fs.open_rw(&group_wal_path(dir), false)?;
         let (end, records) = replay_group_wal(&file, identity)?;
         // Re-establish durability after a process-only restart before reuse.
         file.sync_data()?;
         fs.sync_dir(dir)?;
-        Ok((Self { _lock: lock, inner: FramedGroupWal { file, end, records: records.len(), failed: false } }, records))
+        Ok((
+            Self {
+                _lock: lock,
+                inner: FramedGroupWal {
+                    file,
+                    end,
+                    records: records.len(),
+                    failed: false,
+                },
+            },
+            records,
+        ))
     }
 
     /// An I/O error has an unknown outcome and poisons this handle. A complete
@@ -252,10 +310,18 @@ impl LockedGroupWal {
 
 impl<F: VirtualFile> FramedGroupWal<F> {
     fn append(&mut self, payload: &[u8]) -> Result<(), GroupWalError> {
-        if self.failed { return Err(GroupWalError::Unavailable); }
-        if self.records >= MAX_RECORDS { return Err(GroupWalError::Limit); }
+        if self.failed {
+            return Err(GroupWalError::Unavailable);
+        }
+        if self.records >= MAX_RECORDS {
+            return Err(GroupWalError::Limit);
+        }
         let frame = encode_group_frame(payload, self.end)?;
-        if let Err(e) = self.file.write_at(self.end, &frame).and_then(|_| self.file.sync_data()) {
+        if let Err(e) = self
+            .file
+            .write_at(self.end, &frame)
+            .and_then(|_| self.file.sync_data())
+        {
             self.failed = true;
             return Err(e.into());
         }
@@ -266,8 +332,14 @@ impl<F: VirtualFile> FramedGroupWal<F> {
 }
 
 fn encode_group_frame(payload: &[u8], end: u64) -> Result<Vec<u8>, GroupWalError> {
-    if payload.len() > MAX_RECORD_BYTES || end.checked_add(FRAME_HEADER as u64 + payload.len() as u64)
-        .filter(|&n| n <= MAX_WAL_BYTES).is_none() { return Err(GroupWalError::Limit); }
+    if payload.len() > MAX_RECORD_BYTES
+        || end
+            .checked_add(FRAME_HEADER as u64 + payload.len() as u64)
+            .filter(|&n| n <= MAX_WAL_BYTES)
+            .is_none()
+    {
+        return Err(GroupWalError::Limit);
+    }
     let mut frame = Vec::with_capacity(FRAME_HEADER + payload.len());
     frame.extend_from_slice(FRAME_MAGIC);
     frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
@@ -276,25 +348,43 @@ fn encode_group_frame(payload: &[u8], end: u64) -> Result<Vec<u8>, GroupWalError
     Ok(frame)
 }
 
-fn replay_group_wal<F: VirtualFile>(file: &F, identity: &ReplicaIdentity) -> Result<(u64, Vec<Vec<u8>>), GroupWalError> {
+fn replay_group_wal<F: VirtualFile>(
+    file: &F,
+    identity: &ReplicaIdentity,
+) -> Result<(u64, Vec<Vec<u8>>), GroupWalError> {
     let len = file.len()?;
-    if len > MAX_WAL_BYTES { return Err(GroupWalError::Limit); }
+    if len > MAX_WAL_BYTES {
+        return Err(GroupWalError::Limit);
+    }
     let expected = group_wal_header(identity);
-    if len < expected.len() as u64 { return Err(GroupWalError::Corrupt); }
+    if len < expected.len() as u64 {
+        return Err(GroupWalError::Corrupt);
+    }
     let mut header = vec![0; expected.len()];
-    if file.read_at(0, &mut header)? != header.len() || header != expected { return Err(GroupWalError::Corrupt); }
+    if file.read_at(0, &mut header)? != header.len() || header != expected {
+        return Err(GroupWalError::Corrupt);
+    }
     let mut pos = expected.len() as u64;
     let mut records = Vec::new();
     while pos < len {
-        if records.len() >= MAX_RECORDS { return Err(GroupWalError::Limit); }
-        if len - pos < FRAME_HEADER as u64 { return Err(GroupWalError::Corrupt); }
+        if records.len() >= MAX_RECORDS {
+            return Err(GroupWalError::Limit);
+        }
+        if len - pos < FRAME_HEADER as u64 {
+            return Err(GroupWalError::Corrupt);
+        }
         let mut hdr = [0u8; FRAME_HEADER];
-        if file.read_at(pos, &mut hdr)? != hdr.len() || &hdr[..4] != FRAME_MAGIC { return Err(GroupWalError::Corrupt); }
+        if file.read_at(pos, &mut hdr)? != hdr.len() || &hdr[..4] != FRAME_MAGIC {
+            return Err(GroupWalError::Corrupt);
+        }
         let size = u32::from_le_bytes(hdr[4..8].try_into().unwrap()) as usize;
-        if size > MAX_RECORD_BYTES || size as u64 > len - pos - FRAME_HEADER as u64 { return Err(GroupWalError::Corrupt); }
+        if size > MAX_RECORD_BYTES || size as u64 > len - pos - FRAME_HEADER as u64 {
+            return Err(GroupWalError::Corrupt);
+        }
         let mut payload = vec![0; size];
         if file.read_at(pos + FRAME_HEADER as u64, &mut payload)? != size
-            || crc32fast::hash(&payload) != u32::from_le_bytes(hdr[8..12].try_into().unwrap()) {
+            || crc32fast::hash(&payload) != u32::from_le_bytes(hdr[8..12].try_into().unwrap())
+        {
             return Err(GroupWalError::Corrupt);
         }
         records.push(payload);
@@ -308,9 +398,17 @@ fn replay_group_wal<F: VirtualFile>(file: &F, identity: &ReplicaIdentity) -> Res
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub enum GroupRaftRecord {
-    HardState { term: u64, voted_for: Option<u32> },
-    ReplaceSuffix { from_index: u64, entries: Vec<crate::LogEntry> },
-    Commit { index: u64 },
+    HardState {
+        term: u64,
+        voted_for: Option<u32>,
+    },
+    ReplaceSuffix {
+        from_index: u64,
+        entries: Vec<crate::LogEntry>,
+    },
+    Commit {
+        index: u64,
+    },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -322,25 +420,49 @@ pub struct GroupRaftState {
 }
 
 impl GroupRaftState {
-    fn apply(&mut self, record: &GroupRaftRecord, identity: &ReplicaIdentity) -> Result<(), GroupWalError> {
+    fn apply(
+        &mut self,
+        record: &GroupRaftRecord,
+        identity: &ReplicaIdentity,
+    ) -> Result<(), GroupWalError> {
         match record {
             GroupRaftRecord::HardState { term, voted_for } => {
-                if *term < self.term || (*term == 0 && voted_for.is_some())
+                if *term < self.term
+                    || (*term == 0 && voted_for.is_some())
                     || voted_for.is_some_and(|v| identity.voters.binary_search(&v).is_err())
-                    || (*term == self.term && self.voted_for.is_some() && *voted_for != self.voted_for) {
+                    || (*term == self.term
+                        && self.voted_for.is_some()
+                        && *voted_for != self.voted_for)
+                {
                     return Err(GroupWalError::Corrupt);
                 }
                 self.term = *term;
                 self.voted_for = *voted_for;
             }
-            GroupRaftRecord::ReplaceSuffix { from_index, entries } => {
-                let keep = usize::try_from(from_index.checked_sub(1).ok_or(GroupWalError::Corrupt)?)
-                    .map_err(|_| GroupWalError::Corrupt)?;
-                if keep > self.log.len() || *from_index <= self.commit_index { return Err(GroupWalError::Corrupt); }
-                let mut previous_term = if keep == 0 { 0 } else { self.log[keep - 1].term };
+            GroupRaftRecord::ReplaceSuffix {
+                from_index,
+                entries,
+            } => {
+                let keep =
+                    usize::try_from(from_index.checked_sub(1).ok_or(GroupWalError::Corrupt)?)
+                        .map_err(|_| GroupWalError::Corrupt)?;
+                if keep > self.log.len() || *from_index <= self.commit_index {
+                    return Err(GroupWalError::Corrupt);
+                }
+                let mut previous_term = if keep == 0 {
+                    0
+                } else {
+                    self.log[keep - 1].term
+                };
                 for (offset, entry) in entries.iter().enumerate() {
-                    let index = from_index.checked_add(offset as u64).ok_or(GroupWalError::Corrupt)?;
-                    if entry.index != index || entry.term == 0 || entry.term < previous_term || entry.term > self.term {
+                    let index = from_index
+                        .checked_add(offset as u64)
+                        .ok_or(GroupWalError::Corrupt)?;
+                    if entry.index != index
+                        || entry.term == 0
+                        || entry.term < previous_term
+                        || entry.term > self.term
+                    {
                         return Err(GroupWalError::Corrupt);
                     }
                     if let Some(existing) = self.log.get(keep + offset) {
@@ -356,9 +478,66 @@ impl GroupRaftState {
                 self.log.extend_from_slice(entries);
             }
             GroupRaftRecord::Commit { index } => {
-                if *index < self.commit_index || *index > self.log.len() as u64 { return Err(GroupWalError::Corrupt); }
+                if *index < self.commit_index || *index > self.log.len() as u64 {
+                    return Err(GroupWalError::Corrupt);
+                }
                 self.commit_index = *index;
             }
+        }
+        Ok(())
+    }
+
+    /// Merge an AppendEntries batch after its prev-log position has been checked.
+    /// Matching entries are idempotent; only the first real uncommitted conflict
+    /// replaces a suffix. An empty heartbeat never truncates a local log.
+    fn merge_entries(
+        &mut self,
+        from_index: u64,
+        entries: &[crate::LogEntry],
+    ) -> Result<(), GroupWalError> {
+        let keep = usize::try_from(from_index.checked_sub(1).ok_or(GroupWalError::Corrupt)?)
+            .map_err(|_| GroupWalError::Corrupt)?;
+        if keep > self.log.len() {
+            return Err(GroupWalError::Corrupt);
+        }
+        let mut previous_term = if keep == 0 {
+            0
+        } else {
+            self.log[keep - 1].term
+        };
+        for (offset, entry) in entries.iter().enumerate() {
+            let index = from_index
+                .checked_add(offset as u64)
+                .ok_or(GroupWalError::Corrupt)?;
+            if entry.index != index
+                || entry.term == 0
+                || entry.term < previous_term
+                || entry.term > self.term
+            {
+                return Err(GroupWalError::Corrupt);
+            }
+            if let Some(existing) = keep.checked_add(offset).and_then(|i| self.log.get(i)) {
+                if existing.term == entry.term && existing != entry {
+                    return Err(GroupWalError::Corrupt);
+                }
+            }
+            previous_term = entry.term;
+        }
+        for (offset, entry) in entries.iter().enumerate() {
+            let index = keep.checked_add(offset).ok_or(GroupWalError::Corrupt)?;
+            if let Some(existing) = self.log.get(index) {
+                if existing == entry {
+                    continue;
+                }
+                if existing.term == entry.term || index as u64 + 1 <= self.commit_index {
+                    return Err(GroupWalError::Corrupt);
+                }
+                self.log.truncate(index);
+                self.log.extend_from_slice(&entries[offset..]);
+                return Ok(());
+            }
+            self.log.extend_from_slice(&entries[offset..]);
+            return Ok(());
         }
         Ok(())
     }
@@ -377,13 +556,20 @@ impl TypedGroupWal {
         let (wal, records) = LockedGroupWal::open(fs, dir, identity)?;
         let mut state = GroupRaftState::default();
         for bytes in records {
-            let record: GroupRaftRecord = serde_json::from_slice(&bytes).map_err(|_| GroupWalError::Corrupt)?;
+            let record: GroupRaftRecord =
+                serde_json::from_slice(&bytes).map_err(|_| GroupWalError::Corrupt)?;
             state.apply(&record, identity)?;
         }
-        Ok(Self { wal, identity: identity.clone(), state })
+        Ok(Self {
+            wal,
+            identity: identity.clone(),
+            state,
+        })
     }
 
-    pub fn state(&self) -> &GroupRaftState { &self.state }
+    pub fn state(&self) -> &GroupRaftState {
+        &self.state
+    }
 
     pub fn append(&mut self, record: &GroupRaftRecord) -> Result<(), GroupWalError> {
         let mut next = self.state.clone();
@@ -411,129 +597,420 @@ pub enum GroupCoreError {
 pub struct DeterministicGroupCore {
     identity: ReplicaIdentity,
     role: RoleState,
-    term: u64,
-    voted_for: Option<u32>,
     leader_id: Option<u32>,
     state: GroupRaftState,
     votes: BTreeSet<u32>,
     next_index: BTreeMap<u32, u64>,
+    match_index: BTreeMap<u32, u64>,
 }
 
 impl DeterministicGroupCore {
     pub fn new(identity: ReplicaIdentity) -> Self {
         Self {
-            identity, role: RoleState::Follower, term: 0, voted_for: None,
-            leader_id: None, state: GroupRaftState::default(), votes: BTreeSet::new(),
+            identity,
+            role: RoleState::Follower,
+            leader_id: None,
+            state: GroupRaftState::default(),
+            votes: BTreeSet::new(),
             next_index: BTreeMap::new(),
+            match_index: BTreeMap::new(),
         }
     }
 
-    pub fn identity(&self) -> &ReplicaIdentity { &self.identity }
-    pub fn role(&self) -> RoleState { self.role }
-    pub fn term(&self) -> u64 { self.term }
-    pub fn leader_id(&self) -> Option<u32> { self.leader_id }
-    pub fn state(&self) -> &GroupRaftState { &self.state }
-
-    fn envelope(&self, recipient: u32, rpc: RaftRpc) -> GroupEnvelope {
-        GroupEnvelope { version: PROTOCOL_VERSION, group: self.identity.group.clone(),
-            sender: self.identity.node, recipient, rpc }
+    pub fn identity(&self) -> &ReplicaIdentity {
+        &self.identity
+    }
+    pub fn role(&self) -> RoleState {
+        self.role
+    }
+    pub fn term(&self) -> u64 {
+        self.state.term
+    }
+    pub fn leader_id(&self) -> Option<u32> {
+        self.leader_id
+    }
+    pub fn state(&self) -> &GroupRaftState {
+        &self.state
     }
 
-    fn quorum(&self) -> usize { self.identity.voters.len() / 2 + 1 }
+    pub fn next_index(&self, peer: u32) -> Option<u64> {
+        self.next_index.get(&peer).copied()
+    }
+    pub fn match_index(&self, peer: u32) -> Option<u64> {
+        self.match_index.get(&peer).copied()
+    }
+    pub fn heartbeat(&self) -> Vec<GroupEnvelope> {
+        self.replication_messages()
+    }
+
+    fn envelope(&self, recipient: u32, rpc: RaftRpc) -> GroupEnvelope {
+        GroupEnvelope {
+            version: PROTOCOL_VERSION,
+            group: self.identity.group.clone(),
+            sender: self.identity.node,
+            recipient,
+            rpc,
+        }
+    }
+
+    fn quorum(&self) -> usize {
+        self.identity.voters.len() / 2 + 1
+    }
 
     pub fn start_election(&mut self) -> Result<Vec<GroupEnvelope>, GroupCoreError> {
-        self.term = self.term.checked_add(1).ok_or(GroupCoreError::Protocol)?;
-        self.state.term = self.term;
+        self.state.term = self
+            .state
+            .term
+            .checked_add(1)
+            .ok_or(GroupCoreError::Protocol)?;
         self.role = RoleState::Candidate;
-        self.voted_for = Some(self.identity.node);
+        self.state.voted_for = Some(self.identity.node);
         self.leader_id = None;
         self.votes.clear();
         self.votes.insert(self.identity.node);
+        if self.votes.len() >= self.quorum() {
+            self.role = RoleState::Leader;
+            self.leader_id = Some(self.identity.node);
+            self.initialize_replication_tracking();
+            return Ok(Vec::new());
+        }
         let last = self.state.log.last();
-        Ok(self.identity.voters.iter().filter(|&&id| id != self.identity.node).map(|&to| self.envelope(to,
-            RaftRpc::RequestVote { term: self.term, candidate_id: self.identity.node,
-                last_log_index: self.state.log.len() as u64,
-                last_log_term: last.map_or(0, |entry| entry.term) })).collect())
+        Ok(self
+            .identity
+            .voters
+            .iter()
+            .filter(|&&id| id != self.identity.node)
+            .map(|&to| {
+                self.envelope(
+                    to,
+                    RaftRpc::RequestVote {
+                        term: self.state.term,
+                        candidate_id: self.identity.node,
+                        last_log_index: self.state.log.len() as u64,
+                        last_log_term: last.map_or(0, |entry| entry.term),
+                    },
+                )
+            })
+            .collect())
     }
 
     pub fn propose(&mut self, cmd: crate::KvCommand) -> Result<Vec<GroupEnvelope>, GroupCoreError> {
-        if self.role != RoleState::Leader { return Err(GroupCoreError::NotLeader); }
+        if self.role != RoleState::Leader {
+            return Err(GroupCoreError::NotLeader);
+        }
         let index = self.state.log.len() as u64 + 1;
-        let entry = crate::LogEntry { index, term: self.term, cmd };
+        let entry = crate::LogEntry {
+            index,
+            term: self.state.term,
+            cmd,
+        };
         let mut next = self.state.clone();
-        next.apply(&GroupRaftRecord::ReplaceSuffix { from_index: index, entries: vec![entry.clone()] }, &self.identity)
-            .map_err(|_| GroupCoreError::Protocol)?;
+        next.apply(
+            &GroupRaftRecord::ReplaceSuffix {
+                from_index: index,
+                entries: vec![entry.clone()],
+            },
+            &self.identity,
+        )
+        .map_err(|_| GroupCoreError::Protocol)?;
         self.state = next;
-        Ok(self.identity.voters.iter().filter(|&&id| id != self.identity.node).map(|&to| self.envelope(to,
-            RaftRpc::AppendEntries { term: self.term, leader_id: self.identity.node,
-                prev_log_index: index - 1,
-                prev_log_term: if index == 1 { 0 } else { self.state.log[index as usize - 2].term },
-                entries: vec![entry.clone()], leader_commit: self.state.commit_index })).collect())
+        self.match_index
+            .insert(self.identity.node, self.state.log.len() as u64);
+        self.advance_commit();
+        Ok(self.replication_messages())
+    }
+
+    fn initialize_replication_tracking(&mut self) {
+        let next = self.state.log.len() as u64 + 1;
+        self.next_index = self.identity.voters.iter().map(|&id| (id, next)).collect();
+        self.match_index = self
+            .identity
+            .voters
+            .iter()
+            .map(|&id| {
+                (
+                    id,
+                    if id == self.identity.node {
+                        self.state.log.len() as u64
+                    } else {
+                        0
+                    },
+                )
+            })
+            .collect();
+    }
+
+    fn replication_messages(&self) -> Vec<GroupEnvelope> {
+        let log_len = self.state.log.len() as u64;
+        self.identity
+            .voters
+            .iter()
+            .filter(|&&to| to != self.identity.node)
+            .map(|&to| {
+                let next = self
+                    .next_index
+                    .get(&to)
+                    .copied()
+                    .unwrap_or(log_len + 1)
+                    .max(1);
+                let prev = next - 1;
+                let prev_term = if prev == 0 {
+                    0
+                } else {
+                    self.state.log[prev as usize - 1].term
+                };
+                let entries = self.state.log[next as usize - 1..].to_vec();
+                self.envelope(
+                    to,
+                    RaftRpc::AppendEntries {
+                        term: self.state.term,
+                        leader_id: self.identity.node,
+                        prev_log_index: prev,
+                        prev_log_term: prev_term,
+                        entries,
+                        leader_commit: self.state.commit_index,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn advance_commit(&mut self) {
+        if self.role != RoleState::Leader {
+            return;
+        }
+        for candidate in (self.state.commit_index + 1..=self.state.log.len() as u64).rev() {
+            if self.state.log[candidate as usize - 1].term != self.state.term {
+                continue;
+            }
+            let replicas = self
+                .match_index
+                .values()
+                .filter(|&&matched| matched >= candidate)
+                .count();
+            if replicas >= self.quorum() {
+                self.state.commit_index = candidate;
+                break;
+            }
+        }
     }
 
     /// Validate the envelope and peer binding before changing term, vote, log or
     /// role. The caller supplies the transport peer identity in this simulator.
-    pub fn receive(&mut self, envelope: &GroupEnvelope, peer: u32) -> Result<Vec<GroupEnvelope>, GroupCoreError> {
-        self.identity.validate(envelope, peer).map_err(GroupCoreError::Identity)?;
+    pub fn receive(
+        &mut self,
+        envelope: &GroupEnvelope,
+        peer: u32,
+    ) -> Result<Vec<GroupEnvelope>, GroupCoreError> {
+        self.identity
+            .validate(envelope, peer)
+            .map_err(GroupCoreError::Identity)?;
         match &envelope.rpc {
-            RaftRpc::RequestVote { term, candidate_id, last_log_index, last_log_term } => {
-                if *term < self.term { return Ok(vec![self.envelope(peer, RaftRpc::RequestVoteReply {
-                    from: self.identity.node, term: self.term, vote_granted: false })]); }
-                if *term > self.term {
-                    self.term = *term; self.state.term = *term; self.voted_for = None; self.state.voted_for = None;
-                    self.role = RoleState::Follower; self.leader_id = None;
+            RaftRpc::RequestVote {
+                term,
+                candidate_id,
+                last_log_index,
+                last_log_term,
+            } => {
+                if *term == 0
+                    || (*last_log_index == 0) != (*last_log_term == 0)
+                    || *last_log_term > *term
+                {
+                    return Err(GroupCoreError::Protocol);
+                }
+                if *term < self.state.term {
+                    return Ok(vec![self.envelope(
+                        peer,
+                        RaftRpc::RequestVoteReply {
+                            from: self.identity.node,
+                            term: self.state.term,
+                            vote_granted: false,
+                        },
+                    )]);
+                }
+                if *term > self.state.term {
+                    self.state.term = *term;
+                    self.state.voted_for = None;
+                    self.role = RoleState::Follower;
+                    self.leader_id = None;
                 }
                 let local = self.state.log.last();
                 let up_to_date = *last_log_term > local.map_or(0, |e| e.term)
-                    || (*last_log_term == local.map_or(0, |e| e.term) && *last_log_index >= self.state.log.len() as u64);
-                let grant = (*term == self.term) && up_to_date && (self.voted_for.is_none() || self.voted_for == Some(*candidate_id));
-                if grant { self.voted_for = Some(*candidate_id); self.state.voted_for = Some(*candidate_id); }
-                Ok(vec![self.envelope(peer, RaftRpc::RequestVoteReply { from: self.identity.node,
-                    term: self.term, vote_granted: grant })])
+                    || (*last_log_term == local.map_or(0, |e| e.term)
+                        && *last_log_index >= self.state.log.len() as u64);
+                let grant = (*term == self.state.term)
+                    && up_to_date
+                    && (self.state.voted_for.is_none()
+                        || self.state.voted_for == Some(*candidate_id));
+                if grant {
+                    self.state.voted_for = Some(*candidate_id);
+                }
+                Ok(vec![self.envelope(
+                    peer,
+                    RaftRpc::RequestVoteReply {
+                        from: self.identity.node,
+                        term: self.state.term,
+                        vote_granted: grant,
+                    },
+                )])
             }
-            RaftRpc::RequestVoteReply { from: _, term, vote_granted } => {
-                if *term > self.term { self.term = *term; self.state.term = *term; self.role = RoleState::Follower;
-                    self.voted_for = None; self.state.voted_for = None; self.votes.clear(); return Ok(Vec::new()); }
-                if self.role != RoleState::Candidate || *term != self.term || !vote_granted { return Ok(Vec::new()); }
+            RaftRpc::RequestVoteReply {
+                from: _,
+                term,
+                vote_granted,
+            } => {
+                if *term > self.state.term {
+                    self.state.term = *term;
+                    self.role = RoleState::Follower;
+                    self.state.voted_for = None;
+                    self.leader_id = None;
+                    self.votes.clear();
+                    return Ok(Vec::new());
+                }
+                if self.role != RoleState::Candidate || *term != self.state.term || !vote_granted {
+                    return Ok(Vec::new());
+                }
                 self.votes.insert(peer);
                 if self.votes.len() >= self.quorum() {
-                    self.role = RoleState::Leader; self.leader_id = Some(self.identity.node);
-                    self.next_index = self.identity.voters.iter().map(|&id| (id, self.state.log.len() as u64 + 1)).collect();
-                    return Ok(self.identity.voters.iter().filter(|&&id| id != self.identity.node).map(|&to| self.envelope(to,
-                        RaftRpc::AppendEntries { term: self.term, leader_id: self.identity.node,
-                            prev_log_index: self.state.log.len() as u64,
-                            prev_log_term: self.state.log.last().map_or(0, |e| e.term), entries: vec![],
-                            leader_commit: self.state.commit_index })).collect());
+                    self.role = RoleState::Leader;
+                    self.leader_id = Some(self.identity.node);
+                    self.initialize_replication_tracking();
+                    return Ok(self.replication_messages());
                 }
                 Ok(Vec::new())
             }
-            RaftRpc::AppendEntries { term, leader_id, prev_log_index, prev_log_term, entries, leader_commit } => {
-                if *term < self.term { return Ok(vec![self.envelope(peer, RaftRpc::AppendEntriesReply {
-                    from: self.identity.node, term: self.term, success: false, match_index: self.state.log.len() as u64 })]); }
-                if *term > self.term { self.term = *term; self.state.term = *term; self.voted_for = None; self.state.voted_for = None; }
-                self.role = RoleState::Follower; self.leader_id = Some(*leader_id);
+            RaftRpc::AppendEntries {
+                term,
+                leader_id,
+                prev_log_index,
+                prev_log_term,
+                entries,
+                leader_commit,
+            } => {
+                // Validate structural fields before updating term, vote or role.
+                if *term == 0
+                    || (*prev_log_index == 0) != (*prev_log_term == 0)
+                    || *prev_log_term > *term
+                {
+                    return Err(GroupCoreError::Protocol);
+                }
+                let mut previous = *prev_log_term;
+                for (offset, entry) in entries.iter().enumerate() {
+                    let expected = prev_log_index
+                        .checked_add(1)
+                        .and_then(|i| i.checked_add(offset as u64))
+                        .ok_or(GroupCoreError::Protocol)?;
+                    if entry.index != expected
+                        || entry.term == 0
+                        || entry.term < previous
+                        || entry.term > *term
+                    {
+                        return Err(GroupCoreError::Protocol);
+                    }
+                    previous = entry.term;
+                }
+                let matched_through = prev_log_index
+                    .checked_add(entries.len() as u64)
+                    .ok_or(GroupCoreError::Protocol)?;
+                if *term < self.state.term {
+                    return Ok(vec![self.envelope(
+                        peer,
+                        RaftRpc::AppendEntriesReply {
+                            from: self.identity.node,
+                            term: self.state.term,
+                            success: false,
+                            match_index: self.state.log.len() as u64,
+                        },
+                    )]);
+                }
+                // Detect a conflicting committed or same-term entry before a
+                // higher-term transition. A normal prev mismatch is not malformed.
+                if *prev_log_index <= self.state.log.len() as u64
+                    && (*prev_log_index == 0
+                        || self.state.log[*prev_log_index as usize - 1].term == *prev_log_term)
+                {
+                    let mut checked = self.state.clone();
+                    checked.term = checked.term.max(*term);
+                    checked
+                        .merge_entries(
+                            prev_log_index
+                                .checked_add(1)
+                                .ok_or(GroupCoreError::Protocol)?,
+                            entries,
+                        )
+                        .map_err(|_| GroupCoreError::Protocol)?;
+                }
+                if *term > self.state.term {
+                    self.state.term = *term;
+                    self.state.voted_for = None;
+                }
+                self.role = RoleState::Follower;
+                self.leader_id = Some(*leader_id);
                 if *prev_log_index > self.state.log.len() as u64
-                    || (*prev_log_index > 0 && self.state.log[*prev_log_index as usize - 1].term != *prev_log_term) {
-                    return Ok(vec![self.envelope(peer, RaftRpc::AppendEntriesReply { from: self.identity.node,
-                        term: self.term, success: false, match_index: self.state.log.len() as u64 })]);
+                    || (*prev_log_index > 0
+                        && self.state.log[*prev_log_index as usize - 1].term != *prev_log_term)
+                {
+                    return Ok(vec![self.envelope(
+                        peer,
+                        RaftRpc::AppendEntriesReply {
+                            from: self.identity.node,
+                            term: self.state.term,
+                            success: false,
+                            match_index: self.state.log.len() as u64,
+                        },
+                    )]);
                 }
                 let from = prev_log_index + 1;
                 let mut next = self.state.clone();
-                next.apply(&GroupRaftRecord::ReplaceSuffix { from_index: from, entries: entries.clone() }, &self.identity)
+                next.merge_entries(from, entries)
                     .map_err(|_| GroupCoreError::Protocol)?;
-                let target_commit = (*leader_commit).min(next.log.len() as u64);
-                if target_commit < next.commit_index { return Err(GroupCoreError::Protocol); }
-                next.commit_index = target_commit;
+                next.commit_index = next.commit_index.max((*leader_commit).min(matched_through));
                 self.state = next;
-                Ok(vec![self.envelope(peer, RaftRpc::AppendEntriesReply { from: self.identity.node,
-                    term: self.term, success: true, match_index: self.state.log.len() as u64 })])
+                Ok(vec![self.envelope(
+                    peer,
+                    RaftRpc::AppendEntriesReply {
+                        from: self.identity.node,
+                        term: self.state.term,
+                        success: true,
+                        match_index: matched_through,
+                    },
+                )])
             }
-            RaftRpc::AppendEntriesReply { from: _, term, success, match_index } => {
-                if *term > self.term { self.term = *term; self.state.term = *term; self.role = RoleState::Follower;
-                    self.voted_for = None; self.state.voted_for = None; self.leader_id = None; return Ok(Vec::new()); }
-                if self.role != RoleState::Leader || *term != self.term || !success || *match_index > self.state.log.len() as u64 {
+            RaftRpc::AppendEntriesReply {
+                from: _,
+                term,
+                success,
+                match_index,
+            } => {
+                if *term > self.state.term {
+                    self.state.term = *term;
+                    self.role = RoleState::Follower;
+                    self.state.voted_for = None;
+                    self.leader_id = None;
                     return Ok(Vec::new());
                 }
+                if self.role != RoleState::Leader
+                    || *term != self.state.term
+                    || *match_index > self.state.log.len() as u64
+                {
+                    return Ok(Vec::new());
+                }
+                if !success {
+                    let next = self
+                        .next_index
+                        .entry(envelope.sender)
+                        .or_insert(self.state.log.len() as u64 + 1);
+                    *next = next.saturating_sub(1).max(1);
+                    return Ok(self
+                        .replication_messages()
+                        .into_iter()
+                        .filter(|message| message.recipient == envelope.sender)
+                        .collect());
+                }
+                let current = self.match_index.entry(envelope.sender).or_insert(0);
+                *current = (*current).max(*match_index);
+                self.next_index.insert(envelope.sender, *current + 1);
+                self.advance_commit();
                 Ok(Vec::new())
             }
         }
@@ -541,7 +1018,9 @@ impl DeterministicGroupCore {
 }
 
 fn descriptor_path(dir: &str) -> String {
-    if dir.is_empty() { DESCRIPTOR_FILE.to_owned() } else {
+    if dir.is_empty() {
+        DESCRIPTOR_FILE.to_owned()
+    } else {
         format!("{}/{DESCRIPTOR_FILE}", dir.trim_end_matches('/'))
     }
 }
@@ -552,7 +1031,11 @@ fn descriptor_path(dir: &str) -> String {
 /// durably created the directory and its parent entries. `StorageFs` does not
 /// provide atomic create-new or locking, so this API is not a runtime lock.
 /// An error may leave a partial or durable descriptor and requires investigation.
-pub fn bootstrap_descriptor<FS: StorageFs>(fs: &FS, dir: &str, identity: &ReplicaIdentity) -> Result<(), DescriptorError> {
+pub fn bootstrap_descriptor<FS: StorageFs>(
+    fs: &FS,
+    dir: &str,
+    identity: &ReplicaIdentity,
+) -> Result<(), DescriptorError> {
     if !fs.list_files(dir)?.is_empty() || fs.exists(&descriptor_path(dir)) {
         return Err(DescriptorError::DirectoryNotEmpty);
     }
@@ -566,10 +1049,16 @@ pub fn bootstrap_descriptor<FS: StorageFs>(fs: &FS, dir: &str, identity: &Replic
 /// Match the complete canonical descriptor without changing it. A successful
 /// check also syncs its bytes and directory entry, including after a process-only
 /// restart following an ambiguous bootstrap. This does not validate any WAL.
-pub fn verify_descriptor<FS: StorageFs>(fs: &FS, dir: &str, identity: &ReplicaIdentity) -> Result<(), DescriptorError> {
+pub fn verify_descriptor<FS: StorageFs>(
+    fs: &FS,
+    dir: &str,
+    identity: &ReplicaIdentity,
+) -> Result<(), DescriptorError> {
     let file = fs.open_rw(&descriptor_path(dir), false)?;
     let expected = descriptor_bytes(identity);
-    if file.len()? != expected.len() as u64 { return Err(DescriptorError::Mismatch); }
+    if file.len()? != expected.len() as u64 {
+        return Err(DescriptorError::Mismatch);
+    }
     let mut actual = vec![0; expected.len()];
     if file.read_at(0, &mut actual)? != actual.len() || actual != expected {
         return Err(DescriptorError::Mismatch);
@@ -593,14 +1082,39 @@ mod tests {
     use super::*;
     use yadb_io::{FaultConfig, SimFs, SyncFault};
 
-    fn group() -> GroupIdentity { GroupIdentity { cluster: [1; 16], group: 1, incarnation: 1 } }
-    fn replica() -> ReplicaIdentity { ReplicaIdentity::new(group(), 1, vec![1, 2, 3]).unwrap() }
+    fn group() -> GroupIdentity {
+        GroupIdentity {
+            cluster: [1; 16],
+            group: 1,
+            incarnation: 1,
+        }
+    }
+    fn replica() -> ReplicaIdentity {
+        ReplicaIdentity::new(group(), 1, vec![1, 2, 3]).unwrap()
+    }
     fn replica_for(group_id: u64, node: u32) -> ReplicaIdentity {
-        ReplicaIdentity::new(GroupIdentity { group: group_id, ..group() }, node, vec![1, 2, 3]).unwrap()
+        ReplicaIdentity::new(
+            GroupIdentity {
+                group: group_id,
+                ..group()
+            },
+            node,
+            vec![1, 2, 3],
+        )
+        .unwrap()
     }
     fn envelope() -> GroupEnvelope {
-        GroupEnvelope { version: PROTOCOL_VERSION, group: group(), sender: 2, recipient: 1,
-            rpc: RaftRpc::RequestVoteReply { from: 2, term: 1, vote_granted: true } }
+        GroupEnvelope {
+            version: PROTOCOL_VERSION,
+            group: group(),
+            sender: 2,
+            recipient: 1,
+            rpc: RaftRpc::RequestVoteReply {
+                from: 2,
+                term: 1,
+                vote_granted: true,
+            },
+        }
     }
 
     #[test]
@@ -613,55 +1127,612 @@ mod tests {
         let mut b3 = DeterministicGroupCore::new(replica_for(2, 3));
 
         let a_votes = a1.start_election().unwrap();
-        let a_reply2 = a2.receive(&a_votes.iter().find(|e| e.recipient == 2).unwrap(), 1).unwrap();
-        let a_reply3 = a3.receive(&a_votes.iter().find(|e| e.recipient == 3).unwrap(), 1).unwrap();
+        let a_reply2 = a2
+            .receive(&a_votes.iter().find(|e| e.recipient == 2).unwrap(), 1)
+            .unwrap();
+        let a_reply3 = a3
+            .receive(&a_votes.iter().find(|e| e.recipient == 3).unwrap(), 1)
+            .unwrap();
         a1.receive(&a_reply2[0], 2).unwrap();
         a1.receive(&a_reply3[0], 3).unwrap();
         assert_eq!(a1.role(), RoleState::Leader);
 
         let b_votes = b2.start_election().unwrap();
-        let b_reply1 = b1.receive(&b_votes.iter().find(|e| e.recipient == 1).unwrap(), 2).unwrap();
-        let b_reply3 = b3.receive(&b_votes.iter().find(|e| e.recipient == 3).unwrap(), 2).unwrap();
+        let b_reply1 = b1
+            .receive(&b_votes.iter().find(|e| e.recipient == 1).unwrap(), 2)
+            .unwrap();
+        let b_reply3 = b3
+            .receive(&b_votes.iter().find(|e| e.recipient == 3).unwrap(), 2)
+            .unwrap();
         b2.receive(&b_reply1[0], 1).unwrap();
         b2.receive(&b_reply3[0], 3).unwrap();
         assert_eq!(b2.role(), RoleState::Leader);
         assert_eq!(a1.leader_id(), Some(1));
         assert_eq!(b2.leader_id(), Some(2));
 
-        let a_append = a1.propose(crate::KvCommand::Put { key: "same".into(), value: vec![b'a'] }).unwrap();
-        let b_append = b2.propose(crate::KvCommand::Put { key: "same".into(), value: vec![b'b'] }).unwrap();
-        a2.receive(&a_append.iter().find(|e| e.recipient == 2).unwrap(), 1).unwrap();
-        b1.receive(&b_append.iter().find(|e| e.recipient == 1).unwrap(), 2).unwrap();
-        assert_eq!(a2.state().log[0].cmd, crate::KvCommand::Put { key: "same".into(), value: vec![b'a'] });
-        assert_eq!(b1.state().log[0].cmd, crate::KvCommand::Put { key: "same".into(), value: vec![b'b'] });
+        let a_append = a1
+            .propose(crate::KvCommand::Put {
+                key: "same".into(),
+                value: vec![b'a'],
+            })
+            .unwrap();
+        let b_append = b2
+            .propose(crate::KvCommand::Put {
+                key: "same".into(),
+                value: vec![b'b'],
+            })
+            .unwrap();
+        a2.receive(&a_append.iter().find(|e| e.recipient == 2).unwrap(), 1)
+            .unwrap();
+        b1.receive(&b_append.iter().find(|e| e.recipient == 1).unwrap(), 2)
+            .unwrap();
+        assert_eq!(
+            a2.state().log[0].cmd,
+            crate::KvCommand::Put {
+                key: "same".into(),
+                value: vec![b'a']
+            }
+        );
+        assert_eq!(
+            b1.state().log[0].cmd,
+            crate::KvCommand::Put {
+                key: "same".into(),
+                value: vec![b'b']
+            }
+        );
     }
 
     #[test]
     fn deterministic_core_rejects_wrong_group_sender_and_recipient_without_mutation() {
         let mut core = DeterministicGroupCore::new(replica_for(1, 1));
-        let before = (core.term(), core.role(), core.leader_id(), core.state().clone());
+        let before = (
+            core.term(),
+            core.role(),
+            core.leader_id(),
+            core.state().clone(),
+        );
         let mut wrong = envelope();
         wrong.group.group = 99;
-        assert!(matches!(core.receive(&wrong, 2), Err(GroupCoreError::Identity(IdentityError::WrongGroup))));
+        assert!(matches!(
+            core.receive(&wrong, 2),
+            Err(GroupCoreError::Identity(IdentityError::WrongGroup))
+        ));
         let mut wrong = envelope();
         wrong.recipient = 3;
-        assert!(matches!(core.receive(&wrong, 2), Err(GroupCoreError::Identity(IdentityError::WrongRecipient))));
+        assert!(matches!(
+            core.receive(&wrong, 2),
+            Err(GroupCoreError::Identity(IdentityError::WrongRecipient))
+        ));
         let mut wrong = envelope();
         wrong.sender = 999;
-        assert!(matches!(core.receive(&wrong, 999), Err(GroupCoreError::Identity(IdentityError::InvalidSender))));
+        assert!(matches!(
+            core.receive(&wrong, 999),
+            Err(GroupCoreError::Identity(IdentityError::InvalidSender))
+        ));
         let mut wrong = envelope();
-        wrong.rpc = RaftRpc::RequestVote { term: 9, candidate_id: 3, last_log_index: 0, last_log_term: 0 };
-        assert!(matches!(core.receive(&wrong, 2), Err(GroupCoreError::Identity(IdentityError::SenderMismatch))));
-        assert_eq!((core.term(), core.role(), core.leader_id(), core.state().clone()), before);
+        wrong.rpc = RaftRpc::RequestVote {
+            term: 9,
+            candidate_id: 3,
+            last_log_index: 0,
+            last_log_term: 0,
+        };
+        assert!(matches!(
+            core.receive(&wrong, 2),
+            Err(GroupCoreError::Identity(IdentityError::SenderMismatch))
+        ));
+        assert_eq!(
+            (
+                core.term(),
+                core.role(),
+                core.leader_id(),
+                core.state().clone()
+            ),
+            before
+        );
+    }
+
+    #[test]
+    fn election_records_self_vote_and_singleton_becomes_leader() {
+        let mut core = DeterministicGroupCore::new(replica_for(1, 1));
+        core.start_election().unwrap();
+        assert_eq!(core.state().term, 1);
+        assert_eq!(core.state().voted_for, Some(1));
+        let identity = ReplicaIdentity::new(group(), 1, vec![1]).unwrap();
+        let mut singleton = DeterministicGroupCore::new(identity);
+        assert!(singleton.start_election().unwrap().is_empty());
+        assert_eq!(singleton.role(), RoleState::Leader);
+        assert_eq!(singleton.leader_id(), Some(1));
+        assert_eq!(singleton.state().voted_for, Some(1));
+        assert!(singleton
+            .propose(crate::KvCommand::Put {
+                key: "k".into(),
+                value: vec![1]
+            })
+            .unwrap()
+            .is_empty());
+        assert_eq!(singleton.state().commit_index, 1);
+    }
+
+    #[test]
+    fn leader_commits_current_term_entry_after_one_follower_ack() {
+        let mut leader = DeterministicGroupCore::new(replica_for(1, 1));
+        let mut follower = DeterministicGroupCore::new(replica_for(1, 2));
+        let requests = leader.start_election().unwrap();
+        let vote = follower
+            .receive(
+                &requests
+                    .iter()
+                    .find(|message| message.recipient == 2)
+                    .unwrap(),
+                1,
+            )
+            .unwrap();
+        leader.receive(&vote[0], 2).unwrap();
+        let append = leader
+            .propose(crate::KvCommand::Put {
+                key: "k".into(),
+                value: vec![1],
+            })
+            .unwrap()
+            .into_iter()
+            .find(|message| message.recipient == 2)
+            .unwrap();
+        assert_eq!(leader.state().commit_index, 0);
+        let reply = follower.receive(&append, 1).unwrap();
+        assert!(matches!(
+            reply[0].rpc,
+            RaftRpc::AppendEntriesReply {
+                success: true,
+                match_index: 1,
+                ..
+            }
+        ));
+        leader.receive(&reply[0], 2).unwrap();
+        assert_eq!(leader.match_index(1), Some(1));
+        assert_eq!(leader.match_index(2), Some(1));
+        assert_eq!(leader.next_index(2), Some(2));
+        assert_eq!(leader.state().commit_index, 1);
+
+        let second = leader
+            .propose(crate::KvCommand::Put {
+                key: "k2".into(),
+                value: vec![2],
+            })
+            .unwrap()
+            .into_iter()
+            .find(|message| message.recipient == 2)
+            .unwrap();
+        match second.rpc {
+            RaftRpc::AppendEntries {
+                prev_log_index,
+                entries,
+                ..
+            } => {
+                assert_eq!(prev_log_index, 1);
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].index, 2);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn failed_append_ack_decrements_next_index_and_retries_from_earlier_prefix() {
+        let mut leader = DeterministicGroupCore::new(replica_for(1, 1));
+        let follower = DeterministicGroupCore::new(replica_for(1, 2));
+        let requests = leader.start_election().unwrap();
+        let mut vote_target = DeterministicGroupCore::new(replica_for(1, 2));
+        let vote = vote_target.receive(&requests[0], 1).unwrap();
+        leader.receive(&vote[0], 2).unwrap();
+        leader
+            .propose(crate::KvCommand::Put {
+                key: "k".into(),
+                value: vec![1],
+            })
+            .unwrap();
+        assert_eq!(leader.next_index(2), Some(1));
+        let failure = GroupEnvelope {
+            version: PROTOCOL_VERSION,
+            group: group(),
+            sender: 2,
+            recipient: 1,
+            rpc: RaftRpc::AppendEntriesReply {
+                from: 2,
+                term: leader.term(),
+                success: false,
+                match_index: 0,
+            },
+        };
+        let retry = leader.receive(&failure, 2).unwrap();
+        assert_eq!(leader.next_index(2), Some(1));
+        assert_eq!(leader.match_index(2), Some(0));
+        assert_eq!(retry.len(), 1);
+        assert!(matches!(
+            retry[0].rpc,
+            RaftRpc::AppendEntries {
+                prev_log_index: 0,
+                ..
+            }
+        ));
+        let _ = follower;
+    }
+
+    #[test]
+    fn lagging_follower_catches_up_with_the_full_missing_suffix() {
+        let mut leader = DeterministicGroupCore::new(replica_for(1, 1));
+        let mut follower = DeterministicGroupCore::new(replica_for(1, 2));
+        let requests = leader.start_election().unwrap();
+        let vote = follower.receive(&requests[0], 1).unwrap();
+        leader.receive(&vote[0], 2).unwrap();
+        let _first = leader
+            .propose(crate::KvCommand::Put {
+                key: "one".into(),
+                value: vec![1],
+            })
+            .unwrap();
+        let second = leader
+            .propose(crate::KvCommand::Put {
+                key: "two".into(),
+                value: vec![2],
+            })
+            .unwrap()
+            .into_iter()
+            .find(|message| message.recipient == 2)
+            .unwrap();
+        let (prev_log_index, entries) = match &second.rpc {
+            RaftRpc::AppendEntries {
+                prev_log_index,
+                entries,
+                ..
+            } => (*prev_log_index, entries.clone()),
+            _ => unreachable!(),
+        };
+        assert_eq!(prev_log_index, 0);
+        assert_eq!(entries.len(), 2);
+        let reply = follower.receive(&second, 1).unwrap();
+        leader.receive(&reply[0], 2).unwrap();
+        assert_eq!(follower.state().log, leader.state().log);
+        assert_eq!(leader.state().commit_index, 2);
+        let heartbeat = leader
+            .heartbeat()
+            .into_iter()
+            .find(|message| message.recipient == 2)
+            .unwrap();
+        follower.receive(&heartbeat, 1).unwrap();
+        assert_eq!(follower.state().commit_index, 2);
+    }
+
+    #[test]
+    fn old_term_entry_is_committed_only_with_a_current_term_entry() {
+        let mut leader = DeterministicGroupCore::new(replica_for(1, 1));
+        let mut follower = DeterministicGroupCore::new(replica_for(1, 2));
+        let requests = leader.start_election().unwrap();
+        let vote = follower.receive(&requests[0], 1).unwrap();
+        leader.receive(&vote[0], 2).unwrap();
+        let first = leader
+            .propose(crate::KvCommand::Put {
+                key: "old".into(),
+                value: vec![1],
+            })
+            .unwrap()
+            .into_iter()
+            .find(|message| message.recipient == 2)
+            .unwrap();
+        assert_eq!(leader.state().commit_index, 0);
+
+        let next_election = leader.start_election().unwrap();
+        let next_vote = follower.receive(&next_election[0], 1).unwrap();
+        leader.receive(&next_vote[0], 2).unwrap();
+        assert_eq!(leader.term(), 2);
+        let current = leader
+            .propose(crate::KvCommand::Put {
+                key: "new".into(),
+                value: vec![2],
+            })
+            .unwrap()
+            .into_iter()
+            .find(|message| message.recipient == 2)
+            .unwrap();
+        // The follower first rejects prev_log_index=1 because it missed the old entry.
+        let failure = follower.receive(&current, 1).unwrap();
+        assert!(matches!(
+            failure[0].rpc,
+            RaftRpc::AppendEntriesReply { success: false, .. }
+        ));
+        let retry = leader.receive(&failure[0], 2).unwrap();
+        let retry_reply = follower.receive(&retry[0], 1).unwrap();
+        leader.receive(&retry_reply[0], 2).unwrap();
+        assert_eq!(leader.state().commit_index, 2);
+        let heartbeat = leader
+            .heartbeat()
+            .into_iter()
+            .find(|message| message.recipient == 2)
+            .unwrap();
+        follower.receive(&heartbeat, 1).unwrap();
+        assert_eq!(follower.state().commit_index, 2);
+        let _ = first;
+    }
+
+    #[test]
+    fn append_entries_heartbeats_and_duplicates_are_idempotent() {
+        let mut leader = DeterministicGroupCore::new(replica_for(1, 1));
+        let mut follower = DeterministicGroupCore::new(replica_for(1, 2));
+        let requests = leader.start_election().unwrap();
+        let vote = follower.receive(&requests[0], 1).unwrap();
+        leader.receive(&vote[0], 2).unwrap();
+        let append = leader
+            .propose(crate::KvCommand::Put {
+                key: "k".into(),
+                value: vec![1],
+            })
+            .unwrap()
+            .into_iter()
+            .find(|e| e.recipient == 2)
+            .unwrap();
+        let heartbeat = match append.rpc.clone() {
+            RaftRpc::AppendEntries {
+                term,
+                leader_id,
+                leader_commit,
+                ..
+            } => GroupEnvelope {
+                version: PROTOCOL_VERSION,
+                group: group(),
+                sender: 1,
+                recipient: 2,
+                rpc: RaftRpc::AppendEntries {
+                    term,
+                    leader_id,
+                    prev_log_index: 0,
+                    prev_log_term: 0,
+                    entries: vec![],
+                    leader_commit,
+                },
+            },
+            _ => unreachable!(),
+        };
+        follower.receive(&append, 1).unwrap();
+        assert_eq!(follower.state().log.len(), 1);
+        follower.receive(&heartbeat, 1).unwrap();
+        assert_eq!(follower.state().log.len(), 1);
+        follower.receive(&append, 1).unwrap();
+        assert_eq!(follower.state().log.len(), 1);
+
+        let stale = GroupEnvelope {
+            version: PROTOCOL_VERSION,
+            group: group(),
+            sender: 1,
+            recipient: 2,
+            rpc: RaftRpc::AppendEntries {
+                term: 1,
+                leader_id: 1,
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: vec![],
+                leader_commit: 0,
+            },
+        };
+        follower.receive(&stale, 1).unwrap();
+        assert_eq!(follower.state().log.len(), 1);
+    }
+
+    #[test]
+    fn append_entries_rejects_invalid_payload_without_partial_transition() {
+        let mut follower = DeterministicGroupCore::new(replica_for(1, 2));
+        let before = (
+            follower.term(),
+            follower.role(),
+            follower.leader_id(),
+            follower.state().clone(),
+        );
+        let malformed = GroupEnvelope {
+            version: PROTOCOL_VERSION,
+            group: group(),
+            sender: 1,
+            recipient: 2,
+            rpc: RaftRpc::AppendEntries {
+                term: 9,
+                leader_id: 1,
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: vec![crate::LogEntry {
+                    index: 2,
+                    term: 9,
+                    cmd: crate::KvCommand::Put {
+                        key: "k".into(),
+                        value: vec![1],
+                    },
+                }],
+                leader_commit: 0,
+            },
+        };
+        assert!(matches!(
+            follower.receive(&malformed, 1),
+            Err(GroupCoreError::Protocol)
+        ));
+        assert_eq!(
+            (
+                follower.term(),
+                follower.role(),
+                follower.leader_id(),
+                follower.state().clone()
+            ),
+            before
+        );
+    }
+
+    #[test]
+    fn append_entries_preserves_prefix_and_replaces_only_conflicting_suffix() {
+        let entry = |index, term, value| crate::LogEntry {
+            index,
+            term,
+            cmd: crate::KvCommand::Put {
+                key: "k".into(),
+                value: vec![value],
+            },
+        };
+        let rpc = |term, prev_log_index, prev_log_term, entries, leader_commit| GroupEnvelope {
+            version: PROTOCOL_VERSION,
+            group: group(),
+            sender: 1,
+            recipient: 2,
+            rpc: RaftRpc::AppendEntries {
+                term,
+                leader_id: 1,
+                prev_log_index,
+                prev_log_term,
+                entries,
+                leader_commit,
+            },
+        };
+        let mut follower = DeterministicGroupCore::new(replica_for(1, 2));
+        let original = vec![entry(1, 1, 1), entry(2, 1, 2), entry(3, 1, 3)];
+        follower
+            .receive(&rpc(1, 0, 0, original.clone(), 1), 1)
+            .unwrap();
+        // Replaying committed entries and a shorter matching batch keeps the tail.
+        let reply = follower
+            .receive(&rpc(1, 0, 0, original[..2].to_vec(), 0), 1)
+            .unwrap();
+        assert!(matches!(
+            reply[0].rpc,
+            RaftRpc::AppendEntriesReply {
+                success: true,
+                match_index: 2,
+                ..
+            }
+        ));
+        assert_eq!(follower.state().log, original);
+        assert_eq!(follower.state().commit_index, 1);
+        // An empty delayed heartbeat must not commit an unmatched suffix.
+        follower.receive(&rpc(1, 0, 0, vec![], 3), 1).unwrap();
+        assert_eq!(follower.state().commit_index, 1);
+        let replacement = vec![entry(2, 2, 9), entry(3, 2, 10)];
+        follower
+            .receive(&rpc(2, 1, 1, replacement.clone(), 2), 1)
+            .unwrap();
+        assert_eq!(
+            follower.state().log,
+            vec![
+                original[0].clone(),
+                replacement[0].clone(),
+                replacement[1].clone()
+            ]
+        );
+        assert_eq!(follower.state().commit_index, 2);
+        let before = (
+            follower.term(),
+            follower.role(),
+            follower.leader_id(),
+            follower.state().clone(),
+        );
+        assert!(matches!(
+            follower.receive(&rpc(3, 0, 0, vec![entry(1, 3, 7)], 0), 1),
+            Err(GroupCoreError::Protocol)
+        ));
+        assert_eq!(
+            (
+                follower.term(),
+                follower.role(),
+                follower.leader_id(),
+                follower.state().clone()
+            ),
+            before
+        );
+        assert!(matches!(
+            follower.receive(&rpc(3, 1, 1, vec![entry(2, 2, 42)], 0), 1),
+            Err(GroupCoreError::Protocol)
+        ));
+        assert_eq!(
+            (
+                follower.term(),
+                follower.role(),
+                follower.leader_id(),
+                follower.state().clone()
+            ),
+            before
+        );
+        // A stale leader is rejected without treating its differing log as corruption.
+        let reply = follower
+            .receive(&rpc(1, 0, 0, vec![entry(1, 1, 42)], 0), 1)
+            .unwrap();
+        assert!(matches!(
+            reply[0].rpc,
+            RaftRpc::AppendEntriesReply { success: false, .. }
+        ));
+        assert_eq!(
+            (
+                follower.term(),
+                follower.role(),
+                follower.leader_id(),
+                follower.state().clone()
+            ),
+            before
+        );
+        // A valid higher-term request with an unavailable predecessor is a normal
+        // Raft rejection: the term advances, but the log and commit do not.
+        let reply = follower.receive(&rpc(4, 4, 3, vec![], 4), 1).unwrap();
+        assert!(matches!(
+            reply[0].rpc,
+            RaftRpc::AppendEntriesReply {
+                success: false,
+                term: 4,
+                ..
+            }
+        ));
+        assert_eq!(follower.term(), 4);
+        assert_eq!(follower.state().log, before.3.log);
+        assert_eq!(follower.state().commit_index, before.3.commit_index);
+    }
+
+    #[test]
+    fn append_entries_checks_whole_batch_before_conflict_replacement() {
+        let entry = |index, term, value| crate::LogEntry {
+            index,
+            term,
+            cmd: crate::KvCommand::Put {
+                key: "k".into(),
+                value: vec![value],
+            },
+        };
+        let mut state = GroupRaftState {
+            term: 3,
+            voted_for: None,
+            log: vec![entry(1, 1, 1), entry(2, 2, 2)],
+            commit_index: 0,
+        };
+        let before = state.clone();
+        assert!(state
+            .merge_entries(1, &[entry(1, 2, 9), entry(2, 2, 99)])
+            .is_err());
+        assert_eq!(state, before);
+        assert!(state.merge_entries(u64::MAX, &[]).is_err());
+        assert_eq!(state, before);
     }
 
     #[test]
     fn configuration_is_strict_and_canonical() {
         for voters in [vec![], vec![1, 1, 2], vec![2, 1], vec![2, 3], vec![0, 1, 2]] {
-            assert_eq!(ReplicaIdentity::new(group(), 1, voters), Err(IdentityError::InvalidVoters));
+            assert_eq!(
+                ReplicaIdentity::new(group(), 1, voters),
+                Err(IdentityError::InvalidVoters)
+            );
         }
-        assert_eq!(ReplicaIdentity::new(group(), 0, vec![1]), Err(IdentityError::InvalidIdentity));
-        assert_eq!(ReplicaIdentity::new(GroupIdentity { incarnation: 0, ..group() }, 1, vec![1]), Err(IdentityError::InvalidIdentity));
+        assert_eq!(
+            ReplicaIdentity::new(group(), 0, vec![1]),
+            Err(IdentityError::InvalidIdentity)
+        );
+        assert_eq!(
+            ReplicaIdentity::new(
+                GroupIdentity {
+                    incarnation: 0,
+                    ..group()
+                },
+                1,
+                vec![1]
+            ),
+            Err(IdentityError::InvalidIdentity)
+        );
         assert_eq!(replica().voters(), &[1, 2, 3]);
     }
 
@@ -669,30 +1740,71 @@ mod tests {
     fn rejects_wrong_identity_version_and_routing() {
         let r = replica();
         assert_eq!(r.validate(&envelope(), 2), Ok(()));
-        let mut e = envelope(); e.version += 1;
+        let mut e = envelope();
+        e.version += 1;
         assert_eq!(r.validate(&e, 2), Err(IdentityError::WrongVersion));
-        for identity in [GroupIdentity { cluster: [2; 16], ..group() },
-            GroupIdentity { group: 2, ..group() }, GroupIdentity { incarnation: 2, ..group() }] {
-            let mut e = envelope(); e.group = identity;
+        for identity in [
+            GroupIdentity {
+                cluster: [2; 16],
+                ..group()
+            },
+            GroupIdentity {
+                group: 2,
+                ..group()
+            },
+            GroupIdentity {
+                incarnation: 2,
+                ..group()
+            },
+        ] {
+            let mut e = envelope();
+            e.group = identity;
             assert_eq!(r.validate(&e, 2), Err(IdentityError::WrongGroup));
         }
-        let mut e = envelope(); e.recipient = 3;
+        let mut e = envelope();
+        e.recipient = 3;
         assert_eq!(r.validate(&e, 2), Err(IdentityError::WrongRecipient));
-        let mut e = envelope(); e.sender = 999;
+        let mut e = envelope();
+        e.sender = 999;
         assert_eq!(r.validate(&e, 999), Err(IdentityError::InvalidSender));
-        assert_eq!(r.validate(&envelope(), 3), Err(IdentityError::InvalidSender));
+        assert_eq!(
+            r.validate(&envelope(), 3),
+            Err(IdentityError::InvalidSender)
+        );
     }
 
     #[test]
     fn all_rpc_claims_must_match_the_transport_peer() {
         let r = replica();
         for rpc in [
-            RaftRpc::RequestVote { term: 1, candidate_id: 3, last_log_index: 0, last_log_term: 0 },
-            RaftRpc::RequestVoteReply { term: 1, from: 3, vote_granted: true },
-            RaftRpc::AppendEntries { term: 1, leader_id: 3, prev_log_index: 0, prev_log_term: 0, entries: vec![], leader_commit: 0 },
-            RaftRpc::AppendEntriesReply { term: 1, from: 3, success: true, match_index: 0 },
+            RaftRpc::RequestVote {
+                term: 1,
+                candidate_id: 3,
+                last_log_index: 0,
+                last_log_term: 0,
+            },
+            RaftRpc::RequestVoteReply {
+                term: 1,
+                from: 3,
+                vote_granted: true,
+            },
+            RaftRpc::AppendEntries {
+                term: 1,
+                leader_id: 3,
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: vec![],
+                leader_commit: 0,
+            },
+            RaftRpc::AppendEntriesReply {
+                term: 1,
+                from: 3,
+                success: true,
+                match_index: 0,
+            },
         ] {
-            let mut e = envelope(); e.rpc = rpc;
+            let mut e = envelope();
+            e.rpc = rpc;
             assert_eq!(r.validate(&e, 2), Err(IdentityError::SenderMismatch));
         }
     }
@@ -705,9 +1817,33 @@ mod tests {
         fs.simulate_power_cut();
         verify_descriptor(&fs, "group", &replica()).unwrap();
         let different = [
-            ReplicaIdentity::new(GroupIdentity { group: 2, ..group() }, 1, vec![1, 2, 3]).unwrap(),
-            ReplicaIdentity::new(GroupIdentity { cluster: [2; 16], ..group() }, 1, vec![1, 2, 3]).unwrap(),
-            ReplicaIdentity::new(GroupIdentity { incarnation: 2, ..group() }, 1, vec![1, 2, 3]).unwrap(),
+            ReplicaIdentity::new(
+                GroupIdentity {
+                    group: 2,
+                    ..group()
+                },
+                1,
+                vec![1, 2, 3],
+            )
+            .unwrap(),
+            ReplicaIdentity::new(
+                GroupIdentity {
+                    cluster: [2; 16],
+                    ..group()
+                },
+                1,
+                vec![1, 2, 3],
+            )
+            .unwrap(),
+            ReplicaIdentity::new(
+                GroupIdentity {
+                    incarnation: 2,
+                    ..group()
+                },
+                1,
+                vec![1, 2, 3],
+            )
+            .unwrap(),
             ReplicaIdentity::new(group(), 2, vec![1, 2, 3]).unwrap(),
             ReplicaIdentity::new(group(), 1, vec![1]).unwrap(),
         ];
@@ -715,28 +1851,47 @@ mod tests {
         let mut before = vec![0; file.len().unwrap() as usize];
         file.read_at(0, &mut before).unwrap();
         for wrong in different {
-            assert!(matches!(verify_descriptor(&fs, "group", &wrong), Err(DescriptorError::Mismatch)));
+            assert!(matches!(
+                verify_descriptor(&fs, "group", &wrong),
+                Err(DescriptorError::Mismatch)
+            ));
             let mut after = vec![0; before.len()];
             file.read_at(0, &mut after).unwrap();
             assert_eq!(before, after);
         }
-        assert!(matches!(bootstrap_descriptor(&fs, "group", &replica()), Err(DescriptorError::DirectoryNotEmpty)));
+        assert!(matches!(
+            bootstrap_descriptor(&fs, "group", &replica()),
+            Err(DescriptorError::DirectoryNotEmpty)
+        ));
         fs.corrupt_byte("group/replica.identity", 12).unwrap();
-        assert!(matches!(verify_descriptor(&fs, "group", &replica()), Err(DescriptorError::Mismatch)));
+        assert!(matches!(
+            verify_descriptor(&fs, "group", &replica()),
+            Err(DescriptorError::Mismatch)
+        ));
     }
 
     #[test]
     fn bootstrap_is_explicit_and_refuses_legacy_wal() {
         let fs = SimFs::new(32);
         fs.create_dir_all("group").unwrap();
-        fs.open_rw("group/raft.wal", true).unwrap().write_at(0, b"YADBWAL1").unwrap();
-        assert!(matches!(bootstrap_descriptor(&fs, "group", &replica()), Err(DescriptorError::DirectoryNotEmpty)));
-        assert!(matches!(verify_descriptor(&fs, "group", &replica()), Err(DescriptorError::Io(_))));
+        fs.open_rw("group/raft.wal", true)
+            .unwrap()
+            .write_at(0, b"YADBWAL1")
+            .unwrap();
+        assert!(matches!(
+            bootstrap_descriptor(&fs, "group", &replica()),
+            Err(DescriptorError::DirectoryNotEmpty)
+        ));
+        assert!(matches!(
+            verify_descriptor(&fs, "group", &replica()),
+            Err(DescriptorError::Io(_))
+        ));
     }
 
     #[test]
     fn os_descriptor_owner_excludes_second_owner() {
-        let base = std::env::var_os("YADB_TEST_TMPDIR").map(std::path::PathBuf::from)
+        let base = std::env::var_os("YADB_TEST_TMPDIR")
+            .map(std::path::PathBuf::from)
             .unwrap_or_else(std::env::temp_dir);
         let dir = base.join(format!("yadb-descriptor-lock-{}", std::process::id()));
         std::fs::create_dir(&dir).unwrap();
@@ -761,19 +1916,49 @@ mod tests {
         let mut original = vec![0; file.len().unwrap() as usize];
         file.read_at(0, &mut original).unwrap();
         for wrong in [
-            ReplicaIdentity::new(GroupIdentity { cluster: [2; 16], ..group() }, 1, vec![1, 2, 3]).unwrap(),
-            ReplicaIdentity::new(GroupIdentity { group: 2, ..group() }, 1, vec![1, 2, 3]).unwrap(),
-            ReplicaIdentity::new(GroupIdentity { incarnation: 2, ..group() }, 1, vec![1, 2, 3]).unwrap(),
+            ReplicaIdentity::new(
+                GroupIdentity {
+                    cluster: [2; 16],
+                    ..group()
+                },
+                1,
+                vec![1, 2, 3],
+            )
+            .unwrap(),
+            ReplicaIdentity::new(
+                GroupIdentity {
+                    group: 2,
+                    ..group()
+                },
+                1,
+                vec![1, 2, 3],
+            )
+            .unwrap(),
+            ReplicaIdentity::new(
+                GroupIdentity {
+                    incarnation: 2,
+                    ..group()
+                },
+                1,
+                vec![1, 2, 3],
+            )
+            .unwrap(),
             ReplicaIdentity::new(group(), 2, vec![1, 2, 3]).unwrap(),
             ReplicaIdentity::new(group(), 1, vec![1]).unwrap(),
         ] {
-            assert!(matches!(verify_empty_wal(&fs, "g", &wrong), Err(DescriptorError::Mismatch)));
+            assert!(matches!(
+                verify_empty_wal(&fs, "g", &wrong),
+                Err(DescriptorError::Mismatch)
+            ));
             let mut after = vec![0; original.len()];
             file.read_at(0, &mut after).unwrap();
             assert_eq!(after, original);
         }
         file.write_at(original.len() as u64, b"record").unwrap();
-        assert!(matches!(verify_empty_wal(&fs, "g", &replica()), Err(DescriptorError::Mismatch)));
+        assert!(matches!(
+            verify_empty_wal(&fs, "g", &replica()),
+            Err(DescriptorError::Mismatch)
+        ));
         assert_eq!(file.len().unwrap(), original.len() as u64 + 6);
         fs.corrupt_byte("g/group.wal", 12).unwrap();
         assert!(verify_empty_wal(&fs, "g", &replica()).is_err());
@@ -793,16 +1978,29 @@ mod tests {
         file.sync_data().unwrap();
         let (_, records) = replay_group_wal(&file, &replica()).unwrap();
         assert_eq!(records, vec![b"one".to_vec(), b"two".to_vec()]);
-        assert!(replay_group_wal(&file, &ReplicaIdentity::new(group(), 1, vec![1]).unwrap()).is_err());
+        assert!(
+            replay_group_wal(&file, &ReplicaIdentity::new(group(), 1, vec![1]).unwrap()).is_err()
+        );
         let len = file.len().unwrap();
-        fs.corrupt_byte("g/group.wal", (offset + FRAME_HEADER as u64) as usize).unwrap();
-        assert!(matches!(replay_group_wal(&file, &replica()), Err(GroupWalError::Corrupt)));
+        fs.corrupt_byte("g/group.wal", (offset + FRAME_HEADER as u64) as usize)
+            .unwrap();
+        assert!(matches!(
+            replay_group_wal(&file, &replica()),
+            Err(GroupWalError::Corrupt)
+        ));
         assert_eq!(file.len().unwrap(), len);
-        fs.corrupt_byte("g/group.wal", (offset + FRAME_HEADER as u64) as usize).unwrap();
+        fs.corrupt_byte("g/group.wal", (offset + FRAME_HEADER as u64) as usize)
+            .unwrap();
         file.set_len(len - 1).unwrap();
-        assert!(matches!(replay_group_wal(&file, &replica()), Err(GroupWalError::Corrupt)));
+        assert!(matches!(
+            replay_group_wal(&file, &replica()),
+            Err(GroupWalError::Corrupt)
+        ));
         assert_eq!(file.len().unwrap(), len - 1);
-        assert!(matches!(encode_group_frame(&vec![0; MAX_RECORD_BYTES + 1], offset), Err(GroupWalError::Limit)));
+        assert!(matches!(
+            encode_group_frame(&vec![0; MAX_RECORD_BYTES + 1], offset),
+            Err(GroupWalError::Limit)
+        ));
     }
 
     #[test]
@@ -812,19 +2010,32 @@ mod tests {
             fs.create_dir_all("g").unwrap();
             bootstrap_empty_wal(&fs, "g", &replica()).unwrap();
             let file = fs.open_rw("g/group.wal", false).unwrap();
-            let mut wal = FramedGroupWal { end: file.len().unwrap(), file, records: 0, failed: false };
+            let mut wal = FramedGroupWal {
+                end: file.len().unwrap(),
+                file,
+                records: 0,
+                failed: false,
+            };
             wal.append(b"committed").unwrap();
-            fs.set_faults(FaultConfig { sync_data_fault: fault, ..Default::default() });
+            fs.set_faults(FaultConfig {
+                sync_data_fault: fault,
+                ..Default::default()
+            });
             assert!(matches!(wal.append(b"unknown"), Err(GroupWalError::Io(_))));
             fs.set_faults(FaultConfig::default());
-            assert!(matches!(wal.append(b"forbidden"), Err(GroupWalError::Unavailable)));
+            assert!(matches!(
+                wal.append(b"forbidden"),
+                Err(GroupWalError::Unavailable)
+            ));
             drop(wal);
             fs.simulate_power_cut();
             let file = fs.open_rw("g/group.wal", false).unwrap();
             let (_, records) = replay_group_wal(&file, &replica()).unwrap();
             let expected = if fault == SyncFault::AfterPersist {
                 vec![b"committed".to_vec(), b"unknown".to_vec()]
-            } else { vec![b"committed".to_vec()] };
+            } else {
+                vec![b"committed".to_vec()]
+            };
             assert_eq!(records, expected);
         }
         for torn in [false, true] {
@@ -832,21 +2043,42 @@ mod tests {
             fs.create_dir_all("g").unwrap();
             bootstrap_empty_wal(&fs, "g", &replica()).unwrap();
             let file = fs.open_rw("g/group.wal", false).unwrap();
-            let mut wal = FramedGroupWal { end: file.len().unwrap(), file, records: 0, failed: false };
-            fs.set_faults(if torn { FaultConfig { torn_write_prob: 1.0, ..Default::default() } }
-                else { FaultConfig { write_eio_prob: 1.0, ..Default::default() } });
+            let mut wal = FramedGroupWal {
+                end: file.len().unwrap(),
+                file,
+                records: 0,
+                failed: false,
+            };
+            fs.set_faults(if torn {
+                FaultConfig {
+                    torn_write_prob: 1.0,
+                    ..Default::default()
+                }
+            } else {
+                FaultConfig {
+                    write_eio_prob: 1.0,
+                    ..Default::default()
+                }
+            });
             assert!(matches!(wal.append(b"entry"), Err(GroupWalError::Io(_))));
             fs.set_faults(FaultConfig::default());
-            assert!(matches!(wal.append(b"forbidden"), Err(GroupWalError::Unavailable)));
+            assert!(matches!(
+                wal.append(b"forbidden"),
+                Err(GroupWalError::Unavailable)
+            ));
             let result = replay_group_wal(&wal.file, &replica());
-            if torn { assert!(matches!(result, Err(GroupWalError::Corrupt))); }
-            else { assert!(result.unwrap().1.is_empty()); }
+            if torn {
+                assert!(matches!(result, Err(GroupWalError::Corrupt)));
+            } else {
+                assert!(result.unwrap().1.is_empty());
+            }
         }
     }
 
     #[test]
     fn os_framed_wal_recovers_records_and_holds_lock() {
-        let base = std::env::var_os("YADB_TEST_TMPDIR").map(std::path::PathBuf::from)
+        let base = std::env::var_os("YADB_TEST_TMPDIR")
+            .map(std::path::PathBuf::from)
             .unwrap_or_else(std::env::temp_dir);
         let dir = base.join(format!("yadb-group-wal-{}", std::process::id()));
         std::fs::create_dir(&dir).unwrap();
@@ -870,28 +2102,152 @@ mod tests {
         use GroupRaftRecord::*;
         let identity = replica();
         let mut state = GroupRaftState::default();
-        let entry = |index, term| crate::LogEntry { index, term,
-            cmd: crate::KvCommand::Put { key: "k".into(), value: vec![1] } };
-        state.apply(&HardState { term: 1, voted_for: Some(1) }, &identity).unwrap();
-        assert!(state.apply(&HardState { term: 1, voted_for: Some(2) }, &identity).is_err());
-        assert!(state.apply(&HardState { term: 1, voted_for: None }, &identity).is_err());
-        assert!(state.apply(&HardState { term: 2, voted_for: Some(999) }, &identity).is_err());
-        assert!(state.apply(&ReplaceSuffix { from_index: 0, entries: vec![entry(0, 1)] }, &identity).is_err());
-        assert!(state.apply(&ReplaceSuffix { from_index: 2, entries: vec![entry(2, 1)] }, &identity).is_err());
-        assert!(state.apply(&ReplaceSuffix { from_index: 1, entries: vec![entry(2, 1)] }, &identity).is_err());
-        assert!(state.apply(&ReplaceSuffix { from_index: 1, entries: vec![entry(1, 2)] }, &identity).is_err());
-        state.apply(&ReplaceSuffix { from_index: 1, entries: vec![entry(1, 1), entry(2, 1)] }, &identity).unwrap();
-        let different = crate::LogEntry { index: 2, term: 1,
-            cmd: crate::KvCommand::Put { key: "k".into(), value: vec![2] } };
-        assert!(state.apply(&ReplaceSuffix { from_index: 2, entries: vec![different] }, &identity).is_err());
+        let entry = |index, term| crate::LogEntry {
+            index,
+            term,
+            cmd: crate::KvCommand::Put {
+                key: "k".into(),
+                value: vec![1],
+            },
+        };
+        state
+            .apply(
+                &HardState {
+                    term: 1,
+                    voted_for: Some(1),
+                },
+                &identity,
+            )
+            .unwrap();
+        assert!(state
+            .apply(
+                &HardState {
+                    term: 1,
+                    voted_for: Some(2)
+                },
+                &identity
+            )
+            .is_err());
+        assert!(state
+            .apply(
+                &HardState {
+                    term: 1,
+                    voted_for: None
+                },
+                &identity
+            )
+            .is_err());
+        assert!(state
+            .apply(
+                &HardState {
+                    term: 2,
+                    voted_for: Some(999)
+                },
+                &identity
+            )
+            .is_err());
+        assert!(state
+            .apply(
+                &ReplaceSuffix {
+                    from_index: 0,
+                    entries: vec![entry(0, 1)]
+                },
+                &identity
+            )
+            .is_err());
+        assert!(state
+            .apply(
+                &ReplaceSuffix {
+                    from_index: 2,
+                    entries: vec![entry(2, 1)]
+                },
+                &identity
+            )
+            .is_err());
+        assert!(state
+            .apply(
+                &ReplaceSuffix {
+                    from_index: 1,
+                    entries: vec![entry(2, 1)]
+                },
+                &identity
+            )
+            .is_err());
+        assert!(state
+            .apply(
+                &ReplaceSuffix {
+                    from_index: 1,
+                    entries: vec![entry(1, 2)]
+                },
+                &identity
+            )
+            .is_err());
+        state
+            .apply(
+                &ReplaceSuffix {
+                    from_index: 1,
+                    entries: vec![entry(1, 1), entry(2, 1)],
+                },
+                &identity,
+            )
+            .unwrap();
+        let different = crate::LogEntry {
+            index: 2,
+            term: 1,
+            cmd: crate::KvCommand::Put {
+                key: "k".into(),
+                value: vec![2],
+            },
+        };
+        assert!(state
+            .apply(
+                &ReplaceSuffix {
+                    from_index: 2,
+                    entries: vec![different]
+                },
+                &identity
+            )
+            .is_err());
         assert_eq!(state.log[1], entry(2, 1));
-        state.apply(&ReplaceSuffix { from_index: 2, entries: vec![entry(2, 1)] }, &identity).unwrap();
+        state
+            .apply(
+                &ReplaceSuffix {
+                    from_index: 2,
+                    entries: vec![entry(2, 1)],
+                },
+                &identity,
+            )
+            .unwrap();
         assert!(state.apply(&Commit { index: 3 }, &identity).is_err());
         state.apply(&Commit { index: 1 }, &identity).unwrap();
-        assert!(state.apply(&ReplaceSuffix { from_index: 1, entries: vec![] }, &identity).is_err());
+        assert!(state
+            .apply(
+                &ReplaceSuffix {
+                    from_index: 1,
+                    entries: vec![]
+                },
+                &identity
+            )
+            .is_err());
         assert!(state.apply(&Commit { index: 0 }, &identity).is_err());
-        state.apply(&HardState { term: 2, voted_for: None }, &identity).unwrap();
-        state.apply(&ReplaceSuffix { from_index: 2, entries: vec![entry(2, 2)] }, &identity).unwrap();
+        state
+            .apply(
+                &HardState {
+                    term: 2,
+                    voted_for: None,
+                },
+                &identity,
+            )
+            .unwrap();
+        state
+            .apply(
+                &ReplaceSuffix {
+                    from_index: 2,
+                    entries: vec![entry(2, 2)],
+                },
+                &identity,
+            )
+            .unwrap();
         assert_eq!(state.log[1].term, 2);
         assert_eq!(state.commit_index, 1);
     }
@@ -899,26 +2255,49 @@ mod tests {
     #[test]
     fn typed_wal_recovers_and_rejects_invalid_records_without_modification() {
         use GroupRaftRecord::*;
-        let base = std::env::var_os("YADB_TEST_TMPDIR").map(std::path::PathBuf::from)
+        let base = std::env::var_os("YADB_TEST_TMPDIR")
+            .map(std::path::PathBuf::from)
             .unwrap_or_else(std::env::temp_dir);
         let dir = base.join(format!("yadb-typed-wal-{}", std::process::id()));
         std::fs::create_dir(&dir).unwrap();
         let fs = OsFs::new(&dir).unwrap();
         drop(LockedEmptyGroupWal::bootstrap(&fs, "", &replica()).unwrap());
         let mut wal = TypedGroupWal::open(&fs, "", &replica()).unwrap();
-        wal.append(&HardState { term: 1, voted_for: Some(1) }).unwrap();
+        wal.append(&HardState {
+            term: 1,
+            voted_for: Some(1),
+        })
+        .unwrap();
         let before = std::fs::metadata(dir.join(GROUP_WAL_FILE)).unwrap().len();
-        assert!(wal.append(&HardState { term: 1, voted_for: Some(2) }).is_err());
-        assert_eq!(std::fs::metadata(dir.join(GROUP_WAL_FILE)).unwrap().len(), before);
+        assert!(wal
+            .append(&HardState {
+                term: 1,
+                voted_for: Some(2)
+            })
+            .is_err());
+        assert_eq!(
+            std::fs::metadata(dir.join(GROUP_WAL_FILE)).unwrap().len(),
+            before
+        );
         drop(wal);
         let wal = TypedGroupWal::open(&fs, "", &replica()).unwrap();
         assert_eq!(wal.state().voted_for, Some(1));
         drop(wal);
         let (mut raw, _) = LockedGroupWal::open(&fs, "", &replica()).unwrap();
-        raw.append(&serde_json::to_vec(&HardState { term: 1, voted_for: Some(2) }).unwrap()).unwrap();
+        raw.append(
+            &serde_json::to_vec(&HardState {
+                term: 1,
+                voted_for: Some(2),
+            })
+            .unwrap(),
+        )
+        .unwrap();
         drop(raw);
         let before = std::fs::read(dir.join(GROUP_WAL_FILE)).unwrap();
-        assert!(matches!(TypedGroupWal::open(&fs, "", &replica()), Err(GroupWalError::Corrupt)));
+        assert!(matches!(
+            TypedGroupWal::open(&fs, "", &replica()),
+            Err(GroupWalError::Corrupt)
+        ));
         assert_eq!(std::fs::read(dir.join(GROUP_WAL_FILE)).unwrap(), before);
         std::fs::remove_file(dir.join(GROUP_WAL_FILE)).unwrap();
         std::fs::remove_dir(dir).unwrap();
@@ -927,7 +2306,8 @@ mod tests {
     #[test]
     fn independent_typed_wals_keep_identity_and_state_separate() {
         use GroupRaftRecord::*;
-        let base = std::env::var_os("YADB_TEST_TMPDIR").map(std::path::PathBuf::from)
+        let base = std::env::var_os("YADB_TEST_TMPDIR")
+            .map(std::path::PathBuf::from)
             .unwrap_or_else(std::env::temp_dir);
         let root = base.join(format!("yadb-two-group-wals-{}", std::process::id()));
         std::fs::create_dir(&root).unwrap();
@@ -935,22 +2315,49 @@ mod tests {
         std::fs::create_dir(root.join("b")).unwrap();
         let fs = OsFs::new(&root).unwrap();
         let a = replica();
-        let b = ReplicaIdentity::new(GroupIdentity { group: 2, ..group() }, 1, vec![1, 2, 3]).unwrap();
+        let b = ReplicaIdentity::new(
+            GroupIdentity {
+                group: 2,
+                ..group()
+            },
+            1,
+            vec![1, 2, 3],
+        )
+        .unwrap();
         drop(LockedEmptyGroupWal::bootstrap(&fs, "a", &a).unwrap());
         drop(LockedEmptyGroupWal::bootstrap(&fs, "b", &b).unwrap());
         let mut wa = TypedGroupWal::open(&fs, "a", &a).unwrap();
         let mut wb = TypedGroupWal::open(&fs, "b", &b).unwrap();
         for (wal, value, vote) in [(&mut wa, b'a', 1), (&mut wb, b'b', 2)] {
-            wal.append(&HardState { term: 1, voted_for: Some(vote) }).unwrap();
-            wal.append(&ReplaceSuffix { from_index: 1, entries: vec![crate::LogEntry {
-                index: 1, term: 1, cmd: crate::KvCommand::Put { key: "same".into(), value: vec![value] },
-            }] }).unwrap();
+            wal.append(&HardState {
+                term: 1,
+                voted_for: Some(vote),
+            })
+            .unwrap();
+            wal.append(&ReplaceSuffix {
+                from_index: 1,
+                entries: vec![crate::LogEntry {
+                    index: 1,
+                    term: 1,
+                    cmd: crate::KvCommand::Put {
+                        key: "same".into(),
+                        value: vec![value],
+                    },
+                }],
+            })
+            .unwrap();
             wal.append(&Commit { index: 1 }).unwrap();
         }
         drop(wa);
         drop(wb);
-        assert!(matches!(TypedGroupWal::open(&fs, "a", &b), Err(GroupWalError::Corrupt)));
-        assert!(matches!(TypedGroupWal::open(&fs, "b", &a), Err(GroupWalError::Corrupt)));
+        assert!(matches!(
+            TypedGroupWal::open(&fs, "a", &b),
+            Err(GroupWalError::Corrupt)
+        ));
+        assert!(matches!(
+            TypedGroupWal::open(&fs, "b", &a),
+            Err(GroupWalError::Corrupt)
+        ));
         let wa = TypedGroupWal::open(&fs, "a", &a).unwrap();
         let mut wb = TypedGroupWal::open(&fs, "b", &b).unwrap();
         assert_eq!(wa.state().voted_for, Some(1));
@@ -975,8 +2382,17 @@ mod tests {
         // A bad append in A does not stop B from making progress.
         drop(wa);
         let mut wa = TypedGroupWal::open(&fs, "a", &a).unwrap();
-        assert!(wa.append(&HardState { term: 1, voted_for: Some(3) }).is_err());
-        wb.append(&HardState { term: 2, voted_for: Some(3) }).unwrap();
+        assert!(wa
+            .append(&HardState {
+                term: 1,
+                voted_for: Some(3)
+            })
+            .is_err());
+        wb.append(&HardState {
+            term: 2,
+            voted_for: Some(3),
+        })
+        .unwrap();
         assert_eq!(wb.state().term, 2);
         assert_eq!(wa.state().term, 1);
         drop(wa);
@@ -996,11 +2412,28 @@ mod tests {
         bootstrap_empty_wal(&fs, "g", &replica()).unwrap();
         let file = fs.open_rw("g/group.wal", false).unwrap();
         let mut end = file.len().unwrap();
-        let entry = |value| crate::LogEntry { index: 1, term: 1,
-            cmd: crate::KvCommand::Put { key: "k".into(), value: vec![value] } };
-        for record in [HardState { term: 1, voted_for: Some(1) },
-            ReplaceSuffix { from_index: 1, entries: vec![entry(1)] },
-            ReplaceSuffix { from_index: 1, entries: vec![entry(2)] }] {
+        let entry = |value| crate::LogEntry {
+            index: 1,
+            term: 1,
+            cmd: crate::KvCommand::Put {
+                key: "k".into(),
+                value: vec![value],
+            },
+        };
+        for record in [
+            HardState {
+                term: 1,
+                voted_for: Some(1),
+            },
+            ReplaceSuffix {
+                from_index: 1,
+                entries: vec![entry(1)],
+            },
+            ReplaceSuffix {
+                from_index: 1,
+                entries: vec![entry(2)],
+            },
+        ] {
             let frame = encode_group_frame(&serde_json::to_vec(&record).unwrap(), end).unwrap();
             file.write_at(end, &frame).unwrap();
             end += frame.len() as u64;
@@ -1008,9 +2441,13 @@ mod tests {
         let (_, records) = replay_group_wal(&file, &replica()).unwrap();
         let mut state = GroupRaftState::default();
         for bytes in &records[..2] {
-            state.apply(&serde_json::from_slice(bytes).unwrap(), &replica()).unwrap();
+            state
+                .apply(&serde_json::from_slice(bytes).unwrap(), &replica())
+                .unwrap();
         }
-        assert!(state.apply(&serde_json::from_slice(&records[2]).unwrap(), &replica()).is_err());
+        assert!(state
+            .apply(&serde_json::from_slice(&records[2]).unwrap(), &replica())
+            .is_err());
         assert_eq!(file.len().unwrap(), end);
         assert_eq!(state.log[0], entry(1));
     }
@@ -1025,20 +2462,37 @@ mod tests {
         ] {
             let fs = SimFs::new(902);
             fs.create_dir_all("g").unwrap();
-            fs.set_faults(FaultConfig { sync_data_fault: data_fault, sync_dir_fault: dir_fault, ..Default::default() });
+            fs.set_faults(FaultConfig {
+                sync_data_fault: data_fault,
+                sync_dir_fault: dir_fault,
+                ..Default::default()
+            });
             assert!(bootstrap_empty_wal(&fs, "g", &replica()).is_err());
             fs.set_faults(FaultConfig::default());
-            assert!(matches!(bootstrap_empty_wal(&fs, "g", &replica()), Err(DescriptorError::DirectoryNotEmpty)));
+            assert!(matches!(
+                bootstrap_empty_wal(&fs, "g", &replica()),
+                Err(DescriptorError::DirectoryNotEmpty)
+            ));
             fs.simulate_power_cut();
             let opened = verify_empty_wal(&fs, "g", &replica());
-            if dir_fault == SyncFault::AfterPersist { opened.unwrap(); } else { assert!(opened.is_err()); }
+            if dir_fault == SyncFault::AfterPersist {
+                opened.unwrap();
+            } else {
+                assert!(opened.is_err());
+            }
         }
         let fs = SimFs::new(903);
         fs.create_dir_all("g").unwrap();
         let file = fs.open_rw("g/group.wal", true).unwrap();
         file.write_at(0, b"YADBWAL1").unwrap();
-        assert!(matches!(verify_empty_wal(&fs, "g", &replica()), Err(DescriptorError::Mismatch)));
-        assert!(matches!(bootstrap_empty_wal(&fs, "g", &replica()), Err(DescriptorError::DirectoryNotEmpty)));
+        assert!(matches!(
+            verify_empty_wal(&fs, "g", &replica()),
+            Err(DescriptorError::Mismatch)
+        ));
+        assert!(matches!(
+            bootstrap_empty_wal(&fs, "g", &replica()),
+            Err(DescriptorError::DirectoryNotEmpty)
+        ));
     }
 
     #[test]
@@ -1046,10 +2500,16 @@ mod tests {
         for fault in [SyncFault::BeforePersist, SyncFault::AfterPersist] {
             let fs = SimFs::new(33);
             fs.create_dir_all("group").unwrap();
-            fs.set_faults(FaultConfig { sync_data_fault: fault, ..Default::default() });
+            fs.set_faults(FaultConfig {
+                sync_data_fault: fault,
+                ..Default::default()
+            });
             assert!(bootstrap_descriptor(&fs, "group", &replica()).is_err());
             fs.set_faults(FaultConfig::default());
-            assert!(matches!(bootstrap_descriptor(&fs, "group", &replica()), Err(DescriptorError::DirectoryNotEmpty)));
+            assert!(matches!(
+                bootstrap_descriptor(&fs, "group", &replica()),
+                Err(DescriptorError::DirectoryNotEmpty)
+            ));
             verify_descriptor(&fs, "group", &replica()).unwrap();
             fs.simulate_power_cut();
             verify_descriptor(&fs, "group", &replica()).unwrap();
@@ -1057,14 +2517,20 @@ mod tests {
         for fault in [SyncFault::BeforePersist, SyncFault::AfterPersist] {
             let fs = SimFs::new(34);
             fs.create_dir_all("group").unwrap();
-            fs.set_faults(FaultConfig { sync_dir_fault: fault, ..Default::default() });
+            fs.set_faults(FaultConfig {
+                sync_dir_fault: fault,
+                ..Default::default()
+            });
             assert!(bootstrap_descriptor(&fs, "group", &replica()).is_err());
             fs.set_faults(FaultConfig::default());
             fs.simulate_power_cut();
             // Absence is an error, never an invitation to bootstrap automatically.
             let result = verify_descriptor(&fs, "group", &replica());
-            if fault == SyncFault::BeforePersist { assert!(result.is_err()); }
-            else { result.unwrap(); }
+            if fault == SyncFault::BeforePersist {
+                assert!(result.is_err());
+            } else {
+                result.unwrap();
+            }
         }
     }
 }

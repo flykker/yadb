@@ -8,6 +8,9 @@ license.workspace = true
 name = "yadbd"
 path = "src/main.rs"
 
+[features]
+experimental-openraft-storage = ["yadb-metakv/experimental-openraft-storage", "dep:openraft", "dep:tokio-rustls"]
+
 [dependencies]
 yadb-io = { path = "../yadb-io" }
 yadb-blob = { path = "../yadb-blob" }
@@ -16,6 +19,8 @@ yadb-metakv = { path = "../yadb-metakv" }
 yadb-s3 = { path = "../yadb-s3" }
 yadb-db = { path = "../yadb-db" }
 yadb-block = { path = "../yadb-block" }
+openraft = { workspace = true, optional = true }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring"], optional = true }
 axum.workspace = true
 bytes.workspace = true
 clap.workspace = true

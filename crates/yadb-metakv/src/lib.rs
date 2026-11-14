@@ -1,12 +1,29 @@
 pub mod kv;
 pub mod multiraft;
+#[cfg(any(test, feature = "experimental-openraft-storage"))]
+pub mod openraft_client;
+#[cfg(any(test, feature = "experimental-openraft-storage"))]
+pub mod openraft_net;
 pub mod openraft_runtime;
+#[cfg(any(test, feature = "experimental-openraft-storage"))]
+pub mod openraft_state_machine;
+#[cfg(any(test, feature = "experimental-openraft-storage"))]
+pub mod openraft_storage;
 #[cfg(test)]
-mod openraft_storage;
+mod openraft_suite;
+#[cfg(test)]
+mod openraft_suite_test;
+#[cfg(any(test, feature = "experimental-openraft-storage"))]
+pub mod openraft_tls;
+#[cfg(any(test, feature = "experimental-openraft-storage"))]
+pub mod openraft_transport;
 pub mod raft;
 pub mod wal;
 
-pub use kv::{CasGuard, KvCommand, KvResult, KvValue, MetaSnapshot, MetaStateMachine, RevisionGuard, TxnOp, WatchEvent};
+pub use kv::{
+    CasGuard, KvCommand, KvResult, KvValue, MetaSnapshot, MetaStateMachine, RevisionGuard, TxnOp,
+    WatchEvent,
+};
 pub use raft::{LocalMetaKv, LogEntry, OutboundMsg, RaftCore, RaftRpc, RoleState};
 pub use wal::RaftWal;
 
@@ -33,6 +50,21 @@ pub enum MetaError {
     /// later leader may replace it; callers must not interpret this as rollback.
     #[error("no confirmed result for proposal at log index {0}; write outcome is unknown")]
     UncommittedIndex(u64),
+
+    /// A submitted OpenRaft write may or may not have committed.
+    #[error("OpenRaft write outcome unknown: {0}")]
+    OpenRaftWriteUnknown(String),
+
+    /// A control-group linearizable read could not be established. Callers must
+    /// fail closed rather than use the locally applied snapshot.
+    #[error("control-plane freshness unavailable: {0}")]
+    ControlFreshnessUnavailable(String),
+
+    #[error("OpenRaft synchronous writes are unsupported in a current-thread Tokio runtime")]
+    OpenRaftAsyncContext,
+
+    #[error("metadata routing error: {0}")]
+    Routing(String),
 }
 
 #[cfg(test)]
@@ -47,9 +79,13 @@ mod tests {
         let meta = LocalMetaKv::open_single_node(&fs, "meta", 1).unwrap();
         let publish = |n: u64| KvCommand::RevisionTxn {
             guards: vec![],
-            ops: ["schema", "shards/a", "idx/a"].into_iter().map(|key| TxnOp::Put {
-                key: key.into(), value: n.to_le_bytes().to_vec(),
-            }).collect(),
+            ops: ["schema", "shards/a", "idx/a"]
+                .into_iter()
+                .map(|key| TxnOp::Put {
+                    key: key.into(),
+                    value: n.to_le_bytes().to_vec(),
+                })
+                .collect(),
         };
         meta.execute(publish(0)).unwrap();
         let keys = vec!["schema".into(), "absent".into()];
@@ -60,8 +96,15 @@ mod tests {
         assert_eq!(pinned.revision(), initial_revision);
         let writer = meta.clone();
         let thread = std::thread::spawn(move || {
-            for n in 1..65 { writer.execute(publish(n)).unwrap(); }
-            writer.execute(KvCommand::Put { key: "absent".into(), value: vec![1] }).unwrap();
+            for n in 1..65 {
+                writer.execute(publish(n)).unwrap();
+            }
+            writer
+                .execute(KvCommand::Put {
+                    key: "absent".into(),
+                    value: vec![1],
+                })
+                .unwrap();
         });
         for _ in 0..128 {
             let snapshot = meta.snapshot(&keys, &prefixes);
@@ -77,12 +120,22 @@ mod tests {
         thread.join().unwrap();
         assert_eq!(pinned.get("schema").unwrap().value, 0u64.to_le_bytes());
         assert!(pinned.get("absent").is_none());
-        meta.execute(KvCommand::Delete { key: "idx/a".into() }).unwrap();
+        meta.execute(KvCommand::Delete {
+            key: "idx/a".into(),
+        })
+        .unwrap();
         assert_eq!(pinned.scan_prefix("idx/").len(), 1);
         drop(meta);
         fs.simulate_power_cut();
         let recovered = LocalMetaKv::open_single_node(&fs, "meta", 1).unwrap();
-        assert_eq!(recovered.snapshot(&keys, &prefixes).get("schema").unwrap().value, 64u64.to_le_bytes());
+        assert_eq!(
+            recovered
+                .snapshot(&keys, &prefixes)
+                .get("schema")
+                .unwrap()
+                .value,
+            64u64.to_le_bytes()
+        );
         // A snapshot is an owned in-memory value, not a persistent reader lease.
         assert_eq!(pinned.get("schema").unwrap().value, 0u64.to_le_bytes());
     }
@@ -91,25 +144,49 @@ mod tests {
     fn process_only_reopen_syncs_recovered_wal_before_matching_log_ack() {
         let fs = SimFs::new(9013);
         let mut follower = RaftCore::open(&fs, "meta", 2, vec![1, 2, 3], true).unwrap();
-        follower.step(RaftRpc::AppendEntries {
-            term: 1, leader_id: 1, prev_log_index: 0, prev_log_term: 0,
-            entries: vec![], leader_commit: 0,
-        }).unwrap();
+        follower
+            .step(RaftRpc::AppendEntries {
+                term: 1,
+                leader_id: 1,
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: vec![],
+                leader_commit: 0,
+            })
+            .unwrap();
         let rpc = RaftRpc::AppendEntries {
-            term: 1, leader_id: 1, prev_log_index: 0, prev_log_term: 0,
-            entries: vec![LogEntry { index: 1, term: 1,
-                cmd: KvCommand::Put { key: "key".into(), value: b"value".to_vec() } }],
+            term: 1,
+            leader_id: 1,
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: vec![LogEntry {
+                index: 1,
+                term: 1,
+                cmd: KvCommand::Put {
+                    key: "key".into(),
+                    value: b"value".to_vec(),
+                },
+            }],
             leader_commit: 1,
         };
-        fs.set_faults(FaultConfig { sync_data_fault: SyncFault::BeforePersist, ..Default::default() });
+        fs.set_faults(FaultConfig {
+            sync_data_fault: SyncFault::BeforePersist,
+            ..Default::default()
+        });
         assert!(follower.step(rpc.clone()).is_err());
         drop(follower);
         assert!(RaftCore::open(&fs, "meta", 2, vec![1, 2, 3], true).is_err());
         fs.set_faults(FaultConfig::default());
         let mut reopened = RaftCore::open(&fs, "meta", 2, vec![1, 2, 3], true).unwrap();
         let replies = reopened.step(rpc).unwrap();
-        assert!(replies.iter().any(|reply| matches!(reply.rpc,
-            RaftRpc::AppendEntriesReply { success: true, match_index: 1, .. })));
+        assert!(replies.iter().any(|reply| matches!(
+            reply.rpc,
+            RaftRpc::AppendEntriesReply {
+                success: true,
+                match_index: 1,
+                ..
+            }
+        )));
         drop(reopened);
         fs.simulate_power_cut();
         let durable = RaftCore::open(&fs, "meta", 2, vec![1, 2, 3], true).unwrap();
@@ -119,22 +196,47 @@ mod tests {
     #[test]
     fn follower_never_acknowledges_memory_only_log_after_wal_failure() {
         for faults in [
-            FaultConfig { write_eio_prob: 1.0, ..Default::default() },
-            FaultConfig { torn_write_prob: 1.0, ..Default::default() },
-            FaultConfig { sync_data_fault: SyncFault::BeforePersist, ..Default::default() },
-            FaultConfig { sync_data_fault: SyncFault::AfterPersist, ..Default::default() },
+            FaultConfig {
+                write_eio_prob: 1.0,
+                ..Default::default()
+            },
+            FaultConfig {
+                torn_write_prob: 1.0,
+                ..Default::default()
+            },
+            FaultConfig {
+                sync_data_fault: SyncFault::BeforePersist,
+                ..Default::default()
+            },
+            FaultConfig {
+                sync_data_fault: SyncFault::AfterPersist,
+                ..Default::default()
+            },
         ] {
             let fs = SimFs::new(9010);
             let mut follower = RaftCore::open(&fs, "meta", 2, vec![1, 2, 3], true).unwrap();
             let heartbeat = RaftRpc::AppendEntries {
-                term: 1, leader_id: 1, prev_log_index: 0, prev_log_term: 0,
-                entries: vec![], leader_commit: 0,
+                term: 1,
+                leader_id: 1,
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: vec![],
+                leader_commit: 0,
             };
             follower.step(heartbeat).unwrap(); // persist term before faulting log
             let rpc = RaftRpc::AppendEntries {
-                term: 1, leader_id: 1, prev_log_index: 0, prev_log_term: 0,
-                entries: vec![LogEntry { index: 1, term: 1,
-                    cmd: KvCommand::Put { key: "key".into(), value: b"value".to_vec() } }],
+                term: 1,
+                leader_id: 1,
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: vec![LogEntry {
+                    index: 1,
+                    term: 1,
+                    cmd: KvCommand::Put {
+                        key: "key".into(),
+                        value: b"value".to_vec(),
+                    },
+                }],
                 leader_commit: 1,
             };
             fs.set_faults(faults);
@@ -142,16 +244,28 @@ mod tests {
             assert_eq!(follower.commit_index(), 0);
             fs.set_faults(FaultConfig::default());
             // Matching in-memory entries are NOT evidence of durability.
-            assert!(matches!(follower.step(rpc.clone()), Err(MetaError::StorageUnavailable)));
-            assert!(matches!(follower.start_election(), Err(MetaError::StorageUnavailable)));
+            assert!(matches!(
+                follower.step(rpc.clone()),
+                Err(MetaError::StorageUnavailable)
+            ));
+            assert!(matches!(
+                follower.start_election(),
+                Err(MetaError::StorageUnavailable)
+            ));
             assert!(follower.broadcast_append_entries().is_empty());
             assert!(follower.get("key").is_none());
             drop(follower);
             fs.simulate_power_cut();
             let mut recovered = RaftCore::open(&fs, "meta", 2, vec![1, 2, 3], true).unwrap();
             let replies = recovered.step(rpc).unwrap();
-            assert!(replies.iter().any(|reply| matches!(reply.rpc,
-                RaftRpc::AppendEntriesReply { success: true, match_index: 1, .. })));
+            assert!(replies.iter().any(|reply| matches!(
+                reply.rpc,
+                RaftRpc::AppendEntriesReply {
+                    success: true,
+                    match_index: 1,
+                    ..
+                }
+            )));
             assert_eq!(recovered.get("key").unwrap().value, b"value");
         }
     }
@@ -162,22 +276,43 @@ mod tests {
             let fs = SimFs::new(9011);
             let mut follower = RaftCore::open(&fs, "meta", 2, vec![1, 2, 3], true).unwrap();
             let vote = RaftRpc::RequestVote {
-                term: 1, candidate_id: 1, last_log_index: 0, last_log_term: 0,
+                term: 1,
+                candidate_id: 1,
+                last_log_index: 0,
+                last_log_term: 0,
             };
-            fs.set_faults(FaultConfig { sync_data_fault: fault, ..Default::default() });
+            fs.set_faults(FaultConfig {
+                sync_data_fault: fault,
+                ..Default::default()
+            });
             assert!(matches!(follower.step(vote.clone()), Err(MetaError::Io(_))));
             fs.set_faults(FaultConfig::default());
-            assert!(matches!(follower.step(vote.clone()), Err(MetaError::StorageUnavailable)));
-            assert!(matches!(follower.step(RaftRpc::AppendEntries {
-                term: 1, leader_id: 1, prev_log_index: 0, prev_log_term: 0,
-                entries: vec![], leader_commit: 0,
-            }), Err(MetaError::StorageUnavailable)));
+            assert!(matches!(
+                follower.step(vote.clone()),
+                Err(MetaError::StorageUnavailable)
+            ));
+            assert!(matches!(
+                follower.step(RaftRpc::AppendEntries {
+                    term: 1,
+                    leader_id: 1,
+                    prev_log_index: 0,
+                    prev_log_term: 0,
+                    entries: vec![],
+                    leader_commit: 0,
+                }),
+                Err(MetaError::StorageUnavailable)
+            ));
             drop(follower);
             fs.simulate_power_cut();
             let mut recovered = RaftCore::open(&fs, "meta", 2, vec![1, 2, 3], true).unwrap();
             let replies = recovered.step(vote).unwrap();
-            assert!(replies.iter().any(|reply| matches!(reply.rpc,
-                RaftRpc::RequestVoteReply { vote_granted: true, .. })));
+            assert!(replies.iter().any(|reply| matches!(
+                reply.rpc,
+                RaftRpc::RequestVoteReply {
+                    vote_granted: true,
+                    ..
+                }
+            )));
         }
     }
 
@@ -186,17 +321,34 @@ mod tests {
         for fault in [SyncFault::BeforePersist, SyncFault::AfterPersist] {
             let fs = SimFs::new(9012);
             let meta = LocalMetaKv::open_single_node(&fs, "meta", 1).unwrap();
-            fs.set_faults(FaultConfig { sync_data_fault: fault, ..Default::default() });
-            let cmd = KvCommand::Put { key: "key".into(), value: b"unknown".to_vec() };
+            fs.set_faults(FaultConfig {
+                sync_data_fault: fault,
+                ..Default::default()
+            });
+            let cmd = KvCommand::Put {
+                key: "key".into(),
+                value: b"unknown".to_vec(),
+            };
             assert!(matches!(meta.execute(cmd.clone()), Err(MetaError::Io(_))));
             fs.set_faults(FaultConfig::default());
-            assert!(matches!(meta.execute(cmd), Err(MetaError::StorageUnavailable)));
+            assert!(matches!(
+                meta.execute(cmd),
+                Err(MetaError::StorageUnavailable)
+            ));
             assert!(meta.get("key").is_none());
             drop(meta);
             fs.simulate_power_cut();
             let recovered = LocalMetaKv::open_single_node(&fs, "meta", 1).unwrap();
-            assert_eq!(recovered.get("key").is_some(), fault == SyncFault::AfterPersist);
-            recovered.execute(KvCommand::Put { key: "next".into(), value: b"durable".to_vec() }).unwrap();
+            assert_eq!(
+                recovered.get("key").is_some(),
+                fault == SyncFault::AfterPersist
+            );
+            recovered
+                .execute(KvCommand::Put {
+                    key: "next".into(),
+                    value: b"durable".to_vec(),
+                })
+                .unwrap();
         }
     }
 
@@ -204,27 +356,54 @@ mod tests {
     fn revision_guards_reject_delete_recreate_aba_after_wal_recovery() {
         let fs = SimFs::new(9001);
         let meta = LocalMetaKv::open_single_node(&fs, "meta", 1).unwrap();
-        meta.execute(KvCommand::Put { key: "key".into(), value: b"old".to_vec() }).unwrap();
+        meta.execute(KvCommand::Put {
+            key: "key".into(),
+            value: b"old".to_vec(),
+        })
+        .unwrap();
         let old = meta.get("key").unwrap();
-        meta.execute(KvCommand::Delete { key: "key".into() }).unwrap();
-        meta.execute(KvCommand::Put { key: "key".into(), value: b"new".to_vec() }).unwrap();
+        meta.execute(KvCommand::Delete { key: "key".into() })
+            .unwrap();
+        meta.execute(KvCommand::Put {
+            key: "key".into(),
+            value: b"new".to_vec(),
+        })
+        .unwrap();
         let new = meta.get("key").unwrap();
         assert_eq!(old.version, new.version); // ordinary version guards have ABA
         assert_ne!(old.mod_revision, new.mod_revision);
         drop(meta);
         fs.simulate_power_cut();
         let meta = LocalMetaKv::open_single_node(&fs, "meta", 1).unwrap();
-        let result = meta.execute(KvCommand::RevisionTxn {
-            guards: vec![RevisionGuard { key: "key".into(), expected_mod_revision: old.mod_revision }],
-            ops: vec![TxnOp::Delete { key: "key".into() }, TxnOp::Put { key: "retired".into(), value: b"old".to_vec() }],
-        }).unwrap();
+        let result = meta
+            .execute(KvCommand::RevisionTxn {
+                guards: vec![RevisionGuard {
+                    key: "key".into(),
+                    expected_mod_revision: old.mod_revision,
+                }],
+                ops: vec![
+                    TxnOp::Delete { key: "key".into() },
+                    TxnOp::Put {
+                        key: "retired".into(),
+                        value: b"old".to_vec(),
+                    },
+                ],
+            })
+            .unwrap();
         assert!(matches!(result, KvResult::CasConflict { .. }));
         assert_eq!(meta.get("key").unwrap().value, b"new");
         assert!(meta.get("retired").is_none());
-        assert!(matches!(meta.execute(KvCommand::RevisionTxn {
-            guards: vec![RevisionGuard { key: "key".into(), expected_mod_revision: new.mod_revision }],
-            ops: vec![TxnOp::Delete { key: "key".into() }],
-        }).unwrap(), KvResult::TxnOk { .. }));
+        assert!(matches!(
+            meta.execute(KvCommand::RevisionTxn {
+                guards: vec![RevisionGuard {
+                    key: "key".into(),
+                    expected_mod_revision: new.mod_revision
+                }],
+                ops: vec![TxnOp::Delete { key: "key".into() }],
+            })
+            .unwrap(),
+            KvResult::TxnOk { .. }
+        ));
     }
 
     /// Deterministic in-memory Raft network simulator supporting partitions & message delivery.
@@ -292,25 +471,39 @@ mod tests {
         let common = cluster.nodes[&1].commit_index();
         cluster.isolate_subset(&[1], &[2, 3]);
         for value in [b"stale-1".as_slice(), b"stale-2".as_slice()] {
-            let (_, msgs) = cluster.nodes.get_mut(&1).unwrap().propose(KvCommand::Put {
-                key: "key".into(), value: value.to_vec(),
-            }).unwrap();
+            let (_, msgs) = cluster
+                .nodes
+                .get_mut(&1)
+                .unwrap()
+                .propose(KvCommand::Put {
+                    key: "key".into(),
+                    value: value.to_vec(),
+                })
+                .unwrap();
             cluster.enqueue_from(1, msgs);
             cluster.drain_network();
         }
         assert_eq!(cluster.nodes[&1].commit_index(), common);
         let term = cluster.nodes[&1].current_term();
-        let replies = cluster.nodes.get_mut(&1).unwrap().step(RaftRpc::AppendEntries {
-            term: term + 1,
-            leader_id: 2,
-            prev_log_index: common,
-            prev_log_term: term,
-            entries: vec![],
-            leader_commit: common + 2,
-        }).unwrap();
-        assert!(matches!(replies[0].rpc, RaftRpc::AppendEntriesReply {
+        let replies = cluster
+            .nodes
+            .get_mut(&1)
+            .unwrap()
+            .step(RaftRpc::AppendEntries {
+                term: term + 1,
+                leader_id: 2,
+                prev_log_index: common,
+                prev_log_term: term,
+                entries: vec![],
+                leader_commit: common + 2,
+            })
+            .unwrap();
+        assert!(
+            matches!(replies[0].rpc, RaftRpc::AppendEntriesReply {
             success: true, match_index, ..
-        } if match_index == common), "{replies:?}");
+        } if match_index == common),
+            "{replies:?}"
+        );
         assert_eq!(cluster.nodes[&1].commit_index(), common);
         assert!(cluster.nodes[&1].get("key").is_none());
     }
@@ -321,16 +514,28 @@ mod tests {
         let msgs = cluster.nodes.get_mut(&1).unwrap().start_election().unwrap();
         cluster.enqueue_from(1, msgs);
         cluster.drain_network();
-        let (_, msgs) = cluster.nodes.get_mut(&1).unwrap().propose(KvCommand::Put {
-            key: "committed".into(), value: b"before".to_vec(),
-        }).unwrap();
+        let (_, msgs) = cluster
+            .nodes
+            .get_mut(&1)
+            .unwrap()
+            .propose(KvCommand::Put {
+                key: "committed".into(),
+                value: b"before".to_vec(),
+            })
+            .unwrap();
         cluster.enqueue_from(1, msgs);
         cluster.drain_network();
 
         cluster.isolate_subset(&[1], &[2, 3]);
-        let (stale_index, msgs) = cluster.nodes.get_mut(&1).unwrap().propose(KvCommand::Put {
-            key: "conflict".into(), value: b"minority".to_vec(),
-        }).unwrap();
+        let (stale_index, msgs) = cluster
+            .nodes
+            .get_mut(&1)
+            .unwrap()
+            .propose(KvCommand::Put {
+                key: "conflict".into(),
+                value: b"minority".to_vec(),
+            })
+            .unwrap();
         cluster.enqueue_from(1, msgs);
         cluster.drain_network();
         assert!(cluster.nodes[&1].commit_index() < stale_index);
@@ -340,9 +545,15 @@ mod tests {
         cluster.enqueue_from(2, msgs);
         cluster.drain_network();
         assert_eq!(cluster.nodes[&2].role(), RoleState::Leader);
-        let (majority_index, msgs) = cluster.nodes.get_mut(&2).unwrap().propose(KvCommand::Put {
-            key: "conflict".into(), value: b"majority".to_vec(),
-        }).unwrap();
+        let (majority_index, msgs) = cluster
+            .nodes
+            .get_mut(&2)
+            .unwrap()
+            .propose(KvCommand::Put {
+                key: "conflict".into(),
+                value: b"majority".to_vec(),
+            })
+            .unwrap();
         cluster.enqueue_from(2, msgs);
         cluster.drain_network();
         assert!(cluster.nodes[&2].commit_index() >= majority_index);
@@ -352,8 +563,14 @@ mod tests {
         cluster.drain_network();
         assert_eq!(cluster.nodes[&1].role(), RoleState::Follower);
         for id in 1..=3 {
-            assert_eq!(cluster.nodes[&id].get("committed").unwrap().value, b"before");
-            assert_eq!(cluster.nodes[&id].get("conflict").unwrap().value, b"majority");
+            assert_eq!(
+                cluster.nodes[&id].get("committed").unwrap().value,
+                b"before"
+            );
+            assert_eq!(
+                cluster.nodes[&id].get("conflict").unwrap().value,
+                b"majority"
+            );
         }
     }
 
@@ -371,17 +588,25 @@ mod tests {
         // 2 and deliberately drop its successful AppendEntries reply. At this
         // boundary execute() can return UncommittedIndex even though the entry
         // may later become committed.
-        let (ambiguous_index, msgs) = cluster.nodes.get_mut(&1).unwrap().propose(
-            KvCommand::Put {
+        let (ambiguous_index, msgs) = cluster
+            .nodes
+            .get_mut(&1)
+            .unwrap()
+            .propose(KvCommand::Put {
                 key: "ambiguous".into(),
                 value: b"may-commit".to_vec(),
-            },
-        ).unwrap();
+            })
+            .unwrap();
         let to_node_2 = msgs
             .into_iter()
             .find(|msg| msg.to == 2)
             .expect("leader must send the proposal to node 2");
-        let replies = cluster.nodes.get_mut(&2).unwrap().step(to_node_2.rpc).unwrap();
+        let replies = cluster
+            .nodes
+            .get_mut(&2)
+            .unwrap()
+            .step(to_node_2.rpc)
+            .unwrap();
         assert!(matches!(
             replies.first().map(|msg| &msg.rpc),
             Some(RaftRpc::AppendEntriesReply { success: true, match_index, .. })

@@ -69,8 +69,13 @@ mod tests {
             let cfg = VolumeConfig::default();
             let store = VolumeStore::open(fs.clone(), "reopen", cfg).unwrap();
             let id = BlobId::new(1, 1, 1, 1, 4, 0);
-            if operation != "put" { store.put(id, b"payload").unwrap(); }
-            fs.set_faults(FaultConfig { sync_data_fault: SyncFault::BeforePersist, ..Default::default() });
+            if operation != "put" {
+                store.put(id, b"payload").unwrap();
+            }
+            fs.set_faults(FaultConfig {
+                sync_data_fault: SyncFault::BeforePersist,
+                ..Default::default()
+            });
             match operation {
                 "put" => assert!(store.put(id, b"payload").is_err()),
                 "delete" => assert!(store.delete(id).is_err()),
@@ -89,7 +94,10 @@ mod tests {
             } else if operation == "delete" {
                 assert!(!reopened.delete(id).unwrap()); // idempotent tombstone acknowledgement
             } else {
-                assert!(matches!(reopened.put(id, b"payload"), Err(BlobError::FencedByBarrier { .. })));
+                assert!(matches!(
+                    reopened.put(id, b"payload"),
+                    Err(BlobError::FencedByBarrier { .. })
+                ));
             }
             drop(reopened);
             fs.simulate_power_cut();
@@ -113,7 +121,10 @@ mod tests {
                 let old = BlobId::new(1, 1, 1, 1, 4, 0);
                 let unknown = BlobId::new(1, 1, 2, 1, 4, 0);
                 store.put(old, b"old").unwrap();
-                fs.set_faults(FaultConfig { sync_data_fault: fault, ..Default::default() });
+                fs.set_faults(FaultConfig {
+                    sync_data_fault: fault,
+                    ..Default::default()
+                });
                 let result = match operation {
                     "put" => store.put(unknown, b"unknown"),
                     "delete" => store.delete(old).map(|_| ()),
@@ -123,11 +134,26 @@ mod tests {
                 fs.set_faults(FaultConfig::default());
                 // Even an idempotent PUT/DELETE must not acknowledge from the
                 // pre-error view or overwrite the ambiguous record's offset.
-                assert!(matches!(store.put(old, b"old"), Err(BlobError::StorageUnavailable)));
-                assert!(matches!(store.put(unknown, b"unknown"), Err(BlobError::StorageUnavailable)));
-                assert!(matches!(store.delete(old), Err(BlobError::StorageUnavailable)));
-                assert!(matches!(store.collect_garbage_barrier(1, 1, 4, 1), Err(BlobError::StorageUnavailable)));
-                assert!(matches!(store.compact_sealed_segments(), Err(BlobError::StorageUnavailable)));
+                assert!(matches!(
+                    store.put(old, b"old"),
+                    Err(BlobError::StorageUnavailable)
+                ));
+                assert!(matches!(
+                    store.put(unknown, b"unknown"),
+                    Err(BlobError::StorageUnavailable)
+                ));
+                assert!(matches!(
+                    store.delete(old),
+                    Err(BlobError::StorageUnavailable)
+                ));
+                assert!(matches!(
+                    store.collect_garbage_barrier(1, 1, 4, 1),
+                    Err(BlobError::StorageUnavailable)
+                ));
+                assert!(matches!(
+                    store.compact_sealed_segments(),
+                    Err(BlobError::StorageUnavailable)
+                ));
                 drop(store);
                 fs.simulate_power_cut();
                 let recovered = VolumeStore::open(fs.clone(), "sync", cfg).unwrap();
@@ -135,7 +161,9 @@ mod tests {
                 if operation == "put" {
                     assert_eq!(recovered.get(old).unwrap(), b"old");
                     assert_eq!(recovered.contains(unknown), persisted);
-                    if persisted { assert_eq!(recovered.get(unknown).unwrap(), b"unknown"); }
+                    if persisted {
+                        assert_eq!(recovered.get(unknown).unwrap(), b"unknown");
+                    }
                 } else {
                     assert_eq!(recovered.contains(old), !persisted);
                     if persisted {
@@ -159,19 +187,31 @@ mod tests {
         for directory in [false, true] {
             for fault in [SyncFault::BeforePersist, SyncFault::AfterPersist] {
                 let fs = SimFs::new(1251);
-                let cfg = VolumeConfig { max_segment_bytes: 80, ..Default::default() };
+                let cfg = VolumeConfig {
+                    max_segment_bytes: 80,
+                    ..Default::default()
+                };
                 let store = VolumeStore::open(fs.clone(), "roll", cfg).unwrap();
                 let old = BlobId::new(1, 1, 1, 1, 4, 0);
                 let next = BlobId::new(1, 1, 1, 2, 4, 0);
                 store.put(old, &[b'o'; 30]).unwrap();
                 fs.set_faults(if directory {
-                    FaultConfig { sync_dir_fault: fault, ..Default::default() }
+                    FaultConfig {
+                        sync_dir_fault: fault,
+                        ..Default::default()
+                    }
                 } else {
-                    FaultConfig { sync_data_fault: fault, ..Default::default() }
+                    FaultConfig {
+                        sync_data_fault: fault,
+                        ..Default::default()
+                    }
                 });
                 assert!(matches!(store.put(next, b"next"), Err(BlobError::Io(_))));
                 fs.set_faults(FaultConfig::default());
-                assert!(matches!(store.put(next, b"next"), Err(BlobError::StorageUnavailable)));
+                assert!(matches!(
+                    store.put(next, b"next"),
+                    Err(BlobError::StorageUnavailable)
+                ));
                 assert_eq!(store.get(old).unwrap(), vec![b'o'; 30]);
                 drop(store);
                 fs.simulate_power_cut();
@@ -188,7 +228,10 @@ mod tests {
         for directory in [false, true] {
             for fault in [SyncFault::BeforePersist, SyncFault::AfterPersist] {
                 let fs = SimFs::new(1252);
-                let cfg = VolumeConfig { max_segment_bytes: 220, ..Default::default() };
+                let cfg = VolumeConfig {
+                    max_segment_bytes: 220,
+                    ..Default::default()
+                };
                 let store = VolumeStore::open(fs.clone(), "compact_sync", cfg).unwrap();
                 let dead = BlobId::new(1, 1, 1, 1, 4, 0);
                 let live = BlobId::new(1, 1, 1, 2, 4, 0);
@@ -198,9 +241,15 @@ mod tests {
                 store.put(next, &[b'n'; 60]).unwrap(); // seal first segment
                 store.delete(dead).unwrap();
                 fs.set_faults(if directory {
-                    FaultConfig { sync_dir_fault: fault, ..Default::default() }
+                    FaultConfig {
+                        sync_dir_fault: fault,
+                        ..Default::default()
+                    }
                 } else {
-                    FaultConfig { sync_data_fault: fault, ..Default::default() }
+                    FaultConfig {
+                        sync_data_fault: fault,
+                        ..Default::default()
+                    }
                 });
                 assert!(store.compact_sealed_segments().is_err());
                 assert_eq!(store.get(live).unwrap(), vec![b'l'; 60]);
@@ -212,7 +261,10 @@ mod tests {
                 let recovered = VolumeStore::open(fs, "compact_sync", cfg).unwrap();
                 assert_eq!(recovered.get(live).unwrap(), vec![b'l'; 60]);
                 assert_eq!(recovered.get(next).unwrap(), vec![b'n'; 60]);
-                assert!(matches!(recovered.put(dead, &[b'd'; 60]), Err(BlobError::Tombstoned(_))));
+                assert!(matches!(
+                    recovered.put(dead, &[b'd'; 60]),
+                    Err(BlobError::Tombstoned(_))
+                ));
                 recovered.compact_sealed_segments().unwrap();
             }
         }
@@ -228,8 +280,7 @@ mod tests {
         // Drop every possible pair (i, j) out of 6 shards (all 15 combinations: data+data, data+parity, parity+parity)
         for drop_a in 0..6 {
             for drop_b in (drop_a + 1)..6 {
-                let mut partial: Vec<Option<Vec<u8>>> =
-                    shards.iter().cloned().map(Some).collect();
+                let mut partial: Vec<Option<Vec<u8>>> = shards.iter().cloned().map(Some).collect();
                 partial[drop_a] = None;
                 partial[drop_b] = None;
                 let recovered = codec.decode(&partial).unwrap();
@@ -305,7 +356,10 @@ mod tests {
         assert_eq!(evicted, 6);
 
         let reclaimed = store.compact_sealed_segments().unwrap();
-        assert!(reclaimed > 0, "expected segment compaction to reclaim bytes");
+        assert!(
+            reclaimed > 0,
+            "expected segment compaction to reclaim bytes"
+        );
         assert_eq!(store.get(live_id).unwrap(), vec![b'y'; 180]);
     }
 
@@ -330,8 +384,10 @@ mod tests {
         let reopened = VolumeStore::open(fs, "gc_restart", cfg).unwrap();
         assert_eq!(reopened.get(live).unwrap(), vec![b'y'; 100]);
         assert!(matches!(reopened.get(old), Err(BlobError::NotFound(_))));
-        assert!(matches!(reopened.put(old, b"late orphan fragment"),
-            Err(BlobError::FencedByBarrier { barrier_gen: 1, .. })));
+        assert!(matches!(
+            reopened.put(old, b"late orphan fragment"),
+            Err(BlobError::FencedByBarrier { barrier_gen: 1, .. })
+        ));
     }
 
     #[test]
@@ -348,13 +404,18 @@ mod tests {
         store.put(id, b"orphan").unwrap();
         assert!(store.delete(id).unwrap());
         store.put(live, &[b'l'; 100]).unwrap();
-        store.put(BlobId::new(10, 51, 8, 2, 2, 0), &[b'm'; 100]).unwrap();
+        store
+            .put(BlobId::new(10, 51, 8, 2, 2, 0), &[b'm'; 100])
+            .unwrap();
         assert!(store.compact_sealed_segments().unwrap() > 0);
         drop(store);
         fs.simulate_power_cut();
         let reopened = VolumeStore::open(fs, "tombstone", cfg).unwrap();
         assert!(matches!(reopened.get(id), Err(BlobError::NotFound(_))));
-        assert!(matches!(reopened.put(id, b"reused"), Err(BlobError::Tombstoned(_))));
+        assert!(matches!(
+            reopened.put(id, b"reused"),
+            Err(BlobError::Tombstoned(_))
+        ));
     }
 
     #[test]
@@ -365,16 +426,32 @@ mod tests {
             let id = BlobId::new(1, 1, 1, step, 4, 0);
             let start = std::sync::Barrier::new(2);
             let (a, b) = std::thread::scope(|scope| {
-                let a = scope.spawn(|| { start.wait(); store.put(id, b"first") });
-                let b = scope.spawn(|| { start.wait(); store.put(id, b"other") });
+                let a = scope.spawn(|| {
+                    start.wait();
+                    store.put(id, b"first")
+                });
+                let b = scope.spawn(|| {
+                    start.wait();
+                    store.put(id, b"other")
+                });
                 (a.join().unwrap(), b.join().unwrap())
             });
             assert_ne!(a.is_ok(), b.is_ok());
-            assert_eq!(store.get(id).unwrap(), if a.is_ok() { b"first" } else { b"other" });
+            assert_eq!(
+                store.get(id).unwrap(),
+                if a.is_ok() { b"first" } else { b"other" }
+            );
         }
         drop(store);
         fs.simulate_power_cut();
-        assert_eq!(VolumeStore::open(fs, "conflicts", VolumeConfig::default()).unwrap().stats().unwrap().live_blobs, 64);
+        assert_eq!(
+            VolumeStore::open(fs, "conflicts", VolumeConfig::default())
+                .unwrap()
+                .stats()
+                .unwrap()
+                .live_blobs,
+            64
+        );
     }
 
     #[test]
@@ -386,11 +463,19 @@ mod tests {
                 let id = BlobId::new(1, 1, generation, 1, 4, 0);
                 let start = std::sync::Barrier::new(2);
                 std::thread::scope(|scope| {
-                    let put = scope.spawn(|| { start.wait(); store.put(id, b"payload") });
+                    let put = scope.spawn(|| {
+                        start.wait();
+                        store.put(id, b"payload")
+                    });
                     let fence = scope.spawn(|| {
                         start.wait();
-                        if exact { store.delete(id).map(|_| ()) }
-                        else { store.collect_garbage_barrier(1, 1, 4, generation).map(|_| ()) }
+                        if exact {
+                            store.delete(id).map(|_| ())
+                        } else {
+                            store
+                                .collect_garbage_barrier(1, 1, 4, generation)
+                                .map(|_| ())
+                        }
                     });
                     let _ = put.join().unwrap();
                     fence.join().unwrap().unwrap();
@@ -402,7 +487,9 @@ mod tests {
             let recovered = VolumeStore::open(fs, "fences", VolumeConfig::default()).unwrap();
             assert_eq!(recovered.stats().unwrap().live_blobs, 0);
             for generation in 1..=32 {
-                assert!(recovered.put(BlobId::new(1, 1, generation, 1, 4, 0), b"late").is_err());
+                assert!(recovered
+                    .put(BlobId::new(1, 1, generation, 1, 4, 0), b"late")
+                    .is_err());
             }
         }
     }
@@ -410,26 +497,39 @@ mod tests {
     #[test]
     fn reads_pin_matching_offsets_while_compaction_replaces_segment_files() {
         let fs = SimFs::new(1242);
-        let cfg = VolumeConfig { max_segment_bytes: 300, ..Default::default() };
+        let cfg = VolumeConfig {
+            max_segment_bytes: 300,
+            ..Default::default()
+        };
         let store = VolumeStore::open(fs, "compact_read", cfg).unwrap();
         let dead = BlobId::new(1, 1, 1, 1, 4, 0);
         let live = BlobId::new(1, 1, 1, 2, 4, 0);
         store.put(dead, &[b'd'; 70]).unwrap();
         store.put(live, &[b'l'; 70]).unwrap();
-        store.put(BlobId::new(1, 1, 1, 3, 4, 0), &[b'z'; 70]).unwrap();
+        store
+            .put(BlobId::new(1, 1, 1, 3, 4, 0), &[b'z'; 70])
+            .unwrap();
         store.delete(dead).unwrap();
         std::thread::scope(|scope| {
             let compactor = scope.spawn(|| {
-                for _ in 0..100 { store.compact_sealed_segments().unwrap(); }
-            });
-            let readers: Vec<_> = (0..4).map(|_| scope.spawn(|| {
-                for _ in 0..500 {
-                    assert_eq!(store.get(live).unwrap(), vec![b'l'; 70]);
-                    assert_eq!(store.get_slice(live, 10, 20).unwrap(), vec![b'l'; 20]);
+                for _ in 0..100 {
+                    store.compact_sealed_segments().unwrap();
                 }
-            })).collect();
+            });
+            let readers: Vec<_> = (0..4)
+                .map(|_| {
+                    scope.spawn(|| {
+                        for _ in 0..500 {
+                            assert_eq!(store.get(live).unwrap(), vec![b'l'; 70]);
+                            assert_eq!(store.get_slice(live, 10, 20).unwrap(), vec![b'l'; 20]);
+                        }
+                    })
+                })
+                .collect();
             compactor.join().unwrap();
-            for reader in readers { reader.join().unwrap(); }
+            for reader in readers {
+                reader.join().unwrap();
+            }
         });
     }
 
@@ -437,7 +537,8 @@ mod tests {
     fn failed_tombstone_and_barrier_do_not_poison_later_acknowledged_writes() {
         for torn in [false, true] {
             let fs = SimFs::new(1243);
-            let store = VolumeStore::open(fs.clone(), "failed_fence", VolumeConfig::default()).unwrap();
+            let store =
+                VolumeStore::open(fs.clone(), "failed_fence", VolumeConfig::default()).unwrap();
             let id = BlobId::new(1, 1, 1, 1, 4, 0);
             store.put(id, b"old").unwrap();
             fs.set_faults(FaultConfig {
@@ -470,16 +571,59 @@ mod tests {
         store.delete(dead).unwrap();
         store.put(live, b"durable").unwrap();
         store.put(corrupt, b"repair-me").unwrap();
-        fs.corrupt_byte("bitrot_recovery/vol_00000001.dat", 8 + 33).unwrap();
-        fs.corrupt_byte("bitrot_recovery/vol_00000001.dat", 8 + 40 + 33 + 40 + 33).unwrap();
+        fs.corrupt_byte("bitrot_recovery/vol_00000001.dat", 8 + 33)
+            .unwrap();
+        fs.corrupt_byte("bitrot_recovery/vol_00000001.dat", 8 + 40 + 33 + 40 + 33)
+            .unwrap();
         drop(store);
         fs.simulate_power_cut();
         let recovered = VolumeStore::open(fs, "bitrot_recovery", cfg).unwrap();
-        assert!(matches!(recovered.put(dead, b"deleted"), Err(BlobError::Tombstoned(_))));
+        assert!(matches!(
+            recovered.put(dead, b"deleted"),
+            Err(BlobError::Tombstoned(_))
+        ));
         assert_eq!(recovered.get(live).unwrap(), b"durable");
-        assert!(matches!(recovered.get(corrupt), Err(BlobError::CorruptData { .. })));
+        assert!(matches!(
+            recovered.get(corrupt),
+            Err(BlobError::CorruptData { .. })
+        ));
         recovered.put(corrupt, b"repair-me").unwrap();
         assert_eq!(recovered.get(corrupt).unwrap(), b"repair-me");
+    }
+
+    #[test]
+    fn remote_delete_sends_peer_token_only_when_configured() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let peer = listener.local_addr().unwrap().to_string();
+        let server = std::thread::spawn(move || {
+            for expected in [Some("secret"), None] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    stream.read_exact(&mut byte).unwrap();
+                    request.push(byte[0]);
+                }
+                let request = String::from_utf8(request).unwrap();
+                let token = request
+                    .lines()
+                    .find(|line| line.starts_with("x-yadb-raft-token:"));
+                assert_eq!(token, expected.map(|_| "x-yadb-raft-token: secret"));
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nabsent",
+                    )
+                    .unwrap();
+            }
+        });
+        let id = BlobId::new(1, 1, 1, 1, 4, 1);
+        for token in [Some("secret".to_string()), None] {
+            let slot = PoolSlot::<SimFs>::remote("pool", 0, "remote", 2, peer.clone(), token);
+            assert!(!slot.delete(id).unwrap());
+        }
+        server.join().unwrap();
     }
 
     #[test]
@@ -504,7 +648,7 @@ mod tests {
                 stream.write_all(response.as_bytes()).unwrap();
             }
         });
-        let slot = PoolSlot::<SimFs>::remote("pool", 0, "remote", 2, peer);
+        let slot = PoolSlot::<SimFs>::remote("pool", 0, "remote", 2, peer, None);
         let id = BlobId::new(1, 1, 1, 1, 4, 1);
         assert!(slot.delete(id).is_err()); // missing slot/route is NOT a durable fence
         assert!(!slot.delete(id).unwrap());
@@ -521,8 +665,7 @@ mod tests {
             );
         }
 
-        let striper =
-            PoolStriper::new(ErasureScheme::ReedSolomon { k: 4, m: 2 }, domains).unwrap();
+        let striper = PoolStriper::new(ErasureScheme::ReedSolomon { k: 4, m: 2 }, domains).unwrap();
         let id = BlobId::new(7, 1, 1, 1, 2, 0);
         let secret = b"Multi-tenant erasure-coded tablet SSTable block #0001";
         striper.put_blob(id, secret).unwrap();

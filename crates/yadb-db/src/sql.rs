@@ -58,9 +58,7 @@ impl SqlValue {
                 Ok(out)
             }
             SqlValue::Bool(b) => Ok(vec![0x03, u8::from(*b)]),
-            SqlValue::Null => Err(DbError::InvalidQuery(
-                "KEY value cannot be NULL".into(),
-            )),
+            SqlValue::Null => Err(DbError::InvalidQuery("KEY value cannot be NULL".into())),
         }
     }
 
@@ -510,11 +508,7 @@ impl Parser {
                 if let Some(op) = op_opt {
                     self.next();
                     let rhs = self.parse_signed_int()?;
-                    return Ok(AssignExpr::BinOp {
-                        column: s,
-                        op,
-                        rhs,
-                    });
+                    return Ok(AssignExpr::BinOp { column: s, op, rhs });
                 }
                 return Ok(AssignExpr::Column(s));
             }
@@ -923,7 +917,8 @@ pub fn parse_sql(sql: &str) -> Result<SqlStmt, DbError> {
     let mut stmts = parse_sql_script(sql)?;
     if stmts.len() > 1 {
         return Err(DbError::InvalidQuery(
-            "multiple SQL statements passed to single-statement parser (use parse_sql_script)".into(),
+            "multiple SQL statements passed to single-statement parser (use parse_sql_script)"
+                .into(),
         ));
     }
     Ok(stmts.remove(0))

@@ -73,6 +73,7 @@ enum SlotBackend<FS: StorageFs> {
         pool_name: String,
         slot_index: usize,
         peer_addr: String,
+        token: Option<String>,
     },
 }
 
@@ -134,6 +135,7 @@ impl<FS: StorageFs> PoolSlot<FS> {
         domain: impl Into<String>,
         node_id: u32,
         peer_addr: impl Into<String>,
+        token: Option<String>,
     ) -> Self {
         let peer = peer_addr.into();
         Self {
@@ -145,6 +147,7 @@ impl<FS: StorageFs> PoolSlot<FS> {
                 pool_name: pool_name.into(),
                 slot_index,
                 peer_addr: peer,
+                token,
             },
             metrics: SlotMetrics::default(),
         }
@@ -188,10 +191,20 @@ impl<FS: StorageFs> PoolSlot<FS> {
                 pool_name,
                 slot_index,
                 peer_addr,
+                token,
             } => {
-                let path =
-                    format!("/internal/vdisk/{pool_name}/{slot_index}/blob/{}", id.to_hex());
-                match http_raw_request(peer_addr, "PUT", &path, "application/octet-stream", data) {
+                let path = format!(
+                    "/internal/vdisk/{pool_name}/{slot_index}/blob/{}",
+                    id.to_hex()
+                );
+                match http_raw_request(
+                    peer_addr,
+                    "PUT",
+                    &path,
+                    "application/octet-stream",
+                    data,
+                    token.as_deref(),
+                ) {
                     Ok((200 | 201, _)) => {
                         self.metrics.online.store(true, Ordering::Relaxed);
                         Ok(())
@@ -241,10 +254,20 @@ impl<FS: StorageFs> PoolSlot<FS> {
                 pool_name,
                 slot_index,
                 peer_addr,
+                token,
             } => {
-                let path =
-                    format!("/internal/vdisk/{pool_name}/{slot_index}/blob/{}", id.to_hex());
-                match http_raw_request(peer_addr, "GET", &path, "application/octet-stream", &[]) {
+                let path = format!(
+                    "/internal/vdisk/{pool_name}/{slot_index}/blob/{}",
+                    id.to_hex()
+                );
+                match http_raw_request(
+                    peer_addr,
+                    "GET",
+                    &path,
+                    "application/octet-stream",
+                    &[],
+                    token.as_deref(),
+                ) {
                     Ok((200, body)) => {
                         self.metrics.online.store(true, Ordering::Relaxed);
                         Ok(body)
@@ -303,6 +326,7 @@ impl<FS: StorageFs> PoolSlot<FS> {
                 pool_name,
                 slot_index,
                 peer_addr,
+                token,
             } => {
                 let path = format!("/internal/vdisk/{pool_name}/{slot_index}/barrier");
                 let body = serde_json::to_vec(&BarrierRequest {
@@ -312,7 +336,14 @@ impl<FS: StorageFs> PoolSlot<FS> {
                     up_to_generation,
                 })
                 .map_err(|e| BlobError::Io(std::io::Error::other(e)))?;
-                match http_raw_request(peer_addr, "POST", &path, "application/json", &body) {
+                match http_raw_request(
+                    peer_addr,
+                    "POST",
+                    &path,
+                    "application/json",
+                    &body,
+                    token.as_deref(),
+                ) {
                     Ok((200, resp)) => {
                         self.metrics.online.store(true, Ordering::Relaxed);
                         let parsed: BarrierResponse = serde_json::from_slice(&resp)
@@ -339,9 +370,20 @@ impl<FS: StorageFs> PoolSlot<FS> {
                 pool_name,
                 slot_index,
                 peer_addr,
+                token,
             } => {
-                let path = format!("/internal/vdisk/{pool_name}/{slot_index}/blob/{}", id.to_hex());
-                match http_raw_request(peer_addr, "DELETE", &path, "application/octet-stream", &[]) {
+                let path = format!(
+                    "/internal/vdisk/{pool_name}/{slot_index}/blob/{}",
+                    id.to_hex()
+                );
+                match http_raw_request(
+                    peer_addr,
+                    "DELETE",
+                    &path,
+                    "application/octet-stream",
+                    &[],
+                    token.as_deref(),
+                ) {
                     Ok((200, body)) if body == b"deleted" || body == b"absent" => {
                         self.metrics.online.store(true, Ordering::Relaxed);
                         Ok(body == b"deleted")
@@ -369,6 +411,7 @@ impl<FS: StorageFs> PoolSlot<FS> {
                 pool_name,
                 slot_index,
                 peer_addr,
+                token,
             } => {
                 if !probe_remote {
                     return (
@@ -377,7 +420,14 @@ impl<FS: StorageFs> PoolSlot<FS> {
                     );
                 }
                 let path = format!("/internal/vdisk/{pool_name}/{slot_index}/stats");
-                match http_raw_request(peer_addr, "GET", &path, "application/json", &[]) {
+                match http_raw_request(
+                    peer_addr,
+                    "GET",
+                    &path,
+                    "application/json",
+                    &[],
+                    token.as_deref(),
+                ) {
                     Ok((200, body)) => {
                         self.metrics.online.store(true, Ordering::Relaxed);
                         let st = serde_json::from_slice::<VolumeStats>(&body).unwrap_or_default();
@@ -430,9 +480,7 @@ impl<FS: StorageFs> PoolStriper<FS> {
         let slots = domains
             .into_iter()
             .enumerate()
-            .map(|(i, store)| {
-                PoolSlot::local(i, format!("local-{i}"), 1, None, Arc::new(store))
-            })
+            .map(|(i, store)| PoolSlot::local(i, format!("local-{i}"), 1, None, Arc::new(store)))
             .collect();
         Self::from_slots("local", scheme, slots)
     }
@@ -496,8 +544,8 @@ impl<FS: StorageFs> PoolStriper<FS> {
     /// Deterministic subgroup placement based on `BlobId` hash so load spreads evenly across slots
     /// and every node in the cluster computes the exact same slot mapping without extra coordination.
     fn select_slot(&self, logical_id: BlobId, part_index: usize) -> usize {
-        let h = (logical_id.with_part(0).as_u128() as u64)
-            .wrapping_mul(0x9E37_79B9_7F4A_7C15) as usize;
+        let h =
+            (logical_id.with_part(0).as_u128() as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) as usize;
         (h + part_index) % self.slots.len()
     }
 
@@ -523,7 +571,9 @@ impl<FS: StorageFs> PoolStriper<FS> {
                     .into_iter()
                     .map(|h| {
                         h.join().unwrap_or_else(|_| {
-                            Err(BlobError::Io(std::io::Error::other("slot put thread panicked")))
+                            Err(BlobError::Io(std::io::Error::other(
+                                "slot put thread panicked",
+                            )))
                         })
                     })
                     .collect()
@@ -704,10 +754,7 @@ impl<FS: StorageFs> PoolStriper<FS> {
                     .iter()
                     .map(|slot| s.spawn(move || slot.snapshot(true)))
                     .collect();
-                handles
-                    .into_iter()
-                    .filter_map(|h| h.join().ok())
-                    .collect()
+                handles.into_iter().filter_map(|h| h.join().ok()).collect()
             })
         } else {
             self.slots
@@ -755,7 +802,15 @@ fn http_raw_request(
     path: &str,
     content_type: &str,
     body: &[u8],
+    token: Option<&str>,
 ) -> Result<(u16, Vec<u8>), std::io::Error> {
+    // Reject header injection rather than allowing a malformed configured secret to alter framing.
+    if token.is_some_and(|t| t.bytes().any(|b| b == b'\r' || b == b'\n')) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid Raft token header",
+        ));
+    }
     let clean = peer_addr
         .trim()
         .strip_prefix("http://")
@@ -769,8 +824,12 @@ fn http_raw_request(
     stream.set_read_timeout(Some(Duration::from_millis(2000)))?;
     stream.set_write_timeout(Some(Duration::from_millis(2000)))?;
 
+    let token_header = token
+        .filter(|t| !t.is_empty())
+        .map(|t| format!("x-yadb-raft-token: {t}\r\n"))
+        .unwrap_or_default();
     let req_hdr = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {clean}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "{method} {path} HTTP/1.1\r\nHost: {clean}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n{token_header}Connection: close\r\n\r\n",
         body.len()
     );
     stream.write_all(req_hdr.as_bytes())?;

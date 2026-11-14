@@ -1,5 +1,5 @@
-use std::fmt;
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
 /// 128-bit immutable Blob identifier inspired by YDB's `TLogoBlobID`,
 /// extended with `project_id` for zero-overhead multi-tenant isolation.

@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# Opt-in experimental adapters only; not wired to the daemon or client traffic.
+experimental-openraft-storage = ["dep:ring", "dep:tokio-rustls"]
+
 [dependencies]
 yadb-io = { path = "../yadb-io" }
 crc32fast.workspace = true
@@ -11,6 +15,12 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 openraft.workspace = true
+ring = { workspace = true, optional = true }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring"], optional = true }
+tokio = { workspace = true, features = ["io-util"] }
 
 [dev-dependencies]
 tokio.workspace = true
+ring.workspace = true
+tracing.workspace = true
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring"] }

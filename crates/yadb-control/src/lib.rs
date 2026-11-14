@@ -232,7 +232,10 @@ impl ControlPlaneState {
     }
 
     /// Computes dry-run diff AND validates all cross-resource references before mutating state.
-    pub fn plan(&self, manifests: &[Manifest]) -> Result<(Vec<DiffOp>, ControlPlaneState), ControlError> {
+    pub fn plan(
+        &self,
+        manifests: &[Manifest],
+    ) -> Result<(Vec<DiffOp>, ControlPlaneState), ControlError> {
         let mut staged = self.clone();
         let mut ops = Vec::new();
 

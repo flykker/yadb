@@ -238,7 +238,16 @@ pub async fn handle(State(st): State<S3State>, request: Request) -> Response {
     }
     let write = method == Method::PUT || method == Method::DELETE || method == Method::POST;
     let (pid, pool, buckets) = {
-        let cp = st.app.control.read().unwrap();
+        let cp = match st.app.control_for_authorization_async().await {
+            Ok(cp) => cp,
+            Err(_) => {
+                return err(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "ServiceUnavailable",
+                    "control plane stale or unavailable",
+                )
+            }
+        };
         let pid = match cp.authorize(
             &st.project,
             &subject,
@@ -572,19 +581,33 @@ pub async fn handle(State(st): State<S3State>, request: Request) -> Response {
                     let (start, end) = range.unwrap_or((0, snapshot.size - 1));
                     engine.read_manifest_range(&snapshot, start, end)
                 }
-            }).await;
+            })
+            .await;
             let bytes = match read {
                 Ok(Ok(bytes)) => bytes,
-                _ => return err(StatusCode::SERVICE_UNAVAILABLE, "ServiceUnavailable", "object read failed"),
+                _ => {
+                    return err(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "ServiceUnavailable",
+                        "object read failed",
+                    )
+                }
             };
             let mut response = Response::builder()
-                .status(if range.is_some() { StatusCode::PARTIAL_CONTENT } else { StatusCode::OK })
+                .status(if range.is_some() {
+                    StatusCode::PARTIAL_CONTENT
+                } else {
+                    StatusCode::OK
+                })
                 .header(header::CONTENT_TYPE, head.content_type)
                 .header(header::ETAG, head.etag)
                 .header(header::LAST_MODIFIED, modified)
                 .header(header::ACCEPT_RANGES, "bytes");
             if let Some((a, b)) = range {
-                response = response.header(header::CONTENT_RANGE, format!("bytes {a}-{b}/{}", head.size));
+                response = response.header(
+                    header::CONTENT_RANGE,
+                    format!("bytes {a}-{b}/{}", head.size),
+                );
             }
             response.body(axum::body::Body::from(bytes)).unwrap()
         }
@@ -609,10 +632,14 @@ pub async fn handle(State(st): State<S3State>, request: Request) -> Response {
 }
 async fn map_error(response: Response) -> Response {
     let status = response.status();
+    // Preserve the gateway's machine-readable mutation outcome. Dropping it
+    // would tell an S3 client that a failed write is safe to retry.
+    let outcome = response.headers().get("x-yadb-write-outcome").cloned();
+    let retry = response.headers().get("x-yadb-retry").cloned();
     let body = axum::body::to_bytes(response.into_body(), 65536)
         .await
         .unwrap_or_default();
-    err(
+    let mut mapped = err(
         status,
         if status == StatusCode::FORBIDDEN {
             "AccessDenied"
@@ -622,7 +649,14 @@ async fn map_error(response: Response) -> Response {
             "ServiceUnavailable"
         },
         &String::from_utf8_lossy(&body),
-    )
+    );
+    if let Some(value) = outcome {
+        mapped.headers_mut().insert("x-yadb-write-outcome", value);
+    }
+    if let Some(value) = retry {
+        mapped.headers_mut().insert("x-yadb-retry", value);
+    }
+    mapped
 }
 
 #[cfg(test)]
@@ -641,5 +675,37 @@ mod tests {
     #[test]
     fn xml_escape() {
         assert_eq!(esc("<&\""), "&lt;&amp;&quot;");
+    }
+
+    #[tokio::test]
+    async fn map_error_preserves_mutation_outcome_headers() {
+        let mut response = err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "ServiceUnavailable",
+            "write outcome unknown",
+        );
+        response
+            .headers_mut()
+            .insert("x-yadb-write-outcome", "unknown".parse().unwrap());
+        response
+            .headers_mut()
+            .insert("x-yadb-retry", "do-not-retry".parse().unwrap());
+        let mapped = map_error(response).await;
+        assert_eq!(mapped.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(mapped.headers()["x-yadb-write-outcome"], "unknown");
+        assert_eq!(mapped.headers()["x-yadb-retry"], "do-not-retry");
+    }
+
+    #[tokio::test]
+    async fn map_error_without_outcome_headers_adds_none() {
+        let mapped = map_error(err(
+            StatusCode::FORBIDDEN,
+            "AccessDenied",
+            "control plane stale",
+        ))
+        .await;
+        assert_eq!(mapped.status(), StatusCode::FORBIDDEN);
+        assert!(mapped.headers().get("x-yadb-write-outcome").is_none());
+        assert!(mapped.headers().get("x-yadb-retry").is_none());
     }
 }

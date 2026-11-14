@@ -46,6 +46,8 @@ pub struct OsFs {
 /// be renamed, removed or replaced while in use; network filesystems and hostile
 /// filesystem mutation are outside this primitive's contract. This does not
 /// create or sync directories and does not lock legacy users of `OsFs`.
+/// Forked children must not use an inherited descriptor as independent lock ownership;
+/// dropping this wrapper explicitly releases the lock, including for such descriptors.
 pub struct OsDirectoryLock {
     _directory: File,
 }
@@ -54,10 +56,24 @@ impl OsDirectoryLock {
     pub fn try_acquire(path: impl AsRef<Path>) -> IoResult<Self> {
         let directory = File::open(path)?;
         if !directory.metadata()?.is_dir() {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "lock target is not a directory"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "lock target is not a directory",
+            ));
         }
         directory.try_lock()?;
-        Ok(Self { _directory: directory })
+        Ok(Self {
+            _directory: directory,
+        })
+    }
+}
+
+impl Drop for OsDirectoryLock {
+    fn drop(&mut self) {
+        // On Linux the lock belongs to the open file description, which may also
+        // be referenced by a descriptor inherited across fork. Closing this File
+        // alone would retain the lock until every such descriptor is closed.
+        let _ = self._directory.unlock();
     }
 }
 
@@ -71,8 +87,15 @@ impl OsFs {
     /// Lock an existing directory under this filesystem root. Callers must use a
     /// trusted, normalized relative path; do not accept `..` from remote input.
     pub fn try_lock_directory(&self, dir: &str) -> IoResult<OsDirectoryLock> {
-        if Path::new(dir).components().any(|c| !matches!(c, std::path::Component::Normal(_))) && !dir.is_empty() {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "directory path must be relative and normalized"));
+        if Path::new(dir)
+            .components()
+            .any(|c| !matches!(c, std::path::Component::Normal(_)))
+            && !dir.is_empty()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "directory path must be relative and normalized",
+            ));
         }
         OsDirectoryLock::try_acquire(self.resolve(dir))
     }
@@ -372,19 +395,27 @@ impl VirtualFile for SimFile {
     }
 
     fn set_len(&self, size: u64) -> IoResult<()> {
-        self.inode.lock().unwrap().page_cache.resize(size as usize, 0);
+        self.inode
+            .lock()
+            .unwrap()
+            .page_cache
+            .resize(size as usize, 0);
         Ok(())
     }
 
     fn sync_data(&self) -> IoResult<()> {
         let fault = self.fs.lock().unwrap().faults.sync_data_fault;
         if fault == SyncFault::BeforePersist {
-            return Err(io::Error::other("simulated sync_data failure before persistence"));
+            return Err(io::Error::other(
+                "simulated sync_data failure before persistence",
+            ));
         }
         let mut inode = self.inode.lock().unwrap();
         inode.durable = inode.page_cache.clone();
         if fault == SyncFault::AfterPersist {
-            return Err(io::Error::other("simulated sync_data failure after persistence"));
+            return Err(io::Error::other(
+                "simulated sync_data failure after persistence",
+            ));
         }
         Ok(())
     }
@@ -480,7 +511,9 @@ impl StorageFs for SimFs {
         let mut st = self.inner.lock().unwrap();
         let fault = st.faults.sync_dir_fault;
         if fault == SyncFault::BeforePersist {
-            return Err(io::Error::other("simulated sync_dir failure before persistence"));
+            return Err(io::Error::other(
+                "simulated sync_dir failure before persistence",
+            ));
         }
         // Persist directory entries belonging to `norm_dir`
         let durable_keys: Vec<String> = st
@@ -502,7 +535,9 @@ impl StorageFs for SimFs {
             st.durable_dir.insert(k, v);
         }
         if fault == SyncFault::AfterPersist {
-            return Err(io::Error::other("simulated sync_dir failure after persistence"));
+            return Err(io::Error::other(
+                "simulated sync_dir failure after persistence",
+            ));
         }
         Ok(())
     }
@@ -527,7 +562,8 @@ mod tests {
     #[test]
     fn directory_lock_excludes_other_handles_and_processes() {
         let base = std::env::var_os("YADB_TEST_TMPDIR")
-            .map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
         let dir = base.join(format!("yadb-directory-lock-{}", std::process::id()));
         fs::create_dir(&dir).unwrap();
         let lock = OsDirectoryLock::try_acquire(&dir).unwrap();
@@ -535,10 +571,34 @@ mod tests {
         let status = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "tests::directory_lock_child"])
             .env("YADB_DIRECTORY_LOCK_TEST", &dir)
-            .status().unwrap();
+            .status()
+            .unwrap();
         assert!(status.success());
         drop(lock);
         let reacquired = OsDirectoryLock::try_acquire(&dir).unwrap();
+        drop(reacquired);
+        fs::remove_dir(&dir).unwrap();
+    }
+
+    #[test]
+    fn directory_lock_drop_unlocks_even_with_duplicated_descriptor() {
+        let base = std::env::var_os("YADB_TEST_TMPDIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let dir = base.join(format!("yadb-directory-lock-dup-{}", std::process::id()));
+        fs::create_dir(&dir).unwrap();
+        let lock = OsDirectoryLock::try_acquire(&dir).unwrap();
+        // A clone shares the open file description, as a fork-inherited fd does.
+        let duplicate = lock._directory.try_clone().unwrap();
+        assert!(
+            matches!(OsDirectoryLock::try_acquire(&dir), Err(e) if e.kind() == io::ErrorKind::WouldBlock)
+        );
+        drop(lock);
+        let reacquired = OsDirectoryLock::try_acquire(&dir).unwrap();
+        assert!(
+            matches!(OsDirectoryLock::try_acquire(&dir), Err(e) if e.kind() == io::ErrorKind::WouldBlock)
+        );
+        drop(duplicate);
         drop(reacquired);
         fs::remove_dir(&dir).unwrap();
     }
@@ -552,13 +612,23 @@ mod tests {
             file.sync_data().unwrap();
             fs.sync_dir("").unwrap();
             file.write_at(0, b"new").unwrap();
-            fs.set_faults(FaultConfig { sync_data_fault: fault, ..Default::default() });
+            fs.set_faults(FaultConfig {
+                sync_data_fault: fault,
+                ..Default::default()
+            });
             assert!(file.sync_data().is_err());
             fs.simulate_power_cut();
             let recovered = fs.open_rw("file", false).unwrap();
             let mut bytes = [0; 3];
             recovered.read_at(0, &mut bytes).unwrap();
-            assert_eq!(&bytes, if fault == SyncFault::AfterPersist { b"new" } else { b"old" });
+            assert_eq!(
+                &bytes,
+                if fault == SyncFault::AfterPersist {
+                    b"new"
+                } else {
+                    b"old"
+                }
+            );
         }
     }
 
@@ -571,7 +641,10 @@ mod tests {
             file.sync_data().unwrap();
             fs.sync_dir("").unwrap();
             fs.rename_atomic("old", "new").unwrap();
-            fs.set_faults(FaultConfig { sync_dir_fault: fault, ..Default::default() });
+            fs.set_faults(FaultConfig {
+                sync_dir_fault: fault,
+                ..Default::default()
+            });
             assert!(fs.sync_dir("").is_err());
             fs.simulate_power_cut();
             assert_eq!(fs.exists("new"), fault == SyncFault::AfterPersist);
@@ -607,8 +680,13 @@ mod tests {
         file.write_at(0, b"original").unwrap();
         file.sync_data().unwrap();
         fs.sync_dir("").unwrap();
-        fs.set_faults(FaultConfig { write_eio_prob: 1.0, ..Default::default() });
-        assert!(file.write_at(0, b"replacement-longer-than-original").is_err());
+        fs.set_faults(FaultConfig {
+            write_eio_prob: 1.0,
+            ..Default::default()
+        });
+        assert!(file
+            .write_at(0, b"replacement-longer-than-original")
+            .is_err());
         let mut buf = [0; 8];
         file.read_at(0, &mut buf).unwrap();
         assert_eq!(&buf, b"original");

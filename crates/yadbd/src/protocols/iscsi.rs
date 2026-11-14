@@ -267,7 +267,9 @@ pub fn connection(
                 r.h[20..24].fill(255);
                 let kv = fields(&p.data);
                 if s.discovery && kv.contains_key("SendTargets") {
-                    let cp = st.control.read().unwrap();
+                    let cp = st
+                        .control_for_authorization()
+                        .map_err(|e| io::Error::other(e.to_string()))?;
                     for name in cp.block_volumes.keys() {
                         let Some((proj, _)) = name.split_once('/') else {
                             continue;
@@ -317,7 +319,9 @@ fn target(st: &AppState, s: &Session, role: Role) -> io::Result<(u32, String, St
     let (proj, volume) = name
         .split_once(':')
         .ok_or_else(|| io::Error::other("target must be project:volume"))?;
-    let cp = st.control.read().unwrap();
+    let cp = st
+        .control_for_authorization()
+        .map_err(|e| io::Error::other(e.to_string()))?;
     let pid = cp
         .authorize(proj, &s.subject, role)
         .map_err(io::Error::other)?;

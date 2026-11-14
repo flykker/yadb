@@ -231,7 +231,10 @@ impl<FS: StorageFs> RaftCore<FS> {
         // A new leader must commit an entry in its own term before older
         // committed entries can be safely applied after a full restart. An empty
         // transaction is a no-op on keys and uses the existing WAL format.
-        let (_, messages) = self.propose(KvCommand::Txn { guards: vec![], ops: vec![] })?;
+        let (_, messages) = self.propose(KvCommand::Txn {
+            guards: vec![],
+            ops: vec![],
+        })?;
         Ok(messages)
     }
 
@@ -480,9 +483,7 @@ impl<FS: StorageFs> RaftCore<FS> {
                             let replicated = self
                                 .peers
                                 .iter()
-                                .filter(|&&p| {
-                                    self.match_index.get(&p).copied().unwrap_or(0) >= n
-                                })
+                                .filter(|&&p| self.match_index.get(&p).copied().unwrap_or(0) >= n)
                                 .count();
                             if replicated >= self.quorum_size() {
                                 self.commit_index = n;
@@ -554,21 +555,127 @@ impl<FS: StorageFs> RaftCore<FS> {
 /// multi-node Raft cluster replication over HTTP (`/raft/rpc`).
 #[derive(Clone)]
 pub struct LocalMetaKv<FS: StorageFs> {
-    inner: Arc<Mutex<RaftCore<FS>>>,
+    inner: Option<Arc<Mutex<RaftCore<FS>>>>,
+    #[cfg(any(test, feature = "experimental-openraft-storage"))]
+    openraft: Option<crate::openraft_client::GroupRouter>,
     peer_addrs: Arc<BTreeMap<u32, String>>,
     last_leader_contact: Arc<Mutex<Instant>>,
+    /// Shared secret presented to peers on the internal Raft endpoint.
+    raft_token: Option<Arc<str>>,
 }
 
 impl<FS: StorageFs> LocalMetaKv<FS> {
-    pub fn open_single_node(fs: &FS, dir: &str, node_id: u32) -> Result<Self, MetaError> {
-        let core = RaftCore::open(fs, dir, node_id, vec![node_id], true)?;
-        Ok(Self {
-            inner: Arc::new(Mutex::new(core)),
-            peer_addrs: Arc::new(BTreeMap::new()),
+    fn legacy(&self) -> &Mutex<RaftCore<FS>> {
+        self.inner
+            .as_deref()
+            .expect("legacy Raft unavailable for OpenRaft backend")
+    }
+
+    /// Whether this handle routes metadata writes through OpenRaft.
+    pub fn is_openraft(&self) -> bool {
+        #[cfg(any(test, feature = "experimental-openraft-storage"))]
+        {
+            return self.openraft.is_some();
+        }
+        #[cfg(not(any(test, feature = "experimental-openraft-storage")))]
+        {
+            false
+        }
+    }
+
+    /// Wraps an existing OpenRaft and its shared durable state. `peer_addrs`
+    /// contains public HTTP addresses, not the Raft transport addresses.
+    /// Reads are local-applied and may be stale, not linearizable. Writes on
+    /// current-thread Tokio runtimes (including their blocking threads) are
+    /// rejected before submission. Multi-thread runtimes use block_in_place.
+    #[cfg(any(test, feature = "experimental-openraft-storage"))]
+    pub fn from_openraft(
+        raft: crate::openraft_runtime::YadbRaft,
+        state: crate::openraft_state_machine::DurableMetaStateMachine,
+        peer_addrs: BTreeMap<u32, String>,
+        handle: tokio::runtime::Handle,
+    ) -> Self {
+        Self {
+            inner: None,
+            openraft: Some(crate::openraft_client::GroupRouter::singleton(
+                crate::openraft_client::OpenRaftClient::new(raft, state, handle),
+            )),
+            peer_addrs: Arc::new(peer_addrs),
             last_leader_contact: Arc::new(Mutex::new(Instant::now())),
+            raft_token: None,
+        }
+    }
+    /// Explicit immutable project routing; groups must contain a separate
+    /// control group and at least two distinct mapped data groups.
+    /// The owner must persist and verify the mapping and bind each supplied
+    /// Raft handle to its matching state machine and group identity. Infallible
+    /// read methods panic on invalid scope or unavailable state; use
+    /// `try_snapshot` where errors must be handled. Namespace-wide scans merge
+    /// local views without an atomic cross-group revision.
+    #[cfg(any(test, feature = "experimental-openraft-storage"))]
+    pub fn from_openraft_groups(
+        control: u64,
+        groups: BTreeMap<
+            u64,
+            (
+                crate::openraft_runtime::YadbRaft,
+                crate::openraft_state_machine::DurableMetaStateMachine,
+            ),
+        >,
+        projects: BTreeMap<u32, u64>,
+        peer_addrs: BTreeMap<u32, String>,
+        handle: tokio::runtime::Handle,
+    ) -> Result<Self, MetaError> {
+        let router = crate::openraft_client::GroupRouter::new(control, groups, projects, handle)?;
+        Ok(Self {
+            inner: None,
+            openraft: Some(router),
+            peer_addrs: Arc::new(peer_addrs),
+            last_leader_contact: Arc::new(Mutex::new(Instant::now())),
+            raft_token: None,
         })
     }
 
+    pub fn revision_for_key(&self, key: &str) -> Result<u64, MetaError> {
+        #[cfg(any(test, feature = "experimental-openraft-storage"))]
+        if let Some(router) = &self.openraft {
+            return router.revision_for_key(key);
+        }
+        let _ = key;
+        Ok(self.revision())
+    }
+
+    /// Return the locally observed role of the group owning this key; it is
+    /// not proof that the reported leader currently has quorum.
+    pub fn role_info_for_key(
+        &self,
+        key: &str,
+    ) -> Result<(u32, RoleState, u64, Option<u32>, u64), MetaError> {
+        #[cfg(any(test, feature = "experimental-openraft-storage"))]
+        if let Some(router) = &self.openraft {
+            return router.role_for_key(key);
+        }
+        let _ = key;
+        Ok(self.role_info())
+    }
+    pub fn open_single_node(fs: &FS, dir: &str, node_id: u32) -> Result<Self, MetaError> {
+        let core = RaftCore::open(fs, dir, node_id, vec![node_id], true)?;
+        Ok(Self {
+            inner: Some(Arc::new(Mutex::new(core))),
+            #[cfg(any(test, feature = "experimental-openraft-storage"))]
+            openraft: None,
+            peer_addrs: Arc::new(BTreeMap::new()),
+            last_leader_contact: Arc::new(Mutex::new(Instant::now())),
+            raft_token: None,
+        })
+    }
+
+    /// Clustered mode without an internal Raft token.
+    ///
+    /// Deprecated for deployments: the internal Raft endpoint is then
+    /// unauthenticated and any client can inject Raft messages. Use
+    /// [`Self::open_clustered_with_token`] instead.
+    #[deprecated(note = "use open_clustered_with_token so the Raft endpoint is authenticated")]
     pub fn open_clustered(
         fs: &FS,
         dir: &str,
@@ -581,14 +688,56 @@ impl<FS: StorageFs> LocalMetaKv<FS> {
         }
         let core = RaftCore::open(fs, dir, node_id, peer_ids, true)?;
         Ok(Self {
-            inner: Arc::new(Mutex::new(core)),
+            inner: Some(Arc::new(Mutex::new(core))),
+            #[cfg(any(test, feature = "experimental-openraft-storage"))]
+            openraft: None,
             peer_addrs: Arc::new(peer_addrs),
             last_leader_contact: Arc::new(Mutex::new(Instant::now())),
+            raft_token: None,
         })
     }
 
+    /// Clustered mode with the shared secret required by the internal Raft
+    /// endpoint. An empty token is rejected: it would leave the Raft RPC
+    /// endpoint unauthenticated.
+    pub fn open_clustered_with_token(
+        fs: &FS,
+        dir: &str,
+        node_id: u32,
+        peer_addrs: BTreeMap<u32, String>,
+        token: String,
+    ) -> Result<Self, MetaError> {
+        if token.is_empty() {
+            return Err(MetaError::StorageUnavailable);
+        }
+        let mut peer_ids: Vec<u32> = peer_addrs.keys().copied().collect();
+        if !peer_ids.contains(&node_id) {
+            peer_ids.push(node_id);
+        }
+        let core = RaftCore::open(fs, dir, node_id, peer_ids, true)?;
+        Ok(Self {
+            inner: Some(Arc::new(Mutex::new(core))),
+            #[cfg(any(test, feature = "experimental-openraft-storage"))]
+            openraft: None,
+            peer_addrs: Arc::new(peer_addrs),
+            last_leader_contact: Arc::new(Mutex::new(Instant::now())),
+            raft_token: Some(Arc::from(token.as_str())),
+        })
+    }
+
+    /// The shared secret used for internal Raft RPCs.
+    pub fn raft_token(&self) -> Option<&str> {
+        self.raft_token.as_deref()
+    }
+
+    /// The last value is the commit index for legacy Raft and the locally
+    /// applied log index for OpenRaft; it is not a quorum-read guarantee.
     pub fn role_info(&self) -> (u32, RoleState, u64, Option<u32>, u64) {
-        let g = self.inner.lock().unwrap();
+        #[cfg(any(test, feature = "experimental-openraft-storage"))]
+        if let Some(client) = &self.openraft {
+            return client.role_info();
+        }
+        let g = self.legacy().lock().unwrap();
         (
             g.node_id(),
             g.role(),
@@ -599,7 +748,11 @@ impl<FS: StorageFs> LocalMetaKv<FS> {
     }
 
     pub fn node_id(&self) -> u32 {
-        self.inner.lock().unwrap().node_id()
+        #[cfg(any(test, feature = "experimental-openraft-storage"))]
+        if let Some(client) = &self.openraft {
+            return client.role_info().0;
+        }
+        self.legacy().lock().unwrap().node_id()
     }
 
     pub fn peer_addr(&self, node_id: u32) -> Option<String> {
@@ -612,9 +765,12 @@ impl<FS: StorageFs> LocalMetaKv<FS> {
 
     /// Handles an inbound Raft RPC (`RequestVote` or `AppendEntries`) and returns any immediate reply RPC.
     pub fn step_rpc(&self, rpc: RaftRpc) -> Result<Option<RaftRpc>, MetaError> {
+        if self.is_openraft() {
+            return Err(MetaError::StorageUnavailable);
+        }
         let is_heartbeat = matches!(&rpc, RaftRpc::AppendEntries { .. });
         let reply = {
-            let mut guard = self.inner.lock().unwrap();
+            let mut guard = self.legacy().lock().unwrap();
             let cur_term = guard.current_term();
             let valid_ae = match &rpc {
                 RaftRpc::AppendEntries { term, .. } => *term >= cur_term,
@@ -639,13 +795,16 @@ impl<FS: StorageFs> LocalMetaKv<FS> {
 
     /// Triggers a Raft election round across configured peers and returns the resulting role.
     pub fn trigger_election(&self) -> Result<RoleState, MetaError> {
+        if self.is_openraft() {
+            return Err(MetaError::StorageUnavailable);
+        }
         *self.last_leader_contact.lock().unwrap() = Instant::now();
         let initial_msgs = {
-            let mut guard = self.inner.lock().unwrap();
+            let mut guard = self.legacy().lock().unwrap();
             guard.start_election()?
         };
         self.drive_outbound(initial_msgs)?;
-        let role = self.inner.lock().unwrap().role();
+        let role = self.legacy().lock().unwrap().role();
         if role == RoleState::Leader {
             *self.last_leader_contact.lock().unwrap() = Instant::now();
         }
@@ -655,10 +814,13 @@ impl<FS: StorageFs> LocalMetaKv<FS> {
     /// Checks whether the follower election timeout has elapsed without valid Leader heartbeats;
     /// if so, automatically triggers a new Raft election round!
     pub fn check_election_timeout(&self, timeout: Duration) -> Result<bool, MetaError> {
+        if self.is_openraft() {
+            return Ok(false);
+        }
         if self.peer_addrs.len() <= 1 {
             return Ok(false);
         }
-        let is_leader = self.inner.lock().unwrap().role() == RoleState::Leader;
+        let is_leader = self.legacy().lock().unwrap().role() == RoleState::Leader;
         if is_leader {
             *self.last_leader_contact.lock().unwrap() = Instant::now();
             return Ok(false);
@@ -673,8 +835,11 @@ impl<FS: StorageFs> LocalMetaKv<FS> {
 
     /// Broadcasts a heartbeat / catch-up `AppendEntries` round if this node is Leader.
     pub fn broadcast_heartbeat(&self) -> Result<(), MetaError> {
+        if self.is_openraft() {
+            return Ok(());
+        }
         let msgs = {
-            let guard = self.inner.lock().unwrap();
+            let guard = self.legacy().lock().unwrap();
             if guard.role() == RoleState::Leader {
                 *self.last_leader_contact.lock().unwrap() = Instant::now();
             }
@@ -684,7 +849,10 @@ impl<FS: StorageFs> LocalMetaKv<FS> {
     }
 
     fn drive_outbound(&self, pending: Vec<OutboundMsg>) -> Result<(), MetaError> {
-        self.drive_outbound_with(pending, &mut send_raft_http_rpc)
+        let token = self.raft_token.clone();
+        let mut send =
+            move |addr: &str, rpc: &RaftRpc| send_raft_http_rpc(addr, rpc, token.as_deref());
+        self.drive_outbound_with(pending, &mut send)
     }
 
     fn drive_outbound_with(
@@ -709,7 +877,7 @@ impl<FS: StorageFs> LocalMetaKv<FS> {
             if replies.is_empty() {
                 break;
             }
-            let mut guard = self.inner.lock().unwrap();
+            let mut guard = self.legacy().lock().unwrap();
             for rep in replies {
                 let next_msgs = guard.step(rep)?;
                 pending.extend(next_msgs);
@@ -721,7 +889,14 @@ impl<FS: StorageFs> LocalMetaKv<FS> {
     /// Returns the result only for this proposal's (index, term). An error after
     /// proposing is not a rollback guarantee: replication may still commit it.
     pub fn execute(&self, cmd: KvCommand) -> Result<KvResult, MetaError> {
-        self.execute_with(cmd, &mut send_raft_http_rpc)
+        #[cfg(any(test, feature = "experimental-openraft-storage"))]
+        if let Some(client) = &self.openraft {
+            return client.execute(cmd);
+        }
+        let token = self.raft_token.clone();
+        let mut send =
+            move |addr: &str, rpc: &RaftRpc| send_raft_http_rpc(addr, rpc, token.as_deref());
+        self.execute_with(cmd, &mut send)
     }
 
     fn execute_with(
@@ -730,14 +905,14 @@ impl<FS: StorageFs> LocalMetaKv<FS> {
         send: &mut impl FnMut(&str, &RaftRpc) -> Result<Option<RaftRpc>, std::io::Error>,
     ) -> Result<KvResult, MetaError> {
         let (idx, term, msgs) = {
-            let mut guard = self.inner.lock().unwrap();
+            let mut guard = self.legacy().lock().unwrap();
             let (idx, msgs) = guard.propose(cmd)?;
             (idx, guard.current_term(), msgs)
         };
         if !msgs.is_empty() {
             self.drive_outbound_with(msgs, send)?;
         }
-        let mut guard = self.inner.lock().unwrap();
+        let mut guard = self.legacy().lock().unwrap();
         // A new leader may have replaced the uncommitted proposal while the
         // mutex was released for RPCs. An index alone does not identify an
         // entry across terms; never return (or consume) the replacement's result.
@@ -750,14 +925,34 @@ impl<FS: StorageFs> LocalMetaKv<FS> {
     }
 
     pub fn get(&self, key: &str) -> Option<KvValue> {
-        self.inner.lock().unwrap().get(key)
+        #[cfg(any(test, feature = "experimental-openraft-storage"))]
+        if let Some(client) = &self.openraft {
+            return client
+                .try_snapshot(&[key.to_owned()], &[])
+                .expect("invalid or unavailable metadata read")
+                .get(key);
+        }
+        self.legacy().lock().unwrap().get(key)
     }
 
     /// Copies selected keys/ranges while holding the same mutex as Raft apply.
     /// Release it before reading blobs/network I/O; later writes cannot change
     /// the owned values. Unselected keys are not available in this snapshot.
     pub fn snapshot(&self, keys: &[String], prefixes: &[String]) -> MetaSnapshot {
-        let guard = self.inner.lock().unwrap();
+        self.try_snapshot(keys, prefixes)
+            .expect("invalid or unavailable metadata snapshot")
+    }
+
+    pub fn try_snapshot(
+        &self,
+        keys: &[String],
+        prefixes: &[String],
+    ) -> Result<MetaSnapshot, MetaError> {
+        #[cfg(any(test, feature = "experimental-openraft-storage"))]
+        if let Some(client) = &self.openraft {
+            return client.try_snapshot(keys, prefixes);
+        }
+        let guard = self.legacy().lock().unwrap();
         let mut values = BTreeMap::new();
         for key in keys {
             if let Some(value) = guard.get(key) {
@@ -767,26 +962,75 @@ impl<FS: StorageFs> LocalMetaKv<FS> {
         for prefix in prefixes {
             values.extend(guard.scan_prefix(prefix));
         }
-        MetaSnapshot {
+        Ok(MetaSnapshot {
             revision: guard.revision(),
             values,
+        })
+    }
+
+    /// Quorum-confirmed snapshot of one selected group, including its revision.
+    /// Followers, unavailable quorums, cross-group requests and legacy metadata
+    /// return errors; this does not provide cross-group atomicity.
+    pub fn try_linearizable_snapshot(
+        &self,
+        keys: &[String],
+        prefixes: &[String],
+    ) -> Result<MetaSnapshot, MetaError> {
+        #[cfg(any(test, feature = "experimental-openraft-storage"))]
+        if let Some(client) = &self.openraft {
+            return client.linearizable_snapshot(keys, prefixes);
         }
+        Err(MetaError::Routing(
+            "linearizable snapshot requires OpenRaft".into(),
+        ))
+    }
+
+    /// Quorum-confirmed local snapshot of the control group. This only works on
+    /// the current control-group leader; other replicas must ask that leader.
+    /// Legacy metadata has no separate control group and is rejected here.
+    pub fn try_linearizable_control_snapshot(
+        &self,
+        keys: &[String],
+    ) -> Result<MetaSnapshot, MetaError> {
+        #[cfg(any(test, feature = "experimental-openraft-storage"))]
+        if let Some(client) = &self.openraft {
+            return client.linearizable_control_snapshot(keys);
+        }
+        Err(MetaError::Routing(
+            "linearizable control snapshot requires OpenRaft".into(),
+        ))
     }
 
     pub fn scan_prefix(&self, prefix: &str) -> Vec<(String, KvValue)> {
-        self.inner.lock().unwrap().scan_prefix(prefix)
+        #[cfg(any(test, feature = "experimental-openraft-storage"))]
+        if let Some(client) = &self.openraft {
+            return client.scan(prefix);
+        }
+        self.legacy().lock().unwrap().scan_prefix(prefix)
     }
 
     pub fn revision(&self) -> u64 {
-        self.inner.lock().unwrap().revision()
+        #[cfg(any(test, feature = "experimental-openraft-storage"))]
+        if let Some(client) = &self.openraft {
+            return client.revision();
+        }
+        self.legacy().lock().unwrap().revision()
     }
 
     pub fn watch_prefix(&self, prefix: impl Into<String>) -> Receiver<WatchEvent> {
-        self.inner.lock().unwrap().watch_prefix(prefix)
+        #[cfg(any(test, feature = "experimental-openraft-storage"))]
+        if let Some(client) = &self.openraft {
+            return client.watch_prefix(prefix.into());
+        }
+        self.legacy().lock().unwrap().watch_prefix(prefix)
     }
 }
 
-fn send_raft_http_rpc(peer_addr: &str, rpc: &RaftRpc) -> Result<Option<RaftRpc>, std::io::Error> {
+fn send_raft_http_rpc(
+    peer_addr: &str,
+    rpc: &RaftRpc,
+    token: Option<&str>,
+) -> Result<Option<RaftRpc>, std::io::Error> {
     let clean = peer_addr
         .trim()
         .strip_prefix("http://")
@@ -802,10 +1046,16 @@ fn send_raft_http_rpc(peer_addr: &str, rpc: &RaftRpc) -> Result<Option<RaftRpc>,
     stream.set_read_timeout(Some(Duration::from_millis(500)))?;
     stream.set_write_timeout(Some(Duration::from_millis(350)))?;
 
-    let req = format!(
-        "POST /raft/rpc HTTP/1.1\r\nHost: {clean}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
-    );
+    let req = match token {
+        Some(token) => format!(
+            "POST /raft/rpc HTTP/1.1\r\nHost: {clean}\r\nx-yadb-raft-token: {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        ),
+        None => format!(
+            "POST /raft/rpc HTTP/1.1\r\nHost: {clean}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        ),
+    };
     stream.write_all(req.as_bytes())?;
     stream.write_all(&body)?;
     stream.flush()?;
@@ -830,11 +1080,13 @@ mod transport_tests {
 
     fn cluster() -> BTreeMap<u32, LocalMetaKv<SimFs>> {
         let peers: BTreeMap<_, _> = (1..=3).map(|id| (id, id.to_string())).collect();
-        let nodes: BTreeMap<_, _> = (1..=3).map(|id| {
-            let fs = SimFs::new(2000 + id as u64);
-            let meta = LocalMetaKv::open_clustered(&fs, "meta", id, peers.clone()).unwrap();
-            (id, meta)
-        }).collect();
+        let nodes: BTreeMap<_, _> = (1..=3)
+            .map(|id| {
+                let fs = SimFs::new(2000 + id as u64);
+                let meta = LocalMetaKv::open_clustered(&fs, "meta", id, peers.clone()).unwrap();
+                (id, meta)
+            })
+            .collect();
         elect(&nodes, 1);
         nodes
     }
@@ -844,12 +1096,21 @@ mod transport_tests {
         addr: &str,
         rpc: &RaftRpc,
     ) -> Result<Option<RaftRpc>, std::io::Error> {
-        Ok(nodes[&addr.parse::<u32>().unwrap()].step_rpc(rpc.clone()).unwrap())
+        Ok(nodes[&addr.parse::<u32>().unwrap()]
+            .step_rpc(rpc.clone())
+            .unwrap())
     }
 
     fn elect(nodes: &BTreeMap<u32, LocalMetaKv<SimFs>>, id: u32) {
-        let msgs = nodes[&id].inner.lock().unwrap().start_election().unwrap();
-        nodes[&id].drive_outbound_with(msgs, &mut |addr, rpc| deliver(nodes, addr, rpc)).unwrap();
+        let msgs = nodes[&id]
+            .legacy()
+            .lock()
+            .unwrap()
+            .start_election()
+            .unwrap();
+        nodes[&id]
+            .drive_outbound_with(msgs, &mut |addr, rpc| deliver(nodes, addr, rpc))
+            .unwrap();
         assert_eq!(nodes[&id].role_info().1, RoleState::Leader);
     }
 
@@ -860,16 +1121,29 @@ mod transport_tests {
         // (failure before delivery). There is no automatic retry of the command.
         for delivered in [false, true] {
             let nodes = cluster();
-            let result = nodes[&1].execute_with(KvCommand::Put {
-                key: "ambiguous".into(), value: b"original".to_vec(),
-            }, &mut |addr, rpc| {
-                if delivered && addr == "2" {
-                    let reply = deliver(&nodes, addr, rpc)?;
-                    assert!(matches!(reply, Some(RaftRpc::AppendEntriesReply { success: true, .. })));
-                }
-                Err(std::io::Error::new(std::io::ErrorKind::ConnectionReset, "injected reply loss"))
-            });
-            assert!(matches!(result, Err(MetaError::UncommittedIndex(_))), "{result:?}");
+            let result = nodes[&1].execute_with(
+                KvCommand::Put {
+                    key: "ambiguous".into(),
+                    value: b"original".to_vec(),
+                },
+                &mut |addr, rpc| {
+                    if delivered && addr == "2" {
+                        let reply = deliver(&nodes, addr, rpc)?;
+                        assert!(matches!(
+                            reply,
+                            Some(RaftRpc::AppendEntriesReply { success: true, .. })
+                        ));
+                    }
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionReset,
+                        "injected reply loss",
+                    ))
+                },
+            );
+            assert!(
+                matches!(result, Err(MetaError::UncommittedIndex(_))),
+                "{result:?}"
+            );
             assert!(nodes[&1].get("ambiguous").is_none());
             elect(&nodes, 2);
             for node in nodes.values() {
@@ -882,23 +1156,32 @@ mod transport_tests {
     fn execute_must_not_return_result_of_replacement_at_same_index() {
         let nodes = cluster();
         let mut changed_leader = false;
-        let result = nodes[&1].execute_with(KvCommand::Put {
-            key: "discarded".into(), value: b"original".to_vec(),
-        }, &mut |addr, rpc| {
-            if !changed_leader {
-                changed_leader = true;
-                // Before the proposal reaches any follower, elect node 2. Its
-                // no-op replaces and commits the pending proposal's log index
-                // on node 1 while that node's execute() is outside its mutex.
-                elect(&nodes, 2);
-            }
-            deliver(&nodes, addr, rpc)
-        });
-        assert!(matches!(result, Err(MetaError::UncommittedIndex(_))), "{result:?}");
+        let result = nodes[&1].execute_with(
+            KvCommand::Put {
+                key: "discarded".into(),
+                value: b"original".to_vec(),
+            },
+            &mut |addr, rpc| {
+                if !changed_leader {
+                    changed_leader = true;
+                    // Before the proposal reaches any follower, elect node 2. Its
+                    // no-op replaces and commits the pending proposal's log index
+                    // on node 1 while that node's execute() is outside its mutex.
+                    elect(&nodes, 2);
+                }
+                deliver(&nodes, addr, rpc)
+            },
+        );
+        assert!(
+            matches!(result, Err(MetaError::UncommittedIndex(_))),
+            "{result:?}"
+        );
         assert!(nodes.values().all(|node| node.get("discarded").is_none()));
         // Rejecting the stale caller must not consume the replacement's result.
-        assert!(matches!(nodes[&1].inner.lock().unwrap().take_applied_result(2),
-            Some(KvResult::TxnOk { .. })));
+        assert!(matches!(
+            nodes[&1].legacy().lock().unwrap().take_applied_result(2),
+            Some(KvResult::TxnOk { .. })
+        ));
     }
 
     #[test]
@@ -907,25 +1190,42 @@ mod transport_tests {
         // Leave an earlier unreplicated entry at index 2, so the original Put
         // below uses index 3. The new leader's no-op will occupy index 2 and its
         // own Put will occupy index 3.
-        let pending = nodes[&1].execute_with(KvCommand::Put {
-            key: "earlier".into(), value: b"pending".to_vec(),
-        }, &mut |_, _| Ok(None));
+        let pending = nodes[&1].execute_with(
+            KvCommand::Put {
+                key: "earlier".into(),
+                value: b"pending".to_vec(),
+            },
+            &mut |_, _| Ok(None),
+        );
         assert!(matches!(pending, Err(MetaError::UncommittedIndex(2))));
         let mut changed_leader = false;
-        let result = nodes[&1].execute_with(KvCommand::Put {
-            key: "discarded".into(), value: b"original".to_vec(),
-        }, &mut |addr, rpc| {
-            if !changed_leader {
-                changed_leader = true;
-                elect(&nodes, 2);
-                let replacement = nodes[&2].execute_with(KvCommand::Put {
-                    key: "replacement".into(), value: b"new leader".to_vec(),
-                }, &mut |addr, rpc| deliver(&nodes, addr, rpc)).unwrap();
-                assert!(matches!(replacement, KvResult::PutOk { .. }));
-            }
-            deliver(&nodes, addr, rpc)
-        });
-        assert!(matches!(result, Err(MetaError::UncommittedIndex(_))), "{result:?}");
+        let result = nodes[&1].execute_with(
+            KvCommand::Put {
+                key: "discarded".into(),
+                value: b"original".to_vec(),
+            },
+            &mut |addr, rpc| {
+                if !changed_leader {
+                    changed_leader = true;
+                    elect(&nodes, 2);
+                    let replacement = nodes[&2]
+                        .execute_with(
+                            KvCommand::Put {
+                                key: "replacement".into(),
+                                value: b"new leader".to_vec(),
+                            },
+                            &mut |addr, rpc| deliver(&nodes, addr, rpc),
+                        )
+                        .unwrap();
+                    assert!(matches!(replacement, KvResult::PutOk { .. }));
+                }
+                deliver(&nodes, addr, rpc)
+            },
+        );
+        assert!(
+            matches!(result, Err(MetaError::UncommittedIndex(_))),
+            "{result:?}"
+        );
         assert!(nodes.values().all(|node| node.get("discarded").is_none()));
         for node in nodes.values() {
             assert_eq!(node.get("replacement").unwrap().value, b"new leader");
@@ -936,21 +1236,30 @@ mod transport_tests {
     fn execute_returns_original_committed_result_after_leader_change() {
         let nodes = cluster();
         let mut changed_leader = false;
-        let result = nodes[&1].execute_with(KvCommand::Put {
-            key: "retained".into(), value: b"original".to_vec(),
-        }, &mut |addr, rpc| {
-            // The first replication round commits the Put on node 1. Change
-            // leaders during the subsequent commit broadcast, before execute
-            // reads its result. Rejecting every term change would lose success.
-            if !changed_leader && matches!(rpc, RaftRpc::AppendEntries { leader_commit, .. }
-                if *leader_commit >= 2) {
-                changed_leader = true;
-                elect(&nodes, 2);
-            }
-            deliver(&nodes, addr, rpc)
-        });
+        let result = nodes[&1].execute_with(
+            KvCommand::Put {
+                key: "retained".into(),
+                value: b"original".to_vec(),
+            },
+            &mut |addr, rpc| {
+                // The first replication round commits the Put on node 1. Change
+                // leaders during the subsequent commit broadcast, before execute
+                // reads its result. Rejecting every term change would lose success.
+                if !changed_leader
+                    && matches!(rpc, RaftRpc::AppendEntries { leader_commit, .. }
+                if *leader_commit >= 2)
+                {
+                    changed_leader = true;
+                    elect(&nodes, 2);
+                }
+                deliver(&nodes, addr, rpc)
+            },
+        );
         assert!(changed_leader);
-        assert!(matches!(result, Ok(KvResult::PutOk { version: 1, .. })), "{result:?}");
+        assert!(
+            matches!(result, Ok(KvResult::PutOk { version: 1, .. })),
+            "{result:?}"
+        );
         for node in nodes.values() {
             assert_eq!(node.get("retained").unwrap().value, b"original");
         }
@@ -970,10 +1279,19 @@ mod transport_tests {
             deliver(&nodes, addr, rpc)
         });
         assert!(lost_notifications > 0);
-        assert!(matches!(result, Ok(KvResult::PutOk { version: 1, .. })), "{result:?}");
+        assert!(
+            matches!(result, Ok(KvResult::PutOk { version: 1, .. })),
+            "{result:?}"
+        );
         assert!(nodes[&2].get("committed").is_none());
-        let msgs = nodes[&1].inner.lock().unwrap().broadcast_append_entries();
-        nodes[&1].drive_outbound_with(msgs, &mut |addr, rpc| deliver(&nodes, addr, rpc)).unwrap();
+        let msgs = nodes[&1]
+            .legacy()
+            .lock()
+            .unwrap()
+            .broadcast_append_entries();
+        nodes[&1]
+            .drive_outbound_with(msgs, &mut |addr, rpc| deliver(&nodes, addr, rpc))
+            .unwrap();
         for node in nodes.values() {
             assert_eq!(node.get("committed").unwrap().value, b"original");
         }

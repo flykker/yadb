@@ -15,11 +15,16 @@ const INTENT_GRACE_REVISIONS: u64 = 32;
 const MAX_ALLOCATION: u64 = (1u64 << 56) - 1;
 
 fn unix_seconds() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 #[derive(Debug, Error)]
 pub enum S3Error {
+    #[error("namespace-wide orphan collection is unavailable without an atomic cross-group view")]
+    NamespaceScanUnavailable,
     #[error("object generation allocation exhausted or contended")]
     GenerationExhausted,
     #[error("blob engine error: {0}")]
@@ -179,15 +184,23 @@ impl<FS: StorageFs> ObjectStoreEngine<FS> {
                 Some(v) => serde_json::from_slice::<u64>(&v.value)?,
                 None => 0,
             };
-            let next = previous.checked_add(1).filter(|v| *v <= MAX_ALLOCATION)
+            let next = previous
+                .checked_add(1)
+                .filter(|v| *v <= MAX_ALLOCATION)
                 .ok_or(S3Error::GenerationExhausted)?;
-            if matches!(self.meta.execute(KvCommand::RevisionTxn {
-                guards: vec![RevisionGuard {
-                    key: key.clone(),
-                    expected_mod_revision: current.as_ref().map_or(0, |v| v.mod_revision),
-                }],
-                ops: vec![TxnOp::Put { key: key.clone(), value: serde_json::to_vec(&next)? }],
-            })?, KvResult::TxnOk { .. }) {
+            if matches!(
+                self.meta.execute(KvCommand::RevisionTxn {
+                    guards: vec![RevisionGuard {
+                        key: key.clone(),
+                        expected_mod_revision: current.as_ref().map_or(0, |v| v.mod_revision),
+                    }],
+                    ops: vec![TxnOp::Put {
+                        key: key.clone(),
+                        value: serde_json::to_vec(&next)?
+                    }],
+                })?,
+                KvResult::TxnOk { .. }
+            ) {
                 return Ok(next);
             }
         }
@@ -213,11 +226,16 @@ impl<FS: StorageFs> ObjectStoreEngine<FS> {
         let next_gen = (allocation_id & BlobId::MAX_U24 as u64) as u32;
         let upload_id = format!("v2-{allocation_id:014x}");
         let intent_key = Self::intent_key(project_id, &upload_id);
-        let intent_lease = self.meta.revision().saturating_add(INTENT_GRACE_REVISIONS);
+        let intent_lease = self
+            .meta
+            .revision_for_key(&intent_key)?
+            .saturating_add(INTENT_GRACE_REVISIONS);
         let mut chunks = Vec::new();
         let mut offset = 0u64;
         for (index, slice) in payload.chunks(self.chunk_size).enumerate() {
-            let step = u32::try_from(index + 1).ok().filter(|v| *v <= BlobId::MAX_U24)
+            let step = u32::try_from(index + 1)
+                .ok()
+                .filter(|v| *v <= BlobId::MAX_U24)
                 .ok_or(S3Error::GenerationExhausted)?;
             chunks.push(ChunkRef {
                 blob_id: BlobId::new(project_id, owner_id, next_gen, step, S3_CHANNEL, 0),
@@ -233,7 +251,7 @@ impl<FS: StorageFs> ObjectStoreEngine<FS> {
             pool: pool_name.to_string(),
             chunks: chunks.clone(),
             state: UploadState::Prepared,
-            created_revision: self.meta.revision(),
+            created_revision: self.meta.revision_for_key(&intent_key)?,
             lease_until_revision: intent_lease,
             lease_until_unix_secs: unix_seconds().saturating_add(INTENT_GRACE_SECS),
             allocation_id: Some(allocation_id),
@@ -270,7 +288,11 @@ impl<FS: StorageFs> ObjectStoreEngine<FS> {
     }
 
     fn publish_upload(
-        &self, project_id: u32, store: &str, manifest: &ObjectManifest, intent_key: &str,
+        &self,
+        project_id: u32,
+        store: &str,
+        manifest: &ObjectManifest,
+        intent_key: &str,
     ) -> Result<(), S3Error> {
         let mkey = Self::meta_key(project_id, store, &manifest.bucket, &manifest.key);
         // The previous manifest and its guard MUST come from the same read.
@@ -284,12 +306,20 @@ impl<FS: StorageFs> ObjectStoreEngine<FS> {
                 key: mkey.clone(),
                 value: encoded,
             },
-            yadb_metakv::TxnOp::Delete { key: intent_key.to_string() },
+            yadb_metakv::TxnOp::Delete {
+                key: intent_key.to_string(),
+            },
         ];
         if let Some(value) = &previous {
             let old: ObjectManifest = serde_json::from_slice(&value.value)?;
             ops.push(yadb_metakv::TxnOp::Put {
-                key: Self::retired_key(project_id, store, &manifest.bucket, &manifest.key, value.mod_revision),
+                key: Self::retired_key(
+                    project_id,
+                    store,
+                    &manifest.bucket,
+                    &manifest.key,
+                    value.mod_revision,
+                ),
                 value: serde_json::to_vec(&old)?,
             });
         }
@@ -419,13 +449,7 @@ impl<FS: StorageFs> ObjectStoreEngine<FS> {
         let mut ops = vec![yadb_metakv::TxnOp::Delete { key: mkey.clone() }];
         if let Some(value) = &previous {
             let manifest: ObjectManifest = serde_json::from_slice(&value.value)?;
-            let retired = Self::retired_key(
-                project_id,
-                store,
-                bucket,
-                key,
-                value.mod_revision,
-            );
+            let retired = Self::retired_key(project_id, store, bucket, key, value.mod_revision);
             ops.push(yadb_metakv::TxnOp::Put {
                 key: retired,
                 value: serde_json::to_vec(&manifest)?,
@@ -451,38 +475,68 @@ impl<FS: StorageFs> ObjectStoreEngine<FS> {
     }
 
     fn collect_orphans_at(&self, project_id: u32, now: u64) -> Result<usize, S3Error> {
-        let current_revision = self.meta.revision();
+        let current_revision = self
+            .meta
+            .revision_for_key(&Self::intent_prefix(project_id))?;
         let mut removed = 0usize;
         let intents = self.meta.scan_prefix(&Self::intent_prefix(project_id));
         for (key, value) in intents {
-            let Ok(intent) = serde_json::from_slice::<UploadIntent>(&value.value) else { continue };
-            let Some(allocation) = intent.allocation_id.filter(|id| *id > 0 && *id <= MAX_ALLOCATION) else {
+            let Ok(intent) = serde_json::from_slice::<UploadIntent>(&value.value) else {
+                continue;
+            };
+            let Some(allocation) = intent
+                .allocation_id
+                .filter(|id| *id > 0 && *id <= MAX_ALLOCATION)
+            else {
                 continue;
             };
             if key != Self::intent_key(project_id, &format!("v2-{allocation:014x}"))
                 || intent.chunks.len() > BlobId::MAX_U24 as usize
                 || intent.chunks.iter().enumerate().any(|(i, chunk)| {
-                    chunk.blob_id != BlobId::new(project_id, (allocation >> 24) as u32,
-                        (allocation & BlobId::MAX_U24 as u64) as u32, (i + 1) as u32, S3_CHANNEL, 0)
+                    chunk.blob_id
+                        != BlobId::new(
+                            project_id,
+                            (allocation >> 24) as u32,
+                            (allocation & BlobId::MAX_U24 as u64) as u32,
+                            (i + 1) as u32,
+                            S3_CHANNEL,
+                            0,
+                        )
                 })
             {
                 // Legacy/invalid intent: do not turn a hash collision into data loss.
                 continue;
             }
             if intent.state == UploadState::Prepared
-                && (intent.lease_until_revision > current_revision || intent.lease_until_unix_secs > now)
+                && (intent.lease_until_revision > current_revision
+                    || intent.lease_until_unix_secs > now)
             {
                 continue;
             }
             // Even an already-Aborted value is re-confirmed through consensus.
             // Local reads may be stale; neither a follower nor an isolated old
             // leader is allowed to delete based only on its local view.
-            let aborted = UploadIntent { state: UploadState::Aborted, ..intent.clone() };
+            let aborted = UploadIntent {
+                state: UploadState::Aborted,
+                ..intent.clone()
+            };
             let abort = self.meta.execute(KvCommand::RevisionTxn {
-                guards: vec![RevisionGuard { key: key.clone(), expected_mod_revision: value.mod_revision }],
-                ops: vec![TxnOp::Put { key: key.clone(), value: serde_json::to_vec(&aborted)? }],
+                guards: vec![RevisionGuard {
+                    key: key.clone(),
+                    expected_mod_revision: value.mod_revision,
+                }],
+                ops: vec![TxnOp::Put {
+                    key: key.clone(),
+                    value: serde_json::to_vec(&aborted)?,
+                }],
             })?;
-            let KvResult::TxnOk { revision: aborted_revision, .. } = abort else { continue };
+            let KvResult::TxnOk {
+                revision: aborted_revision,
+                ..
+            } = abort
+            else {
+                continue;
+            };
             let mut retain = false;
             for chunk in &aborted.chunks {
                 if self.is_reachable(project_id, &intent.pool, chunk.blob_id)? {
@@ -495,7 +549,10 @@ impl<FS: StorageFs> ObjectStoreEngine<FS> {
                 continue;
             }
             self.meta.execute(KvCommand::RevisionTxn {
-                guards: vec![RevisionGuard { key: key.clone(), expected_mod_revision: aborted_revision }],
+                guards: vec![RevisionGuard {
+                    key: key.clone(),
+                    expected_mod_revision: aborted_revision,
+                }],
                 ops: vec![TxnOp::Delete { key }],
             })?;
         }
@@ -503,7 +560,10 @@ impl<FS: StorageFs> ObjectStoreEngine<FS> {
     }
 
     fn is_reachable(&self, project_id: u32, pool: &str, blob_id: BlobId) -> Result<bool, S3Error> {
-        for prefix in [format!("/s3/{project_id}/"), format!("/s3-retired/{project_id}/")] {
+        for prefix in [
+            format!("/s3/{project_id}/"),
+            format!("/s3-retired/{project_id}/"),
+        ] {
             for (_, value) in self.meta.scan_prefix(&prefix) {
                 let manifest: ObjectManifest = serde_json::from_slice(&value.value)?;
                 if manifest.pool == pool && manifest.chunks.iter().any(|c| c.blob_id == blob_id) {
@@ -518,6 +578,12 @@ impl<FS: StorageFs> ObjectStoreEngine<FS> {
     /// Includes projects with only failed uploads and no published objects.
     /// Malformed unrelated keys are ignored.
     pub fn collect_orphans_all(&self) -> Result<usize, S3Error> {
+        // A Multi-Raft LocalMetaKv cannot provide one atomic, leader-fenced
+        // snapshot across project groups.  Never scan/delete from a mixed
+        // view: callers must disable the namespace-wide operation instead.
+        if self.meta.is_openraft() {
+            return Err(S3Error::NamespaceScanUnavailable);
+        }
         let mut projects = std::collections::BTreeSet::new();
         for prefix in ["/s3/", "/s3-intent/", "/s3-retired/"] {
             for (key, _) in self.meta.scan_prefix(prefix) {
@@ -578,26 +644,46 @@ mod tests {
             let s3 = engine(&meta_fs, &disks);
             let (key, _, manifest) = prepared(&s3);
             let id = manifest.chunks[0].blob_id;
-            s3.get_pool("pool").unwrap().put_blob(id, b"payload").unwrap();
-            meta_fs.set_faults(FaultConfig { sync_data_fault: fault, ..Default::default() });
-            assert!(matches!(s3.publish_upload(1, "store", &manifest, &key), Err(S3Error::Meta(MetaError::Io(_)))));
+            s3.get_pool("pool")
+                .unwrap()
+                .put_blob(id, b"payload")
+                .unwrap();
+            meta_fs.set_faults(FaultConfig {
+                sync_data_fault: fault,
+                ..Default::default()
+            });
+            assert!(matches!(
+                s3.publish_upload(1, "store", &manifest, &key),
+                Err(S3Error::Meta(MetaError::Io(_)))
+            ));
             meta_fs.set_faults(FaultConfig::default());
-            assert!(matches!(s3.publish_upload(1, "store", &manifest, &key),
-                Err(S3Error::Meta(MetaError::StorageUnavailable))));
+            assert!(matches!(
+                s3.publish_upload(1, "store", &manifest, &key),
+                Err(S3Error::Meta(MetaError::StorageUnavailable))
+            ));
             drop(s3);
             meta_fs.simulate_power_cut();
-            for disk in &disks { disk.simulate_power_cut(); }
+            for disk in &disks {
+                disk.simulate_power_cut();
+            }
             let recovered = engine(&meta_fs, &disks);
             advance_revisions(&recovered);
             if fault == SyncFault::AfterPersist {
                 assert!(recovered.meta.get(&key).is_none());
                 assert_eq!(recovered.collect_orphans_at(1, 1001).unwrap(), 0);
-                assert_eq!(recovered.get_object(1, "store", "bucket", "key").unwrap().1, b"payload");
+                assert_eq!(
+                    recovered.get_object(1, "store", "bucket", "key").unwrap().1,
+                    b"payload"
+                );
             } else {
                 assert!(recovered.head_object(1, "store", "bucket", "key").is_err());
                 assert_eq!(recovered.collect_orphans_at(1, 1001).unwrap(), 1);
                 assert!(recovered.meta.get(&key).is_none());
-                assert!(recovered.get_pool("pool").unwrap().put_blob(id, b"payload").is_err());
+                assert!(recovered
+                    .get_pool("pool")
+                    .unwrap()
+                    .put_blob(id, b"payload")
+                    .is_err());
             }
         }
     }
@@ -610,11 +696,18 @@ mod tests {
             let s3 = engine(&meta_fs, &disks);
             let (key, _, manifest) = prepared(&s3);
             let id = manifest.chunks[0].blob_id;
-            s3.get_pool("pool").unwrap().put_blob(id, b"payload").unwrap();
+            s3.get_pool("pool")
+                .unwrap()
+                .put_blob(id, b"payload")
+                .unwrap();
             advance_revisions(&s3);
-            disks[1].set_faults(FaultConfig { sync_data_fault: fault, ..Default::default() });
+            disks[1].set_faults(FaultConfig {
+                sync_data_fault: fault,
+                ..Default::default()
+            });
             assert!(s3.collect_orphans_at(1, 1001).is_err());
-            let intent: UploadIntent = serde_json::from_slice(&s3.meta.get(&key).unwrap().value).unwrap();
+            let intent: UploadIntent =
+                serde_json::from_slice(&s3.meta.get(&key).unwrap().value).unwrap();
             assert_eq!(intent.state, UploadState::Aborted);
             disks[1].set_faults(FaultConfig::default());
             // Clearing injected EIO is not enough: target runtime state remains
@@ -624,22 +717,41 @@ mod tests {
             assert!(s3.publish_upload(1, "store", &manifest, &key).is_err());
             drop(s3);
             meta_fs.simulate_power_cut();
-            for disk in &disks { disk.simulate_power_cut(); }
+            for disk in &disks {
+                disk.simulate_power_cut();
+            }
             let recovered = engine(&meta_fs, &disks);
-            assert_eq!(recovered.collect_orphans_all().unwrap(),
-                if fault == SyncFault::BeforePersist { 1 } else { 0 });
+            assert_eq!(
+                recovered.collect_orphans_all().unwrap(),
+                if fault == SyncFault::BeforePersist {
+                    1
+                } else {
+                    0
+                }
+            );
             assert!(recovered.meta.get(&key).is_none());
-            assert!(recovered.get_pool("pool").unwrap().put_blob(id, b"payload").is_err());
+            assert!(recovered
+                .get_pool("pool")
+                .unwrap()
+                .put_blob(id, b"payload")
+                .is_err());
         }
     }
 
     fn engine(meta_fs: &SimFs, disks: &[SimFs]) -> ObjectStoreEngine<SimFs> {
         let meta = LocalMetaKv::open_single_node(meta_fs, "meta", 1).unwrap();
         let s3 = ObjectStoreEngine::new(meta, 4096);
-        let domains = disks.iter().enumerate().map(|(i, fs)| {
-            VolumeStore::open(fs.clone(), format!("d{i}"), VolumeConfig::default()).unwrap()
-        }).collect();
-        s3.register_pool("pool", Arc::new(PoolStriper::new(ErasureScheme::Mirror { replicas: 3 }, domains).unwrap()));
+        let domains = disks
+            .iter()
+            .enumerate()
+            .map(|(i, fs)| {
+                VolumeStore::open(fs.clone(), format!("d{i}"), VolumeConfig::default()).unwrap()
+            })
+            .collect();
+        s3.register_pool(
+            "pool",
+            Arc::new(PoolStriper::new(ErasureScheme::Mirror { replicas: 3 }, domains).unwrap()),
+        );
         s3
     }
 
@@ -649,30 +761,57 @@ mod tests {
         let upload_id = format!("v2-{allocation:014x}");
         let key = ObjectStoreEngine::<SimFs>::intent_key(1, &upload_id);
         let chunks = vec![ChunkRef {
-            blob_id: BlobId::new(1, (allocation >> 24) as u32,
-                (allocation & BlobId::MAX_U24 as u64) as u32, 1, S3_CHANNEL, 0),
-            offset: 0, len: 7,
+            blob_id: BlobId::new(
+                1,
+                (allocation >> 24) as u32,
+                (allocation & BlobId::MAX_U24 as u64) as u32,
+                1,
+                S3_CHANNEL,
+                0,
+            ),
+            offset: 0,
+            len: 7,
         }];
         let intent = UploadIntent {
-            upload_id, manifest_key: "/s3/1/store/bucket/key".into(),
-            generation: chunks[0].blob_id.generation(), pool: "pool".into(), chunks: chunks.clone(),
-            state: UploadState::Prepared, created_revision: s3.meta.revision(),
+            upload_id,
+            manifest_key: "/s3/1/store/bucket/key".into(),
+            generation: chunks[0].blob_id.generation(),
+            pool: "pool".into(),
+            chunks: chunks.clone(),
+            state: UploadState::Prepared,
+            created_revision: s3.meta.revision(),
             lease_until_revision: s3.meta.revision() + INTENT_GRACE_REVISIONS,
-            lease_until_unix_secs: 1000, allocation_id: Some(allocation),
+            lease_until_unix_secs: 1000,
+            allocation_id: Some(allocation),
         };
-        s3.meta.execute(KvCommand::CompareAndSwap {
-            key: key.clone(), expected_version: 0, new_value: Some(serde_json::to_vec(&intent).unwrap()),
-        }).unwrap();
+        s3.meta
+            .execute(KvCommand::CompareAndSwap {
+                key: key.clone(),
+                expected_version: 0,
+                new_value: Some(serde_json::to_vec(&intent).unwrap()),
+            })
+            .unwrap();
         let manifest = ObjectManifest {
-            bucket: "bucket".into(), key: "key".into(), size: 7, etag: "test".into(),
-            content_type: "text/plain".into(), pool: "pool".into(), chunks, last_modified: 0,
+            bucket: "bucket".into(),
+            key: "key".into(),
+            size: 7,
+            etag: "test".into(),
+            content_type: "text/plain".into(),
+            pool: "pool".into(),
+            chunks,
+            last_modified: 0,
         };
         (key, intent, manifest)
     }
 
     fn advance_revisions(s3: &ObjectStoreEngine<SimFs>) {
         for _ in 0..INTENT_GRACE_REVISIONS {
-            s3.meta.execute(KvCommand::Put { key: "/test-tick".into(), value: Vec::new() }).unwrap();
+            s3.meta
+                .execute(KvCommand::Put {
+                    key: "/test-tick".into(),
+                    value: Vec::new(),
+                })
+                .unwrap();
         }
     }
 
@@ -690,7 +829,10 @@ mod tests {
         assert_eq!(s3.collect_orphans_at(1, 999).unwrap(), 0); // revisions alone
         assert_eq!(s3.collect_orphans_at(1, 1001).unwrap(), 1);
         assert!(s3.meta.get(&key).is_none());
-        assert!(matches!(s3.publish_upload(1, "store", &manifest, &key), Err(S3Error::ConcurrentModification)));
+        assert!(matches!(
+            s3.publish_upload(1, "store", &manifest, &key),
+            Err(S3Error::ConcurrentModification)
+        ));
         assert!(pool.put_blob(id, b"payload").is_err());
         assert!(s3.head_object(1, "store", "bucket", "key").is_err());
     }
@@ -702,21 +844,34 @@ mod tests {
         let s3 = engine(&meta_fs, &disks);
         let (key, _, manifest) = prepared(&s3);
         let id = manifest.chunks[0].blob_id;
-        s3.get_pool("pool").unwrap().put_blob(id, b"payload").unwrap();
+        s3.get_pool("pool")
+            .unwrap()
+            .put_blob(id, b"payload")
+            .unwrap();
         advance_revisions(&s3);
-        disks[1].set_faults(FaultConfig { write_eio_prob: 1.0, ..Default::default() });
+        disks[1].set_faults(FaultConfig {
+            write_eio_prob: 1.0,
+            ..Default::default()
+        });
         assert!(s3.collect_orphans_at(1, 1001).is_err());
-        let aborted: UploadIntent = serde_json::from_slice(&s3.meta.get(&key).unwrap().value).unwrap();
+        let aborted: UploadIntent =
+            serde_json::from_slice(&s3.meta.get(&key).unwrap().value).unwrap();
         assert_eq!(aborted.state, UploadState::Aborted);
         drop(s3);
         disks[1].set_faults(FaultConfig::default());
         meta_fs.simulate_power_cut();
-        for disk in &disks { disk.simulate_power_cut(); }
+        for disk in &disks {
+            disk.simulate_power_cut();
+        }
         let recovered = engine(&meta_fs, &disks);
         // No live object in this project: discovery must use the intent namespace.
         assert_eq!(recovered.collect_orphans_all().unwrap(), 1);
         assert!(recovered.meta.get(&key).is_none());
-        assert!(recovered.get_pool("pool").unwrap().put_blob(id, b"payload").is_err());
+        assert!(recovered
+            .get_pool("pool")
+            .unwrap()
+            .put_blob(id, b"payload")
+            .is_err());
     }
 
     #[test]
@@ -725,15 +880,23 @@ mod tests {
         let disks = [SimFs::new(6221), SimFs::new(6222), SimFs::new(6223)];
         let s3 = engine(&meta_fs, &disks);
         let (key, _, manifest) = prepared(&s3);
-        s3.get_pool("pool").unwrap().put_blob(manifest.chunks[0].blob_id, b"payload").unwrap();
+        s3.get_pool("pool")
+            .unwrap()
+            .put_blob(manifest.chunks[0].blob_id, b"payload")
+            .unwrap();
         s3.publish_upload(1, "store", &manifest, &key).unwrap();
         advance_revisions(&s3);
         assert_eq!(s3.collect_orphans_at(1, 1001).unwrap(), 0);
         drop(s3);
         meta_fs.simulate_power_cut();
-        for disk in &disks { disk.simulate_power_cut(); }
+        for disk in &disks {
+            disk.simulate_power_cut();
+        }
         let recovered = engine(&meta_fs, &disks);
-        assert_eq!(recovered.get_object(1, "store", "bucket", "key").unwrap().1, b"payload");
+        assert_eq!(
+            recovered.get_object(1, "store", "bucket", "key").unwrap().1,
+            b"payload"
+        );
     }
 
     #[test]
@@ -742,11 +905,20 @@ mod tests {
         let disks = [SimFs::new(6231), SimFs::new(6232), SimFs::new(6233)];
         let s3 = engine(&meta_fs, &disks);
         let (key, _, manifest) = prepared(&s3);
-        s3.get_pool("pool").unwrap().put_blob(manifest.chunks[0].blob_id, b"payload").unwrap();
+        s3.get_pool("pool")
+            .unwrap()
+            .put_blob(manifest.chunks[0].blob_id, b"payload")
+            .unwrap();
         advance_revisions(&s3);
-        disks[0].set_faults(FaultConfig { write_eio_prob: 1.0, ..Default::default() });
+        disks[0].set_faults(FaultConfig {
+            write_eio_prob: 1.0,
+            ..Default::default()
+        });
         assert!(s3.collect_orphans_at(1, 1001).is_err());
-        assert!(matches!(s3.publish_upload(1, "store", &manifest, &key), Err(S3Error::ConcurrentModification)));
+        assert!(matches!(
+            s3.publish_upload(1, "store", &manifest, &key),
+            Err(S3Error::ConcurrentModification)
+        ));
     }
 
     #[test]
@@ -755,19 +927,42 @@ mod tests {
         let disks = [SimFs::new(6241), SimFs::new(6242), SimFs::new(6243)];
         let s3 = engine(&meta_fs, &disks);
         let ids = std::thread::scope(|scope| {
-            let handles: Vec<_> = (0..12).map(|i| {
-                let writer = ObjectStoreEngine::new(s3.meta.clone(), 4096);
-                writer.register_pool("pool", s3.get_pool("pool").unwrap());
-                scope.spawn(move || writer.put_object(1, "store", "pool", "bucket", &format!("key-{i}"), "text/plain", b"payload").unwrap().chunks[0].blob_id)
-            }).collect();
-            handles.into_iter().map(|h| h.join().unwrap()).collect::<std::collections::BTreeSet<_>>()
+            let handles: Vec<_> = (0..12)
+                .map(|i| {
+                    let writer = ObjectStoreEngine::new(s3.meta.clone(), 4096);
+                    writer.register_pool("pool", s3.get_pool("pool").unwrap());
+                    scope.spawn(move || {
+                        writer
+                            .put_object(
+                                1,
+                                "store",
+                                "pool",
+                                "bucket",
+                                &format!("key-{i}"),
+                                "text/plain",
+                                b"payload",
+                            )
+                            .unwrap()
+                            .chunks[0]
+                            .blob_id
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .collect::<std::collections::BTreeSet<_>>()
         });
         assert_eq!(ids.len(), 12);
         drop(s3);
         meta_fs.simulate_power_cut();
-        for disk in &disks { disk.simulate_power_cut(); }
+        for disk in &disks {
+            disk.simulate_power_cut();
+        }
         let recovered = engine(&meta_fs, &disks);
-        let new = recovered.put_object(1, "store", "pool", "bucket", "key-0", "text/plain", b"new").unwrap();
+        let new = recovered
+            .put_object(1, "store", "pool", "bucket", "key-0", "text/plain", b"new")
+            .unwrap();
         assert!(!ids.contains(&new.chunks[0].blob_id));
     }
 
@@ -776,18 +971,37 @@ mod tests {
         let meta_fs = SimFs::new(6245);
         let disks = [SimFs::new(6246), SimFs::new(6247), SimFs::new(6248)];
         let s3 = engine(&meta_fs, &disks);
-        s3.meta.execute(KvCommand::Put {
-            key: "/s3-upload-sequence/1".into(), value: serde_json::to_vec(&(BlobId::MAX_U24 as u64)).unwrap(),
-        }).unwrap();
-        let manifest = s3.put_object(1, "store", "pool", "bucket", "key", "text/plain", b"payload").unwrap();
+        s3.meta
+            .execute(KvCommand::Put {
+                key: "/s3-upload-sequence/1".into(),
+                value: serde_json::to_vec(&(BlobId::MAX_U24 as u64)).unwrap(),
+            })
+            .unwrap();
+        let manifest = s3
+            .put_object(
+                1,
+                "store",
+                "pool",
+                "bucket",
+                "key",
+                "text/plain",
+                b"payload",
+            )
+            .unwrap();
         let id = manifest.chunks[0].blob_id;
         assert_eq!(id.owner_id(), 1);
         assert_eq!(id.generation(), 0);
         assert_eq!(id.channel(), S3_CHANNEL);
-        s3.meta.execute(KvCommand::Put {
-            key: "/s3-upload-sequence/1".into(), value: serde_json::to_vec(&MAX_ALLOCATION).unwrap(),
-        }).unwrap();
-        assert!(matches!(s3.reserve_upload(1), Err(S3Error::GenerationExhausted)));
+        s3.meta
+            .execute(KvCommand::Put {
+                key: "/s3-upload-sequence/1".into(),
+                value: serde_json::to_vec(&MAX_ALLOCATION).unwrap(),
+            })
+            .unwrap();
+        assert!(matches!(
+            s3.reserve_upload(1),
+            Err(S3Error::GenerationExhausted)
+        ));
     }
 
     #[test]
@@ -797,12 +1011,26 @@ mod tests {
         let s3 = engine(&meta_fs, &disks);
         let (key, _, manifest) = prepared(&s3);
         let id = manifest.chunks[0].blob_id;
-        s3.get_pool("pool").unwrap().put_blob(id, b"payload").unwrap();
+        s3.get_pool("pool")
+            .unwrap()
+            .put_blob(id, b"payload")
+            .unwrap();
         advance_revisions(&s3);
-        s3.meta.execute(KvCommand::Put { key: manifest_key(), value: b"invalid-json".to_vec() }).unwrap();
-        assert!(matches!(s3.collect_orphans_at(1, 1001), Err(S3Error::Json(_))));
+        s3.meta
+            .execute(KvCommand::Put {
+                key: manifest_key(),
+                value: b"invalid-json".to_vec(),
+            })
+            .unwrap();
+        assert!(matches!(
+            s3.collect_orphans_at(1, 1001),
+            Err(S3Error::Json(_))
+        ));
         assert!(s3.meta.get(&key).is_some());
-        assert_eq!(s3.get_pool("pool").unwrap().get_blob(id).unwrap(), b"payload");
+        assert_eq!(
+            s3.get_pool("pool").unwrap().get_blob(id).unwrap(),
+            b"payload"
+        );
     }
 
     #[test]
@@ -810,10 +1038,24 @@ mod tests {
         let meta_fs = SimFs::new(6250);
         let disks = [SimFs::new(6251), SimFs::new(6252), SimFs::new(6253)];
         let s3 = engine(&meta_fs, &disks);
-        s3.meta.execute(KvCommand::Put {
-            key: ObjectStoreEngine::<SimFs>::intent_key(1, "v2-00000000000001"), value: b"occupied".to_vec(),
-        }).unwrap();
-        assert!(matches!(s3.put_object(1, "store", "pool", "bucket", "key", "text/plain", b"payload"), Err(S3Error::ConcurrentModification)));
+        s3.meta
+            .execute(KvCommand::Put {
+                key: ObjectStoreEngine::<SimFs>::intent_key(1, "v2-00000000000001"),
+                value: b"occupied".to_vec(),
+            })
+            .unwrap();
+        assert!(matches!(
+            s3.put_object(
+                1,
+                "store",
+                "pool",
+                "bucket",
+                "key",
+                "text/plain",
+                b"payload"
+            ),
+            Err(S3Error::ConcurrentModification)
+        ));
         for slot in s3.get_pool("pool").unwrap().slots() {
             assert_eq!(slot.local_store().unwrap().stats().unwrap().live_blobs, 0);
         }
@@ -827,19 +1069,27 @@ mod tests {
             let s3 = engine(&meta_fs, &disks);
             let (key, _, manifest) = prepared(&s3);
             let id = manifest.chunks[0].blob_id;
-            s3.get_pool("pool").unwrap().put_blob(id, b"payload").unwrap();
+            s3.get_pool("pool")
+                .unwrap()
+                .put_blob(id, b"payload")
+                .unwrap();
             meta_fs.set_faults(FaultConfig {
                 torn_write_prob: if torn { 1.0 } else { 0.0 },
                 write_eio_prob: if torn { 0.0 } else { 1.0 },
                 ..Default::default()
             });
-            assert!(matches!(s3.publish_upload(1, "store", &manifest, &key), Err(S3Error::Meta(_))));
+            assert!(matches!(
+                s3.publish_upload(1, "store", &manifest, &key),
+                Err(S3Error::Meta(_))
+            ));
             assert!(s3.meta.get(&manifest_key()).is_none());
             assert!(s3.meta.get(&key).is_some());
             drop(s3);
             meta_fs.set_faults(FaultConfig::default());
             meta_fs.simulate_power_cut();
-            for disk in &disks { disk.simulate_power_cut(); }
+            for disk in &disks {
+                disk.simulate_power_cut();
+            }
             let recovered = engine(&meta_fs, &disks);
             advance_revisions(&recovered);
             assert_eq!(recovered.collect_orphans_at(1, 1001).unwrap(), 1);
@@ -860,13 +1110,25 @@ mod tests {
         for _ in 0..32 {
             let (key, _, manifest) = prepared(&s3);
             let id = manifest.chunks[0].blob_id;
-            s3.get_pool("pool").unwrap().put_blob(id, b"payload").unwrap();
+            s3.get_pool("pool")
+                .unwrap()
+                .put_blob(id, b"payload")
+                .unwrap();
             advance_revisions(&s3);
             let start = std::sync::Barrier::new(2);
             let (published, collected) = std::thread::scope(|scope| {
-                let publisher = scope.spawn(|| { start.wait(); s3.publish_upload(1, "store", &manifest, &key) });
-                let collector = scope.spawn(|| { start.wait(); s3.collect_orphans_at(1, 1001) });
-                (publisher.join().unwrap(), collector.join().unwrap().unwrap())
+                let publisher = scope.spawn(|| {
+                    start.wait();
+                    s3.publish_upload(1, "store", &manifest, &key)
+                });
+                let collector = scope.spawn(|| {
+                    start.wait();
+                    s3.collect_orphans_at(1, 1001)
+                });
+                (
+                    publisher.join().unwrap(),
+                    collector.join().unwrap().unwrap(),
+                )
             });
             if published.is_ok() {
                 assert_eq!(collected, 0);
@@ -895,7 +1157,12 @@ mod tests {
         pool.put_blob(intent.chunks[0].blob_id, b"payload").unwrap();
         let unknown = BlobId::new(1, 100, 1, 1, 2, 0);
         pool.put_blob(unknown, b"unknown").unwrap();
-        s3.meta.execute(KvCommand::Put { key, value: serde_json::to_vec(&intent).unwrap() }).unwrap();
+        s3.meta
+            .execute(KvCommand::Put {
+                key,
+                value: serde_json::to_vec(&intent).unwrap(),
+            })
+            .unwrap();
         assert_eq!(s3.collect_orphans_all().unwrap(), 0);
         assert_eq!(pool.get_blob(intent.chunks[0].blob_id).unwrap(), b"payload");
         assert_eq!(pool.get_blob(unknown).unwrap(), b"unknown");
@@ -908,15 +1175,34 @@ mod tests {
         let s3 = engine(&meta_fs, &disks);
         let (key, mut intent, manifest) = prepared(&s3);
         let id = manifest.chunks[0].blob_id;
-        s3.get_pool("pool").unwrap().put_blob(id, b"payload").unwrap();
+        s3.get_pool("pool")
+            .unwrap()
+            .put_blob(id, b"payload")
+            .unwrap();
         intent.state = UploadState::Aborted;
-        s3.meta.execute(KvCommand::Put { key, value: serde_json::to_vec(&intent).unwrap() }).unwrap();
+        s3.meta
+            .execute(KvCommand::Put {
+                key,
+                value: serde_json::to_vec(&intent).unwrap(),
+            })
+            .unwrap();
         let term = s3.meta.role_info().2;
-        s3.meta.step_rpc(yadb_metakv::RaftRpc::RequestVote {
-            term: term + 1, candidate_id: 2, last_log_index: u64::MAX, last_log_term: term + 1,
-        }).unwrap();
-        assert!(matches!(s3.collect_orphans_at(1, 1001), Err(S3Error::Meta(MetaError::NotLeader { .. }))));
-        assert_eq!(s3.get_pool("pool").unwrap().get_blob(id).unwrap(), b"payload");
+        s3.meta
+            .step_rpc(yadb_metakv::RaftRpc::RequestVote {
+                term: term + 1,
+                candidate_id: 2,
+                last_log_index: u64::MAX,
+                last_log_term: term + 1,
+            })
+            .unwrap();
+        assert!(matches!(
+            s3.collect_orphans_at(1, 1001),
+            Err(S3Error::Meta(MetaError::NotLeader { .. }))
+        ));
+        assert_eq!(
+            s3.get_pool("pool").unwrap().get_blob(id).unwrap(),
+            b"payload"
+        );
     }
 
     #[test]
@@ -925,25 +1211,54 @@ mod tests {
             let meta_fs = SimFs::new(6300);
             let disks = [SimFs::new(6301), SimFs::new(6302), SimFs::new(6303)];
             let s3 = engine(&meta_fs, &disks);
-            s3.put_object(1, "store", "pool", "bucket", "live", "text/plain", b"live").unwrap();
+            s3.put_object(1, "store", "pool", "bucket", "live", "text/plain", b"live")
+                .unwrap();
             for disk in &disks[1..] {
                 disk.set_faults(FaultConfig {
                     torn_write_prob: if torn { 1.0 } else { 0.0 },
-                    write_eio_prob: if torn { 0.0 } else { 1.0 }, ..Default::default()
+                    write_eio_prob: if torn { 0.0 } else { 1.0 },
+                    ..Default::default()
                 });
             }
-            assert!(matches!(s3.put_object(1, "store", "pool", "bucket", "failed", "text/plain", b"orphan"), Err(S3Error::Blob(_))));
+            assert!(matches!(
+                s3.put_object(
+                    1,
+                    "store",
+                    "pool",
+                    "bucket",
+                    "failed",
+                    "text/plain",
+                    b"orphan"
+                ),
+                Err(S3Error::Blob(_))
+            ));
             let pending = s3.meta.scan_prefix("/s3-intent/1/");
             assert_eq!(pending.len(), 1);
             let intent: UploadIntent = serde_json::from_slice(&pending[0].1.value).unwrap();
             drop(s3);
             meta_fs.simulate_power_cut();
-            for disk in &disks { disk.set_faults(FaultConfig::default()); disk.simulate_power_cut(); }
+            for disk in &disks {
+                disk.set_faults(FaultConfig::default());
+                disk.simulate_power_cut();
+            }
             let recovered = engine(&meta_fs, &disks);
             advance_revisions(&recovered);
-            assert_eq!(recovered.collect_orphans_at(1, intent.lease_until_unix_secs + 1).unwrap(), 1);
-            assert_eq!(recovered.get_object(1, "store", "bucket", "live").unwrap().1, b"live");
-            assert!(recovered.head_object(1, "store", "bucket", "failed").is_err());
+            assert_eq!(
+                recovered
+                    .collect_orphans_at(1, intent.lease_until_unix_secs + 1)
+                    .unwrap(),
+                1
+            );
+            assert_eq!(
+                recovered
+                    .get_object(1, "store", "bucket", "live")
+                    .unwrap()
+                    .1,
+                b"live"
+            );
+            assert!(recovered
+                .head_object(1, "store", "bucket", "failed")
+                .is_err());
         }
     }
 
@@ -1003,9 +1318,24 @@ mod tests {
 
         // A reader holding the original manifest must not switch versions when
         // the object is replaced between metadata lookup and payload read.
-        s3.put_object(1, "receipts", "data-ec", "invoices-2026", "nov/inv-002.bin", "text/plain", b"replacement").unwrap();
-        assert_eq!(s3.read_manifest_range(&mf, 4090, 8200).unwrap(), payload[4090..=8200]);
-        assert!(matches!(s3.read_manifest_range(&mf, 0, mf.size), Err(S3Error::InvalidRange { .. })));
+        s3.put_object(
+            1,
+            "receipts",
+            "data-ec",
+            "invoices-2026",
+            "nov/inv-002.bin",
+            "text/plain",
+            b"replacement",
+        )
+        .unwrap();
+        assert_eq!(
+            s3.read_manifest_range(&mf, 4090, 8200).unwrap(),
+            payload[4090..=8200]
+        );
+        assert!(matches!(
+            s3.read_manifest_range(&mf, 0, mf.size),
+            Err(S3Error::InvalidRange { .. })
+        ));
 
         // Sorted listing
         let listed = s3
@@ -1033,11 +1363,8 @@ mod tests {
                 .unwrap(),
             );
         }
-        let pool = Arc::new(PoolStriper::new(
-            ErasureScheme::Mirror { replicas: 3 },
-            domains,
-        )
-        .unwrap());
+        let pool =
+            Arc::new(PoolStriper::new(ErasureScheme::Mirror { replicas: 3 }, domains).unwrap());
         s3.register_pool("wal-fast", pool.clone());
 
         // The metadata WAL remains healthy; only fragment writes are faulted.
@@ -1111,12 +1438,26 @@ mod tests {
         let s3 = ObjectStoreEngine::new(meta, 4096);
         let mut domains = Vec::new();
         for i in 0..3 {
-            domains.push(VolumeStore::open(data_fs.clone(), format!("d{i}"), VolumeConfig::default()).unwrap());
+            domains.push(
+                VolumeStore::open(data_fs.clone(), format!("d{i}"), VolumeConfig::default())
+                    .unwrap(),
+            );
         }
-        let pool = Arc::new(PoolStriper::new(ErasureScheme::Mirror { replicas: 3 }, domains).unwrap());
+        let pool =
+            Arc::new(PoolStriper::new(ErasureScheme::Mirror { replicas: 3 }, domains).unwrap());
         s3.register_pool("pool", pool.clone());
 
-        let live = s3.put_object(1, "store", "pool", "bucket", "key", "text/plain", b"live-value").unwrap();
+        let live = s3
+            .put_object(
+                1,
+                "store",
+                "pool",
+                "bucket",
+                "key",
+                "text/plain",
+                b"live-value",
+            )
+            .unwrap();
         let orphan_id = BlobId::new(1, 0, 77, 1, S3_CHANNEL, 0);
         pool.put_blob(orphan_id, b"orphan-value").unwrap();
         let upload_id = format!("v2-{:014x}", 77);
@@ -1126,17 +1467,32 @@ mod tests {
             manifest_key: "/s3/1/store/bucket/orphan".into(),
             generation: 77,
             pool: "pool".into(),
-            chunks: vec![ChunkRef { blob_id: orphan_id, offset: 0, len: 12 }],
+            chunks: vec![ChunkRef {
+                blob_id: orphan_id,
+                offset: 0,
+                len: 12,
+            }],
             state: UploadState::Prepared,
             created_revision: 0,
             lease_until_revision: 0,
             lease_until_unix_secs: 0,
             allocation_id: Some(77),
         };
-        s3.meta.execute(KvCommand::Put { key: intent_key, value: serde_json::to_vec(&intent).unwrap() }).unwrap();
+        s3.meta
+            .execute(KvCommand::Put {
+                key: intent_key,
+                value: serde_json::to_vec(&intent).unwrap(),
+            })
+            .unwrap();
         assert_eq!(s3.collect_orphans(1).unwrap(), 1);
-        assert!(matches!(pool.get_blob(orphan_id), Err(BlobError::NotFound(_))));
-        assert_eq!(s3.get_object(1, "store", "bucket", "key").unwrap().1, b"live-value");
+        assert!(matches!(
+            pool.get_blob(orphan_id),
+            Err(BlobError::NotFound(_))
+        ));
+        assert_eq!(
+            s3.get_object(1, "store", "bucket", "key").unwrap().1,
+            b"live-value"
+        );
         assert_eq!(live.size, 10);
     }
 
@@ -1147,18 +1503,31 @@ mod tests {
         let s3 = ObjectStoreEngine::new(meta, 4096);
         let mut domains = Vec::new();
         for i in 0..3 {
-            domains.push(VolumeStore::open(fs.clone(), format!("d{i}"), VolumeConfig::default()).unwrap());
+            domains.push(
+                VolumeStore::open(fs.clone(), format!("d{i}"), VolumeConfig::default()).unwrap(),
+            );
         }
-        let pool = Arc::new(PoolStriper::new(ErasureScheme::Mirror { replicas: 3 }, domains).unwrap());
+        let pool =
+            Arc::new(PoolStriper::new(ErasureScheme::Mirror { replicas: 3 }, domains).unwrap());
         s3.register_pool("pool", pool.clone());
-        let old = s3.put_object(1, "store", "pool", "bucket", "key", "text/plain", b"old").unwrap();
-        let new = s3.put_object(1, "store", "pool", "bucket", "key", "text/plain", b"new").unwrap();
+        let old = s3
+            .put_object(1, "store", "pool", "bucket", "key", "text/plain", b"old")
+            .unwrap();
+        let new = s3
+            .put_object(1, "store", "pool", "bucket", "key", "text/plain", b"new")
+            .unwrap();
         assert_eq!(s3.collect_orphans(1).unwrap(), 0);
         assert_eq!(s3.read_manifest_range(&old, 0, 2).unwrap(), b"old");
-        assert_eq!(s3.get_object(1, "store", "bucket", "key").unwrap().1, b"new");
+        assert_eq!(
+            s3.get_object(1, "store", "bucket", "key").unwrap().1,
+            b"new"
+        );
         assert!(s3.delete_object(1, "store", "bucket", "key").unwrap());
         assert_eq!(s3.collect_orphans(1).unwrap(), 0);
-        assert!(matches!(s3.head_object(1, "store", "bucket", "key"), Err(S3Error::ObjectNotFound { .. })));
+        assert!(matches!(
+            s3.head_object(1, "store", "bucket", "key"),
+            Err(S3Error::ObjectNotFound { .. })
+        ));
         assert_eq!(s3.read_manifest_range(&new, 0, 2).unwrap(), b"new");
     }
 }

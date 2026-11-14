@@ -26,6 +26,9 @@ pub enum BlockError {
     #[error("metakv error: {0}")]
     Meta(#[from] MetaError),
 
+    #[error("volume changed during a consistent read: blob {blob_id} is unavailable")]
+    Inconsistent { blob_id: BlobId },
+
     #[error("JSON serialization error: {0}")]
     Json(#[from] serde_json::Error),
 
@@ -310,6 +313,57 @@ impl<FS: StorageFs> BlockVolumeEngine<FS> {
 
         let pool = self.get_pool(pool_name)?;
         let map = self.load_map(project_id, volume)?;
+        self.read_map_range(&pool, &map, offset, len, false)
+    }
+
+    /// Quorum-confirmed read of one volume range on the OpenRaft group leader.
+    /// The map reflects committed state as of the read, and its immutable blobs
+    /// were published before the map. Legacy metadata stores return a routing error.
+    pub fn read_at_consistent(
+        &self,
+        project_id: u32,
+        volume: &str,
+        pool_name: &str,
+        volume_size_bytes: u64,
+        offset: u64,
+        len: usize,
+    ) -> Result<Vec<u8>, BlockError> {
+        if offset
+            .checked_add(len as u64)
+            .is_none_or(|end| end > volume_size_bytes)
+        {
+            return Err(BlockError::OutOfBounds {
+                offset,
+                len,
+                size_bytes: volume_size_bytes,
+            });
+        }
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+        let pool = self.get_pool(pool_name)?;
+        let key = Self::meta_key(project_id, volume);
+        let snapshot = self.meta.try_linearizable_snapshot(&[key.clone()], &[])?;
+        let map = match snapshot.get(&key) {
+            Some(kv) => serde_json::from_slice(&kv.value)?,
+            None => VolumeExtentMap {
+                block_size: self.block_size,
+                generation: 1,
+                blocks: BTreeMap::new(),
+            },
+        };
+        // Re-reading the map here would discard the quorum-confirmed view.
+        self.read_map_range(&pool, &map, offset, len, true)
+    }
+
+    fn read_map_range(
+        &self,
+        pool: &PoolStriper<FS>,
+        map: &VolumeExtentMap,
+        offset: u64,
+        len: usize,
+        consistent: bool,
+    ) -> Result<Vec<u8>, BlockError> {
         let bs = map.block_size as u64;
 
         let mut out = vec![0u8; len];
@@ -321,7 +375,22 @@ impl<FS: StorageFs> BlockVolumeEngine<FS> {
             let copy_len = (len - cursor).min(bs as usize - in_blk_off);
 
             if let Some(&blob_id) = map.blocks.get(&blk_idx) {
-                let blk_data = pool.get_blob(blob_id)?;
+                let blk_data = pool.get_blob(blob_id).map_err(|err| {
+                    // The linearizable map snapshot does not fence GC: an old
+                    // referenced blob may disappear before we fetch it.
+                    if consistent
+                        && matches!(
+                            err,
+                            BlobError::NotFound(_)
+                                | BlobError::Tombstoned(_)
+                                | BlobError::InsufficientFragments { .. }
+                        )
+                    {
+                        BlockError::Inconsistent { blob_id }
+                    } else {
+                        BlockError::Blob(err)
+                    }
+                })?;
                 out[cursor..cursor + copy_len]
                     .copy_from_slice(&blk_data[in_blk_off..in_blk_off + copy_len]);
             }
@@ -350,6 +419,87 @@ mod tests {
             })
             .collect();
         Arc::new(PoolStriper::new(ErasureScheme::Mirror { replicas: 3 }, domains).unwrap())
+    }
+
+    #[test]
+    fn consistent_map_reader_matches_legacy_for_cross_block_ranges() {
+        let fs = SimFs::new(8812);
+        let meta = LocalMetaKv::open_single_node(&fs, "meta", 1).unwrap();
+        let engine = BlockVolumeEngine::new(meta, 4096);
+        let pool = pool(&fs);
+        engine.register_pool("data", pool.clone());
+        let data = (0..8192).map(|i| (i % 251) as u8).collect::<Vec<_>>();
+        engine.write_at(1, "disk", "data", 12288, 0, &data).unwrap();
+        let map = engine.load_map(1, "disk").unwrap();
+        for (offset, len) in [(0, 8192), (123, 6000)] {
+            assert_eq!(
+                engine
+                    .read_map_range(&pool, &map, offset, len, true)
+                    .unwrap(),
+                engine
+                    .read_at(1, "disk", "data", 12288, offset, len)
+                    .unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn consistent_read_bounds_and_empty_match_legacy() {
+        let fs = SimFs::new(8813);
+        let meta = LocalMetaKv::open_single_node(&fs, "meta", 1).unwrap();
+        let engine = BlockVolumeEngine::new(meta, 4096);
+        for (size, offset, len) in [(10, 11, 0), (10, 9, 2), (u64::MAX, u64::MAX, 1)] {
+            let a = engine
+                .read_at(1, "disk", "missing", size, offset, len)
+                .unwrap_err();
+            let b = engine
+                .read_at_consistent(1, "disk", "missing", size, offset, len)
+                .unwrap_err();
+            assert!(matches!(a, BlockError::OutOfBounds { .. }));
+            assert_eq!(a.to_string(), b.to_string());
+        }
+        assert_eq!(
+            engine.read_at(1, "disk", "missing", 10, 10, 0).unwrap(),
+            engine
+                .read_at_consistent(1, "disk", "missing", 10, 10, 0)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn consistent_read_rejects_legacy_metadata() {
+        let fs = SimFs::new(8814);
+        let meta = LocalMetaKv::open_single_node(&fs, "meta", 1).unwrap();
+        let engine = BlockVolumeEngine::new(meta, 4096);
+        engine.register_pool("data", pool(&fs));
+        engine
+            .write_at(1, "disk", "data", 4096, 0, b"data")
+            .unwrap();
+        assert!(
+            matches!(engine.read_at_consistent(1, "disk", "data", 4096, 0, 4),
+            Err(BlockError::Meta(MetaError::Routing(message))) if message == "linearizable snapshot requires OpenRaft")
+        );
+    }
+
+    #[test]
+    fn consistent_map_reader_rejects_tombstoned_blob() {
+        let fs = SimFs::new(8815);
+        let meta = LocalMetaKv::open_single_node(&fs, "meta", 1).unwrap();
+        let engine = BlockVolumeEngine::new(meta, 4096);
+        let pool = pool(&fs);
+        engine.register_pool("data", pool.clone());
+        engine
+            .write_at(1, "disk", "data", 4096, 0, b"data")
+            .unwrap();
+        let map = engine.load_map(1, "disk").unwrap();
+        let id = map.blocks[&0];
+        assert!(pool.delete(id).unwrap());
+        assert!(matches!(engine.read_map_range(&pool, &map, 0, 4, true),
+            Err(BlockError::Inconsistent { blob_id }) if blob_id == id));
+        assert!(matches!(
+            engine.read_at(1, "disk", "data", 4096, 0, 4),
+            Err(BlockError::Blob(BlobError::NotFound(_)))
+        ));
     }
 
     #[test]

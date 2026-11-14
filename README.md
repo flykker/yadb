@@ -2,6 +2,51 @@
 
 Development priorities, reliability work and future features: [ROADMAP.md](ROADMAP.md).
 
+OpenRaft client routing for a **new empty nonproduction cluster** is under
+implementation: [scope and safeguards](docs/openraft-empty-test-cluster.md).
+Legacy remains the default. Multi-group facade/engine tests pass for two projects
+on separate data groups. A child-daemon integration test also passed with singleton
+groups, and a targeted three-process test covered multi-node HTTP leader routing.
+Broader daemon validation remains open; no cluster was deployed.
+This work does not authorize reusing existing data or imply production readiness.
+See the [production checklist](docs/multiraft-production-todo.md).
+
+The experimental local-cluster generator opts into per-group leader preferences
+(control 1 → node 1, data 2 → node 2, data 3 → node 3) and relaxed Raft
+timings. These settings bias elections, not placement guarantees or workload
+balancing; failover remains enabled. A healthy nonpreferred leader is not
+automatically displaced when the preferred node returns. Authenticated
+`/experimental/openraft/status` reports each group's observed `leader_id`,
+`preferred_leader`, and `preference_met` (null when either is unknown). The
+ordinary health leader refers only to the control group. All replicas of a
+group must use the same preference and timing values; the election maximum is
+also the OpenRaft leader-lease duration. Defaults remain unchanged when the
+opt-in fields are absent. These local timing values are not a diagnosed fix
+for replication issues and require evaluation for each deployment.
+
+For example, for group 2 on **all** its voters, add to the version-1 group
+config (choose preferred node 1 for group 1 and 3 for group 3):
+
+```json
+"preferred_leader": 2,
+"raft_timing": {
+  "heartbeat_ms": 250,
+  "election_min_ms": 1500,
+  "nonpreferred_election_min_ms": 2750,
+  "election_max_ms": 3000
+}
+```
+
+The two election ranges overlap by design because the maximum must remain
+common; a nonpreferred voter can legitimately win. Both fields are opt-in
+together, and `preferred_leader` must identify a voter.
+
+The status endpoint is the authenticated experimental endpoint
+`GET /experimental/openraft/status`; it is not an unauthenticated admin
+interface. Configure the preference on every replica of the group. A returning
+preferred node does not automatically reclaim a healthy leader, and failover
+availability remains enabled.
+
 `yadb` is a modular Rust distributed storage and multi-tenant data platform inspired by **YDB's immutable `BlobStorage` + Tablets** and **Kubernetes' declarative YAML control plane**—designed to run directly on standard Linux filesystems (`ext4`/`xfs`) without raw `PDisk` block devices.
 
 ## Highlights
@@ -221,6 +266,8 @@ Clock changes can affect cleanup timing, but are not the publication safety fenc
 In clustered mode the leader runs scrub periodically; `/v1/pools/scrub` also requests it
 explicitly. `orphan_blobs_collected` counts logical blobs, not physical fragments;
 `orphan_collection_error` exposes cleanup failures (partial progress is not a total).
+These scrub and orphan-GC operations are disabled in experimental Multi-Raft mode;
+do not rely on automatic repair or reclamation there.
 
 **Retention is deliberately conservative:** overwritten/deleted manifests and their
 fragments remain stored because an in-flight reader on another node can hold an old
@@ -388,6 +435,17 @@ filesystem read-write across multiple VMs is not safe without additional coordin
 UNMAP drops logical extent references; it does not yet reclaim the old fragments on disk.
 Keep the legacy HTTP/control-plane ports private: their existing subject headers are a
 trusted internal interface, not a replacement for protocol authentication.
+`/v1/apply` additionally requires a signed, allowlisted admin subject: start the
+daemon with `--subject-secret` and `--admin-subject <subject>`, and pass the same
+secret to `yadbctl` via `--subject-secret` (or `YADB_SUBJECT_SECRET`). Unsigned,
+forged, or non-allowlisted callers are refused.
+A keyed `/v1/apply` is idempotent: send `Idempotency-Key: <1-128 of [A-Za-z0-9._~-]>`
+and the daemon commits the response record in the same Raft transaction as the
+mutation, so a retry with the same key and payload replays the recorded response
+instead of re-applying, a different payload under the same key is refused with 409,
+and `POST /v1/idempotency/resolve` with `{"scope":"control","key":"<key>"}` answers
+`committed`, `not_committed`, or `unknown`. Keys are not supported on SQL, S3 or
+block writes (501), and the record set has no quota yet.
 
 ## Quickstart
 
@@ -424,3 +482,14 @@ cargo test --offline
   --project billing --volume vm-root --subject sa:billing-backend \
   --offset 4096 --data "HELLO-YADB-BLOCK-STORE"
 ```
+
+## Testing
+
+`cargo test` runs the MetaKV library target's tests in parallel. The OpenRaft
+cluster tests assert progress against real wall-clock deadlines — a quorum
+confirmation inside `heartbeat_interval`, a write inside the client bridge
+deadline, a snapshot installed before a purge — so they are serialized through a
+process-global test gate (`crates/yadb-metakv/src/openraft_test_gate.rs`). A full
+run is therefore slower than the test count suggests. A red run in these tests
+should be investigated as either a real quorum/leadership problem or CPU
+starvation, not retried.

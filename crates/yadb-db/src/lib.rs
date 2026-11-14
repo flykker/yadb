@@ -9,7 +9,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use yadb_blob::{BlobError, PoolStriper};
 use yadb_io::StorageFs;
-use yadb_metakv::{KvCommand, KvResult, LocalMetaKv, MetaError, MetaSnapshot, RevisionGuard, TxnOp};
+use yadb_metakv::{
+    KvCommand, KvResult, LocalMetaKv, MetaError, MetaSnapshot, RevisionGuard, TxnOp,
+};
 
 #[cfg(test)]
 thread_local! {
@@ -22,7 +24,9 @@ thread_local! {
 #[cfg(test)]
 fn after_dml_collection() {
     let hook = AFTER_DML_COLLECTION.with(|slot| slot.borrow_mut().take());
-    if let Some(hook) = hook { hook(); }
+    if let Some(hook) = hook {
+        hook();
+    }
 }
 
 pub use sql::{
@@ -170,7 +174,10 @@ impl<FS: StorageFs> Clone for DatabaseEngine<FS> {
 
 impl<FS: StorageFs> DatabaseEngine<FS> {
     pub fn has_session(&self, pid: u32, db: &str, subject: &str) -> bool {
-        self.sessions.lock().unwrap().contains_key(&format!("{pid}:{db}:{subject}"))
+        self.sessions
+            .lock()
+            .unwrap()
+            .contains_key(&format!("{pid}:{db}:{subject}"))
     }
     pub fn new(meta: LocalMetaKv<FS>, flush_threshold_rows: usize) -> Self {
         Self {
@@ -356,12 +363,8 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
         }];
         let mut live_rows = Vec::new();
         for shard_idx in 0..schema.shards {
-            let (rows, revision) = self.scan_committed_shard_rows_with_revision(
-                project_id,
-                db,
-                &schema,
-                shard_idx,
-            )?;
+            let (rows, revision) =
+                self.scan_committed_shard_rows_with_revision(project_id, db, &schema, shard_idx)?;
             live_rows.extend(rows);
             // Guard the manifest that supplied these rows, not a later read of
             // metadata. Revision zero protects an absent (empty) shard too.
@@ -377,7 +380,12 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
             let pk_bytes = row[schema.pk_index].encode_order_preserving_key()?;
             ops.push(TxnOp::Put {
                 key: Self::index_entry_key(
-                    project_id, db, &table, &index_name, &row[col_idx], &pk_bytes,
+                    project_id,
+                    db,
+                    &table,
+                    &index_name,
+                    &row[col_idx],
+                    &pk_bytes,
                 )?,
                 value: pk_bytes,
             });
@@ -504,7 +512,13 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
         tx: Option<&TxBuffer>,
     ) -> Result<Vec<Vec<SqlValue>>, DbError> {
         self.collect_table_rows_at_boundaries(
-            project_id, db, schema, resolved_preds, tx, |_| {}, || {},
+            project_id,
+            db,
+            schema,
+            resolved_preds,
+            tx,
+            |_| {},
+            || {},
         )
     }
 
@@ -525,23 +539,36 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
         let mut keys = vec![schema_key.clone()];
         let mut prefixes = Vec::new();
         let pk_predicate = resolved_preds.iter().find(|(col_i, pred)| {
-            *col_i == schema.pk_index && pred.op == CmpOp::Eq
-                && pred.value.check_type(schema.columns[*col_i].col_type, false)
+            *col_i == schema.pk_index
+                && pred.op == CmpOp::Eq
+                && pred
+                    .value
+                    .check_type(schema.columns[*col_i].col_type, false)
         });
         if let Some((_, pred)) = pk_predicate {
             let pk = pred.value.encode_order_preserving_key()?;
-            keys.push(Self::shard_meta_key(project_id, db, &schema.table,
-                Self::route_shard(&pk, schema.shards)));
+            keys.push(Self::shard_meta_key(
+                project_id,
+                db,
+                &schema.table,
+                Self::route_shard(&pk, schema.shards),
+            ));
         } else {
             prefixes.push(format!("/db/{project_id}/{db}/shards/{}/", schema.table));
-            let has_overlay = tx.and_then(|buf| buf.writes.get(&schema.table))
+            let has_overlay = tx
+                .and_then(|buf| buf.writes.get(&schema.table))
                 .is_some_and(|rows| !rows.is_empty());
             if !has_overlay {
                 for (col_i, pred) in resolved_preds {
                     if pred.op == CmpOp::Eq {
-                        if let Some(index) = schema.indexes.iter().find(|ix| ix.col_index == *col_i) {
+                        if let Some(index) = schema.indexes.iter().find(|ix| ix.col_index == *col_i)
+                        {
                             prefixes.push(Self::index_prefix_value(
-                                project_id, db, &schema.table, &index.name, &pred.value,
+                                project_id,
+                                db,
+                                &schema.table,
+                                &index.name,
+                                &pred.value,
                             )?);
                             break;
                         }
@@ -550,7 +577,8 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
             }
         }
         let snapshot = self.meta.snapshot(&keys, &prefixes);
-        let schema_value = snapshot.get(&schema_key)
+        let schema_value = snapshot
+            .get(&schema_key)
             .ok_or_else(|| DbError::TableNotFound(schema.table.clone()))?;
         let snapshot_schema: TableSchema = serde_json::from_slice(&schema_value.value)?;
         if snapshot_schema != *schema {
@@ -559,8 +587,14 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
             ));
         }
         self.collect_table_rows_from_snapshot(
-            project_id, db, schema, resolved_preds, tx, &snapshot,
-            after_shard_scan, after_index_scan,
+            project_id,
+            db,
+            schema,
+            resolved_preds,
+            tx,
+            &snapshot,
+            after_shard_scan,
+            after_index_scan,
         )
     }
 
@@ -582,18 +616,23 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
         for (col_i, pred) in resolved_preds {
             if *col_i == schema.pk_index
                 && pred.op == CmpOp::Eq
-                && pred.value.check_type(schema.columns[*col_i].col_type, false)
+                && pred
+                    .value
+                    .check_type(schema.columns[*col_i].col_type, false)
             {
                 let pk_bytes = pred.value.encode_order_preserving_key()?;
                 let mut out = Vec::new();
-                let overlay = tx.and_then(|buf| buf.writes.get(&schema.table))
+                let overlay = tx
+                    .and_then(|buf| buf.writes.get(&schema.table))
                     .and_then(|rows| rows.get(&pk_bytes));
                 let row = if let Some((_, row)) = overlay {
                     row.clone()
                 } else {
                     let shard_idx = Self::route_shard(&pk_bytes, schema.shards);
                     self.snapshot_tablet(project_id, db, schema, snapshot, &mut tablets, shard_idx)?
-                        .map(|tablet| tablet.get_row(&pk_bytes)).transpose()?.flatten()
+                        .map(|tablet| tablet.get_row(&pk_bytes))
+                        .transpose()?
+                        .flatten()
                 };
                 if let Some(row) = row {
                     if resolved_preds.iter().all(|(ci, p)| p.eval(&row[*ci])) {
@@ -624,9 +663,18 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
                         let mut out = Vec::with_capacity(idx_hits.len());
                         for (_, kv) in idx_hits {
                             let shard_idx = Self::route_shard(&kv.value, schema.shards);
-                            let row = self.snapshot_tablet(project_id, db, schema, snapshot,
-                                &mut tablets, shard_idx)?
-                                .map(|tablet| tablet.get_row(&kv.value)).transpose()?.flatten();
+                            let row = self
+                                .snapshot_tablet(
+                                    project_id,
+                                    db,
+                                    schema,
+                                    snapshot,
+                                    &mut tablets,
+                                    shard_idx,
+                                )?
+                                .map(|tablet| tablet.get_row(&kv.value))
+                                .transpose()?
+                                .flatten();
                             if let Some(row) = row {
                                 if resolved_preds.iter().all(|(ci, p)| p.eval(&row[*ci])) {
                                     out.push(row);
@@ -644,9 +692,9 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
         // 3. Full shard scan + uncommitted transaction overlay
         let mut by_pk: BTreeMap<Vec<u8>, Vec<SqlValue>> = BTreeMap::new();
         for shard_idx in 0..schema.shards {
-            if let Some(tablet) = self.snapshot_tablet(
-                project_id, db, schema, snapshot, &mut tablets, shard_idx,
-            )? {
+            if let Some(tablet) =
+                self.snapshot_tablet(project_id, db, schema, snapshot, &mut tablets, shard_idx)?
+            {
                 for row in tablet.scan_all_live_rows()? {
                     let pk = row[schema.pk_index].encode_order_preserving_key()?;
                     by_pk.insert(pk, row);
@@ -692,8 +740,11 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
             let key = Self::shard_meta_key(project_id, db, &schema.table, shard_idx);
             let tablet = match snapshot.get(&key) {
                 Some(value) => Some(DataShardTablet::open_snapshot_value(
-                    self.meta.clone(), key, value,
-                    self.get_pool(&schema.wal_pool)?, self.get_pool(&schema.data_pool)?,
+                    self.meta.clone(),
+                    key,
+                    value,
+                    self.get_pool(&schema.wal_pool)?,
+                    self.get_pool(&schema.data_pool)?,
                 )?),
                 None => None,
             };
@@ -706,12 +757,7 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
     /// using immutable preparation followed by one atomic metadata transaction:
     /// - Phase 1: write immutable WAL batches to `walPool` for every touched shard;
     /// - Phase 2: `RevisionTxn` sealing all shard manifests + secondary index keys.
-    fn commit_tx_buffer(
-        &self,
-        project_id: u32,
-        db: &str,
-        tx: TxBuffer,
-    ) -> Result<(), DbError> {
+    fn commit_tx_buffer(&self, project_id: u32, db: &str, tx: TxBuffer) -> Result<(), DbError> {
         self.commit_tx_buffer_at_boundaries(project_id, db, tx, || {}, || {})
     }
 
@@ -731,21 +777,28 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
 
         let mut schemas: BTreeMap<String, (TableSchema, u64)> = BTreeMap::new();
         #[allow(clippy::type_complexity)]
-        let mut shard_batches: BTreeMap<(String, u32), Vec<(Vec<u8>, Option<Vec<SqlValue>>)>> =
-            BTreeMap::new();
+        let mut shard_batches: BTreeMap<
+            (String, u32),
+            Vec<(Vec<u8>, Option<Vec<SqlValue>>)>,
+        > = BTreeMap::new();
         #[allow(clippy::type_complexity)]
-        let mut expected_rows: BTreeMap<(String, u32), Vec<(Vec<u8>, Option<Vec<SqlValue>>)>> =
-            BTreeMap::new();
+        let mut expected_rows: BTreeMap<
+            (String, u32),
+            Vec<(Vec<u8>, Option<Vec<SqlValue>>)>,
+        > = BTreeMap::new();
         let mut index_ops: Vec<TxnOp> = Vec::new();
 
         for (table, pk_map) in tx.writes {
             if pk_map.is_empty() {
                 continue;
             }
-            let (schema, schema_revision) = self.load_schema_with_revision(project_id, db, &table)?;
+            let (schema, schema_revision) =
+                self.load_schema_with_revision(project_id, db, &table)?;
             for (pk_bytes, (old_row, new_row)) in pk_map {
                 if self.read_committed_row(project_id, db, &schema, &pk_bytes)? != old_row {
-                    return Err(DbError::InvalidQuery("transaction write conflict; restart transaction".into()));
+                    return Err(DbError::InvalidQuery(
+                        "transaction write conflict; restart transaction".into(),
+                    ));
                 }
                 let shard_idx = Self::route_shard(&pk_bytes, schema.shards);
                 expected_rows
@@ -897,7 +950,15 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
         default_shards: u32,
         sql: &str,
     ) -> Result<QueryResult, DbError> {
-        self.execute_sql_with_session(project_id, db, wal_pool, data_pool, default_shards, None, sql)
+        self.execute_sql_with_session(
+            project_id,
+            db,
+            wal_pool,
+            data_pool,
+            default_shards,
+            None,
+            sql,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1147,8 +1208,14 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
                     ));
                 }
                 self.create_index_at_boundaries(
-                    project_id, db, index_name, if_not_exists, table, column,
-                    |_| {}, || {},
+                    project_id,
+                    db,
+                    index_name,
+                    if_not_exists,
+                    table,
+                    column,
+                    |_| {},
+                    || {},
                 )
             }
 
@@ -1162,7 +1229,8 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
                         "DROP INDEX cannot run inside an open transaction".into(),
                     ));
                 }
-                let (mut schema, schema_revision) = self.load_schema_with_revision(project_id, db, &table)?;
+                let (mut schema, schema_revision) =
+                    self.load_schema_with_revision(project_id, db, &table)?;
                 let Some(pos) = schema
                     .indexes
                     .iter()
@@ -1199,8 +1267,11 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
                     ops,
                 })? {
                     KvResult::TxnOk { .. } => (),
-                    KvResult::CasConflict { .. } => return Err(DbError::InvalidQuery(
-                        "concurrent schema modification during DROP INDEX".into())),
+                    KvResult::CasConflict { .. } => {
+                        return Err(DbError::InvalidQuery(
+                            "concurrent schema modification during DROP INDEX".into(),
+                        ))
+                    }
                     _ => unreachable!(),
                 }
 
@@ -1262,13 +1333,8 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
                     }
 
                     let pk_bytes = full_row[schema.pk_index].encode_order_preserving_key()?;
-                    let existing = self.read_row_in_tx(
-                        project_id,
-                        db,
-                        &schema,
-                        &pk_bytes,
-                        Some(&working_tx),
-                    )?;
+                    let existing =
+                        self.read_row_in_tx(project_id, db, &schema, &pk_bytes, Some(&working_tx))?;
                     if !upsert && existing.is_some() {
                         return Err(DbError::DuplicatePrimaryKey(table));
                     }
@@ -1366,7 +1432,9 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
                         #[cfg(test)]
                         {
                             let hook = AFTER_DML_TARGET_CHECK.with(|slot| slot.borrow_mut().take());
-                            if let Some(hook) = hook { hook(); }
+                            if let Some(hook) = hook {
+                                hook();
+                            }
                         }
                         // The target was observed absent above. Do not reread it:
                         // a concurrent insert must conflict at commit, not become
@@ -1456,7 +1524,8 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
                                         "unknown column `{name}` in SELECT list"
                                     ))
                                 })?;
-                            out_cols.push(alias.unwrap_or_else(|| schema.columns[pos].name.clone()));
+                            out_cols
+                                .push(alias.unwrap_or_else(|| schema.columns[pos].name.clone()));
                             proj_idxs.push(pos);
                         }
                         SelectItem::Aggregate { .. } => unreachable!(),
@@ -1473,7 +1542,11 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
                             let cmp = a[schema_pos]
                                 .sql_cmp(&b[schema_pos])
                                 .unwrap_or(Ordering::Equal);
-                            if desc { cmp.reverse() } else { cmp }
+                            if desc {
+                                cmp.reverse()
+                            } else {
+                                cmp
+                            }
                         });
                     } else if let Some(alias_pos) = out_cols
                         .iter()
@@ -1481,10 +1554,12 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
                     {
                         let src_idx = proj_idxs[alias_pos];
                         rows.sort_by(|a, b| {
-                            let cmp = a[src_idx]
-                                .sql_cmp(&b[src_idx])
-                                .unwrap_or(Ordering::Equal);
-                            if desc { cmp.reverse() } else { cmp }
+                            let cmp = a[src_idx].sql_cmp(&b[src_idx]).unwrap_or(Ordering::Equal);
+                            if desc {
+                                cmp.reverse()
+                            } else {
+                                cmp
+                            }
                         });
                     } else {
                         return Err(DbError::InvalidQuery(format!(
@@ -1624,10 +1699,7 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
                 .iter()
                 .position(|c| c.name.eq_ignore_ascii_case(&pred.column))
                 .ok_or_else(|| {
-                    DbError::InvalidQuery(format!(
-                        "unknown column `{}` in {clause}",
-                        pred.column
-                    ))
+                    DbError::InvalidQuery(format!("unknown column `{}` in {clause}", pred.column))
                 })?;
             out.push((idx, pred));
         }
@@ -1728,7 +1800,11 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
                             "column `{name}` must appear in GROUP BY or be wrapped in an aggregate function"
                         )));
                     }
-                    out_cols.push(alias.clone().unwrap_or_else(|| schema.columns[pos].name.clone()));
+                    out_cols.push(
+                        alias
+                            .clone()
+                            .unwrap_or_else(|| schema.columns[pos].name.clone()),
+                    );
                 }
                 SelectItem::Aggregate {
                     func,
@@ -1822,7 +1898,8 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
                                     Some(ci) => grows
                                         .iter()
                                         .filter(|r| !matches!(r[ci], SqlValue::Null))
-                                        .count() as i64,
+                                        .count()
+                                        as i64,
                                 };
                                 SqlValue::Int(cnt)
                             }
@@ -1836,7 +1913,11 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
                                         any = true;
                                     }
                                 }
-                                if any { SqlValue::Int(sum) } else { SqlValue::Null }
+                                if any {
+                                    SqlValue::Int(sum)
+                                } else {
+                                    SqlValue::Null
+                                }
                             }
                             AggFunc::Avg => {
                                 let ci = col_pos.unwrap();
@@ -1914,7 +1995,11 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
                 })?;
             out_rows.sort_by(|a, b| {
                 let cmp = a[ord_pos].sql_cmp(&b[ord_pos]).unwrap_or(Ordering::Equal);
-                if desc { cmp.reverse() } else { cmp }
+                if desc {
+                    cmp.reverse()
+                } else {
+                    cmp
+                }
             });
         }
 
@@ -1943,9 +2028,8 @@ mod tests {
                 VolumeStore::open(fs.clone(), format!("wal_{i}"), VolumeConfig::default()).unwrap(),
             );
         }
-        let wal = Arc::new(
-            PoolStriper::new(ErasureScheme::Mirror { replicas: 3 }, wal_doms).unwrap(),
-        );
+        let wal =
+            Arc::new(PoolStriper::new(ErasureScheme::Mirror { replicas: 3 }, wal_doms).unwrap());
 
         let mut data_doms = Vec::new();
         for i in 0..6 {
@@ -1976,17 +2060,37 @@ mod tests {
             let run = |engine: &DatabaseEngine<SimFs>, sql: &str| {
                 engine.execute_sql(1, "db", "wal", "data", 4, sql).unwrap()
             };
-            let id_in = |shard| (1..100).find(|id| DatabaseEngine::<SimFs>::route_shard(
-                &SqlValue::Int(*id).encode_order_preserving_key().unwrap(), 4) == shard).unwrap();
+            let id_in = |shard| {
+                (1..100)
+                    .find(|id| {
+                        DatabaseEngine::<SimFs>::route_shard(
+                            &SqlValue::Int(*id).encode_order_preserving_key().unwrap(),
+                            4,
+                        ) == shard
+                    })
+                    .unwrap()
+            };
             let (a, b) = (id_in(0), id_in(3));
             run(&first, &format!("CREATE TABLE t (id INT PRIMARY KEY, v INT); INSERT INTO t VALUES ({a},10),({b},10);"));
             if indexed {
-                run(&first, &format!("UPDATE t SET v=20 WHERE id={b}; CREATE INDEX by_v ON t (v);"));
+                run(
+                    &first,
+                    &format!("UPDATE t SET v=20 WHERE id={b}; CREATE INDEX by_v ON t (v);"),
+                );
             }
             let schema = first.load_schema(1, "db", "t").unwrap();
             let predicates = if indexed {
-                vec![(1, Predicate { column: "v".into(), op: CmpOp::Eq, value: SqlValue::Int(10) })]
-            } else { vec![] };
+                vec![(
+                    1,
+                    Predicate {
+                        column: "v".into(),
+                        op: CmpOp::Eq,
+                        value: SqlValue::Int(10),
+                    },
+                )]
+            } else {
+                vec![]
+            };
             // One atomic commit changes both shards. A scan must not return
             // old a/new b; an index lookup must not combine old hits/new rows.
             let update = || {
@@ -1999,19 +2103,42 @@ mod tests {
                 }
             };
             let result = first.collect_table_rows_at_boundaries(
-                1, "db", &schema, &predicates, None,
-                |shard| { if !indexed && shard == 0 { update(); } },
-                || { if indexed { update(); } },
+                1,
+                "db",
+                &schema,
+                &predicates,
+                None,
+                |shard| {
+                    if !indexed && shard == 0 {
+                        update();
+                    }
+                },
+                || {
+                    if indexed {
+                        update();
+                    }
+                },
             );
             let mut expected_old = vec![vec![SqlValue::Int(a), SqlValue::Int(10)]];
-            if !indexed { expected_old.push(vec![SqlValue::Int(b), SqlValue::Int(10)]); }
+            if !indexed {
+                expected_old.push(vec![SqlValue::Int(b), SqlValue::Int(10)]);
+            }
             expected_old.sort_by(|a, b| a[0].sql_cmp(&b[0]).unwrap());
-            assert_eq!(result.unwrap(), expected_old,
-                "collection must preserve its pinned state (indexed={indexed})");
+            assert_eq!(
+                result.unwrap(),
+                expected_old,
+                "collection must preserve its pinned state (indexed={indexed})"
+            );
             let rows = run(&first, "SELECT v FROM t ORDER BY id;").rows;
             if indexed {
-                assert_eq!(run(&first, "SELECT id FROM t WHERE v=10;").rows, vec![vec![SqlValue::Int(b)]]);
-                assert_eq!(run(&first, "SELECT id FROM t WHERE v=20;").rows, vec![vec![SqlValue::Int(a)]]);
+                assert_eq!(
+                    run(&first, "SELECT id FROM t WHERE v=10;").rows,
+                    vec![vec![SqlValue::Int(b)]]
+                );
+                assert_eq!(
+                    run(&first, "SELECT id FROM t WHERE v=20;").rows,
+                    vec![vec![SqlValue::Int(a)]]
+                );
             } else {
                 assert_eq!(rows, vec![vec![SqlValue::Int(20)], vec![SqlValue::Int(20)]]);
             }
@@ -2027,17 +2154,26 @@ mod tests {
             let recovered = DatabaseEngine::new(meta, 1024);
             recovered.register_pool("wal", wal);
             recovered.register_pool("data", data);
-            assert_eq!(run(&recovered, "SELECT * FROM t ORDER BY id;").rows, expected);
+            assert_eq!(
+                run(&recovered, "SELECT * FROM t ORDER BY id;").rows,
+                expected
+            );
             if indexed {
-                assert_eq!(run(&recovered, "SELECT id FROM t WHERE v=10;").rows,
-                    vec![vec![SqlValue::Int(b)]]);
+                assert_eq!(
+                    run(&recovered, "SELECT id FROM t WHERE v=10;").rows,
+                    vec![vec![SqlValue::Int(b)]]
+                );
             }
         }
     }
 
     #[test]
     fn dml_rejects_change_between_collection_and_buffering() {
-        for statement in ["UPDATE t SET v=11 WHERE id=1", "DELETE FROM t WHERE id=1", "UPDATE t SET id=2 WHERE id=1"] {
+        for statement in [
+            "UPDATE t SET v=11 WHERE id=1",
+            "DELETE FROM t WHERE id=1",
+            "UPDATE t SET id=2 WHERE id=1",
+        ] {
             let fs = SimFs::new(9510);
             let meta = LocalMetaKv::open_single_node(&fs, "meta", 1).unwrap();
             let (wal, data) = make_pools(&fs);
@@ -2050,16 +2186,30 @@ mod tests {
             first.execute_sql(1, "db", "wal", "data", 4,
                 "CREATE TABLE t (id INT PRIMARY KEY, v INT); INSERT INTO t VALUES (1,10); CREATE INDEX by_v ON t (v);").unwrap();
             let writer = second.clone();
-            AFTER_DML_COLLECTION.with(|slot| *slot.borrow_mut() = Some(Box::new(move || {
-                writer.execute_sql(1, "db", "wal", "data", 4,
-                    "UPDATE t SET v=20 WHERE id=1;").unwrap();
-            })));
+            AFTER_DML_COLLECTION.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    writer
+                        .execute_sql(1, "db", "wal", "data", 4, "UPDATE t SET v=20 WHERE id=1;")
+                        .unwrap();
+                }))
+            });
             let result = first.execute_sql(1, "db", "wal", "data", 4, statement);
-            assert!(matches!(result, Err(DbError::InvalidQuery(ref message)) if message.contains("transaction write conflict")), "{statement}: {result:?}");
-            assert_eq!(second.execute_sql(1, "db", "wal", "data", 4,
-                "SELECT id FROM t WHERE v=20;").unwrap().rows, vec![vec![SqlValue::Int(1)]]);
-            assert!(second.execute_sql(1, "db", "wal", "data", 4,
-                "SELECT id FROM t WHERE v=11;").unwrap().rows.is_empty());
+            assert!(
+                matches!(result, Err(DbError::InvalidQuery(ref message)) if message.contains("transaction write conflict")),
+                "{statement}: {result:?}"
+            );
+            assert_eq!(
+                second
+                    .execute_sql(1, "db", "wal", "data", 4, "SELECT id FROM t WHERE v=20;")
+                    .unwrap()
+                    .rows,
+                vec![vec![SqlValue::Int(1)]]
+            );
+            assert!(second
+                .execute_sql(1, "db", "wal", "data", 4, "SELECT id FROM t WHERE v=11;")
+                .unwrap()
+                .rows
+                .is_empty());
         }
     }
 
@@ -2074,16 +2224,39 @@ mod tests {
             engine.register_pool("wal", wal.clone());
             engine.register_pool("data", data.clone());
         }
-        first.execute_sql(1, "db", "wal", "data", 4,
-            "CREATE TABLE t (id INT PRIMARY KEY, v INT); INSERT INTO t VALUES (1,10);").unwrap();
+        first
+            .execute_sql(
+                1,
+                "db",
+                "wal",
+                "data",
+                4,
+                "CREATE TABLE t (id INT PRIMARY KEY, v INT); INSERT INTO t VALUES (1,10);",
+            )
+            .unwrap();
         let writer = second.clone();
-        AFTER_DML_TARGET_CHECK.with(|slot| *slot.borrow_mut() = Some(Box::new(move || {
-            writer.execute_sql(1, "db", "wal", "data", 4, "INSERT INTO t VALUES (2,20);").unwrap();
-        })));
+        AFTER_DML_TARGET_CHECK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                writer
+                    .execute_sql(1, "db", "wal", "data", 4, "INSERT INTO t VALUES (2,20);")
+                    .unwrap();
+            }))
+        });
         let result = first.execute_sql(1, "db", "wal", "data", 4, "UPDATE t SET id=2 WHERE id=1;");
-        assert!(matches!(result, Err(DbError::InvalidQuery(ref message)) if message.contains("transaction write conflict")), "{result:?}");
-        assert_eq!(second.execute_sql(1, "db", "wal", "data", 4, "SELECT * FROM t ORDER BY id;").unwrap().rows,
-            vec![vec![SqlValue::Int(1), SqlValue::Int(10)], vec![SqlValue::Int(2), SqlValue::Int(20)]]);
+        assert!(
+            matches!(result, Err(DbError::InvalidQuery(ref message)) if message.contains("transaction write conflict")),
+            "{result:?}"
+        );
+        assert_eq!(
+            second
+                .execute_sql(1, "db", "wal", "data", 4, "SELECT * FROM t ORDER BY id;")
+                .unwrap()
+                .rows,
+            vec![
+                vec![SqlValue::Int(1), SqlValue::Int(10)],
+                vec![SqlValue::Int(2), SqlValue::Int(20)]
+            ]
+        );
     }
 
     #[test]
@@ -2096,8 +2269,11 @@ mod tests {
         engine.register_pool("data", data);
         let run = |sql: &str| engine.execute_sql(1, "db", "wal", "data", 4, sql).unwrap();
         let pk = |id| SqlValue::Int(id).encode_order_preserving_key().unwrap();
-        let id_in = |shard| (1..100).find(|id|
-            DatabaseEngine::<SimFs>::route_shard(&pk(*id), 4) == shard).unwrap();
+        let id_in = |shard| {
+            (1..100)
+                .find(|id| DatabaseEngine::<SimFs>::route_shard(&pk(*id), 4) == shard)
+                .unwrap()
+        };
         let (a, b) = (id_in(0), id_in(3));
         run(&format!("CREATE TABLE t (id INT PRIMARY KEY, v INT); INSERT INTO t VALUES ({a},10); FLUSH TABLE t; CREATE INDEX by_v ON t (v);"));
         let schema = engine.load_schema(1, "db", "t").unwrap();
@@ -2109,30 +2285,95 @@ mod tests {
         let revision = meta.revision();
         for predicates in [
             vec![],
-            vec![(0, Predicate { column: "id".into(), op: CmpOp::Eq, value: SqlValue::Int(a) })],
-            vec![(1, Predicate { column: "v".into(), op: CmpOp::Eq, value: SqlValue::Int(10) })],
+            vec![(
+                0,
+                Predicate {
+                    column: "id".into(),
+                    op: CmpOp::Eq,
+                    value: SqlValue::Int(a),
+                },
+            )],
+            vec![(
+                1,
+                Predicate {
+                    column: "v".into(),
+                    op: CmpOp::Eq,
+                    value: SqlValue::Int(10),
+                },
+            )],
         ] {
-            let rows = engine.collect_table_rows_from_snapshot(
-                1, "db", &schema, &predicates, None, &snapshot, |_| {}, || {},
-            ).unwrap();
+            let rows = engine
+                .collect_table_rows_from_snapshot(
+                    1,
+                    "db",
+                    &schema,
+                    &predicates,
+                    None,
+                    &snapshot,
+                    |_| {},
+                    || {},
+                )
+                .unwrap();
             assert_eq!(rows, vec![vec![SqlValue::Int(a), SqlValue::Int(10)]]);
         }
         let mut overlay = TxBuffer::default();
-        overlay.record_mutation("t", pk(a), Some(vec![SqlValue::Int(a), SqlValue::Int(10)]), None);
-        overlay.record_mutation("t", pk(b), None, Some(vec![SqlValue::Int(b), SqlValue::Int(40)]));
+        overlay.record_mutation(
+            "t",
+            pk(a),
+            Some(vec![SqlValue::Int(a), SqlValue::Int(10)]),
+            None,
+        );
+        overlay.record_mutation(
+            "t",
+            pk(b),
+            None,
+            Some(vec![SqlValue::Int(b), SqlValue::Int(40)]),
+        );
         let expected = vec![vec![SqlValue::Int(b), SqlValue::Int(40)]];
-        for predicates in [vec![], vec![(1, Predicate {
-            column: "v".into(), op: CmpOp::Eq, value: SqlValue::Int(40),
-        })], vec![(0, Predicate {
-            column: "id".into(), op: CmpOp::Eq, value: SqlValue::Int(b),
-        })]] {
-            assert_eq!(engine.collect_table_rows_from_snapshot(
-                1, "db", &schema, &predicates, Some(&overlay), &snapshot, |_| {}, || {},
-            ).unwrap(), expected);
+        for predicates in [
+            vec![],
+            vec![(
+                1,
+                Predicate {
+                    column: "v".into(),
+                    op: CmpOp::Eq,
+                    value: SqlValue::Int(40),
+                },
+            )],
+            vec![(
+                0,
+                Predicate {
+                    column: "id".into(),
+                    op: CmpOp::Eq,
+                    value: SqlValue::Int(b),
+                },
+            )],
+        ] {
+            assert_eq!(
+                engine
+                    .collect_table_rows_from_snapshot(
+                        1,
+                        "db",
+                        &schema,
+                        &predicates,
+                        Some(&overlay),
+                        &snapshot,
+                        |_| {},
+                        || {},
+                    )
+                    .unwrap(),
+                expected
+            );
         }
         assert_eq!(meta.revision(), revision);
-        assert_eq!(run(&format!("SELECT v FROM t WHERE id={a};")).rows, vec![vec![SqlValue::Int(20)]]);
-        assert_eq!(run(&format!("SELECT v FROM t WHERE id={b};")).rows, vec![vec![SqlValue::Int(30)]]);
+        assert_eq!(
+            run(&format!("SELECT v FROM t WHERE id={a};")).rows,
+            vec![vec![SqlValue::Int(20)]]
+        );
+        assert_eq!(
+            run(&format!("SELECT v FROM t WHERE id={b};")).rows,
+            vec![vec![SqlValue::Int(30)]]
+        );
     }
 
     #[test]
@@ -2152,24 +2393,53 @@ mod tests {
             };
             run(&first, "CREATE TABLE t (id INT PRIMARY KEY, v INT);");
             let schema = first.load_schema(1, "db", "t").unwrap();
-            let id = (1..100).find(|id| DatabaseEngine::<SimFs>::route_shard(
-                &SqlValue::Int(*id).encode_order_preserving_key().unwrap(), 4) == 0).unwrap();
-            let predicates = vec![(1, Predicate {
-                column: "v".into(), op: CmpOp::Ge, value: SqlValue::Int(10),
-            })];
+            let id = (1..100)
+                .find(|id| {
+                    DatabaseEngine::<SimFs>::route_shard(
+                        &SqlValue::Int(*id).encode_order_preserving_key().unwrap(),
+                        4,
+                    ) == 0
+                })
+                .unwrap();
+            let predicates = vec![(
+                1,
+                Predicate {
+                    column: "v".into(),
+                    op: CmpOp::Ge,
+                    value: SqlValue::Int(10),
+                },
+            )];
             let result = first.collect_table_rows_at_boundaries(
-                1, "db", &schema, &predicates, None,
+                1,
+                "db",
+                &schema,
+                &predicates,
+                None,
                 |shard| {
                     if shard == 0 {
                         match change {
-                            "phantom" => { run(&second, &format!("INSERT INTO t VALUES ({id},20);")); }
-                            "schema" => { run(&second, "CREATE INDEX by_v ON t (v);"); }
-                            _ => { meta.execute(KvCommand::Put { key: "/unrelated".into(), value: vec![] }).unwrap(); }
+                            "phantom" => {
+                                run(&second, &format!("INSERT INTO t VALUES ({id},20);"));
+                            }
+                            "schema" => {
+                                run(&second, "CREATE INDEX by_v ON t (v);");
+                            }
+                            _ => {
+                                meta.execute(KvCommand::Put {
+                                    key: "/unrelated".into(),
+                                    value: vec![],
+                                })
+                                .unwrap();
+                            }
                         }
                     }
-                }, || {},
+                },
+                || {},
             );
-            assert!(result.unwrap().is_empty(), "snapshot changed after {change}");
+            assert!(
+                result.unwrap().is_empty(),
+                "snapshot changed after {change}"
+            );
             // Stable collection succeeds, even if the preceding write was to
             // unrelated metadata. No retries/hidden write side effects here.
             let revision = meta.revision();
@@ -2179,8 +2449,10 @@ mod tests {
             if change == "schema" {
                 // Predicates/column positions resolved with stale schema are
                 // rejected if schema changed before snapshot capture.
-                assert!(matches!(first.collect_table_rows(1, "db", &schema, &predicates, None),
-                    Err(DbError::InvalidQuery(_))));
+                assert!(matches!(
+                    first.collect_table_rows(1, "db", &schema, &predicates, None),
+                    Err(DbError::InvalidQuery(_))
+                ));
             }
         }
     }
@@ -2199,26 +2471,52 @@ mod tests {
         let run = |engine: &DatabaseEngine<SimFs>, sql: &str| {
             engine.execute_sql(1, "db", "wal", "data", 4, sql).unwrap()
         };
-        let session = |sql: &str| first.execute_sql_with_session(
-            1, "db", "wal", "data", 4, Some("reader"), sql,
-        ).unwrap();
+        let session = |sql: &str| {
+            first
+                .execute_sql_with_session(1, "db", "wal", "data", 4, Some("reader"), sql)
+                .unwrap()
+        };
         run(&first, "CREATE TABLE t (id INT PRIMARY KEY, v INT); INSERT INTO t VALUES (1,10),(2,20); CREATE INDEX by_v ON t (v);");
         session("BEGIN;");
-        assert_eq!(session("SELECT v FROM t WHERE id=1;").rows, vec![vec![SqlValue::Int(10)]]);
-        run(&second, "UPDATE t SET v=11 WHERE id=1; INSERT INTO t VALUES (3,30);");
+        assert_eq!(
+            session("SELECT v FROM t WHERE id=1;").rows,
+            vec![vec![SqlValue::Int(10)]]
+        );
+        run(
+            &second,
+            "UPDATE t SET v=11 WHERE id=1; INSERT INTO t VALUES (3,30);",
+        );
         // Nonrepeatable reads and phantoms BETWEEN statements are deliberately
         // not prevented: BEGIN holds an overlay, not a committed read snapshot.
-        assert_eq!(session("SELECT v FROM t WHERE id=1;").rows, vec![vec![SqlValue::Int(11)]]);
+        assert_eq!(
+            session("SELECT v FROM t WHERE id=1;").rows,
+            vec![vec![SqlValue::Int(11)]]
+        );
         assert_eq!(session("SELECT id FROM t WHERE v>=10;").rows.len(), 3);
         session("UPDATE t SET v=12 WHERE id=1;");
-        assert_eq!(session("SELECT id FROM t WHERE v=12;").rows, vec![vec![SqlValue::Int(1)]]);
+        assert_eq!(
+            session("SELECT id FROM t WHERE v=12;").rows,
+            vec![vec![SqlValue::Int(1)]]
+        );
         assert!(session("SELECT id FROM t WHERE v=11;").rows.is_empty());
         run(&second, "UPDATE t SET v=21 WHERE id=2;");
-        assert_eq!(session("SELECT v FROM t ORDER BY id;").rows,
-            vec![vec![SqlValue::Int(12)], vec![SqlValue::Int(21)], vec![SqlValue::Int(30)]]);
+        assert_eq!(
+            session("SELECT v FROM t ORDER BY id;").rows,
+            vec![
+                vec![SqlValue::Int(12)],
+                vec![SqlValue::Int(21)],
+                vec![SqlValue::Int(30)]
+            ]
+        );
         session("COMMIT;");
-        assert_eq!(run(&second, "SELECT v FROM t ORDER BY id;").rows,
-            vec![vec![SqlValue::Int(12)], vec![SqlValue::Int(21)], vec![SqlValue::Int(30)]]);
+        assert_eq!(
+            run(&second, "SELECT v FROM t ORDER BY id;").rows,
+            vec![
+                vec![SqlValue::Int(12)],
+                vec![SqlValue::Int(21)],
+                vec![SqlValue::Int(30)]
+            ]
+        );
     }
 
     #[test]
@@ -2238,13 +2536,14 @@ mod tests {
                     engine.execute_sql(1, "db", "wal", "data", 4, sql).unwrap()
                 };
                 let pk = |id| SqlValue::Int(id).encode_order_preserving_key().unwrap();
-                let ids = (1..100).filter(|id|
-                    DatabaseEngine::<SimFs>::route_shard(&pk(*id), 4) == 0
-                ).take(2).collect::<Vec<_>>();
+                let ids = (1..100)
+                    .filter(|id| DatabaseEngine::<SimFs>::route_shard(&pk(*id), 4) == 0)
+                    .take(2)
+                    .collect::<Vec<_>>();
                 let (a, c) = (ids[0], ids[1]);
-                let b = (1..100).find(|id|
-                    DatabaseEngine::<SimFs>::route_shard(&pk(*id), 4) == 3
-                ).unwrap();
+                let b = (1..100)
+                    .find(|id| DatabaseEngine::<SimFs>::route_shard(&pk(*id), 4) == 3)
+                    .unwrap();
                 run(&first, "CREATE TABLE t (id INT PRIMARY KEY, v INT);");
                 if operation != "empty-table" {
                     run(&first, &format!("INSERT INTO t VALUES ({b},100);"));
@@ -2260,12 +2559,27 @@ mod tests {
                     _ => format!("INSERT INTO t VALUES ({a},20);"),
                 };
                 let result = first.create_index_at_boundaries(
-                    1, "db", "by_v".into(), false, "t".into(), "v".into(),
-                    |shard| { if stage == "during-scan" && shard == 0 { run(&second, &sql); } },
-                    || { if stage == "after-backfill" { run(&second, &sql); } },
+                    1,
+                    "db",
+                    "by_v".into(),
+                    false,
+                    "t".into(),
+                    "v".into(),
+                    |shard| {
+                        if stage == "during-scan" && shard == 0 {
+                            run(&second, &sql);
+                        }
+                    },
+                    || {
+                        if stage == "after-backfill" {
+                            run(&second, &sql);
+                        }
+                    },
                 );
-                assert!(matches!(result, Err(DbError::InvalidQuery(_))),
-                    "stale index for {operation} at {stage} was published: {result:?}");
+                assert!(
+                    matches!(result, Err(DbError::InvalidQuery(_))),
+                    "stale index for {operation} at {stage} was published: {result:?}"
+                );
                 assert!(first.load_schema(1, "db", "t").unwrap().indexes.is_empty());
                 let prefix = DatabaseEngine::<SimFs>::index_prefix_all(1, "db", "t", "by_v");
                 assert!(meta.scan_prefix(&prefix).is_empty());
@@ -2281,22 +2595,48 @@ mod tests {
                 let recovered = DatabaseEngine::new(meta.clone(), 1024);
                 recovered.register_pool("wal", wal);
                 recovered.register_pool("data", data);
-                assert!(recovered.load_schema(1, "db", "t").unwrap().indexes.is_empty());
+                assert!(recovered
+                    .load_schema(1, "db", "t")
+                    .unwrap()
+                    .indexes
+                    .is_empty());
                 assert!(meta.scan_prefix(&prefix).is_empty());
                 assert_eq!(run(&recovered, "SELECT * FROM t ORDER BY id;").rows, rows);
                 let result = run(&recovered, "CREATE INDEX by_v ON t (v);");
                 assert_eq!(result.rows_affected, rows.len() as u64);
-                let expected = rows.iter().map(|row| {
-                    let pk = row[0].encode_order_preserving_key().unwrap();
-                    (DatabaseEngine::<SimFs>::index_entry_key(1, "db", "t", "by_v", &row[1], &pk).unwrap(), pk)
-                }).collect::<BTreeMap<_, _>>();
-                let actual = meta.scan_prefix(&prefix).into_iter()
-                    .map(|(key, value)| (key, value.value)).collect::<BTreeMap<_, _>>();
+                let expected = rows
+                    .iter()
+                    .map(|row| {
+                        let pk = row[0].encode_order_preserving_key().unwrap();
+                        (
+                            DatabaseEngine::<SimFs>::index_entry_key(
+                                1, "db", "t", "by_v", &row[1], &pk,
+                            )
+                            .unwrap(),
+                            pk,
+                        )
+                    })
+                    .collect::<BTreeMap<_, _>>();
+                let actual = meta
+                    .scan_prefix(&prefix)
+                    .into_iter()
+                    .map(|(key, value)| (key, value.value))
+                    .collect::<BTreeMap<_, _>>();
                 assert_eq!(actual, expected);
                 for value in [10, 20, 100] {
-                    let expected = rows.iter().filter(|row| row[1] == SqlValue::Int(value))
-                        .map(|row| vec![row[0].clone()]).collect::<Vec<_>>();
-                    assert_eq!(run(&recovered, &format!("SELECT id FROM t WHERE v={value} ORDER BY id;")).rows, expected);
+                    let expected = rows
+                        .iter()
+                        .filter(|row| row[1] == SqlValue::Int(value))
+                        .map(|row| vec![row[0].clone()])
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        run(
+                            &recovered,
+                            &format!("SELECT id FROM t WHERE v={value} ORDER BY id;")
+                        )
+                        .rows,
+                        expected
+                    );
                 }
                 drop(recovered);
                 drop(meta);
@@ -2306,9 +2646,17 @@ mod tests {
                 let recovered = DatabaseEngine::new(meta.clone(), 1024);
                 recovered.register_pool("wal", wal);
                 recovered.register_pool("data", data);
-                assert_eq!(recovered.load_schema(1, "db", "t").unwrap().indexes.len(), 1);
-                assert_eq!(meta.scan_prefix(&prefix).into_iter()
-                    .map(|(key, value)| (key, value.value)).collect::<BTreeMap<_, _>>(), expected);
+                assert_eq!(
+                    recovered.load_schema(1, "db", "t").unwrap().indexes.len(),
+                    1
+                );
+                assert_eq!(
+                    meta.scan_prefix(&prefix)
+                        .into_iter()
+                        .map(|(key, value)| (key, value.value))
+                        .collect::<BTreeMap<_, _>>(),
+                    expected
+                );
                 assert_eq!(run(&recovered, "SELECT * FROM t ORDER BY id;").rows, rows);
             }
         }
@@ -2325,17 +2673,42 @@ mod tests {
                 let engine = DatabaseEngine::new(meta.clone(), 1024);
                 engine.register_pool("wal", wal);
                 engine.register_pool("data", data);
-                engine.execute_sql(1, "db", "wal", "data", 4,
-                    "CREATE TABLE t (id INT PRIMARY KEY, v INT);").unwrap();
+                engine
+                    .execute_sql(
+                        1,
+                        "db",
+                        "wal",
+                        "data",
+                        4,
+                        "CREATE TABLE t (id INT PRIMARY KEY, v INT);",
+                    )
+                    .unwrap();
                 if !empty {
-                    engine.execute_sql(1, "db", "wal", "data", 4,
-                        "INSERT INTO t VALUES (1,10),(2,20);").unwrap();
+                    engine
+                        .execute_sql(
+                            1,
+                            "db",
+                            "wal",
+                            "data",
+                            4,
+                            "INSERT INTO t VALUES (1,10),(2,20);",
+                        )
+                        .unwrap();
                 }
                 let result = engine.create_index_at_boundaries(
-                    1, "db", "by_v".into(), false, "t".into(), "v".into(), |_| {},
-                    || fs.set_faults(FaultConfig {
-                        sync_data_fault: fault, ..Default::default()
-                    }),
+                    1,
+                    "db",
+                    "by_v".into(),
+                    false,
+                    "t".into(),
+                    "v".into(),
+                    |_| {},
+                    || {
+                        fs.set_faults(FaultConfig {
+                            sync_data_fault: fault,
+                            ..Default::default()
+                        })
+                    },
                 );
                 assert!(matches!(result, Err(DbError::Meta(_))));
                 drop(engine);
@@ -2348,19 +2721,32 @@ mod tests {
                 engine.register_pool("wal", wal);
                 engine.register_pool("data", data);
                 let committed = fault == SyncFault::AfterPersist;
-                assert_eq!(engine.load_schema(1, "db", "t").unwrap().indexes.len(), usize::from(committed));
+                assert_eq!(
+                    engine.load_schema(1, "db", "t").unwrap().indexes.len(),
+                    usize::from(committed)
+                );
                 let prefix = DatabaseEngine::<SimFs>::index_prefix_all(1, "db", "t", "by_v");
-                assert_eq!(meta.scan_prefix(&prefix).len(), if committed && !empty { 2 } else { 0 });
+                assert_eq!(
+                    meta.scan_prefix(&prefix).len(),
+                    if committed && !empty { 2 } else { 0 }
+                );
                 // Retry is allowed only after inspecting recovered schema. An
                 // error alone does not imply the index publication rolled back.
                 if !committed {
-                    engine.execute_sql(1, "db", "wal", "data", 4,
-                        "CREATE INDEX by_v ON t (v);").unwrap();
+                    engine
+                        .execute_sql(1, "db", "wal", "data", 4, "CREATE INDEX by_v ON t (v);")
+                        .unwrap();
                 }
-                engine.execute_sql(1, "db", "wal", "data", 4,
-                    "INSERT INTO t VALUES (3,30);").unwrap();
-                assert_eq!(engine.execute_sql(1, "db", "wal", "data", 4,
-                    "SELECT id FROM t WHERE v=30;").unwrap().rows, vec![vec![SqlValue::Int(3)]]);
+                engine
+                    .execute_sql(1, "db", "wal", "data", 4, "INSERT INTO t VALUES (3,30);")
+                    .unwrap();
+                assert_eq!(
+                    engine
+                        .execute_sql(1, "db", "wal", "data", 4, "SELECT id FROM t WHERE v=30;")
+                        .unwrap()
+                        .rows,
+                    vec![vec![SqlValue::Int(3)]]
+                );
                 assert_eq!(meta.scan_prefix(&prefix).len(), if empty { 1 } else { 3 });
             }
         }
@@ -2375,8 +2761,16 @@ mod tests {
             let engine = DatabaseEngine::new(meta.clone(), 1024);
             engine.register_pool("wal", wal);
             engine.register_pool("data", data);
-            engine.execute_sql(1, "db", "wal", "data", 1,
-                "CREATE TABLE t (id INT PRIMARY KEY, v INT); INSERT INTO t VALUES (1,10);").unwrap();
+            engine
+                .execute_sql(
+                    1,
+                    "db",
+                    "wal",
+                    "data",
+                    1,
+                    "CREATE TABLE t (id INT PRIMARY KEY, v INT); INSERT INTO t VALUES (1,10);",
+                )
+                .unwrap();
             let key = if target == "manifest" {
                 DatabaseEngine::<SimFs>::shard_meta_key(1, "db", "t", 0)
             } else {
@@ -2384,24 +2778,37 @@ mod tests {
             };
             let old = meta.get(&key).unwrap();
             let result = engine.create_index_at_boundaries(
-                1, "db", "by_v".into(), false, "t".into(), "v".into(), |_| {},
+                1,
+                "db",
+                "by_v".into(),
+                false,
+                "t".into(),
+                "v".into(),
+                |_| {},
                 || {
-                    meta.execute(KvCommand::Delete { key: key.clone() }).unwrap();
+                    meta.execute(KvCommand::Delete { key: key.clone() })
+                        .unwrap();
                     for _ in 0..old.version {
                         meta.execute(KvCommand::Put {
-                            key: key.clone(), value: old.value.clone(),
-                        }).unwrap();
+                            key: key.clone(),
+                            value: old.value.clone(),
+                        })
+                        .unwrap();
                     }
                     assert_eq!(meta.get(&key).unwrap().version, old.version);
                     assert_ne!(meta.get(&key).unwrap().mod_revision, old.mod_revision);
                 },
             );
-            assert!(matches!(result, Err(DbError::InvalidQuery(_))), "accepted {target} ABA");
+            assert!(
+                matches!(result, Err(DbError::InvalidQuery(_))),
+                "accepted {target} ABA"
+            );
             assert!(engine.load_schema(1, "db", "t").unwrap().indexes.is_empty());
             let prefix = DatabaseEngine::<SimFs>::index_prefix_all(1, "db", "t", "by_v");
             assert!(meta.scan_prefix(&prefix).is_empty());
-            engine.execute_sql(1, "db", "wal", "data", 1,
-                "CREATE INDEX by_v ON t (v);").unwrap();
+            engine
+                .execute_sql(1, "db", "wal", "data", 1, "CREATE INDEX by_v ON t (v);")
+                .unwrap();
             assert_eq!(meta.scan_prefix(&prefix).len(), 1);
         }
     }
@@ -2420,18 +2827,37 @@ mod tests {
         let run = |engine: &DatabaseEngine<SimFs>, sql: &str| {
             engine.execute_sql(1, "db", "wal", "data", 1, sql).unwrap()
         };
-        run(&first, "CREATE TABLE t (id INT PRIMARY KEY, v INT); INSERT INTO t VALUES (1,10);");
+        run(
+            &first,
+            "CREATE TABLE t (id INT PRIMARY KEY, v INT); INSERT INTO t VALUES (1,10);",
+        );
         let mut tx = TxBuffer::default();
-        tx.record_mutation("t", SqlValue::Int(1).encode_order_preserving_key().unwrap(),
+        tx.record_mutation(
+            "t",
+            SqlValue::Int(1).encode_order_preserving_key().unwrap(),
             Some(vec![SqlValue::Int(1), SqlValue::Int(10)]),
-            Some(vec![SqlValue::Int(1), SqlValue::Int(20)]));
-        let result = first.commit_tx_buffer_at_boundaries(1, "db", tx, || {},
-            || { run(&second, "CREATE INDEX by_v ON t (v);"); });
+            Some(vec![SqlValue::Int(1), SqlValue::Int(20)]),
+        );
+        let result = first.commit_tx_buffer_at_boundaries(
+            1,
+            "db",
+            tx,
+            || {},
+            || {
+                run(&second, "CREATE INDEX by_v ON t (v);");
+            },
+        );
         assert!(matches!(result, Err(DbError::StaleTabletGeneration { .. })));
-        assert_eq!(run(&second, "SELECT id FROM t WHERE v=10;").rows, vec![vec![SqlValue::Int(1)]]);
+        assert_eq!(
+            run(&second, "SELECT id FROM t WHERE v=10;").rows,
+            vec![vec![SqlValue::Int(1)]]
+        );
         assert!(run(&second, "SELECT id FROM t WHERE v=20;").rows.is_empty());
         run(&first, "UPDATE t SET v=20 WHERE id=1;");
-        assert_eq!(run(&second, "SELECT id FROM t WHERE v=20;").rows, vec![vec![SqlValue::Int(1)]]);
+        assert_eq!(
+            run(&second, "SELECT id FROM t WHERE v=20;").rows,
+            vec![vec![SqlValue::Int(1)]]
+        );
         assert!(run(&second, "SELECT id FROM t WHERE v=10;").rows.is_empty());
         let prefix = DatabaseEngine::<SimFs>::index_prefix_all(1, "db", "t", "by_v");
         assert_eq!(meta.scan_prefix(&prefix).len(), 1);
@@ -2451,17 +2877,37 @@ mod tests {
         let run = |engine: &DatabaseEngine<SimFs>, sql: &str| {
             engine.execute_sql(1, "db", "wal", "data", 4, sql).unwrap()
         };
-        let id = (1..100).find(|id| DatabaseEngine::<SimFs>::route_shard(
-            &SqlValue::Int(*id).encode_order_preserving_key().unwrap(), 4) == 3).unwrap();
+        let id = (1..100)
+            .find(|id| {
+                DatabaseEngine::<SimFs>::route_shard(
+                    &SqlValue::Int(*id).encode_order_preserving_key().unwrap(),
+                    4,
+                ) == 3
+            })
+            .unwrap();
         run(&first, "CREATE TABLE t (id INT PRIMARY KEY, v INT);");
         run(&first, &format!("INSERT INTO t VALUES ({id},10);"));
-        let result = first.create_index_at_boundaries(
-            1, "db", "by_v".into(), false, "t".into(), "v".into(),
-            |shard| { if shard == 0 { run(&second, &format!("UPDATE t SET v=20 WHERE id={id};")); } },
-            || {},
-        ).unwrap();
+        let result = first
+            .create_index_at_boundaries(
+                1,
+                "db",
+                "by_v".into(),
+                false,
+                "t".into(),
+                "v".into(),
+                |shard| {
+                    if shard == 0 {
+                        run(&second, &format!("UPDATE t SET v=20 WHERE id={id};"));
+                    }
+                },
+                || {},
+            )
+            .unwrap();
         assert_eq!(result.rows_affected, 1);
-        assert_eq!(run(&first, "SELECT id FROM t WHERE v=20;").rows, vec![vec![SqlValue::Int(id)]]);
+        assert_eq!(
+            run(&first, "SELECT id FROM t WHERE v=20;").rows,
+            vec![vec![SqlValue::Int(id)]]
+        );
         assert!(run(&first, "SELECT id FROM t WHERE v=10;").rows.is_empty());
         let prefix = DatabaseEngine::<SimFs>::index_prefix_all(1, "db", "t", "by_v");
         assert_eq!(meta.scan_prefix(&prefix).len(), 1);
@@ -2471,8 +2917,13 @@ mod tests {
     fn independent_writer_between_validation_and_preparation_must_conflict() {
         for stage in ["before-prepare", "after-prepare"] {
             for operation in [
-                "update", "insert", "delete", "delete-update", "multi-shard",
-                "noop", "noop-multi-shard",
+                "update",
+                "insert",
+                "delete",
+                "delete-update",
+                "multi-shard",
+                "noop",
+                "noop-multi-shard",
             ] {
                 let fs = SimFs::new(9300);
                 let meta = LocalMetaKv::open_single_node(&fs, "meta", 1).unwrap();
@@ -2489,45 +2940,114 @@ mod tests {
                 run(&first, "CREATE TABLE t (id INT PRIMARY KEY, v INT);");
                 // Pick two PKs routed to distinct shards deterministically.
                 let a = 1;
-                let shard_a = DatabaseEngine::<SimFs>::route_shard(&SqlValue::Int(a).encode_order_preserving_key().unwrap(), 4);
-                let b = (2..100).find(|id| DatabaseEngine::<SimFs>::route_shard(&SqlValue::Int(*id).encode_order_preserving_key().unwrap(), 4) != shard_a).unwrap();
+                let shard_a = DatabaseEngine::<SimFs>::route_shard(
+                    &SqlValue::Int(a).encode_order_preserving_key().unwrap(),
+                    4,
+                );
+                let b = (2..100)
+                    .find(|id| {
+                        DatabaseEngine::<SimFs>::route_shard(
+                            &SqlValue::Int(*id).encode_order_preserving_key().unwrap(),
+                            4,
+                        ) != shard_a
+                    })
+                    .unwrap();
                 if operation != "insert" {
                     run(&first, &format!("INSERT INTO t VALUES ({a},10);"));
                 }
                 run(&first, &format!("INSERT INTO t VALUES ({b},100);"));
                 run(&first, "CREATE INDEX by_v ON t (v);");
                 let pk = SqlValue::Int(a).encode_order_preserving_key().unwrap();
-                let old = if operation == "insert" { None } else { Some(vec![SqlValue::Int(a), SqlValue::Int(10)]) };
-                let new = if operation == "delete" { None } else if operation.starts_with("noop") { old.clone() }
-                    else { Some(vec![SqlValue::Int(a), SqlValue::Int(11)]) };
+                let old = if operation == "insert" {
+                    None
+                } else {
+                    Some(vec![SqlValue::Int(a), SqlValue::Int(10)])
+                };
+                let new = if operation == "delete" {
+                    None
+                } else if operation.starts_with("noop") {
+                    old.clone()
+                } else {
+                    Some(vec![SqlValue::Int(a), SqlValue::Int(11)])
+                };
                 let mut tx = TxBuffer::default();
                 tx.record_mutation("t", pk, old, new);
                 if operation == "multi-shard" || operation == "noop-multi-shard" {
-                    tx.record_mutation("t", SqlValue::Int(b).encode_order_preserving_key().unwrap(),
-                        Some(vec![SqlValue::Int(b), SqlValue::Int(100)]), Some(vec![SqlValue::Int(b), SqlValue::Int(101)]));
+                    tx.record_mutation(
+                        "t",
+                        SqlValue::Int(b).encode_order_preserving_key().unwrap(),
+                        Some(vec![SqlValue::Int(b), SqlValue::Int(100)]),
+                        Some(vec![SqlValue::Int(b), SqlValue::Int(101)]),
+                    );
                 }
                 let concurrent_sql = match operation {
                     "insert" => format!("INSERT INTO t VALUES ({a},20);"),
                     "delete-update" => format!("DELETE FROM t WHERE id={a};"),
                     _ => format!("UPDATE t SET v=20 WHERE id={a};"),
                 };
-                let result = first.commit_tx_buffer_at_boundaries(1, "db", tx,
-                    || { if stage == "before-prepare" { run(&second, &concurrent_sql); } },
-                    || { if stage == "after-prepare" { run(&second, &concurrent_sql); } });
-                assert!(matches!(result, Err(DbError::InvalidQuery(_)) | Err(DbError::StaleTabletGeneration { .. })),
-                    "stale {operation} at {stage} was not rejected: {result:?}");
-                let expected_a = if operation == "delete-update" { vec![] } else { vec![vec![SqlValue::Int(20)]] };
-                assert_eq!(run(&second, &format!("SELECT v FROM t WHERE id={a};")).rows, expected_a);
-                assert_eq!(run(&second, &format!("SELECT v FROM t WHERE id={b};")).rows, vec![vec![SqlValue::Int(100)]]);
+                let result = first.commit_tx_buffer_at_boundaries(
+                    1,
+                    "db",
+                    tx,
+                    || {
+                        if stage == "before-prepare" {
+                            run(&second, &concurrent_sql);
+                        }
+                    },
+                    || {
+                        if stage == "after-prepare" {
+                            run(&second, &concurrent_sql);
+                        }
+                    },
+                );
+                assert!(
+                    matches!(
+                        result,
+                        Err(DbError::InvalidQuery(_)) | Err(DbError::StaleTabletGeneration { .. })
+                    ),
+                    "stale {operation} at {stage} was not rejected: {result:?}"
+                );
+                let expected_a = if operation == "delete-update" {
+                    vec![]
+                } else {
+                    vec![vec![SqlValue::Int(20)]]
+                };
+                assert_eq!(
+                    run(&second, &format!("SELECT v FROM t WHERE id={a};")).rows,
+                    expected_a
+                );
+                assert_eq!(
+                    run(&second, &format!("SELECT v FROM t WHERE id={b};")).rows,
+                    vec![vec![SqlValue::Int(100)]]
+                );
                 let schema = second.load_schema(1, "db", "t").unwrap();
                 let prefix = DatabaseEngine::<SimFs>::index_prefix_all(1, "db", "t", "by_v");
-                let actual = meta.scan_prefix(&prefix).into_iter().map(|(key, _)| key).collect::<BTreeSet<_>>();
+                let actual = meta
+                    .scan_prefix(&prefix)
+                    .into_iter()
+                    .map(|(key, _)| key)
+                    .collect::<BTreeSet<_>>();
                 let mut expected = BTreeSet::new();
-                for row in second.collect_table_rows(1, "db", &schema, &[], None).unwrap() {
-                    expected.insert(DatabaseEngine::<SimFs>::index_entry_key(1, "db", "t", "by_v", &row[1],
-                        &row[0].encode_order_preserving_key().unwrap()).unwrap());
+                for row in second
+                    .collect_table_rows(1, "db", &schema, &[], None)
+                    .unwrap()
+                {
+                    expected.insert(
+                        DatabaseEngine::<SimFs>::index_entry_key(
+                            1,
+                            "db",
+                            "t",
+                            "by_v",
+                            &row[1],
+                            &row[0].encode_order_preserving_key().unwrap(),
+                        )
+                        .unwrap(),
+                    );
                 }
-                assert_eq!(actual, expected, "index diverged for {operation} at {stage}");
+                assert_eq!(
+                    actual, expected,
+                    "index diverged for {operation} at {stage}"
+                );
                 drop(first);
                 drop(second);
                 drop(meta);
@@ -2539,9 +3059,22 @@ mod tests {
                 let recovered = DatabaseEngine::new(recovered_meta.clone(), 1024);
                 recovered.register_pool("wal", wal);
                 recovered.register_pool("data", data);
-                assert_eq!(run(&recovered, &format!("SELECT v FROM t WHERE id={a};")).rows, expected_a);
-                assert_eq!(run(&recovered, &format!("SELECT v FROM t WHERE id={b};")).rows, vec![vec![SqlValue::Int(100)]]);
-                assert_eq!(recovered_meta.scan_prefix(&prefix).into_iter().map(|(key, _)| key).collect::<BTreeSet<_>>(), expected);
+                assert_eq!(
+                    run(&recovered, &format!("SELECT v FROM t WHERE id={a};")).rows,
+                    expected_a
+                );
+                assert_eq!(
+                    run(&recovered, &format!("SELECT v FROM t WHERE id={b};")).rows,
+                    vec![vec![SqlValue::Int(100)]]
+                );
+                assert_eq!(
+                    recovered_meta
+                        .scan_prefix(&prefix)
+                        .into_iter()
+                        .map(|(key, _)| key)
+                        .collect::<BTreeSet<_>>(),
+                    expected
+                );
             }
         }
     }
@@ -2556,27 +3089,43 @@ mod tests {
             engine.register_pool("wal", wal);
             engine.register_pool("data", data);
             let run = |sql: &str| {
-                engine.execute_sql(1, "db", "wal", "data", shards, sql).unwrap()
+                engine
+                    .execute_sql(1, "db", "wal", "data", shards, sql)
+                    .unwrap()
             };
             let pk = |id| SqlValue::Int(id).encode_order_preserving_key().unwrap();
             let a = 1;
             let shard_a = DatabaseEngine::<SimFs>::route_shard(&pk(a), shards);
-            let b = (2..100).find(|id| shards == 1 ||
-                DatabaseEngine::<SimFs>::route_shard(&pk(*id), shards) != shard_a).unwrap();
+            let b = (2..100)
+                .find(|id| {
+                    shards == 1 || DatabaseEngine::<SimFs>::route_shard(&pk(*id), shards) != shard_a
+                })
+                .unwrap();
             run(&format!("CREATE TABLE t (id INT PRIMARY KEY, v INT); INSERT INTO t VALUES ({a},10),({b},100); CREATE INDEX by_v ON t (v);"));
             let key = DatabaseEngine::<SimFs>::shard_meta_key(1, "db", "t", shard_a);
             let before = meta.get(&key).unwrap();
             let mut tx = TxBuffer::default();
             let row_a = Some(vec![SqlValue::Int(a), SqlValue::Int(10)]);
             tx.record_mutation("t", pk(a), row_a.clone(), row_a);
-            tx.record_mutation("t", pk(b),
+            tx.record_mutation(
+                "t",
+                pk(b),
                 Some(vec![SqlValue::Int(b), SqlValue::Int(100)]),
-                Some(vec![SqlValue::Int(b), SqlValue::Int(101)]));
+                Some(vec![SqlValue::Int(b), SqlValue::Int(101)]),
+            );
             engine.commit_tx_buffer(1, "db", tx).unwrap();
-            assert_eq!(run("SELECT v FROM t ORDER BY id;").rows,
-                vec![vec![SqlValue::Int(10)], vec![SqlValue::Int(101)]]);
-            assert_eq!(run("SELECT id FROM t WHERE v=10;").rows, vec![vec![SqlValue::Int(a)]]);
-            assert_eq!(run("SELECT id FROM t WHERE v=101;").rows, vec![vec![SqlValue::Int(b)]]);
+            assert_eq!(
+                run("SELECT v FROM t ORDER BY id;").rows,
+                vec![vec![SqlValue::Int(10)], vec![SqlValue::Int(101)]]
+            );
+            assert_eq!(
+                run("SELECT id FROM t WHERE v=10;").rows,
+                vec![vec![SqlValue::Int(a)]]
+            );
+            assert_eq!(
+                run("SELECT id FROM t WHERE v=101;").rows,
+                vec![vec![SqlValue::Int(b)]]
+            );
             assert!(run("SELECT id FROM t WHERE v=100;").rows.is_empty());
             if shards > 1 {
                 let after = meta.get(&key).unwrap();
@@ -2591,10 +3140,15 @@ mod tests {
             let mut noop = TxBuffer::default();
             noop.record_mutation("t", pk(a), row_a.clone(), row_a);
             engine.commit_tx_buffer(1, "db", noop).unwrap();
-            assert_eq!(meta.get(&key).unwrap().mod_revision, before_noop.mod_revision);
+            assert_eq!(
+                meta.get(&key).unwrap().mod_revision,
+                before_noop.mod_revision
+            );
             assert_eq!(meta.get(&key).unwrap().value, before_noop.value);
-            assert_eq!(meta.get("/sql-blob-sequence/1").unwrap().mod_revision,
-                allocation.mod_revision);
+            assert_eq!(
+                meta.get("/sql-blob-sequence/1").unwrap().mod_revision,
+                allocation.mod_revision
+            );
         }
     }
 
@@ -2614,16 +3168,39 @@ mod tests {
         };
         run(&first, "CREATE TABLE t (id INT PRIMARY KEY, v INT); INSERT INTO t VALUES (1,10),(2,100); CREATE INDEX by_v ON t (v);");
         let mut tx = TxBuffer::default();
-        tx.record_mutation("t", SqlValue::Int(1).encode_order_preserving_key().unwrap(),
-            Some(vec![SqlValue::Int(1), SqlValue::Int(10)]), Some(vec![SqlValue::Int(1), SqlValue::Int(11)]));
-        first.commit_tx_buffer_at_boundaries(1, "db", tx,
-            || { run(&second, "UPDATE t SET v=200 WHERE id=2;"); }, || {}).unwrap();
-        assert_eq!(run(&second, "SELECT v FROM t ORDER BY id;").rows,
-            vec![vec![SqlValue::Int(11)], vec![SqlValue::Int(200)]]);
-        assert_eq!(run(&second, "SELECT id FROM t WHERE v=11;").rows, vec![vec![SqlValue::Int(1)]]);
-        assert_eq!(run(&second, "SELECT id FROM t WHERE v=200;").rows, vec![vec![SqlValue::Int(2)]]);
+        tx.record_mutation(
+            "t",
+            SqlValue::Int(1).encode_order_preserving_key().unwrap(),
+            Some(vec![SqlValue::Int(1), SqlValue::Int(10)]),
+            Some(vec![SqlValue::Int(1), SqlValue::Int(11)]),
+        );
+        first
+            .commit_tx_buffer_at_boundaries(
+                1,
+                "db",
+                tx,
+                || {
+                    run(&second, "UPDATE t SET v=200 WHERE id=2;");
+                },
+                || {},
+            )
+            .unwrap();
+        assert_eq!(
+            run(&second, "SELECT v FROM t ORDER BY id;").rows,
+            vec![vec![SqlValue::Int(11)], vec![SqlValue::Int(200)]]
+        );
+        assert_eq!(
+            run(&second, "SELECT id FROM t WHERE v=11;").rows,
+            vec![vec![SqlValue::Int(1)]]
+        );
+        assert_eq!(
+            run(&second, "SELECT id FROM t WHERE v=200;").rows,
+            vec![vec![SqlValue::Int(2)]]
+        );
         assert!(run(&second, "SELECT id FROM t WHERE v=10;").rows.is_empty());
-        assert!(run(&second, "SELECT id FROM t WHERE v=100;").rows.is_empty());
+        assert!(run(&second, "SELECT id FROM t WHERE v=100;")
+            .rows
+            .is_empty());
     }
 
     #[test]
@@ -2634,23 +3211,42 @@ mod tests {
         let db = DatabaseEngine::new(meta.clone(), 1024);
         db.register_pool("wal", wal);
         db.register_pool("data", data);
-        db.execute_sql(1, "db", "wal", "data", 1,
-            "CREATE TABLE t (id INT PRIMARY KEY, v INT); INSERT INTO t VALUES (1,10);").unwrap();
+        db.execute_sql(
+            1,
+            "db",
+            "wal",
+            "data",
+            1,
+            "CREATE TABLE t (id INT PRIMARY KEY, v INT); INSERT INTO t VALUES (1,10);",
+        )
+        .unwrap();
         let key = DatabaseEngine::<SimFs>::shard_meta_key(1, "db", "t", 0);
         let old = meta.get(&key).unwrap();
         let mut replacement: TabletManifest = serde_json::from_slice(&old.value).unwrap();
         replacement.wal_blobs.clear();
         replacement.sst_blobs.clear();
-        meta.execute(KvCommand::Delete { key: key.clone() }).unwrap();
+        meta.execute(KvCommand::Delete { key: key.clone() })
+            .unwrap();
         for _ in 0..old.version {
-            meta.execute(KvCommand::Put { key: key.clone(), value: serde_json::to_vec(&replacement).unwrap() }).unwrap();
+            meta.execute(KvCommand::Put {
+                key: key.clone(),
+                value: serde_json::to_vec(&replacement).unwrap(),
+            })
+            .unwrap();
         }
         assert_eq!(meta.get(&key).unwrap().version, old.version);
         assert_ne!(meta.get(&key).unwrap().mod_revision, old.mod_revision);
         let schema = db.load_schema(1, "db", "t").unwrap();
         let pk = SqlValue::Int(1).encode_order_preserving_key().unwrap();
-        assert!(db.read_committed_row(1, "db", &schema, &pk).unwrap().is_none());
-        assert!(db.scan_committed_shard_rows_with_revision(1, "db", &schema, 0).unwrap().0.is_empty());
+        assert!(db
+            .read_committed_row(1, "db", &schema, &pk)
+            .unwrap()
+            .is_none());
+        assert!(db
+            .scan_committed_shard_rows_with_revision(1, "db", &schema, 0)
+            .unwrap()
+            .0
+            .is_empty());
         let handle = db.get_or_open_shard(1, "db", &schema, 0).unwrap();
         assert!(handle.lock().unwrap().get_row(&pk).unwrap().is_none());
     }
@@ -2687,7 +3283,14 @@ mod tests {
             .unwrap();
 
             let fl = db
-                .execute_sql(1, "ledger", "wal-fast", "data-ec", 4, "FLUSH TABLE accounts")
+                .execute_sql(
+                    1,
+                    "ledger",
+                    "wal-fast",
+                    "data-ec",
+                    4,
+                    "FLUSH TABLE accounts",
+                )
                 .unwrap();
             assert!(fl.rows_affected >= 1);
 
@@ -2993,8 +3596,15 @@ mod tests {
         );
 
         // 5. Multiple SSTable flushes + DELETE + logical COMPACT TABLE.
-        db.execute_sql(1, "ledger", "wal-fast", "data-ec", 4, "FLUSH TABLE accounts;")
-            .unwrap();
+        db.execute_sql(
+            1,
+            "ledger",
+            "wal-fast",
+            "data-ec",
+            4,
+            "FLUSH TABLE accounts;",
+        )
+        .unwrap();
         db.execute_sql(
             1,
             "ledger",
@@ -3004,11 +3614,25 @@ mod tests {
             "DELETE FROM accounts WHERE active = false;",
         )
         .unwrap();
-        db.execute_sql(1, "ledger", "wal-fast", "data-ec", 4, "FLUSH TABLE accounts;")
-            .unwrap();
+        db.execute_sql(
+            1,
+            "ledger",
+            "wal-fast",
+            "data-ec",
+            4,
+            "FLUSH TABLE accounts;",
+        )
+        .unwrap();
 
         let comp = db
-            .execute_sql(1, "ledger", "wal-fast", "data-ec", 4, "COMPACT TABLE accounts;")
+            .execute_sql(
+                1,
+                "ledger",
+                "wal-fast",
+                "data-ec",
+                4,
+                "COMPACT TABLE accounts;",
+            )
             .unwrap();
         assert_eq!(comp.rows[0][2], SqlValue::Int(3)); // 3 live rows remain
         assert_eq!(comp.rows[0][3], SqlValue::Int(0)); // Retain fragments for old readers.

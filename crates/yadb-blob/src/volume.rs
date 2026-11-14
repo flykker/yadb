@@ -170,17 +170,14 @@ impl<FS: StorageFs> VolumeStore<FS> {
         }
 
         // Enforce generation fencing barrier
-        if let Some(&barrier_gen) = self
-            .barriers
-            .read()
-            .unwrap()
-            .get(&(id.project_id(), id.owner_id(), id.channel()))
+        if let Some(&barrier_gen) =
+            self.barriers
+                .read()
+                .unwrap()
+                .get(&(id.project_id(), id.owner_id(), id.channel()))
         {
             if id.generation() <= barrier_gen {
-                return Err(BlobError::FencedByBarrier {
-                    id,
-                    barrier_gen,
-                });
+                return Err(BlobError::FencedByBarrier { id, barrier_gen });
             }
         }
 
@@ -192,7 +189,11 @@ impl<FS: StorageFs> VolumeStore<FS> {
         if let Some(existing) = existing {
             if existing.data_len == data.len() as u32 && existing.data_crc == data_crc {
                 if let Ok(bytes) = self.get(id) {
-                    return if bytes == data { Ok(()) } else { Err(BlobError::ImmutableConflict(id)) };
+                    return if bytes == data {
+                        Ok(())
+                    } else {
+                        Err(BlobError::ImmutableConflict(id))
+                    };
                 }
             } else {
                 return Err(BlobError::ImmutableConflict(id));
@@ -290,18 +291,13 @@ impl<FS: StorageFs> VolumeStore<FS> {
     /// Reads and verifies the full CRC32 of a blob.
     pub fn get(&self, id: BlobId) -> Result<Vec<u8>, BlobError> {
         let index = self.index.read().unwrap();
-        let entry = index
-            .get(&id)
-            .copied()
-            .ok_or(BlobError::NotFound(id))?;
+        let entry = index.get(&id).copied().ok_or(BlobError::NotFound(id))?;
 
         let segs = self.segments.read().unwrap();
         // Pin the matching segment handle before allowing compaction to swap
         // its file and offsets. Lock order is index -> segments everywhere.
         drop(index);
-        let file = segs
-            .get(&entry.seg_id)
-            .ok_or(BlobError::NotFound(id))?;
+        let file = segs.get(&entry.seg_id).ok_or(BlobError::NotFound(id))?;
 
         let mut buf = vec![0u8; entry.data_len as usize];
         let n = file.read_at(entry.data_offset, &mut buf)?;
@@ -324,10 +320,7 @@ impl<FS: StorageFs> VolumeStore<FS> {
     /// Sub-blob range read (`offset..offset+len`) for DB SSTable pages or virtual block volumes.
     pub fn get_slice(&self, id: BlobId, offset: usize, len: usize) -> Result<Vec<u8>, BlobError> {
         let index = self.index.read().unwrap();
-        let entry = index
-            .get(&id)
-            .copied()
-            .ok_or(BlobError::NotFound(id))?;
+        let entry = index.get(&id).copied().ok_or(BlobError::NotFound(id))?;
 
         if offset + len > entry.data_len as usize {
             return Err(BlobError::SliceOutOfBounds {
@@ -399,7 +392,9 @@ impl<FS: StorageFs> VolumeStore<FS> {
         let mut idx = self.index.write().unwrap();
         let doomed: Vec<BlobId> = idx
             .range(start..=end)
-            .filter_map(|(&k, _)| (k.channel() == channel && k.generation() <= up_to_generation).then_some(k))
+            .filter_map(|(&k, _)| {
+                (k.channel() == channel && k.generation() <= up_to_generation).then_some(k)
+            })
             .collect();
         let removed = doomed.len();
         for k in doomed {
@@ -469,7 +464,8 @@ impl<FS: StorageFs> VolumeStore<FS> {
                 BlobId::new(project_id, owner_id, generation, 0, channel, 0)
             })
             .collect();
-        let tombstone_markers: Vec<BlobId> = self.tombstones.read().unwrap().iter().copied().collect();
+        let tombstone_markers: Vec<BlobId> =
+            self.tombstones.read().unwrap().iter().copied().collect();
 
         let tmp_path = format!("{}.compact", segment_path(&self.dir, seg_id));
         let final_path = segment_path(&self.dir, seg_id);
@@ -579,7 +575,12 @@ fn init_new_segment<FS: StorageFs>(fs: &FS, dir: &str, seg_id: u32) -> Result<FS
     Ok(file)
 }
 
-fn encode_record_header(kind: u8, id: BlobId, data_len: u32, data_crc: u32) -> [u8; RECORD_HEADER_LEN] {
+fn encode_record_header(
+    kind: u8,
+    id: BlobId,
+    data_len: u32,
+    data_crc: u32,
+) -> [u8; RECORD_HEADER_LEN] {
     let mut hdr = [0u8; RECORD_HEADER_LEN];
     hdr[0..4].copy_from_slice(&RECORD_MAGIC.to_le_bytes());
     hdr[4] = kind;
@@ -600,7 +601,9 @@ fn recover_segment<F: VirtualFile>(
 ) -> Result<(), BlobError> {
     let file_len = file.len()?;
     if file_len < VOLUME_MAGIC.len() as u64 {
-        return Err(BlobError::InvalidSegment("segment shorter than magic header"));
+        return Err(BlobError::InvalidSegment(
+            "segment shorter than magic header",
+        ));
     }
     let mut magic = [0u8; 8];
     file.read_at(0, &mut magic)?;

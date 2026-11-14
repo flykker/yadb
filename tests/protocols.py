@@ -28,6 +28,8 @@ import xml.etree.ElementTree as ET
 ROOT = Path(__file__).resolve().parents[1]
 SECRET = "integration-secret-12345"
 SUBJECT = "sa:billing-backend"
+# Clustered legacy daemons refuse to start without a shared Raft token.
+RAFT_TOKEN = "integration-raft-token-12345"
 
 
 class PeerProxy(socketserver.ThreadingTCPServer):
@@ -446,7 +448,8 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
                 "--listen", f"127.0.0.1:{19000+i}", "--peers", peers, "--data-dir", str(temp/f"n{i}"),
                 "--protocol-credentials", str(creds), "--pg-listen", f"127.0.0.1:{19100+i}",
                 "--iscsi-listen", f"127.0.0.1:{19300+i}", "--iscsi-portals", portals,
-                "--s3-listen", f"127.0.0.1:{19200+i}", "--s3-target", "billing/receipts"],
+                "--s3-listen", f"127.0.0.1:{19200+i}", "--s3-target", "billing/receipts",
+                "--raft-token", RAFT_TOKEN],
                 stdout=logs[i-1], stderr=logs[i-1])
         try:
             for i in range(1, 4):

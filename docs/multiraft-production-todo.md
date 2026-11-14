@@ -1,0 +1,530 @@
+# OpenRaft Multi-Raft production checklist
+
+## Current status (2026-11-14)
+
+**Before the test serialization gate described below, the last completed full
+gates were GREEN on the authorization-freshness delta plus the nonblocking-refresh
+fix and post-review hardening.** Offline, locked `-j 2` runs
+with `CARGO_INCREMENTAL=0` and the approved `YADB_TEST_TMPDIR` root passed:
+all-features MetaKV **124/124** (68.77 s), yadbd units **27/27**, clients
+**2/2**, daemon **2/2** (10.11 s); default MetaKV **124/124** (75.50 s), yadbd
+**20/20**. The previously red all-features
+MetaKV failure at `crates/yadb-metakv/src/openraft_multigroup_test.rs:245`
+(`OpenRaftWriteUnknown`, client write timeout) did not reproduce: that test
+passed alone **15/15** and inside both full gates. No causal fix is claimed and
+the historical process-failure/election-churn failures remain unexplained.
+Logs: `/data/data/com.foxdebug.acodefree/cache/opencode/workspace-all-features-review2-20261114.log`
+and `.../workspace-default-review2-20261114.log`. Security tests pass **16/16**,
+lifecycle unit tests for `scripts/yadb-local.py` pass **11/11**, and smoke
+port-base tests pass **3/3**.
+
+Authorization freshness is now lease-bound. In OpenRaft mode a node accepts a
+control snapshot only after a quorum-confirmed linearizable barrier on the
+current control-group leader. The leader reads its own applied state after
+`ensure_linearizable`; a follower requests the same snapshot through the
+internal `GET /internal/control/snapshot` endpoint protected by the Raft token.
+The snapshot is installed before the lease is extended, so observing a fresh
+lease implies the corresponding control state is present. The background refresher
+wakes on a nominal 200 ms interval and leases expire after 2 s; after expiry,
+DB/block/S3/PostgreSQL-wire/iSCSI authorization fails closed unless an on-demand
+refresh attempt succeeds. A failed
+refresh or quorum loss does not immediately invalidate an existing valid lease;
+authorization may continue using its snapshot until expiry. Revocation is not
+instantaneous cluster-wide. The 2 s TTL is measured at snapshot acceptance, not
+at the barrier, so neither a hard 2 s snapshot-age/revocation bound nor a 200 ms
+revocation bound is established. The 200 ms interval is a wakeup cadence, not a
+completion guarantee, and the fetch has per-operation socket timeouts, not a total
+deadline.
+
+The HTTP authorization path no longer performs the blocking fetch on a Tokio
+worker: `control_for_authorization_async` and `refresh_openraft_control_async`
+delegate to `spawn_blocking`, while the PG/iSCSI connection threads and the
+background refresh thread keep the synchronous path. Before this change a stalled
+control leader could occupy a runtime worker in a TCP read and hold the refresh
+mutex, preventing the node from answering the leader's internal snapshot request.
+A `SIGSTOP` of the control leader for about 1.2 s left follower health and 403
+denials at 4–14 ms. This is plausible mitigation for historical
+`client write timed out`, not a reproduced or causally proven fix. It is also not
+starvation-proof: failed refreshes serialize, each expired-lease request can
+enqueue a blocking task, and the internal endpoint shares the blocking pool.
+
+The completed final independent GPT-6.1 Sol review of this delta returned ACCEPT
+for the narrow experimental local scope only. Its in-scope non-blocking findings
+were fixed: empty Raft tokens are rejected instead of matching an absent header,
+S3-wire error mapping preserves `x-yadb-write-outcome`/`x-yadb-retry`, the
+`--port-base` upper bound is 55527, prepared-state status also checks Raft
+listeners, and docs no longer claim more than the code proves. Open findings are
+listed in `docs/multiraft-verification.md`; they are not production blockers for
+the narrow scope but remain before any broader claim.
+
+The completed final independent Sol leadership review accepted only the narrow
+local experimental group-count balance, not production readiness. Earlier
+targeted checks also passed: security tests 16/16, state tests 16/16, storage
+23/23, S3 19/19 and IO 7/7; `git diff --check` passed. These do not replace the
+full gates above. S3 GC is disabled. OpenRaft `consistent=true` block reads are
+implemented (linearizable extent-map read on the project-group leader, forwarded
+from followers, missing blob is a `503`), so the iSCSI read path is no longer
+refused; that map snapshot is not a GC fence. Startup and shutdown cancellation
+are both covered: a dropped startup future releases the acquired replica and the
+durable lock. The POSIX compaction stale-FD claim was
+false; explicit reopen and an append regression are retained only.
+
+`force_leader` is routing preference, not a linearizable-read guarantee. Legacy
+remains default, `production_ready: false`, no existing cluster was switched,
+old data was untouched, and no migration occurred. Do not claim known
+regressions resolved.
+
+Status: **not production-ready**. Legacy Raft remains the daemon default; the
+experimental v2 client integration is still being hardened. A local
+nonproduction loopback cluster is running at `/public/cluster_data`: three
+daemon processes host nine replicas. It is **not empty**: at 21:25:24 on
+2026-11-14 an unidentified apply committed exactly `examples/platform.yaml`
+(generation `1`, project `billing`), which the orchestrator did not issue and
+`yadbctl` did not perform; the state was preserved, not rolled back. Freshness and
+token-gated internal-snapshot behavior were exercised live (unknown-project
+SQL/S3/block reads return 403, not 503; the internal endpoint returns 401 without
+a token, 200 with revision 2 on the control leader and 409 on followers).
+Independent Sol accepted only the narrow experimental delta, not production
+readiness; see `docs/multiraft-verification.md` for the root, evidence, incident
+and election-churn caveat. The
+`experimental-openraft-storage` feature is opt-in, not an operational release.
+Do not enable production routing until the gates below are complete. The user
+has separately authorized this new nonproduction test cluster to exercise
+real client routing before those gates close; it is not a production release or
+authorization to migrate existing data. The leadership-preference,
+authorization-freshness and nonblocking-refresh deltas now have passing full gates
+and a narrow-scope independent review; broader protocol semantics, starvation
+bounds and reliability gates remain open.
+
+## Authorized client-routing work on the nonproduction test cluster
+
+Status: implementation in progress; the new nonproduction cluster is running but
+is no longer empty (see current status above), and no existing cluster has been
+switched. See `docs/multiraft-verification.md`.
+
+- [ ] Add explicit daemon metadata-runtime selection, preserving legacy default
+  and requiring the OpenRaft feature and mandatory-mTLS group configuration.
+- [ ] Route existing SQL, S3, block and iSCSI metadata through actual OpenRaft
+  client writes across several active groups. Use a dedicated control group and
+  an explicit immutable project-ID-to-data-group map with at least two distinct
+  data groups. Keep each project's SQL/S3/block metadata in its assigned group,
+  retaining atomic multi-key operations and existing local-applied read semantics
+  without claiming linearizable reads. A single-group adapter is only a component
+  test, not completion of the user's Multi-Raft request.
+  The three-group engine integration case passes: control plus two data groups
+  serve SQL/S3/block for two projects, with state-placement, cross-group rejection
+  and all-group reopen assertions. These are single-node groups; daemon and
+  a child-daemon singleton-group integration test has also passed. A targeted in-process
+  loopback-mTLS test now covers nine replicas, three nodes and three groups with
+  group 2 led by node 1 and group 3 by node 2; it checks per-project `NotLeader`,
+  continued group 3 writes after stopping group 2's leader and selected reopen
+  state. It does not establish multi-process/multi-host behavior or replacement
+  election. A separate targeted three-process daemon test covers SQL/S3 HTTP
+  leader routing; the local cluster smoke also covers SQL/S3/block, but broader
+  multi-node daemon and protocol validation remain pending.
+- [ ] Select the independent group leader for forwarding and protocol transaction
+  fencing; do not use the control group's leader/term for every project.
+- [ ] Reject transactions spanning groups before submission. Never synthesize a
+  global revision or an atomic cross-group snapshot. Use project-group revisions
+  for S3 leases/GC; administrative merged scans are non-atomic local observations.
+- [ ] Require a new empty data root for creation, bind its runtime/replica identity
+  durably, reject mismatched reopen and legacy access to marked OpenRaft roots.
+  Do not modify, import or erase old legacy directories; no automatic fallback.
+- [ ] Test actual adapter/engine paths, empty-root admission, persistence/reopen,
+  follower write rejection and disabled legacy Raft endpoints in OpenRaft mode.
+- [ ] Preserve control-plane/RBAC watcher correctness across durable snapshot
+  installation: notify installed-state deltas only after successful persistence,
+  never on failed installation, and retain subscriptions for later applies.
+- [ ] Ensure a lost forwarded mutation response does not trigger automatic
+  resubmission in the new runtime; retain explicit unknown-outcome semantics.
+- [ ] Complete post-fix combined offline/locked regressions, address the completed
+  independent Sol review's blockers, and keep `production_ready: false` until gates close.
+
+Targeted evidence: the orchestrator's offline/locked `openraft_client::tests`
+passed 2/2 in 0.19 s after correcting groups 1/2/3; its
+`openraft_state_machine::tests` passed 16/16 in 0.73 s, including durable
+snapshot watch delta/removal, no notification on failed write and surviving
+subscriptions. Both used the approved `YADB_TEST_TMPDIR`, `CARGO_INCREMENTAL=0`
+and `-j2`. Terra reported 19/19 `yadb-s3` tests passed offline/locked, with no
+doc tests. These do not close the unchecked gates or imply final review.
+The `openraft_daemon` child test passed 1/1 in 1.06 s using the feature-enabled
+daemon and v2 singleton groups: HTTP apply of two projects and SQL/S3/block writes,
+durable state placement, SIGINT/reopen HTTP reads, legacy rejection of the marked
+root, changed-map rejection and an untouched legacy sentinel. It predates final
+control-cache hardening and full-suite validation and is not multi-node or deployed
+cluster evidence. An earlier default full-workspace gate failed: with the approved
+test temporary root and `CARGO_INCREMENTAL=0`, `cargo test --offline --locked -j2
+--workspace` reported 122 MetaKV passes and one failure in 116.92 s. The new
+`openraft_runtime::multigroup_tests::three_nodes_three_groups_route_independent_leaders_over_mtls`
+timed out at line 69 after 15 seconds awaiting leader 1; node 1 was Candidate at
+term 2 with last log 0, applied None and leader None. Its earlier targeted 1/1 pass
+is not reliable combined-gate evidence. Terra is investigating a possible
+initialization/immediate manual-election race under concurrent load; no root cause
+was established and no retry or timeout increase masked it. Both process tests and
+the 17 MiB snapshot test passed in this run, without resolving the historical
+process catch-up failure. At that checkpoint final all-features testing and
+independent Sol review were pending; see current status above.
+
+The subsequent `openraft_daemon` full file passed 2/2 in 2.39 s; its new test
+passed alone 1/1 in 3.58 s. Three actual daemon processes host nine replicas in
+three loopback groups, bootstrapped and observed with control/data leaders 1/2/3.
+SQL and S3 writes for both projects through node 1 returned the respective
+`x-yadb-leader-id` 2/3 and underlying placement persisted after shutdown. This
+closes that targeted multi-node HTTP routing check only, not multi-node block,
+PostgreSQL-wire or iSCSI coverage, deployment, final hardening or combined review.
+
+Subsequently Terra corrected the independent-leader test setup: initialization
+already starts an election, so the duplicate immediate manual trigger was removed.
+Only the designated bootstrap node has its normal automatic election timer enabled;
+follower timers are disabled, avoiding a stranded no-retry configuration. The trace
+is consistent with the duplicate trigger, not proof of why quorum was missed. No
+timeout increase or test retry loop was added. The subsequent offline/locked
+`-j2 --workspace` default-feature run passed, including 123/123 MetaKV tests and
+the concurrent 17 MiB snapshot test; daemon integration files ran zero tests under
+default features as expected. This predates final daemon control-cache/barrier edits,
+so final combined verification remained necessary. The all-features gate and
+independent Sol review were then pending; see current status above. Neither this
+pass nor the test setup change closes production gates or resolves the historical
+process catch-up regression.
+
+This changes the earlier legacy-only test-routing policy, not the production
+acceptance criteria. Existing data migration, backup/restore, durability/security
+qualification and multi-group design remain separate incomplete gates.
+
+A second flaky MetaKV test was diagnosed rather than retried.
+`openraft_persistent_cluster_recovers_lagging_follower_via_snapshot` failed about
+8% of all-features runs. Its `snapshots_delivered > 0` precondition was vacuous:
+the counter is global across targets and openraft reports success even when it
+skips an install because the snapshot is not newer than the follower's committed
+log. Diagnostics showed a leadership change to term 4, node 3. openraft 0.9.25 has
+no pre-vote, so the isolated follower inflated its term and deposed the leader on
+rejoin; the new leader's unpurged log then let the follower catch up by append
+entries, so no snapshot was installed and the final durable-snapshot assertion
+failed legitimately. The test now polls the lagging follower's own state machine,
+uses 20–25 s election timeouts so leadership is stable for the ~1.5 s run, and
+passed 40/40 consecutive runs. The term inflation is a real liveness property of
+this Raft configuration and a candidate explanation for historical election churn;
+it is not proven to be the cause and no mitigation is implemented.
+
+### Heavy-test serialization gate (2026-11-15)
+
+`crates/yadb-metakv/src/openraft_test_gate.rs` serializes the OpenRaft tests that
+assert wall-clock progress: the multigroup independent-leader test, both
+three-process mTLS tests, the child-process kill/reopen test and the two persistent
+three-node catch-up tests. Each acquires a process-global `tokio::sync::Mutex`
+through `exclusive()`; the process tests take it in the parent only. That skip is
+not a deadlock fix — the mutex is process-local, so a child re-executing the
+binary would get a private copy — it just keeps child mode honest. Both full
+workspace gates were red before the gate, with a heartbeat-bound quorum miss, a 5 s
+bridge-deadline write timeout and a process-test leadership change. The gate
+restores the dedicated-CPU assumption behind the first two and mitigates the
+load-aggravated third; it does not add pre-vote to openraft 0.9.25, does not widen
+the 50 ms-heartbeat quorum window and does not change the 5 s bridge deadline. Its
+scope is one process: other test binaries, other Cargo invocations and the live
+cluster still compete for CPU, so it reduces contention rather than guaranteeing a
+dedicated core. A post-gate full-workspace run has not finished, so no gate is
+green here. What remains unexplained: the historical process catch-up failures and
+the historical election churn. Solo passes (the process test 8/8, the multigroup
+test 24/24 with eight concurrent copies) do not establish a cause for either.
+
+## 1. Contracts and durable storage
+
+- [ ] Run the OpenRaft 0.9.25 storage suite on the actual adapters. Its test
+  harness requires `NodeId: From<u64>`, unlike YADB's `u32`; adapt the harness
+  without changing production semantics or implement and document equivalent
+  coverage with a case-by-case mapping. Do not claim suite compliance otherwise.
+- [ ] Audit vote, append, truncation, purge, callback ordering, concurrent readers,
+  restart and bounds against OpenRaft contracts; test each boundary and replay.
+- [ ] Bound memory, disk growth, startup replay and snapshot reception; introduce
+  compaction and resource limits without losing acknowledged state.
+  The checkpoint implementation is under validation: 32 MiB active-log limit,
+  1024 replay frames, 4096 retained live entries and an 8 MiB serialized live
+  checkpoint. Replacements sync a new file, rename, sync the directory, then
+  switch the append handle; failures poison until validated reopen. Temporary
+  replacement can increase peak disk usage, and memory/CPU admission across
+  groups, end-to-end snapshot capacity and real failure testing remain open.
+  Storage hardening's targeted run passed all 21 storage tests and the adapted
+  suite after rejecting disconnected prepends before I/O. Contiguous prepends
+  survive checkpoint/reopen, and overlap comparison uses bounded serialization.
+  These results do not clear the separate process catch-up regression.
+  The subsequent purge/checkpoint mismatch is fixed: a purge marker leaving a
+  gap before the retained suffix is rejected before I/O. The regression covers
+  markers immediately before, within and beyond the suffix, conflicting identity,
+  unchanged files after rejection and checkpoint/reopen of accepted states.
+  All 22 storage tests and the adapted suite passed after the fix; broader
+  storage-contract and combined-regression gates remain open.
+- [ ] Ensure file and parent-directory durability for create, rename and reopen,
+  including partial bootstrap, directory sync failures and unknown outcomes.
+- [ ] Make snapshot identity, membership, log pointers, concurrent build/install,
+  watchers and recovery correct; explicitly test stale and conflicting snapshots.
+- [ ] Inject write, partial write, file sync, rename and directory sync faults via
+  an injectable filesystem; test every outcome and poisoned-handle recovery.
+- [ ] Run separate-process crash/kill and OS/filesystem power-loss tests; document
+  filesystem and hardware assumptions. In-process fault simulation is not proof.
+- [ ] Idempotency and read-consistency contracts. A keyed `POST /v1/apply` is
+  implemented (`Idempotency-Key`, the outcome record committed in the same
+  `RevisionTxn` as the mutation, `POST /v1/idempotency/resolve`, and a replicated
+  `10_000`-record / `8 MiB` admission counter at `/sys/idempotency/_usage` that
+  refuses with `429` before planning); every other mutating endpoint still rejects
+  a key with 501. Reads mostly still serve the locally applied state:
+  `LocalMetaKv::try_linearizable_snapshot` is consumed only by OpenRaft block
+  reads with `consistent=true` (and the iSCSI read path), which forward to the
+  project-group leader and fail rather than return a stale or partially collected
+  volume.
+  `docs/multiraft-idempotency-design.md` holds the full contract and the blockers
+  that prevent the remaining scopes: `GroupRouter::group_id` now routes a
+  project-scoped `/idempotency/<project-id>/…` namespace and
+  `idempotency_namespace` fails closed for unmapped projects, so the routing
+  prerequisite exists, but no endpoint writes or reads such a record; SQL/S3/block
+  still cannot publish all visible effects and a bounded response in one guarded
+  transaction, and a linearizable read needs one pinned snapshot per read path.
+- [ ] Consistent backup and restore. Nothing is implemented.
+  `docs/multiraft-backup-restore-design.md` designs a whole-deployment artifact
+  and a restore into a new root, and records why raw `cp -a` of live data, a
+  `state.json`-only copy and a Raft snapshot alone are not backups. Its hardest
+  unsolved problem is a cluster-wide fence that drains delayed and forwarded
+  mutations so independently captured group states form one consistent cut.
+
+## 2. Network and security
+
+- [x] Replace the shared-secret envelope with per-node Ed25519 signatures. A
+  verifier only holds public keys, so it cannot impersonate another sender.
+  The envelope binds group, incarnation, sender, recipient and a per-sender
+  monotonic sequence number, and an in-memory replay guard rejects old messages
+  until restart; it is not durable replay protection.
+  `openraft_transport` covers impersonation, tampering, unknown senders and
+  replay.
+- [ ] Complete the OpenRaft network factory and listener over TCP with
+  length-prefixed frames, request timeouts, connection limits and a payload
+  limit. The server verifies the signature against the sender's trusted public
+  key and only then dispatches the Raft RPC. Responses are signed and bound to
+  a random per-request nonce. Requests bind a fresh server challenge per TCP
+  connection, including across server restart; the captured-request test checks
+  this. Protocol security still needs adversarial review and lifecycle/resource
+  validation; opt-in TLS/mTLS is implemented separately below.
+- [ ] Deploy and validate mandatory TLS/mTLS for operational Raft listeners.
+  `TransportConfig::with_tls` implements TLS 1.3 with CA/time/hostname validation,
+  ALPN, exact leaf SHA-256 pins bound to node IDs and no plaintext fallback.
+  TLS resumption/tickets are disabled. In-process three-node replication and
+  untrusted/expired/wrong-node/plaintext/hostname/pin rejection tests pass.
+  Plaintext mode remains an explicit isolated-experiment API; provisioning,
+  deployment and rotation tests are not complete.
+- [ ] Define credential provisioning, authorization, rotation, revocation and
+  membership changes; enforce message and snapshot size, concurrency and
+  timeout limits. Test impersonation, wrong group/node, tampering, replay and
+  cancellation.
+  `multiraft-security-operations.md` defines the proposed manual offline trust
+  procedure and incident response. Dynamic reload, rolling rotation, revocation
+  and membership integration are not implemented or validated deployment gates.
+- [x] Protect the legacy internal endpoints: `/raft/rpc` and `/raft/elect`
+  now require the shared `--raft-token` in clustered mode and the daemon
+  refuses to start without it. Client subjects are only trusted with a valid
+  `x-yadb-subject-signature` when `--subject-secret` is configured, and the
+  signature is forwarded to the leader.
+- [x] Authorize control-plane mutations. `/v1/apply` now requires a subject
+  proven with `x-yadb-subject-signature` (HMAC-SHA256 over the subject with
+  `--subject-secret`) that appears on the `--admin-subject` allowlist. Unsigned
+  or forged subjects get 401, a proven non-admin subject gets 403, and an
+  unconfigured allowlist or missing secret gets 503. In OpenRaft mode an empty
+  allowlist refuses startup, and an allowlist without a secret refuses startup in
+  every mode. The check runs before forwarding, and the signature is forwarded so
+  the leader verifies the same identity rather than trusting a plain header.
+  `yadbctl` signs its requests when `--subject-secret`/`YADB_SUBJECT_SECRET` is
+  set. The browser UI cannot hold the secret, so its apply button now fails with
+  the daemon's 401 rather than acting as an anonymous administrator.
+- [ ] Replace the client-supplied subject header entirely with a verified
+  credential once the protocol listeners share one identity model.
+- [ ] Split the internal Raft listener from the public client listener so the
+  Raft port is not reachable from client networks.
+- [x] Protect the remote VDisk RPCs. `PUT|GET|DELETE
+  /internal/vdisk/{pool}/{slot}/blob/{blob_hex}`, `GET .../stats` and `POST
+  .../barrier` are served on the public listener and were unauthenticated: an
+  unauthenticated caller could install a permanent exact-ID tombstone or a
+  garbage-collection barrier that evicts live fragments and fences future
+  writes, repeated per replica slot to defeat erasure redundancy. All five
+  handlers now require the Raft peer token (`x-yadb-raft-token`) and the remote
+  client sends it; the token is threaded from `--raft-token` through
+  `Slot::remote`. The credential is the peer token rather than an admin
+  subject, because this is node-to-node traffic and an admin check would break
+  every remote slot call. Two residual exposures remain and are documented in
+  `multiraft-security-operations.md`: the token is a shared cluster secret, so
+  it authenticates the cluster rather than an individual peer; and the routes
+  are still reachable by anything that can reach the listener, so only the
+  dedicated internal listener plus verified firewall rules actually bound who
+  can attempt them. Separating that listener is the item above.
+
+## 3. Runtime and operations
+
+- [x] Implement a durable group owner with validated identity, exclusive
+  directory ownership, explicit bootstrap/open and clean shutdown
+  (`openraft_runtime::persistent`). A partial bootstrap is never reinitialized
+  automatically. Callers must await shutdown to completion; arbitrary owner drop
+  and startup cancellation are not proven safe.
+  A versioned replica descriptor also binds bootstrap voters; tests reject
+  changed voters on reopen and wrong-identity registry lookup/shutdown.
+- [ ] Implement a multi-group registry: several independent groups per node,
+  per-group directories, per-group failure isolation and bounded resources.
+  An experimental in-process registry provides separate directories and a
+  group-count limit; it does not yet provide resource isolation, robust
+  cancellation/shutdown handling or shared network routing. The in-progress daemon
+  v2 implementation instead owns multiple groups with dedicated listeners; its
+  integration and failure behavior still require validation.
+- [ ] Integrate the runtime behind explicit daemon configuration; provide metrics,
+  logging, health/readiness, operator commands and recovery/upgrade runbooks.
+  The observational v1 daemon module starts one isolated group with strict bounded
+  JSON configuration, explicit create/open/bootstrap, mandatory mTLS and a separate
+  listener; its create/shutdown/reopen tests pass. In-progress v2 client routing
+  uses a manifest and group-specific listeners; singleton-group child-daemon
+  integration passed, while multi-node validation, full observability and cancellation
+  coverage remain open. Status reports `production_ready: false`.
+  Local certificate
+  chain/name/time and server/client-purpose preflight runs before storage mutation;
+  invalid hostname, untrusted and expired-certificate rejection cases pass without
+  replica creation. A historical full locked all-features run passed with 111 MetaKV
+  tests and 11 daemon tests; its then-needed rerun is superseded by the current
+  full gates above, not by that historical result.
+  Daemon shutdown now borrows its owner and retains the listener join handle
+  across cancellation; a deterministic cancellation/retry/reopen test passes
+  (all three daemon module tests passed). This does not qualify arbitrary owner
+  drop or cancellation during startup.
+  `multiraft-runtime-operations.md` records ownership/shutdown and fail-closed
+  recovery boundaries. It does not establish implemented operational tooling.
+- [x] Test replication over a real TCP transport with authenticated envelopes
+  and durable file stores (`openraft_net_test`), including rejection of unknown
+  addresses and forged signatures.
+- [ ] Test node shutdown/restart, partitions, leadership changes, quorum loss,
+  delayed/duplicate messages, snapshots and catch-up with independent
+  processes, real filesystems and TLS.
+
+## 4. Migration and release
+
+- [ ] Specify legacy-to-OpenRaft migration, fencing, cutover, rollback limits,
+  backups, compatibility and versioned formats. Validate with realistic data.
+  The draft in `multiraft-migration.md` defines required manifest fields,
+  authority states and a recovery matrix. It is not an implemented migration
+  tool; external fencing authority and exact state import remain blockers.
+- [ ] Preserve SQL, S3, block and iSCSI semantics and client identity; test legacy
+  compatibility and cross-group transaction/read semantics before routing traffic.
+- [ ] Run offline locked workspace checks and full tests; run security, durability,
+  fault and multi-process integration suites on supported production systems.
+- [ ] Obtain independent GPT-6.1 Sol review of consensus, storage, transport,
+  security, lifecycle and migration; address blocking findings and rerun gates.
+- [ ] Only then enable production routing with an explicit rollout and recovery plan.
+
+## Evidence already available (not completed gates)
+
+OpenRaft singleton and three-node tests use in-process transport. File-backed
+test stores cover restart, follower catch-up and snapshot transfer; selected
+faults are simulated in process. A persistent group owner and storage adapters
+are available behind an experimental feature and wired to an opt-in observational
+daemon group with mandatory mTLS. The multi-group client daemon path has a bounded
+singleton-group child test pass and a narrow local experimental deployment, but is
+still under hardening; none of this establishes
+OS/filesystem/hardware power-loss safety.
+
+`persistent_singleton_process_kill_reopen` acknowledges three OpenRaft writes
+in a child process, kills it without graceful shutdown, verifies exact values
+and reopens the replica. This proves that tested process-death scenario only:
+the operating system remains running and may retain dirty filesystem pages.
+It does not close the OS/filesystem/hardware power-loss gate.
+
+`three_process_mtls_failover_and_quorum_loss` runs three independent durable
+replicas over loopback mTLS. It checks leader kill/failover, old-peer reopen,
+no acknowledgment without quorum, quorum restoration and exact persisted values.
+Its latest targeted run also verifies an offline follower installs a snapshot
+after log purge (install counter greater than zero). This is not a multi-host,
+network-partition or power-loss test; those gates remain distinct.
+Historically, a later default-feature workspace run failed this test at post-snapshot
+catch-up (111 MetaKV tests passed, one failed). Diagnosis remains active; earlier
+green targeted/all-features results do not override this unresolved regression.
+One test-only defect was identified: a fixed purge through index >= 6 did not
+necessarily exceed the stopped follower's last log index 7. The improved setup
+passed 2/2 targeted process tests in 5.92 s, but a true offline-last-log race is
+being fixed again. The setup is not final, and this is not a proven root-cause
+fix for the original failure.
+See `multiraft-verification.md` for the preserved artifacts.
+
+`three_process_mtls_network_partition` adds six directed parent-owned TCP proxies
+that forward encrypted traffic without terminating TLS. It cuts active tunnels
+and isolates the old leader in both directions, checks no isolated acknowledgment,
+majority progress, healing/catch-up and persisted acknowledged values. Both process
+tests passed together in a targeted run. This models connection cuts, not delayed
+or duplicated RPCs, multi-host deployments or OS/device power loss.
+
+Transport handlers now use owned `JoinSet` tasks and RAII connection permits;
+request vote-owner claims must match the authenticated sender. The client bounds
+the challenge frame to 32 bytes before allocating its body. A shared 32 MiB encoded
+inbound-request budget is reserved before allocating body buffers; this is not a
+bound on decoded JSON, responses, TLS or total process memory. `serve_until` stops
+accepts and aborts/drains handlers; dropping the future only requests cancellation.
+Byte-budget/cancellation/panic-permit and explicit-drain tests passed in the full
+locked all-features run (109 MetaKV tests); later changes need another run.
+Signed snapshot streaming now uses a signed manifest and at most 256 KiB raw
+chunks on one mTLS connection, bound to sender/group/recipient, sequence,
+challenge/nonce, ordinal, total length and SHA-256. The transport caps raw snapshot
+data at 64 MiB + 24 bytes, manifest payload at 64 KiB, and separately budgets
+assembly bytes; legacy inline snapshot reception is rejected. Targeted malformed,
+stalled, cancellation and mTLS tests passed. A 17 MiB transport-only round trip
+passed with explicit 180-second deadlines and took about 100 seconds in debug.
+This does not establish large transfers under the default five-second server
+deadline or durable installation capacity. The 64 MiB state-image limit includes
+retained snapshot plus live state, and budgets do not bound total process memory.
+End-to-end snapshot capacity remains open.
+
+The adapted upstream storage-suite runner is **not** the unmodified upstream
+suite and does not close the contract gate. The latest append/purge audit initially
+failed in `get_initial_state_membership_from_log_and_sm`: recovery purged through
+index 2 before the case appended index 1, contrary to this adapter's readable-on-
+return append requirement. The adapted runner now isolates the empty-log assertion
+in a fresh store and passes; this is an additional setup substitution, not proof
+of equivalence to the unmodified case. The full workspace run passed with it.
+The harness reconstructs the key-log-ID view from public storage methods rather
+than inspecting OpenRaft's private cache; the recovery test for a state machine
+ahead of the log checks the purge side effect rather than private `RaftState`
+fields; and `last_applied_state` inserts a blank entry to avoid an apply gap.
+These substitutions do not demonstrate equivalent coverage of the private
+state assertions. Purged-prefix append behavior and conflicting boundary
+identities require explicit contract reconciliation and regression coverage,
+not a production-readiness claim.
+
+The current checkpoint-capable log format is `YORLOG04`; `YORLOG02` and
+`YORLOG03` are rejected unchanged because corrected overlap replay rules and
+checkpoint capabilities must not silently reinterpret older records.
+No automatic log migration exists. Preserve old experimental directories for
+explicit analysis; never delete/reinitialize them to bypass a version error.
+
+Compatibility warning: legacy clustered daemon deployments now require
+`--raft-token` / `YADB_RAFT_TOKEN`; configure matching tokens on every peer
+before upgrading, or the daemon will refuse to start. This is a deliberate
+fail-closed security change, not transparent rolling-upgrade compatibility.
+In OpenRaft mode the daemon also requires a non-empty `--admin-subject`, and any
+allowlist requires a non-empty `--subject-secret` / `YADB_SUBJECT_SECRET`.
+Without those flags an upgraded daemon refuses to start rather than serving an
+unauthenticated `/v1/apply`.
+
+### Upstream storage-suite mapping and residual differences
+
+The adapted runner executes the upstream-named cases on actual file-backed log
+and state adapters with `u32` IDs. The table distinguishes unchanged observable
+assertions from replacements; neither the runner nor the extra reopen tests are
+claimed to reproduce inaccessible upstream internal assertions.
+
+| OpenRaft 0.9.25 suite cases | YADB evidence |
+| --- | --- |
+| `initial_logs`, parts of `get_log_state`, `purge_logs_upto_0/5/20` | `contract_log_state_and_purge_boundaries_survive_reopen` |
+| `delete_logs_since_0/11`, `append_to_log` | `contract_truncate_and_append_after_purge_survive_reopen` |
+| `save_vote`, parts of `get_log_entries` | `contract_vote_and_range_reads_survive_reopen` |
+| Membership scans and `get_membership_*` | Adapted suite retains observable membership assertions; numeric node-ID construction and blocking append helper differ |
+| `get_initial_state_without_init` | Replaces whole private `RaftState` equality with public vote, membership, snapshot and store log/purge observations; private fields remain uncovered |
+| `get_initial_state_with_state`, `get_initial_state_last_log_gt_sm` | Checks store log state and state-machine applied state instead of private recovered-state log/commit fields; not equivalent private-cache evidence |
+| `get_initial_state_last_log_lt_sm` | Checks recovery's purge side effect and retained suffix rather than private recovered-state last-log value |
+| `get_initial_state_membership_from_log_and_sm` | Moves the initial empty-log recovery to a fresh store so that its purge does not precede the later below-boundary append; sequential setup differs |
+| `get_initial_state_log_ids` | Reconstructs key log IDs from public reads; does not inspect OpenRaft's internal cache |
+| `get_initial_state_re_apply_committed` | Retains applied-state observation but replaces private `io_applied` assertion; the no-op committed-persistence default also limits this case's coverage |
+| Limited reads, single-entry/log-ID lookup, last-ID, snapshot metadata, single/multiple apply, snapshot transfer | Cases run in the adapted runner with public blocking append/node-ID helpers; this does not add process-crash or fault-boundary coverage |
+| `last_applied_state` | Adds blank index 4 before index 5 to satisfy this adapter's consecutive-apply rule; input differs |
+
+The direct contract tests above add reopen checks but do not close these private-
+state and changed-input differences. Full equivalence requires preserving the
+original assertions through an appropriate upstream harness or proving and testing
+each replacement independently; a green adapted runner alone is insufficient.

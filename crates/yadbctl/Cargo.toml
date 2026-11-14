@@ -13,6 +13,7 @@ yadb-io = { path = "../yadb-io" }
 yadb-blob = { path = "../yadb-blob" }
 yadb-control = { path = "../yadb-control" }
 yadb-db = { path = "../yadb-db" }
-clap.workspace = true
+clap = { workspace = true, features = ["env"] }
+ring.workspace = true
 serde.workspace = true
 serde_json.workspace = true

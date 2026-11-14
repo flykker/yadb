@@ -134,15 +134,41 @@ YADB uses ordinary filesystems; raw PDisk and NBD are not project goals.
   duplicate after a newer write; arbitrary reordering and other scenarios remain open.
 - [ ] Build and audit OpenRaft durable storage, snapshots and serialized vote/log
   writes; run OpenRaft's storage suite and crash/fault tests before daemon use.
-  A `#[cfg(test)]` file-backed prototype now exercises serialized framed vote/log
-  writes, reopen, suffix replacement, OS directory lock ownership and fail-closed
+  Opt-in file-backed adapters exercise serialized framed vote/log
+  writes, reopen, suffix handling, OS directory lock ownership and fail-closed
   corruption handling. Simulated partial writes and sync errors poison the handle;
   these tests do not simulate power loss. The test log binds cluster/group/incarnation
-  and node identity, with separate create/open paths; broader fault injection,
-  snapshots, state-machine persistence and OpenRaft storage-suite coverage remain open.
+  and node identity, with separate create/open paths. The experimental state machine
+  persists applied position, membership and KV state, and exercises cross-node
+  snapshot installation. A persistent three-node test uses an in-process network
+  and clean follower restart. Simulated install failures before/after file sync,
+  rename and directory sync exercise reopen, not power-loss safety. The official
+  storage suite requires `NodeId: From<u64>` whereas YADB uses `u32`; an adapted
+  runner passes but its public-state assertions and changed apply input do not
+  establish full equivalence. Persistent-group/registry tests reject changed
+  bootstrap voters; a separate-process singleton kill/reopen test preserves
+  acknowledged values. The experimental `YORLOG04` log now checkpoints with
+  bounded physical bytes, replay frames and retained live state; this fixed
+  capacity is not scalable resource isolation. Broader crash testing and
+  power-loss evidence remain open; see `docs/multiraft-production-todo.md`.
+  A targeted three-process loopback mTLS test now covers leader kill/failover,
+  quorum loss/restoration, reopen and snapshot catch-up after purge. This is
+  process-death evidence, not network-partition or OS/device power-loss evidence.
+  A separate targeted three-process mTLS test uses six directed TCP proxies to
+  isolate the old leader while all processes remain alive, verify majority
+  progress and heal/catch up. It models connection cuts, not delayed/duplicated
+  RPC schedules, multi-host deployment or power loss.
 - [ ] Secure internal Raft RPC and client identity: separate listeners, authenticate
   peers (evaluate rustls/mTLS), bind node and group identity, and do not trust
   client-supplied subject headers. Existing deployment exposure must be audited.
+  Experimental OpenRaft TCP supports Ed25519 envelopes, per-connection challenges,
+  signed nonce-bound replies and opt-in pinned TLS 1.3 mTLS; positive three-node
+  and negative certificate/identity tests pass in process. Legacy cluster endpoints
+  now require matching `--raft-token` credentials (a fail-closed upgrade change).
+  Signed subject headers are required when `--subject-secret` is configured, and
+  `/v1/apply` accepts only a signed subject on the `--admin-subject` allowlist.
+  Unified client credentials, listener separation and operational rotation remain
+  open; `docs/multiraft-security-operations.md` is a draft offline runbook only.
 - [ ] Evaluate ready libraries before extending custom parsers: hyper/reqwest for
   HTTP, ring/subtle for secret verification, pgwire, SQL/YAML parsers, S3/SigV4,
   Reed–Solomon, and Linux LIO or SPDK for iSCSI. Check licenses, offline builds,
@@ -152,9 +178,15 @@ YADB uses ordinary filesystems; raw PDisk and NBD are not project goals.
   not an implementation or a commitment to unsupported transaction guarantees.
 - [ ] Implement an isolated Multi-Raft runtime with explicit group identities,
   independent storage/elections and fixed membership; preserve existing traffic.
+  The opt-in daemon feature starts one isolated persistent group with explicit
+  create/open/bootstrap, mandatory mTLS, local certificate preflight, joined
+  normal shutdown and observational status (`production_ready: false`). It does
+  not use the registry for multi-group daemon routing or serve client operations.
 - [ ] Design and test the directory, group lifecycle, cross-group transactions,
   read visibility, safe allocation and coordinated migration before routing
   existing SQL/S3/block data across independently replicated groups.
+  `docs/multiraft-migration.md` specifies proposed offline fencing, manifest,
+  cutover and rollback states; no migration tool or cutover authority is implemented.
 
 - [ ] Add a tablet lifecycle manager: durable ownership, failure detection,
   generation fencing, recovery, observability and controlled migration.

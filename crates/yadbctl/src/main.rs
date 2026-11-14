@@ -25,6 +25,15 @@ struct Cli {
     #[arg(long, default_value = ".yadb-state.json", global = true)]
     state: PathBuf,
 
+    /// Shared secret used to sign `x-yadb-subject`; when set, every request that carries a subject also carries a matching `x-yadb-subject-signature`.
+    #[arg(
+        long,
+        env = "YADB_SUBJECT_SECRET",
+        hide_env_values = true,
+        global = true
+    )]
+    subject_secret: Option<String>,
+
     #[command(subcommand)]
     cmd: Command,
 }
@@ -40,6 +49,22 @@ enum Command {
     Apply {
         #[arg(short = 'f', long)]
         file: PathBuf,
+        #[arg(long, default_value = "yadbctl")]
+        subject: String,
+        /// Retry-safe key for a live apply (requires --server)
+        #[arg(long)]
+        idempotency_key: Option<String>,
+    },
+    /// Resolve a control key; an unused key is permanently fenced
+    Resolve {
+        #[arg(long)]
+        key: String,
+        /// Must match the subject used for apply
+        #[arg(long, default_value = "yadbctl")]
+        subject: String,
+        /// Print the daemon response verbatim
+        #[arg(long)]
+        json: bool,
     },
     /// Show current cluster generation, pools, projects, databases, object stores, and block volumes
     Status,
@@ -154,7 +179,10 @@ enum Command {
     },
     /// Benchmark/demo real OS filesystem erasure-coded PoolStriper (RS 4+2) on a directory
     DemoPool {
-        #[arg(long, default_value = "/data/data/com.foxdebug.acodefree/cache/opencode/yadb-demo")]
+        #[arg(
+            long,
+            default_value = "/data/data/com.foxdebug.acodefree/cache/opencode/yadb-demo"
+        )]
         dir: PathBuf,
     },
 }
@@ -170,6 +198,162 @@ struct RemotePlanResp {
 struct RemoteApplyResp {
     generation: u64,
     ops: Vec<DiffOp>,
+}
+
+#[derive(Deserialize)]
+struct ResolveResponse {
+    outcome: String,
+    reason: Option<String>,
+    response: Option<RecordedResponse>,
+}
+
+#[derive(Deserialize)]
+struct RecordedResponse {
+    status: u16,
+    body_base64: String,
+}
+
+/// Mirrors `valid_idempotency_key` in `yadbd` (`crates/yadbd/src/main.rs`). The
+/// two crates cannot share it, so the rule is duplicated deliberately: rejecting
+/// a bad key here gives the operator a precise message instead of a bare 400 from
+/// the daemon, and it must never accept something the daemon would refuse.
+fn validate_idempotency_key(key: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let bytes = key.as_bytes();
+    if bytes.is_empty()
+        || bytes.len() > 128
+        || !bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || b"._~-".contains(b))
+    {
+        return Err("idempotency key must be 1–128 bytes and contain only ASCII letters, digits, '.', '_', '~', or '-'".into());
+    }
+    Ok(())
+}
+
+fn apply_request(
+    srv: &str,
+    payload: &[u8],
+    subject: &str,
+    secret: Option<&str>,
+    key: Option<&str>,
+) -> Result<(u16, Vec<u8>), Box<dyn std::error::Error>> {
+    let mut headers = vec![("Content-Type", "application/json")];
+    if let Some(key) = key {
+        validate_idempotency_key(key)?;
+        headers.push(("Idempotency-Key", key));
+    }
+    http_subject_request(srv, "POST", "/v1/apply", &headers, payload, subject, secret)
+}
+
+fn resolve_request(
+    srv: &str,
+    key: &str,
+    subject: &str,
+    secret: Option<&str>,
+) -> Result<(u16, Vec<u8>), Box<dyn std::error::Error>> {
+    validate_idempotency_key(key)?;
+    let payload = serde_json::to_vec(&serde_json::json!({"scope": "control", "key": key}))?;
+    http_subject_request(
+        srv,
+        "POST",
+        "/v1/idempotency/resolve",
+        &[("Content-Type", "application/json")],
+        &payload,
+        subject,
+        secret,
+    )
+}
+
+fn resolve_success(code: u16, outcome: &str) -> bool {
+    // Only definite answers are success; unknown must not be mistaken for a failed write.
+    code == 200 && matches!(outcome, "committed" | "not_committed")
+}
+
+fn decode_base64(input: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    fn value(b: u8) -> Option<u8> {
+        match b {
+            b'A'..=b'Z' => Some(b - b'A'),
+            b'a'..=b'z' => Some(b - b'a' + 26),
+            b'0'..=b'9' => Some(b - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let bytes = input.as_bytes();
+    if bytes.len() % 4 != 0 {
+        return Err("invalid recorded base64".into());
+    }
+    let mut out = Vec::new();
+    for (i, chunk) in bytes.chunks_exact(4).enumerate() {
+        let a = value(chunk[0]).ok_or("invalid recorded base64")?;
+        let b = value(chunk[1]).ok_or("invalid recorded base64")?;
+        let c = if chunk[2] == b'=' {
+            0
+        } else {
+            value(chunk[2]).ok_or("invalid recorded base64")?
+        };
+        let d = if chunk[3] == b'=' {
+            0
+        } else {
+            value(chunk[3]).ok_or("invalid recorded base64")?
+        };
+        if (chunk[2] == b'=' && (chunk[3] != b'=' || b & 15 != 0))
+            || (chunk[3] == b'=' && chunk[2] != b'=' && c & 3 != 0)
+            || ((chunk[2] == b'=' || chunk[3] == b'=') && i + 1 != bytes.len() / 4)
+        {
+            return Err("invalid recorded base64".into());
+        }
+        out.push((a << 2) | (b >> 4));
+        if chunk[2] != b'=' {
+            out.push((b << 4) | (c >> 2));
+        }
+        if chunk[3] != b'=' {
+            out.push((c << 6) | d);
+        }
+    }
+    Ok(out)
+}
+
+fn subject_signature(secret: &str, subject: &str) -> String {
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret.as_bytes());
+    ring::hmac::sign(&key, subject.as_bytes())
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn subject_headers(subject: &str, secret: Option<&str>) -> Vec<(String, String)> {
+    let mut headers = vec![("x-yadb-subject".to_string(), subject.to_string())];
+    if !subject.is_empty() {
+        if let Some(secret) = secret {
+            headers.push((
+                "x-yadb-subject-signature".to_string(),
+                subject_signature(secret, subject),
+            ));
+        }
+    }
+    headers
+}
+
+fn http_subject_request(
+    base_url: &str,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+    subject: &str,
+    secret: Option<&str>,
+) -> Result<(u16, Vec<u8>), Box<dyn std::error::Error>> {
+    let subject_headers = subject_headers(subject, secret);
+    let mut headers = headers.to_vec();
+    headers.extend(
+        subject_headers
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str())),
+    );
+    http_request(base_url, method, path, &headers, body)
 }
 
 /// Zero-dependency HTTP/1.1 client over `TcpStream` (`Connection: close`) for fast `yadbd` calls.
@@ -416,16 +600,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 print_ops(&ops);
             }
         }
-        Command::Apply { file } => {
+        Command::Apply {
+            file,
+            subject,
+            idempotency_key,
+        } => {
+            if let Some(key) = &idempotency_key {
+                validate_idempotency_key(key)?;
+                if cli.server.is_none() {
+                    return Err("--idempotency-key requires --server: local apply has no replicated idempotency record".into());
+                }
+            }
             let yaml = fs::read_to_string(&file)?;
             if let Some(srv) = &cli.server {
                 let payload = serde_json::to_vec(&serde_json::json!({ "yaml": yaml }))?;
-                let (code, body) = http_request(
+                let (code, body) = apply_request(
                     srv,
-                    "POST",
-                    "/v1/apply",
-                    &[("Content-Type", "application/json")],
                     &payload,
+                    &subject,
+                    cli.subject_secret.as_deref(),
+                    idempotency_key.as_deref(),
                 )?;
                 if code != 200 {
                     eprintln!("Apply failed ({code}): {}", String::from_utf8_lossy(&body));
@@ -441,6 +635,62 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 save_state(&cli.state, &state)?;
                 println!("Applied locally -> generation {}", state.generation);
                 print_ops(&ops);
+            }
+        }
+        Command::Resolve { key, subject, json } => {
+            let srv = cli.server.as_deref().ok_or(
+                "resolve requires --server; resolving an unused key permanently fences it",
+            )?;
+            let (code, body) = resolve_request(srv, &key, &subject, cli.subject_secret.as_deref())?;
+            if code != 200 && code != 503 {
+                eprintln!(
+                    "Resolve failed ({code}): {}",
+                    String::from_utf8_lossy(&body)
+                );
+                std::process::exit(1);
+            }
+            let resp: ResolveResponse = serde_json::from_slice(&body).map_err(|_| {
+                format!(
+                    "Resolve failed ({code}): {}",
+                    String::from_utf8_lossy(&body)
+                )
+            })?;
+            if json {
+                std::io::stdout().write_all(&body)?;
+            } else {
+                println!("Outcome: {}", resp.outcome);
+                match resp.outcome.as_str() {
+                    "committed" => {
+                        let recorded = resp
+                            .response
+                            .as_ref()
+                            .ok_or("committed resolve response missing recorded response")?;
+                        let decoded = decode_base64(&recorded.body_base64)?;
+                        println!("Recorded HTTP status: {}", recorded.status);
+                        if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&decoded) {
+                            println!("{}", serde_json::to_string_pretty(&value)?);
+                        } else {
+                            let preview = &decoded[..decoded.len().min(128)];
+                            println!(
+                                "Recorded body: {} bytes; first bytes: {:?}",
+                                decoded.len(),
+                                preview
+                            );
+                        }
+                    }
+                    "not_committed" => {
+                        println!("Reason: {}", resp.reason.as_deref().unwrap_or("unknown"));
+                        println!("This key is permanently fenced; a later apply with it will be refused.");
+                    }
+                    "unknown" => {
+                        println!("Reason: {}", resp.reason.as_deref().unwrap_or("unknown"));
+                        println!("This is NOT proof that the write did not happen.");
+                    }
+                    _ => return Err("unrecognized resolve outcome".into()),
+                }
+            }
+            if !resolve_success(code, &resp.outcome) {
+                std::process::exit(1);
             }
         }
         Command::Status => {
@@ -519,7 +769,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 load_state(&cli.state)?
             };
-            let role = if write { Role::ReadWrite } else { Role::ReadOnly };
+            let role = if write {
+                Role::ReadWrite
+            } else {
+                Role::ReadOnly
+            };
             match state.authorize(&project, &subject, role) {
                 Ok(pid) => println!(
                     "ALLOW: `{subject}` authorized on project `{project}` (project_id={pid}, mode={role:?})"
@@ -539,15 +793,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let srv = cli.server.as_deref().unwrap_or("http://127.0.0.1:8420");
             let payload = serde_json::to_vec(&serde_json::json!({ "sql": query }))?;
             let path = format!("/db/{project}/{db}/query");
-            let (code, body) = http_request(
+            let (code, body) = http_subject_request(
                 srv,
                 "POST",
                 &path,
-                &[
-                    ("Content-Type", "application/json"),
-                    ("x-yadb-subject", &subject),
-                ],
+                &[("Content-Type", "application/json")],
                 &payload,
+                &subject,
+                cli.subject_secret.as_deref(),
             )?;
             if code != 200 {
                 eprintln!("SQL failed ({code}): {}", String::from_utf8_lossy(&body));
@@ -573,12 +826,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return Err("specify either `--data <str>` or `-f <file>`".into());
             };
             let path = format!("/block/{project}/{volume}?offset={offset}");
-            let (code, body) = http_request(
+            let (code, body) = http_subject_request(
                 srv,
                 "PUT",
                 &path,
-                &[("x-yadb-subject", &subject)],
+                &[],
                 &bytes,
+                &subject,
+                cli.subject_secret.as_deref(),
             )?;
             if code != 200 {
                 eprintln!(
@@ -599,8 +854,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             let srv = cli.server.as_deref().unwrap_or("http://127.0.0.1:8420");
             let path = format!("/block/{project}/{volume}?offset={offset}&len={len}");
-            let (code, body) =
-                http_request(srv, "GET", &path, &[("x-yadb-subject", &subject)], &[])?;
+            let (code, body) = http_subject_request(
+                srv,
+                "GET",
+                &path,
+                &[],
+                &[],
+                &subject,
+                cli.subject_secret.as_deref(),
+            )?;
             if code != 200 {
                 eprintln!(
                     "Block read failed ({code}): {}",
@@ -624,21 +886,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             subject,
             file,
         } => {
-            let srv = cli
-                .server
-                .as_deref()
-                .unwrap_or("http://127.0.0.1:8420");
+            let srv = cli.server.as_deref().unwrap_or("http://127.0.0.1:8420");
             let data = fs::read(&file)?;
-            let path = format!("/s3/{project}/{store}/{bucket}/{}", key.trim_start_matches('/'));
-            let (code, body) = http_request(
+            let path = format!(
+                "/s3/{project}/{store}/{bucket}/{}",
+                key.trim_start_matches('/')
+            );
+            let (code, body) = http_subject_request(
                 srv,
                 "PUT",
                 &path,
-                &[("x-yadb-subject", &subject)],
+                &[],
                 &data,
+                &subject,
+                cli.subject_secret.as_deref(),
             )?;
             if code != 200 {
-                eprintln!("S3 PUT denied/failed ({code}): {}", String::from_utf8_lossy(&body));
+                eprintln!(
+                    "S3 PUT denied/failed ({code}): {}",
+                    String::from_utf8_lossy(&body)
+                );
                 std::process::exit(1);
             }
             println!("S3 PUT OK: {}", String::from_utf8_lossy(&body));
@@ -652,18 +919,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             range,
             out,
         } => {
-            let srv = cli
-                .server
-                .as_deref()
-                .unwrap_or("http://127.0.0.1:8420");
-            let path = format!("/s3/{project}/{store}/{bucket}/{}", key.trim_start_matches('/'));
-            let mut hdrs = vec![("x-yadb-subject", subject.as_str())];
+            let srv = cli.server.as_deref().unwrap_or("http://127.0.0.1:8420");
+            let path = format!(
+                "/s3/{project}/{store}/{bucket}/{}",
+                key.trim_start_matches('/')
+            );
+            let mut hdrs = Vec::new();
             let range_val;
             if let Some(r) = &range {
                 range_val = format!("bytes={r}");
                 hdrs.push(("Range", range_val.as_str()));
             }
-            let (code, body) = http_request(srv, "GET", &path, &hdrs, &[])?;
+            let (code, body) = http_subject_request(
+                srv,
+                "GET",
+                &path,
+                &hdrs,
+                &[],
+                &subject,
+                cli.subject_secret.as_deref(),
+            )?;
             if code != 200 && code != 206 {
                 eprintln!("S3 GET failed ({code}): {}", String::from_utf8_lossy(&body));
                 std::process::exit(1);
@@ -683,13 +958,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             subject,
             prefix,
         } => {
-            let srv = cli
-                .server
-                .as_deref()
-                .unwrap_or("http://127.0.0.1:8420");
+            let srv = cli.server.as_deref().unwrap_or("http://127.0.0.1:8420");
             let path = format!("/s3/{project}/{store}/{bucket}?prefix={prefix}");
-            let (code, body) =
-                http_request(srv, "GET", &path, &[("x-yadb-subject", &subject)], &[])?;
+            let (code, body) = http_subject_request(
+                srv,
+                "GET",
+                &path,
+                &[],
+                &[],
+                &subject,
+                cli.subject_secret.as_deref(),
+            )?;
             if code != 200 {
                 eprintln!("S3 LS failed ({code}): {}", String::from_utf8_lossy(&body));
                 std::process::exit(1);
@@ -698,7 +977,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("{}", serde_json::to_string_pretty(&pretty)?);
         }
         Command::SimCrash { seed } => {
-            println!("Running deterministic crash & erasure self-healing simulation (seed={seed})...");
+            println!(
+                "Running deterministic crash & erasure self-healing simulation (seed={seed})..."
+            );
             let fs = SimFs::new(seed);
             let mut domains = Vec::new();
             for d in 0..6 {
@@ -790,4 +1071,159 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        apply_request, decode_base64, resolve_request, resolve_success, subject_headers,
+        subject_signature, validate_idempotency_key,
+    };
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    fn capture_request(f: impl FnOnce(&str)) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let thread = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0; 1024];
+            loop {
+                let n = stream.read(&mut buf).unwrap();
+                assert!(n > 0);
+                request.extend_from_slice(&buf[..n]);
+                if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let header = std::str::from_utf8(&request[..end]).unwrap();
+                    let len: usize = header
+                        .lines()
+                        .find_map(|l| l.strip_prefix("Content-Length: "))
+                        .unwrap()
+                        .parse()
+                        .unwrap();
+                    if request.len() >= end + 4 + len {
+                        break;
+                    }
+                }
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+                .unwrap();
+            String::from_utf8(request).unwrap()
+        });
+        f(&format!("http://{addr}"));
+        thread.join().unwrap()
+    }
+
+    #[test]
+    fn idempotency_key_validation_boundaries() {
+        for key in ["a", "-", "_", "~", ".", "AZaz09._~-", &"a".repeat(128)] {
+            assert!(validate_idempotency_key(key).is_ok(), "{key:?}");
+        }
+        for key in ["", &"a".repeat(129), "a b", "/", "é", "\n"] {
+            assert!(validate_idempotency_key(key).is_err(), "{key:?}");
+        }
+        for byte in 0..=127u8 {
+            let key = String::from_utf8(vec![byte]).unwrap();
+            assert_eq!(
+                validate_idempotency_key(&key).is_ok(),
+                byte.is_ascii_alphanumeric() || b"._~-".contains(&byte)
+            );
+        }
+    }
+
+    #[test]
+    fn apply_sends_optional_idempotency_header() {
+        for key in [Some("safe-key"), None] {
+            let request = capture_request(|srv| {
+                apply_request(srv, b"{}", "alice", Some("secret"), key).unwrap();
+            });
+            assert!(request.starts_with("POST /v1/apply HTTP/1.1\r\n"));
+            assert_eq!(
+                request.contains("Idempotency-Key: safe-key\r\n"),
+                key.is_some()
+            );
+            assert!(request.contains("x-yadb-subject-signature: "));
+        }
+    }
+
+    #[test]
+    fn resolve_sends_control_key_and_signed_subject() {
+        let request = capture_request(|srv| {
+            resolve_request(srv, "key-1", "alice", Some("secret")).unwrap();
+        });
+        assert!(request.starts_with("POST /v1/idempotency/resolve HTTP/1.1\r\n"));
+        assert!(request.contains("x-yadb-subject: alice\r\n"));
+        assert!(request.contains(&format!(
+            "x-yadb-subject-signature: {}\r\n",
+            subject_signature("secret", "alice")
+        )));
+        let body = request.split_once("\r\n\r\n").unwrap().1;
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(body).unwrap(),
+            serde_json::json!({"scope":"control", "key":"key-1"})
+        );
+    }
+
+    #[test]
+    fn resolve_exit_status_requires_definite_success() {
+        assert!(resolve_success(200, "committed"));
+        assert!(resolve_success(200, "not_committed"));
+        assert!(!resolve_success(503, "unknown"));
+        assert!(!resolve_success(200, "unknown"));
+        assert!(!resolve_success(503, "committed"));
+    }
+
+    #[test]
+    fn recorded_base64_decoding() {
+        for (encoded, expected) in [
+            ("", b"".as_slice()),
+            ("Zg==", b"f"),
+            ("Zm8=", b"fo"),
+            ("Zm9v", b"foo"),
+            ("//8=", b"\xff\xff"),
+        ] {
+            assert_eq!(decode_base64(encoded).unwrap(), expected);
+        }
+        for encoded in ["a", "====", "Zg=A", "Zh==", "Zm9=", "Zg==AAAA"] {
+            assert!(decode_base64(encoded).is_err());
+        }
+    }
+
+    #[test]
+    fn signature_matches_known_hmac_sha256_vector() {
+        assert_eq!(
+            subject_signature("key", "The quick brown fox jumps over the lazy dog"),
+            "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8"
+        );
+    }
+
+    #[test]
+    fn signature_is_lowercase_hex() {
+        let signature = subject_signature("key", "subject");
+        assert_eq!(signature.len(), 64);
+        assert!(signature
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+    }
+
+    #[test]
+    fn headers_include_exactly_one_signature_only_with_secret() {
+        let signed = subject_headers("alice", Some("key"));
+        let signatures: Vec<_> = signed
+            .iter()
+            .filter(|(name, _)| name == "x-yadb-subject-signature")
+            .collect();
+        assert_eq!(signatures.len(), 1);
+        assert_eq!(signatures[0].1, subject_signature("key", "alice"));
+        assert!(!subject_headers("alice", None)
+            .iter()
+            .any(|(name, _)| name == "x-yadb-subject-signature"));
+    }
+
+    #[test]
+    fn empty_subject_has_no_signature() {
+        let headers = subject_headers("", Some("key"));
+        assert_eq!(headers, vec![("x-yadb-subject".into(), "".into())]);
+    }
 }

@@ -447,7 +447,7 @@
   </div>
   <div style="display:flex;gap:8px;align-items:center">
     <button class="btn btn-secondary btn-sm" onclick="refreshAll()">↻ Refresh</button>
-    <button class="btn btn-secondary btn-sm" onclick="electLeader()" title="Trigger Raft Leader Election on this node">⚡ Elect Leader</button>
+    <button class="btn btn-secondary btn-sm" id="elect-leader" onclick="electLeader()" disabled title="Waiting for metadata runtime">⚡ Elect Leader</button>
   </div>
 </div>
 
@@ -501,7 +501,7 @@
           <div class="stat-sub" id="ov-cluster-sub">0 failure domains</div>
         </div>
         <div class="card">
-          <div class="card-title"><span>Raft MetaKV</span><span>Consensus</span></div>
+          <div class="card-title"><span id="ov-raft-title">Raft MetaKV</span><span>Consensus</span></div>
           <div class="stat-big" id="ov-raft-role">-</div>
           <div class="stat-sub" id="ov-raft-sub">Term 0 · Revision 0</div>
         </div>
@@ -515,6 +515,12 @@
           <div class="stat-big" id="ov-inv-cnt">0</div>
           <div class="stat-sub" id="ov-inv-sub">0 DB · 0 S3 · 0 Disk</div>
         </div>
+      </div>
+
+      <div class="card hidden" id="ov-openraft-card">
+        <div class="card-title">OpenRaft group observations</div>
+        <div class="stat-sub">Local observations only; not a linearizable guarantee. Experimental: production_ready = false. Leader distribution counts groups, not workload.</div>
+        <div id="ov-openraft-groups"></div>
       </div>
 
       <div class="card">
@@ -661,6 +667,8 @@
 <script>
 let state = { generation: 0, pools: {}, projects: {}, databases: {}, object_stores: {}, block_volumes: {}, cluster: null };
 let raft = { node_id: 1, role: "Unknown", term: 0, leader_id: null, commit_index: 0, metakv_revision: 0 };
+let openraftStatus = null;
+let refreshSequence = 0;
 let poolHealth = { pools: [], last_scrub: null };
 let currentView = "overview";
 
@@ -729,20 +737,36 @@ async function api(path, opts = {}) {
 }
 
 async function refreshAll() {
+  const sequence = ++refreshSequence;
+  openraftStatus = null;
+  renderOpenraftGroups();
   const [h, s, ph] = await Promise.all([
-    api("/healthz"),
-    api("/v1/status"),
-    api("/v1/pools/health")
+    api("/healthz").catch(() => null),
+    api("/v1/status").catch(() => null),
+    api("/v1/pools/health").catch(() => null)
   ]);
-  if (h.ok && h.json) raft = h.json;
-  if (s.ok && s.json) state = s.json;
-  if (ph.ok && ph.json) poolHealth = ph.json;
+  if (sequence !== refreshSequence) return;
+  if (h?.ok && h.json) raft = h.json;
+  if (s?.ok && s.json) state = s.json;
+  if (ph?.ok && ph.json) poolHealth = ph.json;
+  const isOpenraft = raft.metadata_runtime === "openraft";
+  const elect = document.getElementById("elect-leader");
+  elect.disabled = !h?.ok || !h.json || isOpenraft;
+  elect.title = isOpenraft ? "Leader election is unsupported for OpenRaft" :
+    (elect.disabled ? "Metadata runtime unavailable" : "Trigger Raft Leader Election on this node");
+  document.getElementById("ov-raft-title").textContent = isOpenraft ? "Raft MetaKV · CONTROL" : "Raft MetaKV";
+  document.getElementById("ov-openraft-card").classList.toggle("hidden", !isOpenraft);
+  if (isOpenraft) {
+    const status = await api("/experimental/openraft/status").catch(() => null);
+    if (sequence !== refreshSequence) return;
+    if (status?.ok && Array.isArray(status.json?.local_observations)) openraftStatus = status.json;
+  }
 
   // Update Masthead Raft Pill
   const dot = document.getElementById("raft-dot");
   dot.className = "dot" + (raft.role === "Leader" ? "" : " follower");
   document.getElementById("raft-label").textContent =
-    `Node #${raft.node_id} · ${raft.role} · Term ${raft.term}`;
+    `${isOpenraft ? "CONTROL · " : ""}Node #${raft.node_id} · ${raft.role} · Term ${raft.term}`;
   document.getElementById("gen-indicator").textContent =
     `Generation: ${state.generation} · Rev: ${raft.metakv_revision ?? 0}`;
 
@@ -764,8 +788,32 @@ async function refreshAll() {
   renderCurrent();
 }
 
+function renderOpenraftGroups() {
+  const box = document.getElementById("ov-openraft-groups");
+  const groups = openraftStatus?.local_observations;
+  if (!groups) {
+    box.innerHTML = '<div class="empty-box">Group observations unavailable or refreshing.</div>';
+    return;
+  }
+  if (!groups.length) {
+    box.innerHTML = '<div class="empty-box">No local group observations.</div>';
+    return;
+  }
+  const counts = new Map();
+  let unknown = 0;
+  groups.forEach(g => {
+    if (g.leader_id == null) unknown++;
+    else counts.set(String(g.leader_id), (counts.get(String(g.leader_id)) || 0) + 1);
+  });
+  const distribution = Array.from(counts, ([id, count]) => `Node ${esc(id)}: ${count}`).join(" · ");
+  box.innerHTML = `<div class="stat-sub">Observed leader group counts: ${distribution || "none"}${unknown ? ` · Unknown: ${unknown}` : ""}</div>
+    <table class="pf-table"><thead><tr><th>Group</th><th>Observed leader</th><th>Local node</th><th>Local role</th><th>Term</th><th>Preferred leader (configured)</th></tr></thead>
+    <tbody>${groups.map(g => `<tr><td>${esc(g.group ?? "-")}</td><td>${esc(g.leader_id ?? "Unknown")}</td><td>${esc(g.node_id ?? "-")}</td><td>${esc(g.state ?? "-")}</td><td>${esc(g.term ?? "-")}</td><td>${esc(g.preferred_leader ?? "-")}</td></tr>`).join("")}</tbody></table>`;
+}
+
 function renderCurrent() {
   renderOverview();
+  renderOpenraftGroups();
   if (currentView === "databases") renderDatabases();
   if (currentView === "s3") renderS3();
   if (currentView === "blocks") renderBlocks();
@@ -814,7 +862,7 @@ function renderOverview() {
 
   document.getElementById("ov-raft-role").textContent = raft.role || "-";
   document.getElementById("ov-raft-sub").textContent =
-    `Leader: ${raft.leader_id ?? "-"} · Term ${raft.term} · Commit #${raft.commit_index}`;
+    `${raft.metadata_runtime === "openraft" ? "CONTROL leader" : "Leader"}: ${raft.leader_id ?? "-"} · Term ${raft.term} · Commit #${raft.commit_index}`;
 
   const poolKeys = Object.keys(state.pools || {});
   const phList = poolHealth.pools || [];
@@ -896,6 +944,7 @@ async function runYamlApply() {
 }
 
 async function electLeader() {
+  if (document.getElementById("elect-leader").disabled || raft.metadata_runtime === "openraft") return;
   await api("/raft/elect", { method: "POST" });
   await refreshAll();
 }

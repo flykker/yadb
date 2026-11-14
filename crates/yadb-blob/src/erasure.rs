@@ -117,13 +117,15 @@ impl ErasureCodec {
         }
 
         match self.scheme {
-            ErasureScheme::Mirror { .. } => parts
-                .iter()
-                .find_map(|p| p.clone())
-                .ok_or(BlobError::InsufficientFragments {
-                    available: 0,
-                    required: 1,
-                }),
+            ErasureScheme::Mirror { .. } => {
+                parts
+                    .iter()
+                    .find_map(|p| p.clone())
+                    .ok_or(BlobError::InsufficientFragments {
+                        available: 0,
+                        required: 1,
+                    })
+            }
             ErasureScheme::ReedSolomon { k, .. } => {
                 let k = k as usize;
                 let present_count = parts.iter().filter(|p| p.is_some()).count();
@@ -192,7 +194,9 @@ impl ErasureCodec {
 fn unframe_systematic(data_shards: &[&[u8]]) -> Result<Vec<u8>, BlobError> {
     let total_cap: usize = data_shards.iter().map(|s| s.len()).sum();
     if total_cap < 4 {
-        return Err(BlobError::InvalidErasure("corrupt framed shard (<4B)".into()));
+        return Err(BlobError::InvalidErasure(
+            "corrupt framed shard (<4B)".into(),
+        ));
     }
     let mut joined = Vec::with_capacity(total_cap);
     for s in data_shards {

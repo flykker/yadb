@@ -664,7 +664,11 @@ impl<FS: StorageFs> DataShardTablet<FS> {
             return Ok(None);
         };
         Ok(Some(Self::open_snapshot_value(
-            meta, meta_key, kv, wal_striper, data_striper,
+            meta,
+            meta_key,
+            kv,
+            wal_striper,
+            data_striper,
         )?))
     }
 

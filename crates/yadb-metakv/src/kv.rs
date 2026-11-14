@@ -14,7 +14,7 @@ pub struct KvValue {
 
 /// Owned copy of selected metadata from one locally applied state. Missing keys
 /// stay missing. This is not a quorum read barrier or a transaction-wide snapshot.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetaSnapshot {
     pub(crate) revision: u64,
     pub(crate) values: BTreeMap<String, KvValue>,
@@ -90,10 +90,21 @@ pub enum KvCommand {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum KvResult {
-    PutOk { revision: u64, version: u64 },
-    Deleted { existed: bool, revision: u64 },
-    CasOk { revision: u64, version: u64 },
-    CasConflict { current_version: u64 },
+    PutOk {
+        revision: u64,
+        version: u64,
+    },
+    Deleted {
+        existed: bool,
+        revision: u64,
+    },
+    CasOk {
+        revision: u64,
+        version: u64,
+    },
+    CasConflict {
+        current_version: u64,
+    },
     TxnOk {
         revision: u64,
         versions: BTreeMap<String, u64>,
@@ -114,6 +125,7 @@ pub enum WatchEvent {
     },
 }
 
+#[cfg_attr(any(test, feature = "experimental-openraft-storage"), derive(Clone))]
 struct Watcher {
     prefix: String,
     tx: Sender<WatchEvent>,
@@ -121,10 +133,13 @@ struct Watcher {
 
 /// Ordered deterministic state machine applied identically on all Raft replicas.
 #[derive(Default)]
+#[cfg_attr(any(test, feature = "experimental-openraft-storage"), derive(Clone))]
 pub struct MetaStateMachine {
     revision: u64,
     kv: BTreeMap<String, KvValue>,
     watchers: Vec<Watcher>,
+    #[cfg(any(test, feature = "experimental-openraft-storage"))]
+    deferred: Option<Vec<WatchEvent>>,
 }
 
 impl MetaStateMachine {
@@ -149,6 +164,55 @@ impl MetaStateMachine {
             .collect()
     }
 
+    /// Export only durable key/value state. Watch channels are runtime-owned
+    /// and intentionally are not part of a restart or snapshot image.
+    #[cfg(any(test, feature = "experimental-openraft-storage"))]
+    pub(crate) fn durable_snapshot(&self) -> MetaSnapshot {
+        MetaSnapshot {
+            revision: self.revision,
+            values: self.kv.clone(),
+        }
+    }
+
+    /// Restore durable state and discard pre-restart watchers.
+    #[cfg(any(test, feature = "experimental-openraft-storage"))]
+    pub(crate) fn restore_durable_snapshot(&mut self, snapshot: MetaSnapshot) {
+        self.revision = snapshot.revision;
+        self.kv = snapshot.values;
+        self.watchers.clear();
+        self.deferred = None;
+    }
+
+    /// Replace durable data while retaining runtime-owned watch subscriptions.
+    #[cfg(any(test, feature = "experimental-openraft-storage"))]
+    pub(crate) fn replace_durable_snapshot(&mut self, snapshot: MetaSnapshot) {
+        self.revision = snapshot.revision;
+        self.kv = snapshot.values;
+        self.deferred = None;
+    }
+
+    #[cfg(any(test, feature = "experimental-openraft-storage"))]
+    pub(crate) fn defer_notifications(&mut self) {
+        self.deferred = Some(Vec::new());
+    }
+
+    #[cfg(any(test, feature = "experimental-openraft-storage"))]
+    pub(crate) fn take_deferred_notifications(&mut self) -> Vec<WatchEvent> {
+        self.deferred.take().unwrap_or_default()
+    }
+
+    #[cfg(any(test, feature = "experimental-openraft-storage"))]
+    pub(crate) fn deliver_notifications(&mut self, events: Vec<WatchEvent>) {
+        for event in events {
+            self.deliver(event);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn watcher_count(&self) -> usize {
+        self.watchers.len()
+    }
+
     pub fn watch_prefix(&mut self, prefix: impl Into<String>, tx: Sender<WatchEvent>) {
         self.watchers.push(Watcher {
             prefix: prefix.into(),
@@ -167,7 +231,10 @@ impl MetaStateMachine {
                         };
                     }
                 }
-                self.apply(KvCommand::Txn { guards: Vec::new(), ops })
+                self.apply(KvCommand::Txn {
+                    guards: Vec::new(),
+                    ops,
+                })
             }
             KvCommand::Put { key, value } => {
                 self.revision += 1;
@@ -305,6 +372,15 @@ impl MetaStateMachine {
     }
 
     fn notify(&mut self, ev: WatchEvent) {
+        #[cfg(any(test, feature = "experimental-openraft-storage"))]
+        if let Some(events) = &mut self.deferred {
+            events.push(ev);
+            return;
+        }
+        self.deliver(ev);
+    }
+
+    fn deliver(&mut self, ev: WatchEvent) {
         let key = match &ev {
             WatchEvent::Put { key, .. } | WatchEvent::Delete { key, .. } => key.as_str(),
         };

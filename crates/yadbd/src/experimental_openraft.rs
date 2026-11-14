@@ -1,0 +1,1384 @@
+//! One isolated experimental group per daemon, with a dedicated mTLS listener.
+//! Optional nonproduction client operations use this group; no migration exists.
+//!
+//! Configuration version 1 is JSON: {version, root, mode: "create"|"open",
+//! initialize: bool, cluster: [16 bytes], group, incarnation, node, listen,
+//! signing_key_der, tls: {roots_der: [paths], chain_der: [paths], key_der},
+//! peers: [{id, address, public_key: [32 bytes], server_name, cert_sha256: [32 bytes]}]}.
+//! Peers must be sorted by id and include the local node. Initialize is only
+//! allowed on create and on exactly one operator-selected replica.
+
+use serde::Deserialize;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    io::{self, Cursor, Read, Write},
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
+use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle};
+use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use tokio_rustls::rustls::{self, client::danger::ServerCertVerifier};
+use yadb_metakv::{
+    multiraft::{GroupIdentity, ReplicaIdentity},
+    openraft_net::{
+        AuthenticatedTcpNetworkFactory, BoxFuture, RaftPeerServer, TransportConfig, WireRequest,
+        WireResponse,
+    },
+    openraft_runtime::{persistent::PersistentGroup, YadbRaft},
+    openraft_tls::MutualTls,
+    openraft_transport::{NodeSigningKey, PeerKeyRegistry},
+};
+
+const MAX_CONFIG: u64 = 256 * 1024;
+const MAX_DER: u64 = 1024 * 1024;
+const MAX_PEERS: usize = 32;
+const MAX_MARKER: u64 = 256 * 1024;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Config {
+    version: u32,
+    root: PathBuf,
+    mode: Mode,
+    #[serde(default)]
+    initialize: bool,
+    cluster: [u8; 16],
+    group: u64,
+    incarnation: u64,
+    node: u32,
+    listen: SocketAddr,
+    signing_key_der: PathBuf,
+    tls: TlsConfig,
+    peers: Vec<Peer>,
+    #[serde(default)]
+    preferred_leader: Option<u32>,
+    #[serde(default)]
+    raft_timing: Option<RaftTiming>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RaftTiming {
+    heartbeat_ms: u64,
+    election_min_ms: u64,
+    election_max_ms: u64,
+    nonpreferred_election_min_ms: u64,
+}
+
+#[derive(Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum Mode {
+    Create,
+    Open,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TlsConfig {
+    roots_der: Vec<PathBuf>,
+    chain_der: Vec<PathBuf>,
+    key_der: PathBuf,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Peer {
+    id: u32,
+    address: SocketAddr,
+    public_key: [u8; 32],
+    server_name: String,
+    cert_sha256: [u8; 32],
+}
+
+fn invalid(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, message.into())
+}
+
+fn read_bounded(path: &Path, max: u64) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)?
+        .take(max + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.is_empty() || bytes.len() as u64 > max {
+        return Err(invalid("empty or oversized configuration material"));
+    }
+    Ok(bytes)
+}
+
+pub struct Prepared {
+    identity: ReplicaIdentity,
+    path: PathBuf,
+    mode: Mode,
+    initialize: bool,
+    listen: SocketAddr,
+    transport: TransportConfig,
+    members: BTreeMap<u32, openraft::BasicNode>,
+    raft_config: Arc<openraft::Config>,
+    preferred_leader: Option<u32>,
+    #[cfg(test)]
+    startup_pause: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
+}
+
+// A successful result can sit in the channel when its receiver is dropped.
+// Guard that handoff too: merely detecting a failed send misses this race.
+struct StartupGuard<T: StartupShutdown + Send + 'static>(Option<T>);
+
+trait StartupShutdown {
+    fn startup_shutdown(&mut self) -> impl std::future::Future<Output = ()> + Send;
+}
+
+impl<T: StartupShutdown + Send + 'static> Drop for StartupGuard<T> {
+    fn drop(&mut self) {
+        if let Some(mut owner) = self.0.take() {
+            tokio::spawn(async move { owner.startup_shutdown().await });
+        }
+    }
+}
+
+async fn supervised_start<T, F>(future: F) -> io::Result<T>
+where
+    T: StartupShutdown + Send + 'static,
+    F: std::future::Future<Output = io::Result<T>> + Send + 'static,
+{
+    let (send, receive) = oneshot::channel();
+    // Do not abort acquisition when the caller disappears: create/open may
+    // already have spawned Raft but not yet returned its owner to us.
+    tokio::spawn(async move {
+        let result = future.await.map(|owner| StartupGuard(Some(owner)));
+        let _ = send.send(result);
+    });
+    let mut guarded = receive.await.map_err(io::Error::other)??;
+    Ok(guarded.0.take().unwrap())
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MultiConfig {
+    version: u32,
+    control_group: u64,
+    project_groups: BTreeMap<u32, u64>,
+    groups: Vec<PathBuf>,
+}
+
+pub struct PreparedMulti {
+    groups: BTreeMap<u64, Prepared>,
+    control: u64,
+    projects: BTreeMap<u32, u64>,
+}
+
+pub fn prepare_multi(path: &Path) -> io::Result<PreparedMulti> {
+    let config: MultiConfig = serde_json::from_slice(&read_bounded(path, MAX_CONFIG)?)
+        .map_err(|e| invalid(format!("invalid multi-group config: {e}")))?;
+    if config.version != 2
+        || !(3..=16).contains(&config.groups.len())
+        || config.groups.iter().any(|p| !p.is_absolute())
+        || config.project_groups.is_empty()
+        || config.project_groups.len() > 4096
+        || config.project_groups.contains_key(&0)
+    {
+        return Err(invalid(
+            "version 2 requires 3-16 absolute group config paths and bounded project mapping",
+        ));
+    }
+    let mut groups = BTreeMap::new();
+    for path in config.groups {
+        let group = prepare(&path)?;
+        if groups.insert(group.identity.group().group, group).is_some() {
+            return Err(invalid("duplicate group ID"));
+        }
+    }
+    let first = groups.values().next().unwrap();
+    let mut addresses = BTreeSet::new();
+    let mut paths = BTreeSet::new();
+    let mut transport_addresses = BTreeSet::new();
+    for group in groups.values() {
+        if group.identity.group().cluster != first.identity.group().cluster
+            || group.identity.node() != first.identity.node()
+            || group.identity.voters() != first.identity.voters()
+            || group.mode != first.mode
+            || !addresses.insert(group.listen)
+            || !paths.insert(group.path.clone())
+        {
+            return Err(invalid(
+                "groups must share cluster, node, voters and mode, with unique listeners and paths",
+            ));
+        }
+        for address in group.transport.peers.values() {
+            if !transport_addresses.insert(*address) {
+                return Err(invalid(
+                    "transport peer addresses must be unique across groups",
+                ));
+            }
+        }
+    }
+    let data = config
+        .project_groups
+        .values()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    if !groups.contains_key(&config.control_group)
+        || data.len() < 2
+        || data.contains(&config.control_group)
+        || data.iter().any(|id| !groups.contains_key(id))
+        || groups.len() != data.len() + 1
+    {
+        return Err(invalid(
+            "control and at least two distinct mapped data groups required",
+        ));
+    }
+    Ok(PreparedMulti {
+        groups,
+        control: config.control_group,
+        projects: config.project_groups,
+    })
+}
+
+impl PreparedMulti {
+    fn marker(&self, root: &Path, peers: &BTreeMap<u32, String>) -> io::Result<Vec<u8>> {
+        let groups = self
+            .groups
+            .iter()
+            .map(|(id, g)| {
+                (
+                    *id,
+                    g.identity.group(),
+                    g.identity.node(),
+                    g.identity.voters(),
+                    &g.path,
+                )
+            })
+            .collect::<Vec<_>>();
+        let bytes = serde_json::to_vec(&(
+            2u32,
+            "openraft-multiraft",
+            root,
+            self.control,
+            &self.projects,
+            groups,
+            peers,
+        ))
+        .map_err(io::Error::other)?;
+        if bytes.len() as u64 > MAX_MARKER {
+            return Err(invalid("multi-group runtime marker exceeds limit"));
+        }
+        Ok(bytes)
+    }
+    pub fn validate_client_root(
+        &self,
+        root: &Path,
+        node: u32,
+        peers: &BTreeMap<u32, String>,
+        listen: &str,
+    ) -> io::Result<()> {
+        let first = self.groups.values().next().unwrap();
+        if first.identity.node() != node
+            || peers.keys().copied().collect::<Vec<_>>() != first.identity.voters()
+            || peers.get(&node).and_then(|p| p.parse::<SocketAddr>().ok())
+                != listen.parse::<SocketAddr>().ok()
+            || peers.values().any(|p| {
+                p.parse::<SocketAddr>()
+                    .map_or(true, |a| a.port() == 0 || a.ip().is_unspecified())
+            })
+        {
+            return Err(invalid(
+                "public peers must exactly match voters and local public listener",
+            ));
+        }
+        let absolute = if root.exists() {
+            root.canonicalize()?
+        } else {
+            root.parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."))
+                .canonicalize()?
+                .join(root.file_name().ok_or_else(|| invalid("invalid root"))?)
+        };
+        for g in self.groups.values() {
+            if g.path.starts_with(&absolute)
+                || absolute.starts_with(&g.path)
+                || g.path.parent() == Some(absolute.as_path())
+            {
+                return Err(invalid(
+                    "metadata roots must be separate from client data root",
+                ));
+            }
+        }
+        let marker = self.marker(&absolute, peers)?;
+        if first.mode == Mode::Create {
+            if root.exists() && (!root.is_dir() || std::fs::read_dir(root)?.next().is_some()) {
+                return Err(invalid("OpenRaft create requires new or empty data root"));
+            }
+        } else if root.join(".yadb-openraft-runtime.pending").exists()
+            || read_bounded(&root.join(".yadb-openraft-runtime.json"), MAX_MARKER)? != marker
+        {
+            return Err(invalid("multi-group runtime marker mismatch"));
+        }
+        Ok(())
+    }
+    pub fn provision_client_root(
+        &self,
+        root: &Path,
+        peers: &BTreeMap<u32, String>,
+    ) -> io::Result<yadb_io::OsDirectoryLock> {
+        let create = self.groups.values().next().unwrap().mode == Mode::Create;
+        if create && !root.exists() {
+            std::fs::create_dir(root)?;
+            std::fs::File::open(
+                root.parent()
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .unwrap_or_else(|| Path::new(".")),
+            )?
+            .sync_all()?;
+        }
+        let lock = yadb_io::OsDirectoryLock::try_acquire(root)?;
+        let expected = self.marker(&root.canonicalize()?, peers)?;
+        if create {
+            if std::fs::read_dir(root)?.next().is_some() {
+                return Err(invalid("data root not empty"));
+            }
+            let pending = root.join(".yadb-openraft-runtime.pending");
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&pending)?;
+            file.write_all(&expected)?;
+            file.sync_all()?;
+            std::fs::hard_link(&pending, root.join(".yadb-openraft-runtime.json"))?;
+            std::fs::remove_file(pending)?;
+            std::fs::File::open(root)?.sync_all()?;
+        } else if root.join(".yadb-openraft-runtime.pending").exists()
+            || read_bounded(&root.join(".yadb-openraft-runtime.json"), MAX_MARKER)? != expected
+        {
+            return Err(invalid("multi-group runtime marker mismatch"));
+        }
+        Ok(lock)
+    }
+    pub async fn start(self) -> io::Result<MultiRunning> {
+        supervised_start(self.start_inner()).await
+    }
+
+    async fn start_inner(self) -> io::Result<MultiRunning> {
+        let mut groups = BTreeMap::new();
+        for (id, prepared) in self.groups {
+            match prepared.start().await {
+                Ok(group) => {
+                    groups.insert(id, group);
+                }
+                Err(error) => {
+                    for group in groups.values_mut() {
+                        let _ = group.shutdown().await;
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        Ok(MultiRunning {
+            groups,
+            control: self.control,
+            projects: self.projects,
+        })
+    }
+}
+
+pub struct MultiRunning {
+    groups: BTreeMap<u64, Running>,
+    control: u64,
+    projects: BTreeMap<u32, u64>,
+}
+impl StartupShutdown for MultiRunning {
+    async fn startup_shutdown(&mut self) {
+        let _ = self.shutdown().await;
+    }
+}
+pub enum Owner {
+    Single(Running),
+    Multi(MultiRunning),
+}
+impl Owner {
+    pub fn status(&self) -> Status {
+        match self {
+            Self::Single(g) => g.status(false),
+            Self::Multi(g) => g.status(),
+        }
+    }
+    pub fn metadata(
+        &self,
+        peers: BTreeMap<u32, String>,
+    ) -> Result<yadb_metakv::LocalMetaKv<yadb_io::OsFs>, yadb_metakv::MetaError> {
+        match self {
+            Self::Multi(g) => g.metadata(peers),
+            Self::Single(_) => Err(yadb_metakv::MetaError::StorageUnavailable),
+        }
+    }
+    pub async fn listener_finished(&mut self) -> String {
+        match self {
+            Self::Single(g) => g.listener_finished().await,
+            Self::Multi(g) => g.listener_finished().await,
+        }
+    }
+    pub async fn shutdown(&mut self) -> io::Result<()> {
+        match self {
+            Self::Single(g) => g.shutdown().await,
+            Self::Multi(g) => g.shutdown().await,
+        }
+    }
+}
+impl MultiRunning {
+    pub fn metadata(
+        &self,
+        peers: BTreeMap<u32, String>,
+    ) -> Result<yadb_metakv::LocalMetaKv<yadb_io::OsFs>, yadb_metakv::MetaError> {
+        let groups = self
+            .groups
+            .iter()
+            .map(|(id, group)| {
+                (
+                    *id,
+                    (
+                        group.group.raft().clone(),
+                        group.group.state_machine().clone(),
+                    ),
+                )
+            })
+            .collect();
+        yadb_metakv::LocalMetaKv::from_openraft_groups(
+            self.control,
+            groups,
+            self.projects.clone(),
+            peers,
+            tokio::runtime::Handle::current(),
+        )
+    }
+    pub fn status(&self) -> Status {
+        Status {
+            groups: self
+                .groups
+                .iter()
+                .map(|(id, g)| (*id, (g.group.raft().clone(), g.preferred_leader)))
+                .collect(),
+            client_mode: true,
+        }
+    }
+    pub async fn listener_finished(&mut self) -> String {
+        loop {
+            for (id, group) in &mut self.groups {
+                if group.listener.as_ref().is_some_and(|t| t.is_finished()) {
+                    return format!("group {id}: {}", group.listener_finished().await);
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+    /// Cancelling this future retains all group owners in `self`; retry
+    /// shutdown before dropping `self`. Dropping `MultiRunning` itself is not
+    /// safe while shutdown remains incomplete.
+    pub async fn shutdown(&mut self) -> io::Result<()> {
+        let mut error = None;
+        for group in self.groups.values_mut() {
+            if let Err(e) = group.shutdown().await {
+                error = Some(e);
+            }
+        }
+        error.map_or(Ok(()), Err)
+    }
+}
+
+pub fn prepare(path: &Path) -> io::Result<Prepared> {
+    let config: Config = serde_json::from_slice(&read_bounded(path, MAX_CONFIG)?)
+        .map_err(|e| invalid(format!("invalid experimental OpenRaft config: {e}")))?;
+    if config.version != 1
+        || config.peers.is_empty()
+        || config.peers.len() > MAX_PEERS
+        || config.tls.roots_der.is_empty()
+        || config.tls.roots_der.len() > 16
+        || config.tls.chain_der.is_empty()
+        || config.tls.chain_der.len() > 16
+    {
+        return Err(invalid(
+            "unsupported version or config count outside bounds",
+        ));
+    }
+    if config.initialize && config.mode != Mode::Create {
+        return Err(invalid("initialize is only permitted with create"));
+    }
+    if !config.root.is_dir() {
+        return Err(invalid("experimental root must already exist"));
+    }
+    if config.listen.port() == 0
+        || config.peers.iter().any(|p| {
+            p.address.port() == 0
+                || p.address.ip().is_unspecified()
+                || p.server_name.is_empty()
+                || p.server_name.len() > 253
+        })
+        || config.peers.windows(2).any(|p| p[0].id >= p[1].id)
+        || config
+            .peers
+            .iter()
+            .map(|p| p.address)
+            .collect::<BTreeSet<_>>()
+            .len()
+            != config.peers.len()
+        || config
+            .peers
+            .iter()
+            .map(|p| p.public_key)
+            .collect::<BTreeSet<_>>()
+            .len()
+            != config.peers.len()
+    {
+        return Err(invalid("invalid or duplicate peer configuration"));
+    }
+    let identity = ReplicaIdentity::new(
+        GroupIdentity {
+            cluster: config.cluster,
+            group: config.group,
+            incarnation: config.incarnation,
+        },
+        config.node,
+        config.peers.iter().map(|p| p.id).collect(),
+    )
+    .map_err(|e| invalid(format!("invalid replica identity: {e:?}")))?;
+    let local = config
+        .peers
+        .iter()
+        .find(|p| p.id == config.node)
+        .ok_or_else(|| invalid("local peer missing"))?;
+    if local.address.port() != config.listen.port()
+        || (!config.listen.ip().is_unspecified() && local.address != config.listen)
+    {
+        return Err(invalid("local peer address must match listener"));
+    }
+    let key = Arc::new(
+        NodeSigningKey::from_pkcs8(&read_bounded(&config.signing_key_der, MAX_DER)?)
+            .map_err(|_| invalid("invalid signing key"))?,
+    );
+    if key.public_key() != local.public_key {
+        return Err(invalid("local signing public key mismatch"));
+    }
+    let roots = config
+        .tls
+        .roots_der
+        .iter()
+        .map(|p| read_bounded(p, MAX_DER).map(CertificateDer::from))
+        .collect::<io::Result<Vec<_>>>()?;
+    let chain = config
+        .tls
+        .chain_der
+        .iter()
+        .map(|p| read_bounded(p, MAX_DER).map(CertificateDer::from))
+        .collect::<io::Result<Vec<_>>>()?;
+    if MutualTls::fingerprint(chain[0].as_ref()) != local.cert_sha256 {
+        return Err(invalid("local TLS certificate pin mismatch"));
+    }
+    // The TLS constructors validate key syntax and key/cert correspondence,
+    // but do not verify our own certificate's trust, name, validity or EKUs.
+    let mut trust = rustls::RootCertStore::empty();
+    for root in &roots {
+        trust
+            .add(root.clone())
+            .map_err(|e| invalid(format!("invalid TLS root: {e}")))?;
+    }
+    let trust = Arc::new(trust);
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let server_verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(
+        trust.clone(),
+        provider.clone(),
+    )
+    .build()
+    .map_err(|e| invalid(e.to_string()))?;
+    let client_verifier =
+        rustls::server::WebPkiClientVerifier::builder_with_provider(trust, provider)
+            .build()
+            .map_err(|e| invalid(e.to_string()))?;
+    let name = rustls::pki_types::ServerName::try_from(local.server_name.clone())
+        .map_err(|e| invalid(e.to_string()))?;
+    let now = rustls::pki_types::UnixTime::now();
+    server_verifier
+        .verify_server_cert(&chain[0], &chain[1..], &name, &[], now)
+        .map_err(|e| invalid(format!("local server certificate invalid: {e}")))?;
+    client_verifier
+        .verify_client_cert(&chain[0], &chain[1..], now)
+        .map_err(|e| invalid(format!("local client certificate invalid: {e}")))?;
+    let tls_key = PrivateKeyDer::try_from(read_bounded(&config.tls.key_der, MAX_DER)?)
+        .map_err(|_| invalid("invalid TLS private key DER"))?;
+    let tls = MutualTls::new(
+        roots,
+        chain,
+        tls_key,
+        config
+            .peers
+            .iter()
+            .map(|p| (p.id, p.server_name.clone()))
+            .collect(),
+        config.peers.iter().map(|p| (p.id, p.cert_sha256)).collect(),
+    )?;
+    let registry = PeerKeyRegistry::new(
+        config
+            .peers
+            .iter()
+            .map(|p| (p.id, p.public_key.to_vec()))
+            .collect(),
+    )
+    .map_err(|e| invalid(e.to_string()))?;
+    let members = config
+        .peers
+        .iter()
+        .map(|p| (p.id, openraft::BasicNode::new(p.address.to_string())))
+        .collect();
+    let transport = TransportConfig::new(
+        identity.clone(),
+        key,
+        config.peers.iter().map(|p| (p.id, p.address)).collect(),
+        Arc::new(registry),
+    )
+    .with_tls(Arc::new(tls));
+    let cluster = config
+        .cluster
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    let path = config.root.canonicalize()?.join(format!(
+        "{cluster}-{}-{}-{}",
+        config.group, config.incarnation, config.node
+    ));
+    if (config.mode == Mode::Create && path.exists())
+        || (config.mode == Mode::Open && !path.is_dir())
+    {
+        return Err(invalid(
+            "replica path conflicts with explicit create/open mode",
+        ));
+    }
+    if config
+        .preferred_leader
+        .is_some_and(|id| !identity.voters().contains(&id))
+    {
+        return Err(invalid("preferred leader must be a voter"));
+    }
+    if config.preferred_leader.is_some() != config.raft_timing.is_some() {
+        return Err(invalid(
+            "preferred_leader and raft_timing must be configured together",
+        ));
+    }
+    let mut raft_config = openraft::Config::default();
+    if let Some(timing) = &config.raft_timing {
+        if !(10..=10_000).contains(&timing.heartbeat_ms)
+            || timing.election_min_ms < timing.heartbeat_ms.saturating_mul(3)
+            || timing.election_min_ms >= timing.nonpreferred_election_min_ms
+            || timing.nonpreferred_election_min_ms >= timing.election_max_ms
+            || timing.election_max_ms > 120_000
+        {
+            return Err(invalid("invalid raft timing bounds"));
+        }
+        raft_config.heartbeat_interval = timing.heartbeat_ms;
+        raft_config.election_timeout_min = if config.preferred_leader == Some(config.node) {
+            timing.election_min_ms
+        } else {
+            timing.nonpreferred_election_min_ms
+        };
+        // OpenRaft derives the leader lease from election_timeout_max. This
+        // maximum MUST match on all replicas, including the preferred one.
+        raft_config.election_timeout_max = timing.election_max_ms;
+    }
+    let raft_config = Arc::new(raft_config.validate().map_err(|e| invalid(e.to_string()))?);
+    Ok(Prepared {
+        identity,
+        path,
+        mode: config.mode,
+        initialize: config.initialize,
+        listen: config.listen,
+        transport,
+        members,
+        raft_config,
+        preferred_leader: config.preferred_leader,
+        #[cfg(test)]
+        startup_pause: None,
+    })
+}
+
+#[derive(Clone)]
+pub struct Status {
+    groups: BTreeMap<u64, (YadbRaft, Option<u32>)>,
+    client_mode: bool,
+}
+impl Status {
+    pub fn snapshot(&self) -> serde_json::Value {
+        let groups = self.groups.iter().map(|(id, (raft, preferred))| { let m = raft.metrics().borrow().clone(); serde_json::json!({"group": id, "node_id": m.id, "state": format!("{:?}", m.state), "term": m.current_term, "leader_id": m.current_leader, "preferred_leader": preferred, "preference_met": preferred.zip(m.current_leader).map(|(want, actual)| want == actual), "last_applied": format!("{:?}", m.last_applied), "running_state": format!("{:?}", m.running_state)}) }).collect::<Vec<_>>();
+        serde_json::json!({"experimental": true, "enabled": true, "client_traffic": if self.client_mode { "multiraft" } else { "legacy" }, "production_ready": false, "limitation": "dedicated listener per group; reads are local-applied", "local_observations": groups})
+    }
+}
+
+pub struct Running {
+    group: PersistentGroup,
+    listener: Option<JoinHandle<io::Result<()>>>,
+    stop: Option<oneshot::Sender<()>>,
+    preferred_leader: Option<u32>,
+}
+
+impl StartupShutdown for Running {
+    async fn startup_shutdown(&mut self) {
+        let _ = self.shutdown().await;
+    }
+}
+
+impl Prepared {
+    /// Checks the separate client-data root without writing anything. The
+    /// versioned marker is a mode guard, not an authorization to migrate.
+    #[cfg(test)]
+    pub fn validate_client_root(
+        &self,
+        root: &Path,
+        node: u32,
+        peers: &BTreeMap<u32, String>,
+        listen: &str,
+    ) -> io::Result<()> {
+        if self.identity.node() != node
+            || peers.keys().copied().collect::<Vec<_>>() != self.identity.voters()
+        {
+            return Err(invalid(
+                "public peer map and node must match the exact OpenRaft voters",
+            ));
+        }
+        let public: SocketAddr = listen
+            .parse()
+            .map_err(|_| invalid("public listener must be a socket address"))?;
+        if peers.get(&node).and_then(|p| p.parse::<SocketAddr>().ok()) != Some(public)
+            || peers.values().any(|p| {
+                p.parse::<SocketAddr>()
+                    .map_or(true, |a| a.port() == 0 || a.ip().is_unspecified())
+            })
+        {
+            return Err(invalid(
+                "public peer addresses must be concrete and local address must match --listen",
+            ));
+        }
+        let marker = root.join(".yadb-openraft-runtime.json");
+        let canonical_root = if root.exists() {
+            root.canonicalize()?
+        } else {
+            let parent = root
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            parent.canonicalize()?.join(
+                root.file_name()
+                    .ok_or_else(|| invalid("invalid data root"))?,
+            )
+        };
+        if self.path.starts_with(&canonical_root)
+            || canonical_root.starts_with(&self.path)
+            || self.path.parent() == Some(canonical_root.as_path())
+        {
+            return Err(invalid(
+                "experimental replica root must be separate from client data root",
+            ));
+        }
+        match self.mode {
+            Mode::Create => {
+                if root.exists() && (!root.is_dir() || std::fs::read_dir(root)?.next().is_some()) {
+                    return Err(invalid("OpenRaft create requires a new or empty data root"));
+                }
+            }
+            Mode::Open => {
+                if root.join(".yadb-openraft-runtime.pending").exists() {
+                    return Err(invalid("incomplete OpenRaft root provisioning"));
+                }
+                let actual = read_bounded(&marker, 16 * 1024)?;
+                if actual != self.marker_bytes(&canonical_root)? {
+                    return Err(invalid("OpenRaft runtime marker mismatch"));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn marker_bytes(&self, root: &Path) -> io::Result<Vec<u8>> {
+        serde_json::to_vec(&(
+            1u32,
+            "openraft",
+            self.identity.group(),
+            self.identity.node(),
+            self.identity.voters(),
+            &self.path,
+            root,
+        ))
+        .map_err(io::Error::other)
+    }
+
+    #[cfg(test)]
+    pub fn provision_client_root(&self, root: &Path) -> io::Result<yadb_io::OsDirectoryLock> {
+        if self.mode == Mode::Open {
+            let lock = yadb_io::OsDirectoryLock::try_acquire(root)?;
+            if root.join(".yadb-openraft-runtime.pending").exists()
+                || read_bounded(&root.join(".yadb-openraft-runtime.json"), 16 * 1024)?
+                    != self.marker_bytes(&root.canonicalize()?)?
+            {
+                return Err(invalid("OpenRaft runtime marker mismatch"));
+            }
+            return Ok(lock);
+        }
+        if !root.exists() {
+            std::fs::create_dir(root)?;
+            let parent = root
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            std::fs::File::open(parent)?.sync_all()?;
+        }
+        let lock = yadb_io::OsDirectoryLock::try_acquire(root)?;
+        if std::fs::read_dir(root)?.next().is_some() {
+            return Err(invalid("OpenRaft data root is not empty"));
+        }
+        // A leftover temporary marker fails closed in either mode.
+        let temporary = root.join(".yadb-openraft-runtime.pending");
+        let marker = root.join(".yadb-openraft-runtime.json");
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        file.write_all(&self.marker_bytes(&root.canonicalize()?)?)?;
+        file.sync_all()?;
+        std::fs::hard_link(&temporary, &marker)?;
+        std::fs::remove_file(&temporary)?;
+        std::fs::File::open(root)?.sync_all()?;
+        Ok(lock)
+    }
+
+    pub async fn start(self) -> io::Result<Running> {
+        supervised_start(self.start_inner()).await
+    }
+
+    async fn start_inner(self) -> io::Result<Running> {
+        // Bind first, so an address conflict cannot create a partial replica.
+        let listener = TcpListener::bind(self.listen).await?;
+        let network = AuthenticatedTcpNetworkFactory::new(self.transport.clone());
+        let group = match self.mode {
+            Mode::Create => {
+                PersistentGroup::create(&self.path, &self.identity, self.raft_config, network).await
+            }
+            Mode::Open => {
+                PersistentGroup::open(&self.path, &self.identity, self.raft_config, network).await
+            }
+        }
+        .map_err(|e| io::Error::other(e.to_string()))?;
+        #[cfg(test)]
+        if let Some((ready, resume)) = self.startup_pause {
+            let _ = ready.send(());
+            let _ = resume.await;
+        }
+        if self.initialize {
+            if let Err(e) = group.raft().initialize(self.members).await {
+                let error = io::Error::other(format!("experimental bootstrap failed: {e}"));
+                group.raft().shutdown().await.map_err(io::Error::other)?;
+                return Err(error);
+            }
+        }
+        let raft = group.raft().clone();
+        let handler: Arc<dyn Fn(WireRequest) -> BoxFuture<WireResponse> + Send + Sync> =
+            Arc::new(move |request| {
+                let raft = raft.clone();
+                Box::pin(async move {
+                    // On fatal Raft errors panic only this connection task: the wire
+                    // protocol has no error variant and must not forge a success.
+                    match request {
+                        WireRequest::AppendEntries(rpc) => WireResponse::AppendEntries(Box::new(
+                            raft.append_entries(*rpc)
+                                .await
+                                .expect("OpenRaft append failed"),
+                        )),
+                        WireRequest::Vote(rpc) => WireResponse::Vote(Box::new(
+                            raft.vote(*rpc).await.expect("OpenRaft vote failed"),
+                        )),
+                        WireRequest::InstallSnapshot { vote, meta, data } => {
+                            WireResponse::InstallSnapshot(Box::new(
+                                raft.install_full_snapshot(
+                                    vote,
+                                    openraft::Snapshot {
+                                        meta,
+                                        snapshot: Box::new(Cursor::new(data)),
+                                    },
+                                )
+                                .await
+                                .expect("OpenRaft snapshot failed"),
+                            ))
+                        }
+                    }
+                })
+            });
+        let server = RaftPeerServer::from_listener(listener, self.transport, handler);
+        let (stop, stopped) = oneshot::channel();
+        let listener = tokio::spawn(server.serve_until(async {
+            let _ = stopped.await;
+        }));
+        Ok(Running {
+            group,
+            listener: Some(listener),
+            stop: Some(stop),
+            preferred_leader: self.preferred_leader,
+        })
+    }
+}
+
+impl Running {
+    pub fn status(&self, client_mode: bool) -> Status {
+        Status {
+            groups: BTreeMap::from([(
+                self.group.identity().group().group,
+                (self.group.raft().clone(), self.preferred_leader),
+            )]),
+            client_mode,
+        }
+    }
+    pub async fn listener_finished(&mut self) -> String {
+        let result = self
+            .listener
+            .as_mut()
+            .expect("listener already joined")
+            .await;
+        self.listener.take();
+        format!("{result:?}")
+    }
+    /// Cancelling this future retains the owner and listener in `self`; retry
+    /// shutdown before dropping `self`. Dropping `Running` itself is not safe
+    /// while shutdown remains incomplete.
+    pub async fn shutdown(&mut self) -> io::Result<()> {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        let listener_result = match self.listener.as_mut() {
+            Some(listener) => listener.await.map_err(io::Error::other).and_then(|r| r),
+            None => Ok(()),
+        };
+        self.listener.take();
+        self.group
+            .raft()
+            .shutdown()
+            .await
+            .map_err(io::Error::other)?;
+        listener_result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ring::{
+        rand::SystemRandom,
+        signature::{Ed25519KeyPair, KeyPair},
+    };
+    use serde_json::{json, Value};
+    use std::future::Future;
+
+    fn fixture() -> (PathBuf, PathBuf, Value) {
+        let mut random = [0u8; 16];
+        ring::rand::SecureRandom::fill(&SystemRandom::new(), &mut random).unwrap();
+        let suffix = random
+            .iter()
+            .map(|v| format!("{v:02x}"))
+            .collect::<String>();
+        let dir = std::env::temp_dir().join(format!("yadb-openraft-daemon-{suffix}"));
+        std::fs::create_dir(&dir).unwrap();
+        let key = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
+        let pair = Ed25519KeyPair::from_pkcs8(key.as_ref()).unwrap();
+        let signing_key = dir.join("signing.der");
+        std::fs::write(&signing_key, key.as_ref()).unwrap();
+        let tls_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../yadb-metakv/testdata/tls");
+        let cert = std::fs::read(tls_dir.join("node-1.test.cert.der")).unwrap();
+        let address = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let config = json!({
+            "version": 1, "root": dir, "mode": "create", "initialize": true,
+            "cluster": [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1], "group": 1, "incarnation": 1,
+            "node": 1, "listen": address, "signing_key_der": signing_key,
+            "tls": {"roots_der": [tls_dir.join("ca.der")], "chain_der": [tls_dir.join("node-1.test.cert.der")], "key_der": tls_dir.join("node-1.test.key.der")},
+            "peers": [{"id": 1, "address": address, "public_key": pair.public_key().as_ref(), "server_name": "node-1.test", "cert_sha256": MutualTls::fingerprint(&cert)}]
+        });
+        let path = dir.join("config.json");
+        std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+        (dir, path, config)
+    }
+
+    async fn reopen_after_cancel(path: &Path) {
+        let mut config: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        config["mode"] = json!("open");
+        config["initialize"] = json!(false);
+        std::fs::write(path, serde_json::to_vec(&config).unwrap()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Ok(mut running) = prepare(path).unwrap().start().await {
+                    running.shutdown().await.unwrap();
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("cancelled startup leaked a listener or replica directory lock");
+    }
+
+    #[tokio::test]
+    async fn cancelled_start_releases_acquired_replica() {
+        let (dir, path, _) = fixture();
+        let mut prepared = prepare(&path).unwrap();
+        let (ready, reached) = oneshot::channel();
+        let (resume, wait) = oneshot::channel();
+        prepared.startup_pause = Some((ready, wait));
+        let mut start = Box::pin(prepared.start());
+        tokio::select! {
+            _ = &mut start => panic!("startup did not pause"),
+            result = reached => result.unwrap(),
+        }
+        drop(start);
+        resume.send(()).unwrap();
+        reopen_after_cancel(&path).await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_multi_start_releases_first_and_second_replicas() {
+        let (dir, _, template) = fixture();
+        let mut paths = Vec::new();
+        let mut sockets = Vec::new();
+        for id in 1..=3 {
+            let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = socket.local_addr().unwrap();
+            sockets.push(socket);
+            let mut config = template.clone();
+            config["group"] = json!(id);
+            config["listen"] = json!(addr);
+            config["peers"][0]["address"] = json!(addr);
+            let path = dir.join(format!("group-{id}.json"));
+            std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+            paths.push(path);
+        }
+        drop(sockets);
+        let manifest = dir.join("multi.json");
+        std::fs::write(&manifest, serde_json::to_vec(&json!({"version":2,"control_group":1,"project_groups":{"1":2,"2":3},"groups":paths})).unwrap()).unwrap();
+        let mut prepared = prepare_multi(&manifest).unwrap();
+        let (ready, reached) = oneshot::channel();
+        let (resume, wait) = oneshot::channel();
+        prepared.groups.get_mut(&2).unwrap().startup_pause = Some((ready, wait));
+        let mut start = Box::pin(prepared.start());
+        tokio::select! {
+            _ = &mut start => panic!("multi startup did not pause at group 2"),
+            result = reached => result.unwrap(),
+        }
+        drop(start);
+        resume.send(()).unwrap();
+        for path in &paths {
+            reopen_after_cancel(path).await;
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn create_status_shutdown_and_reopen() {
+        let (dir, path, mut config) = fixture();
+        let mut running = prepare(&path).unwrap().start().await.unwrap();
+        let status = running.status(false).snapshot();
+        assert_eq!(status["production_ready"], false);
+        assert_eq!(status["client_traffic"], "legacy");
+        running.shutdown().await.unwrap();
+        drop(running);
+        config["mode"] = json!("open");
+        config["initialize"] = json!(false);
+        std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+        let mut reopened = prepare(&path).unwrap().start().await.unwrap();
+        reopened.shutdown().await.unwrap();
+        drop(reopened);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_shutdown_retains_owner_and_listener_until_retry() {
+        let (dir, path, mut config) = fixture();
+        let mut running = prepare(&path).unwrap().start().await.unwrap();
+        // Replace the listener task with a deterministically blocked one after
+        // first draining the real server. This exercises cancellation at the
+        // exact join boundary without relying on scheduler timing.
+        running.stop.take().unwrap().send(()).unwrap();
+        running.listener.as_mut().unwrap().await.unwrap().unwrap();
+        let (release, wait) = tokio::sync::oneshot::channel::<()>();
+        running.listener = Some(tokio::spawn(async move {
+            let _ = wait.await;
+            Ok(())
+        }));
+        let mut shutdown = Box::pin(running.shutdown());
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(
+                shutdown.as_mut().poll(cx).is_pending()
+            ))
+            .await
+        );
+        drop(shutdown);
+        assert!(running.listener.is_some());
+        config["mode"] = json!("open");
+        config["initialize"] = json!(false);
+        std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+        assert!(prepare(&path).unwrap().start().await.is_err());
+        release.send(()).unwrap();
+        running.shutdown().await.unwrap();
+        drop(running);
+        let mut reopened = prepare(&path).unwrap().start().await.unwrap();
+        reopened.shutdown().await.unwrap();
+        drop(reopened);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn multigroup_cancelled_shutdown_retains_all_owners_until_retry() {
+        let (dir, _, template) = fixture();
+        let mut paths = Vec::new();
+        let mut sockets = Vec::new();
+        for id in 1..=3 {
+            let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = socket.local_addr().unwrap();
+            sockets.push(socket);
+            let mut config = template.clone();
+            config["group"] = json!(id);
+            config["listen"] = json!(addr);
+            config["peers"][0]["address"] = json!(addr);
+            let path = dir.join(format!("group-{id}.json"));
+            std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+            paths.push(path);
+        }
+        drop(sockets);
+        let manifest = dir.join("multi.json");
+        std::fs::write(&manifest, serde_json::to_vec(&json!({"version":2,"control_group":1,"project_groups":{"1":2,"2":3},"groups":paths})).unwrap()).unwrap();
+        let mut running = prepare_multi(&manifest).unwrap().start().await.unwrap();
+        // Drain every real listener so a failed reopen demonstrates the root
+        // owner, not a port conflict. Block the middle group after group 1.
+        for group in running.groups.values_mut() {
+            group.stop.take().unwrap().send(()).unwrap();
+            group.listener.as_mut().unwrap().await.unwrap().unwrap();
+            group.listener.take();
+        }
+        let (release, wait) = oneshot::channel::<()>();
+        running.groups.get_mut(&2).unwrap().listener = Some(tokio::spawn(async move {
+            let _ = wait.await;
+            Ok(())
+        }));
+        let mut shutdown = Box::pin(running.shutdown());
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(
+                shutdown.as_mut().poll(cx).is_pending()
+            ))
+            .await
+        );
+        drop(shutdown);
+        assert!(running.groups[&1].listener.is_none());
+        assert!(running.groups[&2].listener.is_some());
+        for path in &paths {
+            let mut config: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+            config["mode"] = json!("open");
+            config["initialize"] = json!(false);
+            std::fs::write(path, serde_json::to_vec(&config).unwrap()).unwrap();
+            assert!(
+                prepare(path).unwrap().start().await.is_err(),
+                "root reopened while multi shutdown was incomplete: {path:?}"
+            );
+        }
+        release.send(()).unwrap();
+        running.shutdown().await.unwrap();
+        drop(running);
+        let mut reopened = prepare_multi(&manifest).unwrap().start().await.unwrap();
+        reopened.shutdown().await.unwrap();
+        drop(reopened);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn invalid_config_is_rejected_before_replica_creation() {
+        let (dir, path, config) = fixture();
+        for change in 0..10 {
+            let mut bad = config.clone();
+            match change {
+                0 => bad["unknown"] = json!(true),
+                1 => bad["version"] = json!(2),
+                2 => bad["peers"][0]["public_key"] = json!(vec![0; 32]),
+                3 => bad["peers"][0]["cert_sha256"] = json!(vec![0; 32]),
+                4 => bad["tls"]["roots_der"] = json!([]),
+                5 => bad["mode"] = json!("open"),
+                6 => bad["node"] = json!(0),
+                7 => bad["peers"][0]["server_name"] = json!("wrong.example"),
+                8 | 9 => {
+                    let tls_dir =
+                        Path::new(env!("CARGO_MANIFEST_DIR")).join("../yadb-metakv/testdata/tls");
+                    let cert_path = tls_dir.join(if change == 8 {
+                        "untrusted.test.cert.der"
+                    } else {
+                        "expired.test.cert.der"
+                    });
+                    let cert = std::fs::read(&cert_path).unwrap();
+                    bad["tls"]["chain_der"] = json!([cert_path]);
+                    bad["peers"][0]["cert_sha256"] = json!(MutualTls::fingerprint(&cert));
+                }
+                _ => unreachable!(),
+            }
+            std::fs::write(&path, serde_json::to_vec(&bad).unwrap()).unwrap();
+            let error = match prepare(&path) {
+                Ok(_) => panic!("invalid case {change}"),
+                Err(error) => error.to_string(),
+            };
+            if change >= 7 {
+                assert!(
+                    error.contains("local server certificate invalid"),
+                    "case {change}: {error}"
+                );
+            }
+            if change == 9 {
+                assert!(error.to_lowercase().contains("expired"), "{error}");
+            }
+            assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2);
+        }
+        std::fs::write(&path, vec![b' '; MAX_CONFIG as usize + 1]).unwrap();
+        assert!(prepare(&path).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn preference_and_timing_are_opt_in_and_validated() {
+        let (dir, path, mut config) = fixture();
+        let original = prepare(&path).unwrap();
+        assert_eq!(
+            original.raft_config.heartbeat_interval,
+            openraft::Config::default().heartbeat_interval
+        );
+        config["preferred_leader"] = json!(1);
+        std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+        assert!(prepare(&path).is_err());
+        config["raft_timing"] = json!({"heartbeat_ms":250,"election_min_ms":1500,"nonpreferred_election_min_ms":2750,"election_max_ms":3000});
+        std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+        let preferred = prepare(&path).unwrap();
+        assert_eq!(preferred.raft_config.election_timeout_min, 1500);
+        assert_eq!(preferred.raft_config.election_timeout_max, 3000);
+        config["preferred_leader"] = json!(2);
+        std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+        assert!(prepare(&path).is_err());
+        config["preferred_leader"] = json!(1);
+        config["raft_timing"]["election_max_ms"] = json!(2600);
+        std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+        assert!(prepare(&path).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn client_root_rejects_existing_data_and_marker_mismatch() {
+        let (dir, path, _) = fixture();
+        let prepared = prepare(&path).unwrap();
+        let root = dir.join("data");
+        std::fs::create_dir(&root).unwrap();
+        let listen = prepared.members[&1].addr.clone();
+        let peers = BTreeMap::from([(1, listen.clone())]);
+        std::fs::write(root.join("old-data"), b"untouched").unwrap();
+        assert!(prepared
+            .validate_client_root(&root, 1, &peers, &listen)
+            .is_err());
+        assert_eq!(std::fs::read(root.join("old-data")).unwrap(), b"untouched");
+        std::fs::remove_file(root.join("old-data")).unwrap();
+        prepared
+            .validate_client_root(&root, 1, &peers, &listen)
+            .unwrap();
+        prepared.provision_client_root(&root).unwrap();
+        assert!(prepared
+            .validate_client_root(&root, 1, &peers, &listen)
+            .is_err());
+        assert!(prepared
+            .validate_client_root(&root, 2, &peers, &listen)
+            .is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn multigroup_create_write_reopen_and_marker_binding() {
+        let (dir, _, template) = fixture();
+        let mut paths = Vec::new();
+        let mut used = Vec::new();
+        for id in 1..=3 {
+            let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = socket.local_addr().unwrap();
+            used.push(socket);
+            let mut cfg = template.clone();
+            cfg["group"] = json!(id);
+            cfg["listen"] = json!(addr);
+            cfg["peers"][0]["address"] = json!(addr);
+            let path = dir.join(format!("group-{id}.json"));
+            std::fs::write(&path, serde_json::to_vec(&cfg).unwrap()).unwrap();
+            paths.push(path);
+        }
+        drop(used);
+        let manifest = dir.join("multi.json");
+        let mut config =
+            json!({"version":2,"control_group":1,"project_groups":{"1":2,"2":3},"groups":paths});
+        std::fs::write(&manifest, serde_json::to_vec(&config).unwrap()).unwrap();
+        let root = dir.join("client-data");
+        let public = "127.0.0.1:8420";
+        let peers = BTreeMap::from([(1, public.to_string())]);
+        let prepared = prepare_multi(&manifest).unwrap();
+        prepared
+            .validate_client_root(&root, 1, &peers, public)
+            .unwrap();
+        let owner = prepared.provision_client_root(&root, &peers).unwrap();
+        let mut running = prepared.start().await.unwrap();
+        let meta = running.metadata(peers.clone()).unwrap();
+        for _ in 0..100 {
+            if meta.role_info_for_key("/db/1/").unwrap().1 == yadb_metakv::RoleState::Leader
+                && meta.role_info_for_key("/db/2/").unwrap().1 == yadb_metakv::RoleState::Leader
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        for key in ["/db/1/value", "/db/2/value"] {
+            let m = meta.clone();
+            let key = key.to_string();
+            tokio::task::spawn_blocking(move || {
+                m.execute(yadb_metakv::KvCommand::Put {
+                    key,
+                    value: b"ok".to_vec(),
+                })
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        }
+        assert!(!root.join("metakv").exists());
+        assert_eq!(running.status().snapshot()["production_ready"], false);
+        drop(meta);
+        running.shutdown().await.unwrap();
+        drop(running);
+        drop(owner);
+        for path in config["groups"].as_array().unwrap() {
+            let path = PathBuf::from(path.as_str().unwrap());
+            let mut group: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            group["mode"] = json!("open");
+            group["initialize"] = json!(false);
+            std::fs::write(path, serde_json::to_vec(&group).unwrap()).unwrap();
+        }
+        let prepared = prepare_multi(&manifest).unwrap();
+        prepared
+            .validate_client_root(&root, 1, &peers, public)
+            .unwrap();
+        let owner = prepared.provision_client_root(&root, &peers).unwrap();
+        let mut running = prepared.start().await.unwrap();
+        let meta = running.metadata(peers.clone()).unwrap();
+        assert_eq!(meta.get("/db/1/value").unwrap().value, b"ok");
+        assert_eq!(meta.get("/db/2/value").unwrap().value, b"ok");
+        drop(meta);
+        running.shutdown().await.unwrap();
+        drop(running);
+        drop(owner);
+        config["project_groups"]["1"] = json!(3);
+        config["project_groups"]["2"] = json!(2);
+        std::fs::write(&manifest, serde_json::to_vec(&config).unwrap()).unwrap();
+        assert!(prepare_multi(&manifest)
+            .unwrap()
+            .validate_client_root(&root, 1, &peers, public)
+            .is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}

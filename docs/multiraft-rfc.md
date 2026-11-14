@@ -1,18 +1,33 @@
 # Multi-Raft for YADB: architecture and staged migration
 
-Status: design proposal; production Multi-Raft is not implemented. This RFC specifies safety gates and
+Status: design proposal; production Multi-Raft is not implemented. The current
+implementation checklist and evidence are in [multiraft-production-todo.md](multiraft-production-todo.md).
+This RFC specifies safety gates and
 an initial direction; open choices below require implementation-level designs and
-tests. Existing single-group behavior and protocol compatibility remain in force.
+tests. Existing single-group behavior remains in force, except for explicitly
+documented fail-closed legacy authentication requirements in the checklist.
 
 The isolated experimental module contains group identities, a typed WAL and an
 incomplete deterministic memory-only core. The core is not connected to the WAL,
 daemon or client traffic; it must not be used as a production consensus engine.
 The selected production consensus dependency is OpenRaft 0.9.x. Its integration
-boundary is compile-tested, but its durable storage adapter, group transport and
-daemon lifecycle are not implemented yet. The OpenRaft storage contracts require
+boundary includes experimental file-backed adapters, persistent group ownership,
+an in-process registry and signed TCP RPCs with opt-in pinned TLS 1.3 mTLS.
+The opt-in daemon module runs one isolated group with a dedicated mandatory-mTLS
+listener; legacy Raft still serves all client traffic. These are not a production
+runtime: multi-group daemon routing, resource isolation, storage-contract
+equivalence and deployment/recovery gates remain incomplete.
+The user has authorized a new empty nonproduction Multi-Raft client deployment.
+Its in-progress first routing domain is an immutable project-to-data-group map,
+with a separate control group and at least two data-serving groups. This is not
+an already deployed change, general resharding or a distributed transaction
+protocol; single-group adapter tests do not establish this Multi-Raft path.
+The OpenRaft storage contracts require
 persist-before-return for votes and persist-before-callback for log appends; YADB must satisfy those contracts rather
-than route OpenRaft through the experimental WAL/core. Envelope checks do not
-authenticate peers. The runtime and verification gates below remain future work.
+than route OpenRaft through the experimental WAL/core. Field checks alone do not
+authenticate peers: trusted per-node signing keys, TLS certificates and exact
+leaf pins establish the current experimental transport identity boundary.
+The remaining runtime and verification gates below are not complete.
 An OpenRaft singleton smoke test runs with a test-only volatile store and applies
 a YADB command. It does not test durable recovery, replication, quorum loss or
 snapshots; that store deliberately cannot satisfy production durability contracts.
@@ -25,12 +40,17 @@ the new majority, and catches the old leader up after healing. A timed-out write
 This simulated partition is not a durability, snapshot, authenticated transport,
 message reordering, or exhaustive consensus-safety test.
 
-A test-only file-backed OpenRaft log/vote prototype now uses framed records with
-CRC, serialized writes, `sync_data()` before `LogFlushed`, reopen replay, suffix
-replacement, cooperative OS directory locking, and fail-closed malformed-tail handling.
-It is not production storage: it is not wired into the daemon, does not persist
-the state machine or snapshots, and has not passed OpenRaft's complete storage test
-suite. Simulated partial-write and sync errors poison the handle until reopen;
+An experimental opt-in file-backed OpenRaft log/vote prototype uses framed records with
+CRC, serialized writes, `sync_data()` before `LogFlushed`, reopen replay, matching
+overlap preservation with explicit truncation for conflicts, cooperative OS
+directory locking, and fail-closed malformed-tail handling. Corrected replay rules
+and checkpoint capability use `YORLOG04` and reject the prior experimental
+`YORLOG02`/`YORLOG03` formats unchanged;
+no automatic migration is implemented.
+It is not production storage: the opt-in daemon integration does not close the
+storage-contract gate, and the separate experimental state-machine and snapshot
+adapter has not demonstrated complete upstream storage-suite equivalence.
+Simulated partial-write and sync errors poison the handle until reopen;
 these tests do not establish power-loss safety. The experimental log header binds
 cluster, group, incarnation and node, not the mutable OpenRaft membership; creation
 and reopening are separate and identity mismatch is rejected without modifying data.
@@ -39,10 +59,12 @@ and reopening are separate and identity mismatch is rejected without modifying d
 
 OpenRaft, not `DeterministicGroupCore`, is the intended consensus engine. The
 hand-written core remains an isolated experiment, not a candidate runtime. The
-next gates are: bounded three-node OpenRaft tests using a test-only in-process
-network; durable serialized vote/log storage and OpenRaft storage-suite plus crash
-tests; snapshots and recovery; authenticated, group-bound transport and lifecycle;
-then a separately designed offline migration. No existing client traffic moves
+implemented evidence now includes in-process/file-backed tests, signed TCP and
+mTLS replication, process-kill failover/quorum recovery and targeted snapshot
+catch-up. The remaining gates include full storage-contract equivalence, bounded
+resources and compaction, adversarial transport/lifecycle testing, supported-host
+durability qualification and a separately implemented offline migration. No
+existing client traffic moves
 until these gates and the cross-group semantics below are met.
 
 Separately evaluate mature HTTP, TLS, PostgreSQL wire, S3, YAML, SQL, erasure
@@ -208,6 +230,11 @@ safety for arbitrary durable corruption. Legacy behavior is unchanged.
    automated placement and leader balancing. Design split/merge only afterwards.
 
 ## Cutover and restore requirements
+
+The proposed versioned states, manifest requirements and fail-closed recovery
+matrix are specified in [multiraft-migration.md](multiraft-migration.md).
+That document is a draft protocol, not an implemented migration tool or permission
+to switch traffic; fencing authority and import semantics remain release blockers.
 
 Before cutover, develop a versioned offline migration with a coordinated stop of
 all writers, consistent metadata + blob backup, manifest and counter validation,

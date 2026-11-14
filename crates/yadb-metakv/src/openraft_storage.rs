@@ -1,4 +1,4 @@
-//! Experimental, test-only file-backed OpenRaft log and vote prototype.
+//! Experimental opt-in file-backed OpenRaft log and vote prototype.
 //!
 //! Not suitable for production: group identity, recovery, failure handling and
 //! the OpenRaft storage contracts need further work and testing.
@@ -8,7 +8,7 @@ use std::fmt::Debug;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::ops::RangeBounds;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use yadb_io::OsDirectoryLock;
 
@@ -16,20 +16,35 @@ use openraft::storage::{LogFlushed, RaftLogReader, RaftLogStorage};
 use openraft::{Entry, ErrorSubject, ErrorVerb, LogId, LogState, StorageError, Vote};
 use serde::{Deserialize, Serialize};
 
-use crate::openraft_runtime::YadbRaftTypeConfig as C;
 use crate::multiraft::ReplicaIdentity;
+use crate::openraft_runtime::YadbRaftTypeConfig as C;
 
-const MAGIC: &[u8; 8] = b"YORLOG02";
+// Version 02 used suffix-replacing append; version 03 lacks checkpoints.
+// Neither format is migrated or reinterpreted by this experimental store.
+const MAGIC: &[u8; 8] = b"YORLOG04";
 const IDENTITY_LEN: usize = 44;
 const FRAME_MAGIC: &[u8; 4] = b"YORF";
 const FRAME_HEADER_LEN: usize = 12;
 const MAX_FRAME_PAYLOAD: usize = 16 * 1024 * 1024;
+// A checkpoint must fit a single frame. Physical log and replay are bounded
+// independently; temporary replacement can briefly double disk usage.
+const MAX_CHECKPOINT_PAYLOAD: usize = 8 * 1024 * 1024;
+const MAX_LIVE_ENTRIES: usize = 4096;
+const MAX_LOG_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_LOG_FRAMES: usize = 1024;
+const CHECKPOINT_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(bound = "")]
 enum Record {
+    Checkpoint {
+        version: u32,
+        vote: Option<Vote<u32>>,
+        purged: Option<LogId<u32>>,
+        entries: Vec<Entry<C>>,
+    },
     Vote(Vote<u32>),
-    /// An append replaces any existing suffix from the first entry onward.
+    /// Append entries; conflicting existing entries require an explicit truncate.
     Append(Vec<Entry<C>>),
     Truncate(LogId<u32>),
     Purge(LogId<u32>),
@@ -49,17 +64,33 @@ pub struct DurableOpenRaftLog {
 
 struct Inner {
     file: File,
+    dir: PathBuf,
+    header: Vec<u8>,
+    bytes: u64,
+    frames: usize,
     _lock: OsDirectoryLock,
     state: State,
     failed: bool,
-    #[cfg(test)]
     fault: Option<Fault>,
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Copy)]
-enum Fault { WritePartial, SyncBefore, SyncAfter }
+enum Fault {
+    WritePartial,
+    SyncBefore,
+    SyncAfter,
+    CheckpointWrite,
+    CheckpointSync,
+    CheckpointRename,
+    CheckpointDirSync,
+}
 
-fn storage_error(subject: ErrorSubject<u32>, verb: ErrorVerb, error: io::Error) -> StorageError<u32> {
+fn storage_error(
+    subject: ErrorSubject<u32>,
+    verb: ErrorVerb,
+    error: io::Error,
+) -> StorageError<u32> {
     StorageError::from_io_error(subject, verb, error)
 }
 
@@ -67,19 +98,125 @@ fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
 
-fn encode(record: &Record) -> io::Result<Vec<u8>> {
-    let payload = serde_json::to_vec(record).map_err(|e| invalid(e.to_string()))?;
-    if payload.len() > MAX_FRAME_PAYLOAD {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "OpenRaft record exceeds frame limit"));
+struct LimitedBuffer {
+    bytes: Vec<u8>,
+    limit: usize,
+}
+
+impl Write for LimitedBuffer {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.len() > self.limit.saturating_sub(self.bytes.len()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "serialized OpenRaft image exceeds limit",
+            ));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
     }
-    let len = u32::try_from(payload.len())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "OpenRaft record length overflow"))?;
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn serialize_bounded(value: &impl Serialize, limit: usize) -> io::Result<Vec<u8>> {
+    let mut buffer = LimitedBuffer {
+        bytes: Vec::new(),
+        limit,
+    };
+    serde_json::to_writer(&mut buffer, value).map_err(io::Error::other)?;
+    Ok(buffer.bytes)
+}
+
+fn encode(record: &Record) -> io::Result<Vec<u8>> {
+    let payload = serialize_bounded(record, MAX_FRAME_PAYLOAD)?;
+    frame_payload(payload)
+}
+
+fn frame_payload(payload: Vec<u8>) -> io::Result<Vec<u8>> {
+    if payload.len() > MAX_FRAME_PAYLOAD {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "OpenRaft record exceeds frame limit",
+        ));
+    }
+    let len = u32::try_from(payload.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "OpenRaft record length overflow",
+        )
+    })?;
     let mut frame = Vec::with_capacity(FRAME_HEADER_LEN + payload.len());
     frame.extend_from_slice(FRAME_MAGIC);
     frame.extend_from_slice(&len.to_le_bytes());
     frame.extend_from_slice(&crc32fast::hash(&payload).to_le_bytes());
     frame.extend_from_slice(&payload);
     Ok(frame)
+}
+
+fn checkpoint_frame(state: &State) -> io::Result<Vec<u8>> {
+    #[derive(Serialize)]
+    enum Checkpoint<'a> {
+        Checkpoint {
+            version: u32,
+            vote: Option<Vote<u32>>,
+            purged: Option<LogId<u32>>,
+            entries: Vec<&'a Entry<C>>,
+        },
+    }
+    if state.log.len() > MAX_LIVE_ENTRIES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "OpenRaft live entry limit exceeded",
+        ));
+    }
+    let checkpoint = Checkpoint::Checkpoint {
+        version: CHECKPOINT_VERSION,
+        vote: state.vote,
+        purged: state.purged,
+        entries: state.log.values().collect(),
+    };
+    let payload = serialize_bounded(&checkpoint, MAX_CHECKPOINT_PAYLOAD)?;
+    frame_payload(payload)
+}
+
+fn compact(inner: &mut Inner, checkpoint: &[u8], fault: Option<Fault>) -> io::Result<()> {
+    let temp = inner.dir.join("openraft.log.tmp");
+    let active = inner.dir.join("openraft.log");
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .append(true)
+        .open(&temp)?;
+    file.write_all(&inner.header)?;
+    if matches!(fault, Some(Fault::CheckpointWrite)) {
+        file.write_all(&checkpoint[..checkpoint.len() / 2])?;
+        return Err(io::Error::other("simulated checkpoint write failure"));
+    }
+    file.write_all(checkpoint)?;
+    if matches!(fault, Some(Fault::CheckpointSync)) {
+        return Err(io::Error::other("simulated checkpoint sync failure"));
+    }
+    file.sync_data()?;
+    // Explicitly rebind the append handle to the active path after replacement.
+    // POSIX rename does not invalidate the temporary file descriptor.
+    drop(file);
+    fs::rename(&temp, &active)?;
+    if matches!(fault, Some(Fault::CheckpointRename)) {
+        return Err(io::Error::other(
+            "simulated failure after checkpoint rename",
+        ));
+    }
+    File::open(&inner.dir)?.sync_all()?;
+    if matches!(fault, Some(Fault::CheckpointDirSync)) {
+        return Err(io::Error::other(
+            "simulated failure after checkpoint directory sync",
+        ));
+    }
+    inner.file = OpenOptions::new().read(true).append(true).open(&active)?;
+    inner.bytes = (inner.header.len() + checkpoint.len()) as u64;
+    inner.frames = 1;
+    Ok(())
 }
 
 fn append_frame(file: &mut File, record: &Record) -> io::Result<()> {
@@ -91,40 +228,133 @@ fn append_frame(file: &mut File, record: &Record) -> io::Result<()> {
 
 fn validate_entries(entries: &[Entry<C>]) -> io::Result<()> {
     for pair in entries.windows(2) {
-        if pair[1].log_id.index != pair[0].log_id.index.saturating_add(1) {
+        if pair[0].log_id.index.checked_add(1) != Some(pair[1].log_id.index) {
             return Err(invalid("OpenRaft append contains a log-index hole"));
         }
     }
     Ok(())
 }
 
-fn validate_append_state(state: &State, entries: &[Entry<C>]) -> io::Result<()> {
-    validate_entries(entries)?;
-    let Some(first) = entries.first() else { return Ok(()); };
-    let expected = state.log.last_key_value().map_or_else(
-        || state.purged.map_or(0, |id| id.index.saturating_add(1)),
-        |(_, entry)| entry.log_id.index.saturating_add(1),
-    );
-    if first.log_id.index > expected {
+fn prepare_append(state: &State, entries: Vec<Entry<C>>) -> io::Result<Vec<Entry<C>>> {
+    validate_entries(&entries)?;
+    if entries.iter().any(|entry| {
+        state
+            .purged
+            .is_some_and(|id| entry.log_id.index <= id.index)
+    }) {
+        return Err(invalid("cannot append purged logs"));
+    }
+    for entry in &entries {
+        if let Some(existing) = state.log.get(&entry.log_id.index) {
+            if serialize_bounded(existing, MAX_FRAME_PAYLOAD)?
+                != serialize_bounded(entry, MAX_FRAME_PAYLOAD)?
+            {
+                return Err(invalid(
+                    "conflicting log entry requires truncate before append",
+                ));
+            }
+        }
+    }
+    let Some(first) = entries.first() else {
+        return Ok(entries);
+    };
+    if let Some((&first_existing, _)) = state.log.first_key_value() {
+        if first.log_id.index < first_existing
+            && entries.last().unwrap().log_id.index < first_existing.saturating_sub(1)
+        {
+            return Err(invalid(
+                "OpenRaft append would leave a hole before existing logs",
+            ));
+        }
+    }
+    // A fresh, unpurged log may start at any index: after installing a
+    // snapshot, entries before the snapshot boundary live in the state
+    // machine, not in the log. Once the log has entries or a purge marker,
+    // a batch that skips indexes would leave a real hole.
+    let expected = state
+        .log
+        .last_key_value()
+        .map(|(_, entry)| entry.log_id.index.saturating_add(1))
+        .or_else(|| state.purged.map(|id| id.index.saturating_add(1)));
+    if expected.is_some_and(|expected| first.log_id.index > expected) {
         return Err(invalid("OpenRaft append would leave a log-index hole"));
     }
-    Ok(())
+    Ok(entries)
 }
 
 fn apply_record(state: &mut State, record: Record) -> io::Result<()> {
     match record {
-        Record::Vote(vote) => state.vote = Some(vote),
+        Record::Checkpoint {
+            version,
+            vote,
+            purged,
+            entries,
+        } => {
+            if version != CHECKPOINT_VERSION
+                || state.vote.is_some()
+                || state.purged.is_some()
+                || !state.log.is_empty()
+            {
+                return Err(invalid("invalid checkpoint position or version"));
+            }
+            if entries.len() > MAX_LIVE_ENTRIES {
+                return Err(invalid("checkpoint contains too many entries"));
+            }
+            validate_entries(&entries)?;
+            if let (Some(boundary), Some(first)) = (purged, entries.first()) {
+                if boundary.index.checked_add(1) != Some(first.log_id.index) {
+                    return Err(invalid("checkpoint has a hole after purge"));
+                }
+            }
+            state.vote = vote;
+            state.purged = purged;
+            for entry in entries {
+                state.log.insert(entry.log_id.index, entry);
+            }
+        }
+        Record::Vote(vote) => {
+            if state.vote.is_some_and(|old| {
+                vote.partial_cmp(&old)
+                    .map_or(true, |ordering| ordering.is_lt())
+            }) {
+                return Err(invalid("vote cannot move backwards"));
+            }
+            state.vote = Some(vote);
+        }
         Record::Append(entries) => {
-            validate_append_state(state, &entries)?;
-            if let Some(first) = entries.first() {
-                state.log.retain(|index, _| *index < first.log_id.index);
-                for entry in entries { state.log.insert(entry.log_id.index, entry); }
+            let entries = prepare_append(state, entries)?;
+            for entry in entries {
+                state.log.insert(entry.log_id.index, entry);
             }
         }
         Record::Truncate(log_id) => {
+            if state.purged.is_some_and(|id| log_id.index <= id.index) {
+                return Err(invalid("cannot truncate purged logs"));
+            }
             state.log.retain(|index, _| *index < log_id.index);
         }
         Record::Purge(log_id) => {
+            if state.purged.is_some_and(|id| {
+                log_id.index < id.index || (log_id.index == id.index && id != log_id)
+            }) {
+                return Err(invalid("purge cannot move backwards or change identity"));
+            }
+            if state
+                .log
+                .get(&log_id.index)
+                .is_some_and(|entry| entry.log_id != log_id)
+            {
+                return Err(invalid("purge conflicts with stored log identity"));
+            }
+            // A fresh log may have an unknown prefix, but once a purge marker
+            // is recorded it is the predecessor of every retained suffix.
+            // Reject a marker that would expose a hole, as required by the
+            // OpenRaft purge contract and by checkpoint replay.
+            if let Some((&first, _)) = state.log.first_key_value() {
+                if log_id.index < first && log_id.index.checked_add(1) != Some(first) {
+                    return Err(invalid("purge would leave a hole before existing logs"));
+                }
+            }
             state.log.retain(|index, _| *index > log_id.index);
             state.purged = Some(log_id);
         }
@@ -143,37 +373,79 @@ fn header(identity: &ReplicaIdentity) -> Vec<u8> {
     result
 }
 
-fn recover(file: &mut File, identity: &ReplicaIdentity) -> io::Result<State> {
-    let mut bytes = Vec::new();
+fn recover(file: &mut File, identity: &ReplicaIdentity) -> io::Result<(State, u64, usize)> {
+    let file_len = file.metadata()?.len();
+    if file_len > MAX_LOG_BYTES {
+        return Err(invalid("OpenRaft log exceeds disk limit"));
+    }
     file.seek(SeekFrom::Start(0))?;
-    file.read_to_end(&mut bytes)?;
     let expected = header(identity);
-    if bytes.len() < expected.len() || bytes[..expected.len()] != expected {
+    let mut actual = vec![0; expected.len()];
+    file.read_exact(&mut actual).map_err(|e| {
+        if e.kind() == io::ErrorKind::UnexpectedEof {
+            invalid("truncated OpenRaft log header")
+        } else {
+            e
+        }
+    })?;
+    if actual != expected {
         return Err(invalid("invalid OpenRaft log header or replica identity"));
     }
 
     let mut state = State::default();
-    let mut pos = expected.len();
-    while pos < bytes.len() {
-        if bytes.len() - pos < FRAME_HEADER_LEN || &bytes[pos..pos + 4] != FRAME_MAGIC {
-            return Err(invalid("truncated or invalid OpenRaft log frame"));
+    let mut frames = 0;
+    loop {
+        let mut frame_header = [0; FRAME_HEADER_LEN];
+        match file.read(&mut frame_header[..1]) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
         }
-        let len = u32::from_le_bytes(bytes[pos + 4..pos + 8].try_into().unwrap()) as usize;
+        frames += 1;
+        if frames > MAX_LOG_FRAMES {
+            return Err(invalid("OpenRaft log exceeds frame count limit"));
+        }
+        file.read_exact(&mut frame_header[1..]).map_err(|e| {
+            if e.kind() == io::ErrorKind::UnexpectedEof {
+                invalid("truncated OpenRaft log frame")
+            } else {
+                e
+            }
+        })?;
+        if &frame_header[..4] != FRAME_MAGIC {
+            return Err(invalid("invalid OpenRaft log frame"));
+        }
+        let len = u32::from_le_bytes(frame_header[4..8].try_into().unwrap()) as usize;
         if len > MAX_FRAME_PAYLOAD {
             return Err(invalid("OpenRaft log frame exceeds limit"));
         }
-        let end = pos.checked_add(FRAME_HEADER_LEN).and_then(|n| n.checked_add(len))
-            .ok_or_else(|| invalid("OpenRaft log frame length overflow"))?;
-        if end > bytes.len() { return Err(invalid("truncated OpenRaft log frame")); }
-        let payload = &bytes[pos + FRAME_HEADER_LEN..end];
-        let expected = u32::from_le_bytes(bytes[pos + 8..pos + 12].try_into().unwrap());
-        if crc32fast::hash(payload) != expected { return Err(invalid("OpenRaft log checksum mismatch")); }
-        let record: Record = serde_json::from_slice(payload).map_err(|e| invalid(e.to_string()))?;
+        let mut payload = vec![0; len];
+        file.read_exact(&mut payload).map_err(|e| {
+            if e.kind() == io::ErrorKind::UnexpectedEof {
+                invalid("truncated OpenRaft log frame")
+            } else {
+                e
+            }
+        })?;
+        let expected = u32::from_le_bytes(frame_header[8..12].try_into().unwrap());
+        if crc32fast::hash(&payload) != expected {
+            return Err(invalid("OpenRaft log checksum mismatch"));
+        }
+        let record: Record =
+            serde_json::from_slice(&payload).map_err(|e| invalid(e.to_string()))?;
+        if let Record::Checkpoint { .. } = &record {
+            if frames != 1 || len > MAX_CHECKPOINT_PAYLOAD {
+                return Err(invalid("invalid checkpoint frame"));
+            }
+        }
         apply_record(&mut state, record)?;
-        pos = end;
+        if state.log.len() > MAX_LIVE_ENTRIES {
+            return Err(invalid("OpenRaft log exceeds live entry limit"));
+        }
     }
     file.seek(SeekFrom::End(0))?;
-    Ok(state)
+    Ok((state, file_len, frames))
 }
 
 impl DurableOpenRaftLog {
@@ -183,33 +455,110 @@ impl DurableOpenRaftLog {
         fs::create_dir_all(&dir)?;
         let lock = OsDirectoryLock::try_acquire(&dir)?;
         let path = dir.join("openraft.log");
-        let mut file = OpenOptions::new().create_new(true).read(true).append(true).open(&path)?;
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .append(true)
+            .open(&path)?;
         file.write_all(&header(identity))?;
         file.sync_data()?;
         File::open(&dir)?.sync_all()?;
-        Ok(Self { inner: Arc::new(Mutex::new(Inner { file, _lock: lock, state: State::default(), failed: false, fault: None })) })
+        let header = header(identity);
+        Ok(Self {
+            inner: Arc::new(Mutex::new(Inner {
+                file,
+                dir,
+                bytes: header.len() as u64,
+                header,
+                frames: 0,
+                _lock: lock,
+                state: State::default(),
+                failed: false,
+                fault: None,
+            })),
+        })
     }
 
     /// Reopen only an existing log for the same group incarnation and node.
     pub fn open(dir: impl AsRef<Path>, identity: &ReplicaIdentity) -> io::Result<Self> {
         let dir = dir.as_ref();
         let lock = OsDirectoryLock::try_acquire(dir)?;
-        let mut file = OpenOptions::new().read(true).append(true).open(dir.join("openraft.log"))?;
-        let state = recover(&mut file, identity)?;
+        let mut file = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(dir.join("openraft.log"))?;
+        let (state, bytes, frames) = recover(&mut file, identity)?;
+        // Validate checkpoint size too, so every recovered state can later be compacted.
+        checkpoint_frame(&state)?;
         // A process-only restart may still see bytes whose previous sync failed.
         file.sync_data()?;
         File::open(&dir)?.sync_all()?;
-        Ok(Self { inner: Arc::new(Mutex::new(Inner { file, _lock: lock, state, failed: false, fault: None })) })
+        match fs::remove_file(dir.join("openraft.log.tmp")) {
+            Ok(()) => File::open(dir)?.sync_all()?,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        Ok(Self {
+            inner: Arc::new(Mutex::new(Inner {
+                file,
+                dir: dir.to_path_buf(),
+                header: header(identity),
+                bytes,
+                frames,
+                _lock: lock,
+                state,
+                failed: false,
+                fault: None,
+            })),
+        })
     }
 
     fn append_durable(&self, record: &Record) -> Result<(), StorageError<u32>> {
         let mut inner = self.inner.lock().unwrap();
         if inner.failed {
-            return Err(storage_error(ErrorSubject::Store, ErrorVerb::Write, io::Error::other("storage requires recovery")));
+            return Err(storage_error(
+                ErrorSubject::Store,
+                ErrorVerb::Write,
+                io::Error::other("storage requires recovery"),
+            ));
         }
-        if let Record::Append(entries) = record {
-            validate_append_state(&inner.state, entries)
+        // Validate before persisting so rejected transitions never poison replay.
+        let mut next = State {
+            log: inner.state.log.clone(),
+            vote: inner.state.vote,
+            purged: inner.state.purged,
+        };
+        apply_record(&mut next, record.clone())
+            .map_err(|error| storage_error(ErrorSubject::Logs, ErrorVerb::Write, error))?;
+        let frame = encode(record)
+            .map_err(|error| storage_error(ErrorSubject::Logs, ErrorVerb::Write, error))?;
+        // Check the resulting live image before any I/O. This permits later
+        // checkpointing even when the append itself does not trigger it.
+        checkpoint_frame(&next)
+            .map_err(|error| storage_error(ErrorSubject::Logs, ErrorVerb::Write, error))?;
+        if inner.frames + 1 > MAX_LOG_FRAMES || inner.bytes + frame.len() as u64 > MAX_LOG_BYTES {
+            let checkpoint = checkpoint_frame(&inner.state)
                 .map_err(|error| storage_error(ErrorSubject::Logs, ErrorVerb::Write, error))?;
+            if (inner.header.len() + checkpoint.len() + frame.len()) as u64 > MAX_LOG_BYTES {
+                return Err(storage_error(
+                    ErrorSubject::Logs,
+                    ErrorVerb::Write,
+                    invalid("record cannot fit after checkpoint"),
+                ));
+            }
+            let fault = match inner.fault {
+                Some(
+                    Fault::CheckpointWrite
+                    | Fault::CheckpointSync
+                    | Fault::CheckpointRename
+                    | Fault::CheckpointDirSync,
+                ) => inner.fault.take(),
+                _ => None,
+            };
+            if let Err(error) = compact(&mut inner, &checkpoint, fault) {
+                inner.failed = true;
+                return Err(storage_error(ErrorSubject::Logs, ErrorVerb::Write, error));
+            }
         }
         let result = match inner.fault.take() {
             Some(Fault::WritePartial) => encode(record).and_then(|frame| {
@@ -218,33 +567,68 @@ impl DurableOpenRaftLog {
             }),
             Some(Fault::SyncBefore) => encode(record).and_then(|frame| {
                 inner.file.write_all(&frame)?;
-                Err(io::Error::other("simulated sync failure before persistence"))
+                Err(io::Error::other(
+                    "simulated sync failure before persistence",
+                ))
             }),
             Some(Fault::SyncAfter) => append_frame(&mut inner.file, record)
                 .and_then(|_| Err(io::Error::other("simulated sync failure after persistence"))),
+            Some(
+                fault @ (Fault::CheckpointWrite
+                | Fault::CheckpointSync
+                | Fault::CheckpointRename
+                | Fault::CheckpointDirSync),
+            ) => {
+                inner.fault = Some(fault);
+                inner
+                    .file
+                    .write_all(&frame)
+                    .and_then(|_| inner.file.sync_data())
+            }
             None => append_frame(&mut inner.file, record),
         };
         if let Err(error) = result {
             inner.failed = true;
             return Err(storage_error(ErrorSubject::Logs, ErrorVerb::Write, error));
         }
-        apply_record(&mut inner.state, record.clone())
-            .map_err(|error| storage_error(ErrorSubject::Logs, ErrorVerb::Write, error))
+        inner.bytes += frame.len() as u64;
+        inner.frames += 1;
+        inner.state = next;
+        Ok(())
     }
 
     #[cfg(test)]
     fn read_entries(&self, start: u64, end: u64) -> Vec<Entry<C>> {
-        self.inner.lock().unwrap().state.log.range(start..end).map(|(_, e)| e.clone()).collect()
+        self.inner
+            .lock()
+            .unwrap()
+            .state
+            .log
+            .range(start..end)
+            .map(|(_, e)| e.clone())
+            .collect()
     }
 }
 
 impl RaftLogReader<C> for DurableOpenRaftLog {
     async fn try_get_log_entries<R: RangeBounds<u64> + Clone + Debug + Send>(
-        &mut self, range: R,
+        &mut self,
+        range: R,
     ) -> Result<Vec<Entry<C>>, StorageError<u32>> {
         let inner = self.inner.lock().unwrap();
-        if inner.failed { return Err(storage_error(ErrorSubject::Store, ErrorVerb::Read, io::Error::other("storage requires recovery"))); }
-        Ok(inner.state.log.range(range).map(|(_, e)| e.clone()).collect())
+        if inner.failed {
+            return Err(storage_error(
+                ErrorSubject::Store,
+                ErrorVerb::Read,
+                io::Error::other("storage requires recovery"),
+            ));
+        }
+        Ok(inner
+            .state
+            .log
+            .range(range)
+            .map(|(_, e)| e.clone())
+            .collect())
     }
 }
 
@@ -253,14 +637,27 @@ impl RaftLogStorage<C> for DurableOpenRaftLog {
 
     async fn get_log_state(&mut self) -> Result<LogState<C>, StorageError<u32>> {
         let inner = self.inner.lock().unwrap();
-        if inner.failed { return Err(storage_error(ErrorSubject::Store, ErrorVerb::Read, io::Error::other("storage requires recovery"))); }
+        if inner.failed {
+            return Err(storage_error(
+                ErrorSubject::Store,
+                ErrorVerb::Read,
+                io::Error::other("storage requires recovery"),
+            ));
+        }
         Ok(LogState {
             last_purged_log_id: inner.state.purged,
-            last_log_id: inner.state.log.last_key_value().map(|(_, e)| e.log_id).or(inner.state.purged),
+            last_log_id: inner
+                .state
+                .log
+                .last_key_value()
+                .map(|(_, e)| e.log_id)
+                .or(inner.state.purged),
         })
     }
 
-    async fn get_log_reader(&mut self) -> Self { self.clone() }
+    async fn get_log_reader(&mut self) -> Self {
+        self.clone()
+    }
 
     async fn save_vote(&mut self, vote: &Vote<u32>) -> Result<(), StorageError<u32>> {
         self.append_durable(&Record::Vote(*vote))
@@ -268,14 +665,35 @@ impl RaftLogStorage<C> for DurableOpenRaftLog {
 
     async fn read_vote(&mut self) -> Result<Option<Vote<u32>>, StorageError<u32>> {
         let inner = self.inner.lock().unwrap();
-        if inner.failed { return Err(storage_error(ErrorSubject::Store, ErrorVerb::Read, io::Error::other("storage requires recovery"))); }
+        if inner.failed {
+            return Err(storage_error(
+                ErrorSubject::Store,
+                ErrorVerb::Read,
+                io::Error::other("storage requires recovery"),
+            ));
+        }
         Ok(inner.state.vote)
     }
 
-    async fn append<I>(&mut self, entries: I, callback: LogFlushed<C>) -> Result<(), StorageError<u32>>
-    where I: IntoIterator<Item = Entry<C>> + Send, I::IntoIter: Send {
-        let entries: Vec<_> = entries.into_iter().collect();
-        validate_entries(&entries).map_err(|error| storage_error(ErrorSubject::Logs, ErrorVerb::Write, error))?;
+    async fn append<I>(
+        &mut self,
+        entries: I,
+        callback: LogFlushed<C>,
+    ) -> Result<(), StorageError<u32>>
+    where
+        I: IntoIterator<Item = Entry<C>> + Send,
+        I::IntoIter: Send,
+    {
+        let entries: Vec<_> = entries.into_iter().take(MAX_LIVE_ENTRIES + 1).collect();
+        if entries.len() > MAX_LIVE_ENTRIES {
+            return Err(storage_error(
+                ErrorSubject::Logs,
+                ErrorVerb::Write,
+                invalid("OpenRaft append exceeds entry limit"),
+            ));
+        }
+        validate_entries(&entries)
+            .map_err(|error| storage_error(ErrorSubject::Logs, ErrorVerb::Write, error))?;
         self.append_durable(&Record::Append(entries))?;
         callback.log_io_completed(Ok(()));
         Ok(())
@@ -301,37 +719,72 @@ mod tests {
     struct TempDir(PathBuf);
     impl TempDir {
         fn new() -> Self {
-            let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-            let path = std::env::temp_dir().join(format!("yadb-openraft-{nonce}-{}", std::process::id()));
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path =
+                std::env::temp_dir().join(format!("yadb-openraft-{nonce}-{}", std::process::id()));
             fs::create_dir_all(&path).unwrap();
             Self(path)
         }
     }
-    impl Drop for TempDir { fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); } }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
 
     fn identity() -> ReplicaIdentity {
-        ReplicaIdentity::new(crate::multiraft::GroupIdentity { cluster: [1; 16], group: 1, incarnation: 1 }, 1, vec![1]).unwrap()
+        ReplicaIdentity::new(
+            crate::multiraft::GroupIdentity {
+                cluster: [1; 16],
+                group: 1,
+                incarnation: 1,
+            },
+            1,
+            vec![1],
+        )
+        .unwrap()
     }
 
     fn entry(index: u64) -> Entry<C> {
-        Entry { log_id: LogId::new(CommittedLeaderId::new(1, 1), index), payload: EntryPayload::Normal(KvCommand::Put {
-            key: format!("k{index}"), value: vec![index as u8],
-        }) }
+        Entry {
+            log_id: LogId::new(CommittedLeaderId::new(1, 1), index),
+            payload: EntryPayload::Normal(KvCommand::Put {
+                key: format!("k{index}"),
+                value: vec![index as u8],
+            }),
+        }
     }
 
     #[tokio::test]
-    async fn vote_and_log_survive_restart_and_suffix_replacement() {
+    async fn vote_and_log_survive_restart_and_matching_overlap() {
         let dir = TempDir::new();
         let store = DurableOpenRaftLog::create(&dir.0, &identity()).unwrap();
-        store.append_durable(&Record::Vote(Vote::new(4, 2))).unwrap();
-        store.append_durable(&Record::Append(vec![entry(0), entry(1), entry(2), entry(3)])).unwrap();
-        store.append_durable(&Record::Append(vec![entry(2)])).unwrap();
+        store
+            .append_durable(&Record::Vote(Vote::new(4, 2)))
+            .unwrap();
+        store
+            .append_durable(&Record::Append(vec![
+                entry(0),
+                entry(1),
+                entry(2),
+                entry(3),
+            ]))
+            .unwrap();
+        store
+            .append_durable(&Record::Append(vec![entry(2)]))
+            .unwrap();
         drop(store);
         let reopened = DurableOpenRaftLog::open(&dir.0, &identity()).unwrap();
         let mut reopened_reader = reopened.clone();
-        assert_eq!(reopened_reader.read_vote().await.unwrap(), Some(Vote::new(4, 2)));
+        assert_eq!(
+            reopened_reader.read_vote().await.unwrap(),
+            Some(Vote::new(4, 2))
+        );
         let entries = reopened.read_entries(1, 4);
-        assert_eq!(entries.len(), 2);
+        assert_eq!(entries.len(), 3);
         assert_eq!(entries[0].log_id.index, 1);
         assert_eq!(entries[1].log_id.index, 2);
     }
@@ -340,7 +793,9 @@ mod tests {
     fn truncated_or_corrupt_tail_fails_closed() {
         let dir = TempDir::new();
         let store = DurableOpenRaftLog::create(&dir.0, &identity()).unwrap();
-        store.append_durable(&Record::Vote(Vote::new(1, 1))).unwrap();
+        store
+            .append_durable(&Record::Vote(Vote::new(1, 1)))
+            .unwrap();
         drop(store);
         let path = dir.0.join("openraft.log");
         let mut file = OpenOptions::new().append(true).open(&path).unwrap();
@@ -350,15 +805,430 @@ mod tests {
     }
 
     #[test]
+    fn oversized_frame_is_rejected_before_reading_its_payload() {
+        let dir = TempDir::new();
+        let store = DurableOpenRaftLog::create(&dir.0, &identity()).unwrap();
+        drop(store);
+        let path = dir.0.join("openraft.log");
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(FRAME_MAGIC).unwrap();
+        file.write_all(&((MAX_FRAME_PAYLOAD as u32) + 1).to_le_bytes())
+            .unwrap();
+        file.write_all(&0u32.to_le_bytes()).unwrap();
+        drop(file);
+        let before = fs::read(&path).unwrap();
+        assert_eq!(
+            DurableOpenRaftLog::open(&dir.0, &identity())
+                .err()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(fs::read(path).unwrap(), before);
+    }
+
+    // Maps to OpenRaft suite: initial_logs, get_log_state, purge_logs_upto_0,
+    // purge_logs_upto_5 and purge_logs_upto_20. This is partial coverage only.
+    #[tokio::test]
+    async fn contract_log_state_and_purge_boundaries_survive_reopen() {
+        for boundary in [0, 5, 20] {
+            let dir = TempDir::new();
+            let mut store = DurableOpenRaftLog::create(&dir.0, &identity()).unwrap();
+            let initial = store.get_log_state().await.unwrap();
+            assert_eq!(initial.last_log_id, None);
+            assert_eq!(initial.last_purged_log_id, None);
+            store
+                .append_durable(&Record::Append((0..=10).map(entry).collect()))
+                .unwrap();
+            let purged = entry(boundary).log_id;
+            store.purge(purged).await.unwrap();
+            let state = store.get_log_state().await.unwrap();
+            assert_eq!(state.last_purged_log_id, Some(purged));
+            assert_eq!(
+                state.last_log_id,
+                Some(if boundary > 10 {
+                    purged
+                } else {
+                    entry(10).log_id
+                })
+            );
+            let entries = store.try_get_log_entries(0..100).await.unwrap();
+            assert_eq!(entries.len(), 10usize.saturating_sub(boundary as usize));
+            drop(store);
+            let mut reopened = DurableOpenRaftLog::open(&dir.0, &identity()).unwrap();
+            let recovered = reopened.get_log_state().await.unwrap();
+            assert_eq!(recovered.last_log_id, state.last_log_id);
+            assert_eq!(recovered.last_purged_log_id, state.last_purged_log_id);
+            assert_eq!(
+                reopened.try_get_log_entries(0..100).await.unwrap().len(),
+                entries.len()
+            );
+        }
+    }
+
+    // Partial mapping to suite delete_logs_since_0, delete_logs_since_11 and
+    // append_to_log, with additional reopen checks on the actual file store.
+    #[tokio::test]
+    async fn contract_truncate_and_append_after_purge_survive_reopen() {
+        for boundary in [0, 11] {
+            let dir = TempDir::new();
+            let mut store = DurableOpenRaftLog::create(&dir.0, &identity()).unwrap();
+            store
+                .append_durable(&Record::Append((0..=10).map(entry).collect()))
+                .unwrap();
+            store.truncate(entry(boundary).log_id).await.unwrap();
+            let expected = if boundary == 0 {
+                None
+            } else {
+                Some(entry(10).log_id)
+            };
+            assert_eq!(store.get_log_state().await.unwrap().last_log_id, expected);
+            drop(store);
+            let mut reopened = DurableOpenRaftLog::open(&dir.0, &identity()).unwrap();
+            assert_eq!(
+                reopened.get_log_state().await.unwrap().last_log_id,
+                expected
+            );
+            assert_eq!(
+                reopened.try_get_log_entries(0..100).await.unwrap().len(),
+                boundary as usize
+            );
+        }
+
+        let dir = TempDir::new();
+        let mut store = DurableOpenRaftLog::create(&dir.0, &identity()).unwrap();
+        store
+            .append_durable(&Record::Append((0..=10).map(entry).collect()))
+            .unwrap();
+        store.purge(entry(0).log_id).await.unwrap();
+        store
+            .append_durable(&Record::Append(vec![entry(11)]))
+            .unwrap();
+        drop(store);
+        let mut reopened = DurableOpenRaftLog::open(&dir.0, &identity()).unwrap();
+        let state = reopened.get_log_state().await.unwrap();
+        assert_eq!(state.last_purged_log_id, Some(entry(0).log_id));
+        assert_eq!(state.last_log_id, Some(entry(11).log_id));
+        let entries = reopened.try_get_log_entries(0..100).await.unwrap();
+        assert_eq!(entries.len(), 11);
+        assert_eq!(entries.first().unwrap().log_id.index, 1);
+        assert_eq!(entries.last().unwrap().log_id.index, 11);
+    }
+
+    #[tokio::test]
+    async fn contract_vote_and_range_reads_survive_reopen() {
+        let dir = TempDir::new();
+        let mut store = DurableOpenRaftLog::create(&dir.0, &identity()).unwrap();
+        assert_eq!(store.read_vote().await.unwrap(), None);
+        store.save_vote(&Vote::new(3, 1)).await.unwrap();
+        store.save_vote(&Vote::new_committed(3, 1)).await.unwrap();
+        store
+            .append_durable(&Record::Append((0..=10).map(entry).collect()))
+            .unwrap();
+        let ids = |entries: Vec<Entry<C>>| {
+            entries
+                .into_iter()
+                .map(|entry| entry.log_id.index)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            ids(store.try_get_log_entries(3..7).await.unwrap()),
+            vec![3, 4, 5, 6]
+        );
+        assert_eq!(
+            ids(store.try_get_log_entries(8..=10).await.unwrap()),
+            vec![8, 9, 10]
+        );
+        assert!(store.try_get_log_entries(11..20).await.unwrap().is_empty());
+        drop(store);
+        let mut reopened = DurableOpenRaftLog::open(&dir.0, &identity()).unwrap();
+        assert_eq!(
+            reopened.read_vote().await.unwrap(),
+            Some(Vote::new_committed(3, 1))
+        );
+        assert_eq!(
+            ids(reopened.try_get_log_entries(3..7).await.unwrap()),
+            vec![3, 4, 5, 6]
+        );
+    }
+
+    #[test]
     fn append_with_a_hole_is_rejected_without_changing_memory() {
         let dir = TempDir::new();
         let store = DurableOpenRaftLog::create(&dir.0, &identity()).unwrap();
-        store.append_durable(&Record::Append(vec![entry(0), entry(1)])).unwrap();
-        assert!(store.append_durable(&Record::Append(vec![entry(3)] )).is_err());
+        store
+            .append_durable(&Record::Append(vec![entry(0), entry(1)]))
+            .unwrap();
+        assert!(store
+            .append_durable(&Record::Append(vec![entry(3)]))
+            .is_err());
         assert_eq!(store.read_entries(1, 4).len(), 1);
         drop(store);
         let reopened = DurableOpenRaftLog::open(&dir.0, &identity()).unwrap();
         assert_eq!(reopened.read_entries(1, 4).len(), 1);
+    }
+
+    #[test]
+    fn prepend_must_join_existing_suffix_and_survives_checkpoint() {
+        let dir = TempDir::new();
+        let store = DurableOpenRaftLog::create(&dir.0, &identity()).unwrap();
+        store
+            .append_durable(&Record::Append((5..=7).map(entry).collect()))
+            .unwrap();
+        let before = fs::read(dir.0.join("openraft.log")).unwrap();
+        assert!(store
+            .append_durable(&Record::Append(vec![entry(1), entry(2)]))
+            .is_err());
+        assert_eq!(fs::read(dir.0.join("openraft.log")).unwrap(), before);
+        store
+            .append_durable(&Record::Append(vec![entry(3), entry(4)]))
+            .unwrap();
+        store
+            .append_durable(&Record::Append(vec![entry(1), entry(2)]))
+            .unwrap();
+        store.inner.lock().unwrap().frames = MAX_LOG_FRAMES;
+        store
+            .append_durable(&Record::Vote(Vote::new(1, 1)))
+            .unwrap();
+        drop(store);
+        let store = DurableOpenRaftLog::open(&dir.0, &identity()).unwrap();
+        assert_eq!(
+            store
+                .read_entries(0, 10)
+                .iter()
+                .map(|e| e.log_id.index)
+                .collect::<Vec<_>>(),
+            (1..=7).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn purge_missing_prefix_preserves_checkpoint_continuity() {
+        for boundary in [2, 4, 6, 9] {
+            let dir = TempDir::new();
+            let mut store = DurableOpenRaftLog::create(&dir.0, &identity()).unwrap();
+            store
+                .append_durable(&Record::Append((5..=7).map(entry).collect()))
+                .unwrap();
+            let mut wrong = entry(6).log_id;
+            wrong.leader_id = CommittedLeaderId::new(2, 1);
+            let before = fs::read(dir.0.join("openraft.log")).unwrap();
+            assert!(store.purge(wrong).await.is_err());
+            assert_eq!(fs::read(dir.0.join("openraft.log")).unwrap(), before);
+            if boundary == 2 {
+                assert!(store.purge(entry(boundary).log_id).await.is_err());
+                assert_eq!(fs::read(dir.0.join("openraft.log")).unwrap(), before);
+                // Failure does not poison the handle; a joining marker works.
+                store.purge(entry(4).log_id).await.unwrap();
+            } else {
+                store.purge(entry(boundary).log_id).await.unwrap();
+            }
+            let effective = if boundary == 2 { 4 } else { boundary };
+            store.inner.lock().unwrap().frames = MAX_LOG_FRAMES;
+            store.save_vote(&Vote::new(1, 1)).await.unwrap();
+            drop(store);
+            let mut reopened = DurableOpenRaftLog::open(&dir.0, &identity()).unwrap();
+            let state = reopened.get_log_state().await.unwrap();
+            assert_eq!(state.last_purged_log_id, Some(entry(effective).log_id));
+            let expected: Vec<u64> = (5..=7).filter(|index| *index > effective).collect();
+            assert_eq!(
+                reopened
+                    .read_entries(0, 10)
+                    .iter()
+                    .map(|e| e.log_id.index)
+                    .collect::<Vec<_>>(),
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn automatic_checkpoint_preserves_vote_purge_and_suffix() {
+        let dir = TempDir::new();
+        let mut store = DurableOpenRaftLog::create(&dir.0, &identity()).unwrap();
+        store.save_vote(&Vote::new_committed(4, 1)).await.unwrap();
+        store
+            .append_durable(&Record::Append((0..=5).map(entry).collect()))
+            .unwrap();
+        store.purge(entry(2).log_id).await.unwrap();
+        store.inner.lock().unwrap().frames = MAX_LOG_FRAMES;
+        store
+            .append_durable(&Record::Append(vec![entry(6)]))
+            .unwrap();
+        assert_eq!(store.inner.lock().unwrap().frames, 2);
+        drop(store);
+        let mut reopened = DurableOpenRaftLog::open(&dir.0, &identity()).unwrap();
+        assert_eq!(
+            reopened.read_vote().await.unwrap(),
+            Some(Vote::new_committed(4, 1))
+        );
+        assert_eq!(
+            reopened.get_log_state().await.unwrap().last_purged_log_id,
+            Some(entry(2).log_id)
+        );
+        assert_eq!(
+            reopened
+                .read_entries(0, 10)
+                .iter()
+                .map(|e| e.log_id.index)
+                .collect::<Vec<_>>(),
+            vec![3, 4, 5, 6]
+        );
+    }
+
+    #[tokio::test]
+    async fn append_after_checkpoint_survives_reopen() {
+        let dir = TempDir::new();
+        let store = DurableOpenRaftLog::create(&dir.0, &identity()).unwrap();
+        store
+            .append_durable(&Record::Append((0..=5).map(entry).collect()))
+            .unwrap();
+        store.inner.lock().unwrap().frames = MAX_LOG_FRAMES;
+        store
+            .append_durable(&Record::Append(vec![entry(6)]))
+            .unwrap();
+        store
+            .append_durable(&Record::Append(vec![entry(7)]))
+            .unwrap();
+        drop(store);
+        let reopened = DurableOpenRaftLog::open(&dir.0, &identity()).unwrap();
+        assert_eq!(
+            reopened
+                .read_entries(0, 10)
+                .iter()
+                .map(|e| e.log_id.index)
+                .collect::<Vec<_>>(),
+            (0..=7).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn real_frame_limit_triggers_checkpoint() {
+        let dir = TempDir::new();
+        let mut store = DurableOpenRaftLog::create(&dir.0, &identity()).unwrap();
+        for term in 1..=(MAX_LOG_FRAMES as u64 + 3) {
+            store.save_vote(&Vote::new(term, 1)).await.unwrap();
+        }
+        assert_eq!(store.inner.lock().unwrap().frames, 4);
+        drop(store);
+        let mut store = DurableOpenRaftLog::open(&dir.0, &identity()).unwrap();
+        assert_eq!(
+            store.read_vote().await.unwrap(),
+            Some(Vote::new(MAX_LOG_FRAMES as u64 + 3, 1))
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_faults_poison_and_recover_valid_primary() {
+        for fault in [
+            Fault::CheckpointWrite,
+            Fault::CheckpointSync,
+            Fault::CheckpointRename,
+            Fault::CheckpointDirSync,
+        ] {
+            let dir = TempDir::new();
+            let mut store = DurableOpenRaftLog::create(&dir.0, &identity()).unwrap();
+            store.save_vote(&Vote::new(1, 1)).await.unwrap();
+            store
+                .append_durable(&Record::Append(vec![entry(0), entry(1)]))
+                .unwrap();
+            {
+                let mut inner = store.inner.lock().unwrap();
+                inner.frames = MAX_LOG_FRAMES;
+                inner.fault = Some(fault);
+            }
+            assert!(store.save_vote(&Vote::new(2, 1)).await.is_err());
+            assert!(store.read_vote().await.is_err());
+            assert!(store.save_vote(&Vote::new(3, 1)).await.is_err());
+            drop(store);
+            let mut reopened = DurableOpenRaftLog::open(&dir.0, &identity()).unwrap();
+            assert_eq!(reopened.read_vote().await.unwrap(), Some(Vote::new(1, 1)));
+            assert_eq!(reopened.read_entries(0, 2).len(), 2);
+            assert!(!dir.0.join("openraft.log.tmp").exists());
+            reopened.save_vote(&Vote::new(2, 1)).await.unwrap();
+        }
+    }
+
+    #[test]
+    fn rejected_limits_do_not_write_or_poison() {
+        let dir = TempDir::new();
+        let store = DurableOpenRaftLog::create(&dir.0, &identity()).unwrap();
+        let before = fs::read(dir.0.join("openraft.log")).unwrap();
+        assert!(store
+            .append_durable(&Record::Append(
+                (0..=MAX_LIVE_ENTRIES as u64).map(entry).collect()
+            ))
+            .is_err());
+        assert_eq!(fs::read(dir.0.join("openraft.log")).unwrap(), before);
+        store
+            .append_durable(&Record::Vote(Vote::new(2, 1)))
+            .unwrap();
+        assert!(store
+            .append_durable(&Record::Vote(Vote::new(1, 1)))
+            .is_err());
+        store
+            .append_durable(&Record::Vote(Vote::new(3, 1)))
+            .unwrap();
+    }
+
+    #[test]
+    fn invalid_primary_preserves_checkpoint_temp() {
+        let dir = TempDir::new();
+        let store = DurableOpenRaftLog::create(&dir.0, &identity()).unwrap();
+        drop(store);
+        let temp = dir.0.join("openraft.log.tmp");
+        fs::write(&temp, b"recovery evidence").unwrap();
+        fs::write(dir.0.join("openraft.log"), b"corrupt").unwrap();
+        assert!(DurableOpenRaftLog::open(&dir.0, &identity()).is_err());
+        assert_eq!(fs::read(temp).unwrap(), b"recovery evidence");
+    }
+
+    #[test]
+    fn overlap_conflicts_and_purge_identity_are_rejected_across_reopen() {
+        let dir = TempDir::new();
+        let store = DurableOpenRaftLog::create(&dir.0, &identity()).unwrap();
+        store
+            .append_durable(&Record::Append((0..=4).map(entry).collect()))
+            .unwrap();
+        store
+            .append_durable(&Record::Append(vec![entry(1), entry(2)]))
+            .unwrap();
+        let mut conflict = entry(2);
+        conflict.log_id = LogId::new(CommittedLeaderId::new(2, 1), 2);
+        let mut different_payload = entry(2);
+        different_payload.payload = EntryPayload::Blank;
+        let before = fs::read(dir.0.join("openraft.log")).unwrap();
+        assert!(store
+            .append_durable(&Record::Append(vec![conflict.clone()]))
+            .is_err());
+        assert!(store
+            .append_durable(&Record::Append(vec![different_payload]))
+            .is_err());
+        assert!(store
+            .append_durable(&Record::Purge(conflict.log_id))
+            .is_err());
+        assert_eq!(fs::read(dir.0.join("openraft.log")).unwrap(), before);
+        store
+            .append_durable(&Record::Purge(entry(2).log_id))
+            .unwrap();
+        assert!(store
+            .append_durable(&Record::Append(vec![conflict, entry(3)]))
+            .is_err());
+        drop(store);
+        let store = DurableOpenRaftLog::open(&dir.0, &identity()).unwrap();
+        assert_eq!(store.read_entries(3, 5).len(), 2);
+        store
+            .append_durable(&Record::Truncate(entry(3).log_id))
+            .unwrap();
+        let mut replacement = entry(3);
+        replacement.log_id = LogId::new(CommittedLeaderId::new(2, 1), 3);
+        store
+            .append_durable(&Record::Append(vec![replacement.clone()]))
+            .unwrap();
+        drop(store);
+        let store = DurableOpenRaftLog::open(&dir.0, &identity()).unwrap();
+        assert_eq!(store.read_entries(3, 5)[0].log_id, replacement.log_id);
+        assert_eq!(store.read_entries(3, 5).len(), 1);
     }
 
     #[test]
@@ -374,10 +1244,16 @@ mod tests {
     fn partial_write_poisoned_until_reopen_which_fails_closed() {
         let dir = TempDir::new();
         let store = DurableOpenRaftLog::create(&dir.0, &identity()).unwrap();
-        store.append_durable(&Record::Vote(Vote::new(1, 1))).unwrap();
+        store
+            .append_durable(&Record::Vote(Vote::new(1, 1)))
+            .unwrap();
         store.inner.lock().unwrap().fault = Some(Fault::WritePartial);
-        assert!(store.append_durable(&Record::Vote(Vote::new(2, 1))).is_err());
-        assert!(store.append_durable(&Record::Vote(Vote::new(3, 1))).is_err());
+        assert!(store
+            .append_durable(&Record::Vote(Vote::new(2, 1)))
+            .is_err());
+        assert!(store
+            .append_durable(&Record::Vote(Vote::new(3, 1)))
+            .is_err());
         drop(store);
         let path = dir.0.join("openraft.log");
         let before = fs::read(&path).unwrap();
@@ -390,10 +1266,16 @@ mod tests {
         for fault in [Fault::SyncBefore, Fault::SyncAfter] {
             let dir = TempDir::new();
             let store = DurableOpenRaftLog::create(&dir.0, &identity()).unwrap();
-            store.append_durable(&Record::Vote(Vote::new(1, 1))).unwrap();
+            store
+                .append_durable(&Record::Vote(Vote::new(1, 1)))
+                .unwrap();
             store.inner.lock().unwrap().fault = Some(fault);
-            assert!(store.append_durable(&Record::Vote(Vote::new(2, 1))).is_err());
-            assert!(store.append_durable(&Record::Vote(Vote::new(3, 1))).is_err());
+            assert!(store
+                .append_durable(&Record::Vote(Vote::new(2, 1)))
+                .is_err());
+            assert!(store
+                .append_durable(&Record::Vote(Vote::new(3, 1)))
+                .is_err());
             drop(store);
             let mut reopened = DurableOpenRaftLog::open(&dir.0, &identity()).unwrap();
             assert_eq!(reopened.read_vote().await.unwrap(), Some(Vote::new(2, 1)));
@@ -410,19 +1292,67 @@ mod tests {
     }
 
     #[test]
+    fn previous_log_format_is_rejected_without_modification() {
+        let dir = TempDir::new();
+        let store = DurableOpenRaftLog::create(&dir.0, &identity()).unwrap();
+        store
+            .append_durable(&Record::Append(vec![entry(0), entry(1)]))
+            .unwrap();
+        drop(store);
+        let path = dir.0.join("openraft.log");
+        let original = fs::read(&path).unwrap();
+        for magic in [b"YORLOG02", b"YORLOG03"] {
+            let mut bytes = original.clone();
+            bytes[..8].copy_from_slice(magic);
+            let checksum_offset = header(&identity()).len() - 4;
+            let checksum = crc32fast::hash(&bytes[..checksum_offset]);
+            bytes[checksum_offset..checksum_offset + 4].copy_from_slice(&checksum.to_le_bytes());
+            fs::write(&path, &bytes).unwrap();
+            assert!(DurableOpenRaftLog::open(&dir.0, &identity()).is_err());
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+        }
+    }
+
+    #[test]
     fn wrong_identity_and_missing_log_never_modify_data() {
         let dir = TempDir::new();
         assert!(DurableOpenRaftLog::open(&dir.0, &identity()).is_err());
         let store = DurableOpenRaftLog::create(&dir.0, &identity()).unwrap();
-        store.append_durable(&Record::Vote(Vote::new(1, 1))).unwrap();
+        store
+            .append_durable(&Record::Vote(Vote::new(1, 1)))
+            .unwrap();
         drop(store);
         let path = dir.0.join("openraft.log");
         let before = fs::read(&path).unwrap();
         let base = identity().group().clone();
         let variants = [
-            ReplicaIdentity::new(crate::multiraft::GroupIdentity { cluster: [2; 16], ..base.clone() }, 1, vec![1]).unwrap(),
-            ReplicaIdentity::new(crate::multiraft::GroupIdentity { group: 2, ..base.clone() }, 1, vec![1]).unwrap(),
-            ReplicaIdentity::new(crate::multiraft::GroupIdentity { incarnation: 2, ..base.clone() }, 1, vec![1]).unwrap(),
+            ReplicaIdentity::new(
+                crate::multiraft::GroupIdentity {
+                    cluster: [2; 16],
+                    ..base.clone()
+                },
+                1,
+                vec![1],
+            )
+            .unwrap(),
+            ReplicaIdentity::new(
+                crate::multiraft::GroupIdentity {
+                    group: 2,
+                    ..base.clone()
+                },
+                1,
+                vec![1],
+            )
+            .unwrap(),
+            ReplicaIdentity::new(
+                crate::multiraft::GroupIdentity {
+                    incarnation: 2,
+                    ..base.clone()
+                },
+                1,
+                vec![1],
+            )
+            .unwrap(),
             ReplicaIdentity::new(base, 2, vec![2]).unwrap(),
         ];
         for other in variants {
@@ -432,5 +1362,38 @@ mod tests {
         assert!(DurableOpenRaftLog::create(&dir.0, &identity()).is_err());
         assert_eq!(fs::read(&path).unwrap(), before);
         assert!(DurableOpenRaftLog::open(&dir.0, &identity()).is_ok());
+    }
+
+    #[tokio::test]
+    async fn purge_boundary_survives_reopen_and_rejects_invalid_mutations() {
+        let dir = TempDir::new();
+        let mut store = DurableOpenRaftLog::create(&dir.0, &identity()).unwrap();
+        store
+            .append_durable(&Record::Append((0..=3).map(entry).collect()))
+            .unwrap();
+        let boundary = entry(2).log_id;
+        store.purge(boundary).await.unwrap();
+        assert!(store.truncate(boundary).await.is_err());
+        assert!(store.purge(entry(1).log_id).await.is_err());
+        assert!(store
+            .append_durable(&Record::Append(vec![entry(2)]))
+            .is_err());
+        assert!(store.try_get_log_entries(2..=2).await.unwrap().is_empty());
+        drop(store);
+        let mut store = DurableOpenRaftLog::open(&dir.0, &identity()).unwrap();
+        let state = store.get_log_state().await.unwrap();
+        assert_eq!(state.last_purged_log_id, Some(boundary));
+        assert_eq!(state.last_log_id, Some(entry(3).log_id));
+        store.truncate(entry(3).log_id).await.unwrap();
+        assert_eq!(
+            store.get_log_state().await.unwrap().last_log_id,
+            Some(boundary)
+        );
+        drop(store);
+        let mut store = DurableOpenRaftLog::open(&dir.0, &identity()).unwrap();
+        assert_eq!(
+            store.get_log_state().await.unwrap().last_log_id,
+            Some(boundary)
+        );
     }
 }

@@ -116,7 +116,13 @@ pub fn connection(mut c: TcpStream, st: AppState, credentials: Credentials) -> i
         return Ok(());
     };
     {
-        let cp = st.control.read().unwrap();
+        let cp = match st.control_for_authorization() {
+            Ok(cp) => cp,
+            Err(_) => {
+                error(&mut c, "57P03", "control plane stale or unavailable")?;
+                return Ok(());
+            }
+        };
         if cp
             .authorize(project, &cred.subject, yadb_control::Role::ReadOnly)
             .is_err()
@@ -192,7 +198,22 @@ pub fn connection(mut c: TcpStream, st: AppState, credentials: Credentials) -> i
                             error(&mut c, "25P02", "transaction aborted; ROLLBACK required")?;
                             break;
                         }
-                        let term = st.meta.role_info().2;
+                        let term = if st.meta.is_openraft() {
+                            let id = st
+                                .control
+                                .read()
+                                .unwrap()
+                                .projects
+                                .get(project)
+                                .map(|(id, _)| *id)
+                                .ok_or_else(|| io::Error::other("project unavailable"))?;
+                            st.meta
+                                .role_info_for_key(&format!("/db/{id}/"))
+                                .map_err(io::Error::other)?
+                                .2
+                        } else {
+                            st.meta.role_info().2
+                        };
                         if status == b'T' && tx_term != term && !rollback {
                             status = b'E';
                             error(
@@ -223,7 +244,7 @@ pub fn connection(mut c: TcpStream, st: AppState, credentials: Credentials) -> i
                         let tag = match stmt {
                             SqlStmt::Begin => {
                                 status = b'T';
-                                tx_term = st.meta.role_info().2;
+                                tx_term = term;
                                 "BEGIN".into()
                             }
                             SqlStmt::Commit => {
