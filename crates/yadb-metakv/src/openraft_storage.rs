@@ -70,8 +70,23 @@ struct Inner {
     frames: usize,
     _lock: OsDirectoryLock,
     state: State,
+    repaired_tail: Option<TailRepair>,
     failed: bool,
     fault: Option<Fault>,
+}
+
+/// A torn final frame that `open` discarded.
+///
+/// `append_frame` writes a whole frame and syncs it before OpenRaft is told the
+/// append succeeded, so a frame cut short by a crash was never acknowledged and
+/// can be dropped. The repair is surfaced instead of logged so callers can
+/// report it: this module has no logging facility of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TailRepair {
+    /// Length the log was truncated to: the end of the last complete frame.
+    pub valid_len: u64,
+    /// Bytes discarded from the cut-short final frame.
+    pub discarded: u64,
 }
 
 #[allow(dead_code)]
@@ -373,7 +388,81 @@ fn header(identity: &ReplicaIdentity) -> Vec<u8> {
     result
 }
 
-fn recover(file: &mut File, identity: &ReplicaIdentity) -> io::Result<(State, u64, usize)> {
+/// One step of a log walk.
+enum Frame {
+    /// The log ends exactly on a frame boundary.
+    End,
+    /// The file ends inside its final frame.
+    Torn,
+    Complete {
+        header: [u8; FRAME_HEADER_LEN],
+        payload: Vec<u8>,
+    },
+}
+
+/// Fill `buf`, reporting a short read instead of failing.
+///
+/// Only a short read is meaningful here: the caller decides whether the missing
+/// bytes are a crash artefact or corruption.
+fn read_full_or_eof(file: &mut File, buf: &mut [u8]) -> io::Result<bool> {
+    match file.read_exact(buf) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// Read the next frame without interpreting it.
+///
+/// A frame is reported [`Frame::Torn`] only when the file ends in the middle of
+/// it. A frame with a complete header is still validated by the caller, so bad
+/// magic, an impossible length or a checksum mismatch stays an error: those
+/// bytes were synced before being acknowledged, and discarding them would lose
+/// committed entries.
+fn read_frame(file: &mut File) -> io::Result<Frame> {
+    let mut frame_header = [0; FRAME_HEADER_LEN];
+    loop {
+        match file.read(&mut frame_header[..1]) {
+            Ok(0) => return Ok(Frame::End),
+            Ok(_) => break,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    // The file does not end on a frame boundary: at least one byte of the next
+    // frame is present. `append_frame` writes one whole frame per `write_all`
+    // and syncs it before acknowledging, and the log has a single writer behind
+    // `OsDirectoryLock`, so a frame that runs past the end of the file can only
+    // be that writer's final, unacknowledged append interrupted by a crash.
+    // Nothing follows it, so truncating to the frame start loses nothing.
+    if !read_full_or_eof(file, &mut frame_header[1..])? {
+        return Ok(Frame::Torn);
+    }
+    if &frame_header[..4] != FRAME_MAGIC {
+        return Err(invalid("invalid OpenRaft log frame"));
+    }
+    let len = u32::from_le_bytes(frame_header[4..8].try_into().unwrap()) as usize;
+    if len > MAX_FRAME_PAYLOAD {
+        return Err(invalid("OpenRaft log frame exceeds limit"));
+    }
+    let mut payload = vec![0; len];
+    if !read_full_or_eof(file, &mut payload)? {
+        return Ok(Frame::Torn);
+    }
+    Ok(Frame::Complete {
+        header: frame_header,
+        payload,
+    })
+}
+
+struct Recovered {
+    state: State,
+    bytes: u64,
+    frames: usize,
+    repaired_tail: Option<TailRepair>,
+}
+
+fn recover(file: &mut File, dir: &Path, identity: &ReplicaIdentity) -> io::Result<Recovered> {
     let file_len = file.metadata()?.len();
     if file_len > MAX_LOG_BYTES {
         return Err(invalid("OpenRaft log exceeds disk limit"));
@@ -383,6 +472,9 @@ fn recover(file: &mut File, identity: &ReplicaIdentity) -> io::Result<(State, u6
     let mut actual = vec![0; expected.len()];
     file.read_exact(&mut actual).map_err(|e| {
         if e.kind() == io::ErrorKind::UnexpectedEof {
+            // `create` writes the header once and syncs it before the log is
+            // usable, so a file that cannot hold it never was a valid log.
+            // Repairing it would invent a replica identity.
             invalid("truncated OpenRaft log header")
         } else {
             e
@@ -394,42 +486,52 @@ fn recover(file: &mut File, identity: &ReplicaIdentity) -> io::Result<(State, u6
 
     let mut state = State::default();
     let mut frames = 0;
+    // Offset of the next frame, and therefore the length of the longest fully
+    // valid prefix seen so far.
+    let mut valid_len = expected.len() as u64;
+    let mut repaired_tail = None;
     loop {
-        let mut frame_header = [0; FRAME_HEADER_LEN];
-        match file.read(&mut frame_header[..1]) {
-            Ok(0) => break,
-            Ok(_) => {}
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e),
-        }
+        let (frame_header, payload) = match read_frame(file)? {
+            Frame::End => break,
+            Frame::Torn => {
+                // Drop the torn tail and make the shorter file durable before
+                // serving reads, the same way `compact` and `create` publish a
+                // new length. Truncation cannot remove an acknowledged frame:
+                // the cut-short frame was never acknowledged, and every earlier
+                // frame was fully written and synced before its acknowledgement.
+                // Batching several frames per sync would not weaken this, since
+                // a partial write still only leaves a partial *final* frame.
+                // The argument would fail if a second writer bypassed
+                // `OsDirectoryLock`, or if appends could overwrite or skip
+                // bytes of the log instead of extending it; `compact` does
+                // neither, because it publishes a synced temporary file with
+                // `rename`. It also cannot distinguish a torn frame from a
+                // frame whose length field was corrupted upward past the end of
+                // the file: that damage is repaired as a tail rather than
+                // rejected, because the two are byte-identical without a
+                // redundant length. No bytes followed by further bytes are ever
+                // discarded, so the prefix up to the last frame start survives.
+                file.set_len(valid_len)?;
+                file.sync_data()?;
+                File::open(dir)?.sync_all()?;
+                repaired_tail = Some(TailRepair {
+                    valid_len,
+                    discarded: file_len - valid_len,
+                });
+                break;
+            }
+            Frame::Complete {
+                header: frame_header,
+                payload,
+            } => (frame_header, payload),
+        };
         frames += 1;
         if frames > MAX_LOG_FRAMES {
             return Err(invalid("OpenRaft log exceeds frame count limit"));
         }
-        file.read_exact(&mut frame_header[1..]).map_err(|e| {
-            if e.kind() == io::ErrorKind::UnexpectedEof {
-                invalid("truncated OpenRaft log frame")
-            } else {
-                e
-            }
-        })?;
-        if &frame_header[..4] != FRAME_MAGIC {
-            return Err(invalid("invalid OpenRaft log frame"));
-        }
-        let len = u32::from_le_bytes(frame_header[4..8].try_into().unwrap()) as usize;
-        if len > MAX_FRAME_PAYLOAD {
-            return Err(invalid("OpenRaft log frame exceeds limit"));
-        }
-        let mut payload = vec![0; len];
-        file.read_exact(&mut payload).map_err(|e| {
-            if e.kind() == io::ErrorKind::UnexpectedEof {
-                invalid("truncated OpenRaft log frame")
-            } else {
-                e
-            }
-        })?;
-        let expected = u32::from_le_bytes(frame_header[8..12].try_into().unwrap());
-        if crc32fast::hash(&payload) != expected {
+        let len = payload.len();
+        let expected_crc = u32::from_le_bytes(frame_header[8..12].try_into().unwrap());
+        if crc32fast::hash(&payload) != expected_crc {
             return Err(invalid("OpenRaft log checksum mismatch"));
         }
         let record: Record =
@@ -443,9 +545,15 @@ fn recover(file: &mut File, identity: &ReplicaIdentity) -> io::Result<(State, u6
         if state.log.len() > MAX_LIVE_ENTRIES {
             return Err(invalid("OpenRaft log exceeds live entry limit"));
         }
+        valid_len += (FRAME_HEADER_LEN + len) as u64;
     }
     file.seek(SeekFrom::End(0))?;
-    Ok((state, file_len, frames))
+    Ok(Recovered {
+        state,
+        bytes: valid_len,
+        frames,
+        repaired_tail,
+    })
 }
 
 impl DurableOpenRaftLog {
@@ -473,6 +581,7 @@ impl DurableOpenRaftLog {
                 frames: 0,
                 _lock: lock,
                 state: State::default(),
+                repaired_tail: None,
                 failed: false,
                 fault: None,
             })),
@@ -487,7 +596,12 @@ impl DurableOpenRaftLog {
             .read(true)
             .append(true)
             .open(dir.join("openraft.log"))?;
-        let (state, bytes, frames) = recover(&mut file, identity)?;
+        let Recovered {
+            state,
+            bytes,
+            frames,
+            repaired_tail,
+        } = recover(&mut file, dir, identity)?;
         // Validate checkpoint size too, so every recovered state can later be compacted.
         checkpoint_frame(&state)?;
         // A process-only restart may still see bytes whose previous sync failed.
@@ -507,10 +621,20 @@ impl DurableOpenRaftLog {
                 frames,
                 _lock: lock,
                 state,
+                repaired_tail,
                 failed: false,
                 fault: None,
             })),
         })
+    }
+
+    /// The torn final frame discarded by the last [`Self::open`], if any.
+    ///
+    /// A torn frame was cut short by a crash before it was synced, so it was
+    /// never acknowledged to OpenRaft and dropping it cannot lose an entry.
+    /// Corruption is never reported here: it makes `open` fail instead.
+    pub fn repaired_tail(&self) -> Option<TailRepair> {
+        self.inner.lock().unwrap().repaired_tail
     }
 
     fn append_durable(&self, record: &Record) -> Result<(), StorageError<u32>> {
@@ -789,19 +913,185 @@ mod tests {
         assert_eq!(entries[1].log_id.index, 2);
     }
 
-    #[test]
-    fn truncated_or_corrupt_tail_fails_closed() {
+    // A crash between `write_all` and `sync_data` in `append_frame` can leave
+    // any prefix of the final frame. Nothing follows it and it was never
+    // acknowledged, so `open` must repair it instead of refusing the replica.
+    // This replaces `truncated_or_corrupt_tail_fails_closed`, which asserted
+    // the old availability bug for exactly this input.
+    #[tokio::test]
+    async fn torn_final_frame_header_is_repaired_on_open() {
         let dir = TempDir::new();
         let store = DurableOpenRaftLog::create(&dir.0, &identity()).unwrap();
         store
             .append_durable(&Record::Vote(Vote::new(1, 1)))
             .unwrap();
+        store
+            .append_durable(&Record::Append(vec![entry(0), entry(1)]))
+            .unwrap();
         drop(store);
         let path = dir.0.join("openraft.log");
+        let prefix = fs::read(&path).unwrap();
         let mut file = OpenOptions::new().append(true).open(&path).unwrap();
-        file.write_all(b"YORF\x08\x00").unwrap();
+        // Five bytes of a twelve-byte frame header: magic plus one length byte.
+        file.write_all(b"YORF\x08").unwrap();
         drop(file);
-        assert!(DurableOpenRaftLog::open(&dir.0, &identity()).is_err());
+
+        let mut reopened = DurableOpenRaftLog::open(&dir.0, &identity()).unwrap();
+        assert_eq!(
+            reopened.repaired_tail(),
+            Some(TailRepair {
+                valid_len: prefix.len() as u64,
+                discarded: 5,
+            })
+        );
+        assert_eq!(fs::read(&path).unwrap(), prefix);
+        assert_eq!(reopened.read_vote().await.unwrap(), Some(Vote::new(1, 1)));
+        assert_eq!(
+            reopened
+                .read_entries(0, 10)
+                .iter()
+                .map(|e| e.log_id.index)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+
+        // The repaired file is appendable, and reopening it repairs nothing.
+        reopened.save_vote(&Vote::new(2, 1)).await.unwrap();
+        drop(reopened);
+        let reopened = DurableOpenRaftLog::open(&dir.0, &identity()).unwrap();
+        assert_eq!(reopened.repaired_tail(), None);
+        assert_eq!(reopened.read_entries(0, 10).len(), 2);
+    }
+
+    // Same argument for a frame whose header arrived but whose payload did not.
+    #[test]
+    fn torn_final_frame_payload_is_repaired_on_open() {
+        let dir = TempDir::new();
+        let store = DurableOpenRaftLog::create(&dir.0, &identity()).unwrap();
+        store
+            .append_durable(&Record::Append(vec![entry(0)]))
+            .unwrap();
+        drop(store);
+        let path = dir.0.join("openraft.log");
+        let prefix = fs::read(&path).unwrap();
+        let next = encode(&Record::Append(vec![entry(1)])).unwrap();
+        let torn = FRAME_HEADER_LEN + 7;
+        assert!(torn < next.len());
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(&next[..torn]).unwrap();
+        drop(file);
+
+        let reopened = DurableOpenRaftLog::open(&dir.0, &identity()).unwrap();
+        assert_eq!(
+            reopened.repaired_tail(),
+            Some(TailRepair {
+                valid_len: prefix.len() as u64,
+                discarded: torn as u64,
+            })
+        );
+        assert_eq!(fs::read(&path).unwrap(), prefix);
+        assert_eq!(reopened.read_entries(0, 10).len(), 1);
+        assert_eq!(reopened.read_entries(0, 10)[0].log_id.index, 0);
+
+        // Idempotent: the surviving prefix is a complete log.
+        drop(reopened);
+        let reopened = DurableOpenRaftLog::open(&dir.0, &identity()).unwrap();
+        assert_eq!(reopened.repaired_tail(), None);
+        assert_eq!(fs::read(&path).unwrap(), prefix);
+    }
+
+    // Frames 1..3 of a three-frame log, used by the corruption tests below.
+    fn three_frame_log(dir: &Path) -> (PathBuf, usize) {
+        let store = DurableOpenRaftLog::create(dir, &identity()).unwrap();
+        store
+            .append_durable(&Record::Vote(Vote::new(1, 1)))
+            .unwrap();
+        store
+            .append_durable(&Record::Append(vec![entry(0), entry(1)]))
+            .unwrap();
+        store
+            .append_durable(&Record::Append(vec![entry(2)]))
+            .unwrap();
+        drop(store);
+        let second =
+            header(&identity()).len() + encode(&Record::Vote(Vote::new(1, 1))).unwrap().len();
+        (dir.join("openraft.log"), second)
+    }
+
+    // A complete frame that fails validation was synced before being
+    // acknowledged, so it is corruption: discarding it could drop an entry.
+    #[test]
+    fn mid_file_checksum_corruption_still_fails_closed() {
+        let dir = TempDir::new();
+        let (path, second) = three_frame_log(&dir.0);
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[second + FRAME_HEADER_LEN + 5] ^= 0xff;
+        fs::write(&path, &bytes).unwrap();
+
+        let error = DurableOpenRaftLog::open(&dir.0, &identity()).err().unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(error.to_string(), "OpenRaft log checksum mismatch");
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn mid_file_bad_frame_magic_still_fails_closed() {
+        let dir = TempDir::new();
+        let (path, second) = three_frame_log(&dir.0);
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[second..second + 4].copy_from_slice(b"XXXX");
+        fs::write(&path, &bytes).unwrap();
+
+        let error = DurableOpenRaftLog::open(&dir.0, &identity()).err().unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(error.to_string(), "invalid OpenRaft log frame");
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+    }
+
+    // The openraft-visible image, so a repair can be shown to drop only bytes
+    // that never reached the state.
+    async fn image(
+        store: &mut DurableOpenRaftLog,
+    ) -> (
+        Option<LogId<u32>>,
+        Option<LogId<u32>>,
+        Option<Vote<u32>>,
+        Vec<u8>,
+    ) {
+        let state = store.get_log_state().await.unwrap();
+        let vote = store.read_vote().await.unwrap();
+        let entries = store.try_get_log_entries(0..u64::MAX).await.unwrap();
+        (
+            state.last_log_id,
+            state.last_purged_log_id,
+            vote,
+            serde_json::to_vec(&entries).unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn repairing_a_torn_tail_preserves_the_recovered_image() {
+        let dir = TempDir::new();
+        let mut store = DurableOpenRaftLog::create(&dir.0, &identity()).unwrap();
+        store.save_vote(&Vote::new(3, 1)).await.unwrap();
+        store
+            .append_durable(&Record::Append((0..=4).map(entry).collect()))
+            .unwrap();
+        store.purge(entry(1).log_id).await.unwrap();
+        store.truncate(entry(4).log_id).await.unwrap();
+        let expected = image(&mut store).await;
+        drop(store);
+
+        let path = dir.0.join("openraft.log");
+        let prefix = fs::read(&path).unwrap();
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(b"YORF").unwrap();
+        drop(file);
+
+        let mut reopened = DurableOpenRaftLog::open(&dir.0, &identity()).unwrap();
+        assert!(reopened.repaired_tail().is_some());
+        assert_eq!(fs::read(&path).unwrap(), prefix);
+        assert_eq!(image(&mut reopened).await, expected);
     }
 
     #[test]
@@ -1240,25 +1530,64 @@ mod tests {
         assert!(DurableOpenRaftLog::open(&dir.0, &identity()).is_ok());
     }
 
-    #[test]
-    fn partial_write_poisoned_until_reopen_which_fails_closed() {
+    // `Fault::WritePartial` writes the first half of a frame and fails, which is
+    // exactly the artefact a crash between `write_all` and `sync_data` leaves:
+    // a complete header and a partial payload, with nothing after it. The frame
+    // was never acknowledged, so the reopen repairs it instead of failing.
+    #[tokio::test]
+    async fn partial_write_poisoned_until_reopen_which_repairs_the_torn_tail() {
         let dir = TempDir::new();
         let store = DurableOpenRaftLog::create(&dir.0, &identity()).unwrap();
         store
             .append_durable(&Record::Vote(Vote::new(1, 1)))
             .unwrap();
+        store
+            .append_durable(&Record::Append(vec![entry(0), entry(1)]))
+            .unwrap();
+        let path = dir.0.join("openraft.log");
+        let prefix = fs::read(&path).unwrap();
+        let torn = encode(&Record::Vote(Vote::new(2, 1))).unwrap();
+        assert!(torn.len() / 2 > FRAME_HEADER_LEN);
         store.inner.lock().unwrap().fault = Some(Fault::WritePartial);
         assert!(store
             .append_durable(&Record::Vote(Vote::new(2, 1)))
             .is_err());
+        // The live handle stays poisoned until it is reopened, even though the
+        // failure left only a repairable tail on disk.
         assert!(store
             .append_durable(&Record::Vote(Vote::new(3, 1)))
             .is_err());
         drop(store);
-        let path = dir.0.join("openraft.log");
-        let before = fs::read(&path).unwrap();
-        assert!(DurableOpenRaftLog::open(&dir.0, &identity()).is_err());
-        assert_eq!(fs::read(&path).unwrap(), before);
+        assert_eq!(
+            fs::read(&path).unwrap().len(),
+            prefix.len() + torn.len() / 2
+        );
+
+        let mut reopened = DurableOpenRaftLog::open(&dir.0, &identity()).unwrap();
+        assert_eq!(
+            reopened.repaired_tail(),
+            Some(TailRepair {
+                valid_len: prefix.len() as u64,
+                discarded: (torn.len() / 2) as u64,
+            })
+        );
+        assert_eq!(fs::read(&path).unwrap(), prefix);
+        assert_eq!(reopened.read_vote().await.unwrap(), Some(Vote::new(1, 1)));
+        assert_eq!(
+            reopened
+                .read_entries(0, 10)
+                .iter()
+                .map(|e| e.log_id.index)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+
+        // The repaired log is writable again, and the repair is not sticky.
+        reopened.save_vote(&Vote::new(2, 1)).await.unwrap();
+        drop(reopened);
+        let mut reopened = DurableOpenRaftLog::open(&dir.0, &identity()).unwrap();
+        assert_eq!(reopened.repaired_tail(), None);
+        assert_eq!(reopened.read_vote().await.unwrap(), Some(Vote::new(2, 1)));
     }
 
     #[tokio::test]
