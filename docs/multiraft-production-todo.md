@@ -380,6 +380,18 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   and startup cancellation are not proven safe.
   A versioned replica descriptor also binds bootstrap voters; tests reject
   changed voters on reopen and wrong-identity registry lookup/shutdown.
+- [x] Report an ambiguous write outcome as unknown on both runtimes. The OpenRaft
+  bridge already answered `OpenRaftWriteUnknown` with `503` plus
+  `x-yadb-write-outcome: unknown` / `x-yadb-retry: do-not-retry`, but the legacy
+  path's `MetaError::UncommittedIndex` — the same ambiguity, raised when the
+  synchronous RPC cascade did not confirm the proposal in time or a new leader
+  replaced it — fell through to a plain `500`. `meta_err_response` now maps both.
+  Definite errors (`CorruptWal`, `Io`) still map to `500` with no outcome header,
+  and a test asserts that, so a client keying retry policy off the header does not
+  stop retrying ordinary rejections. Open: `drive_outbound_with` propagates
+  `Io`/`StorageUnavailable` from `guard.step(reply)` *after* the proposal was
+  appended, which is also ambiguous, and those variants are not distinguished from
+  a pre-append failure.
 - [ ] Implement a multi-group registry: several independent groups per node,
   per-group directories, per-group failure isolation and bounded resources.
   An experimental in-process registry provides separate directories and a

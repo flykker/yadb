@@ -667,9 +667,9 @@ unproven and no timeout was increased or retry added to mask the failure.
 | Multi-process failure suite | Only the tested stop/restart/quorum/failover scenarios | Network partitions unless explicitly injected; arbitrary schedules |
 | OS/device crash test | Recorded host/filesystem/device/power-failure scenario | Other hardware configurations or unrestricted power-loss guarantees |
 
-### Durability findings S2/S4/S6 (2026-11-15)
+### Durability findings S2/S4/S6/S7 (2026-11-15)
 
-Three defects from the durability audit are fixed on `main`. All evidence below is
+Four defects from the durability audit are fixed on `main`. All evidence below is
 in-process; none of it is a power-loss or device qualification.
 
 **S2 — corruption reported as absence (default build).**
@@ -708,11 +708,21 @@ queue is drained before the manifest scan and on OpenRaft too, since repairing
 blobs this process wrote needs no cross-group metadata view. Three tests; 24/24
 passed. Open: the queue is in-memory and per process, so a restart forgets it.
 
+**S7 — ambiguous legacy write outcome reported as a definite failure.** The
+OpenRaft bridge answered `OpenRaftWriteUnknown` with `503` plus
+`x-yadb-write-outcome: unknown` and `x-yadb-retry: do-not-retry`, but
+`MetaError::UncommittedIndex` on the legacy path — the same ambiguity — mapped to a
+plain `500`. A client could not tell "may have committed" from "rejected".
+`meta_err_response` now maps both; `CorruptWal` and `Io` still map to `500` with no
+outcome header, asserted by a test so the distinction cannot silently collapse.
+Three tests in `yadbd`; 31/31 units passed.
+
 | Finding | Tests | What it still does not prove |
 | --- | --- | --- |
 | S2 | `yadb-blob` 21/21 | No real multi-node pool; corruption is injected by flipping a byte in `SimFs` |
 | S4 | `yadb-metakv` 128/128 | No real power loss; torn tails are hand-cut bytes or `Fault::WritePartial` |
 | S6 | `yadb-blob` 24/24 | Queue is never exercised through a real pool or across a restart |
+| S7 | `yadbd` bins 31/31 | Only the HTTP mapping; `Io` after the append stays indistinguishable from `Io` before it |
 
 ## Required failure record format
 
