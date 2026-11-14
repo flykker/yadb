@@ -667,6 +667,53 @@ unproven and no timeout was increased or retry added to mask the failure.
 | Multi-process failure suite | Only the tested stop/restart/quorum/failover scenarios | Network partitions unless explicitly injected; arbitrary schedules |
 | OS/device crash test | Recorded host/filesystem/device/power-failure scenario | Other hardware configurations or unrestricted power-loss guarantees |
 
+### Durability findings S2/S4/S6 (2026-11-15)
+
+Three defects from the durability audit are fixed on `main`. All evidence below is
+in-process; none of it is a power-loss or device qualification.
+
+**S2 — corruption reported as absence (default build).**
+`PoolStriper::get_blob` discarded every slot error and answered `NotFound` for
+`Mirror` and `InsufficientFragments` for Reed-Solomon, so a blob that was present
+and failed its CRC32 was indistinguishable from one never written. The first
+`CorruptData` is now retained and returned only when decoding cannot produce a
+payload from the healthy fragments. A corrupt mirror copy still reads from a good
+replica, a corrupt RS fragment within `k` still reconstructs and is still treated
+as missing by `repair_blob` so the scrub rewrites it, and an offline replica is
+deliberately **not** promoted (that would turn the consistent-read "map is not a
+GC fence" `503` into a `500`). Status mapping is unchanged: internal VDisk `422`,
+block and object reads `500` with a corruption reason, `404` still means never
+written or deleted. Four tests in `yadb-blob`; 21/21 passed.
+
+**S4 — a torn final OpenRaft log frame prevented the group from opening
+(experimental build).** `append_frame` writes and syncs before OpenRaft is told the
+append succeeded, so a frame cut short by a crash was never acknowledged and can
+be dropped. `recover` now distinguishes `End`, `Torn` and `Complete`: a torn tail is
+truncated to the last frame boundary, synced, and reported through `TailRepair`.
+A complete frame with bad magic, an impossible length or a CRC mismatch is still
+`InvalidData` and leaves the file byte-identical. `partial_write_poisoned_until_
+reopen_which_fails_closed` asserted the bug and was replaced by
+`..._which_repairs_the_torn_tail`; four tests were added. `yadb-metakv` 124 → 128,
+all passing. Residual, documented in `recover`: a length field corrupted *upward*
+in a non-final frame is byte-identical to a torn tail and is repaired rather than
+rejected, dropping the frames after it.
+
+**S6 — degraded acknowledged writes (default build).** `put_blob` acks at
+`min_write_quorum()`, which is `k` for RS 4+2, so an ack could leave zero parity on
+disk while the failed parts were dropped. Short writes are now queued in
+`pending_repairs`, counted in `degraded_puts`, repaired in bounded batches by
+`repair_pending` and dequeued only when every fragment is intact; `repair_blob`
+no longer answers `Ok` when a fragment it could not rewrite is still missing. The
+queue is drained before the manifest scan and on OpenRaft too, since repairing
+blobs this process wrote needs no cross-group metadata view. Three tests; 24/24
+passed. Open: the queue is in-memory and per process, so a restart forgets it.
+
+| Finding | Tests | What it still does not prove |
+| --- | --- | --- |
+| S2 | `yadb-blob` 21/21 | No real multi-node pool; corruption is injected by flipping a byte in `SimFs` |
+| S4 | `yadb-metakv` 128/128 | No real power loss; torn tails are hand-cut bytes or `Fault::WritePartial` |
+| S6 | `yadb-blob` 24/24 | Queue is never exercised through a real pool or across a restart |
+
 ## Required failure record format
 
 For each scenario preserve setup identities, voters, initial applied/log/purge
