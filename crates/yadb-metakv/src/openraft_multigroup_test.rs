@@ -239,7 +239,7 @@ async fn multigroup_routing_body() {
                 LocalMetaKv::<yadb_io::SimFs>::from_openraft_groups(
                     1,
                     groups,
-                    BTreeMap::from([(1, 2), (2, 3)]),
+                    BTreeMap::from([(1, 2), (2, 3), (4, 2)]),
                     BTreeMap::new(),
                     tokio::runtime::Handle::current(),
                 )
@@ -260,7 +260,7 @@ async fn multigroup_routing_body() {
                 )
             })
             .collect(),
-        BTreeMap::from([(1, 2), (2, 3)]),
+        BTreeMap::from([(1, 2), (2, 3), (4, 2)]),
         tokio::runtime::Handle::current(),
     )
     .unwrap();
@@ -356,6 +356,154 @@ async fn multigroup_routing_body() {
         router.try_snapshot(&[], &["/idempotency/1".into()]),
         Err(MetaError::Routing(_))
     ));
+    // Group-scoped idempotency records name their group in the namespace, so the
+    // record and the counter that admits it are guarded in one transaction inside
+    // one group. Control is not `g<control>`: `/sys/idempotency/` is its only
+    // spelling, and accepting both would split the control records across two key
+    // spaces in the same group.
+    assert_eq!(
+        router.group_idempotency_namespace(2).unwrap(),
+        "/idempotency/g2/"
+    );
+    assert_eq!(
+        router.group_idempotency_usage_key(2).unwrap(),
+        "/idempotency/g2/_usage"
+    );
+    for group in [2u64, 3] {
+        let namespace = router.group_idempotency_namespace(group).unwrap();
+        let usage = router.group_idempotency_usage_key(group).unwrap();
+        // The routing function, not this test, decides the group: a namespace
+        // that disagrees with the group it names must fail here.
+        assert_eq!(router.group_id(&namespace).unwrap(), group);
+        assert_eq!(
+            router
+                .group_id(&format!("{namespace}subject-hash/key-hash"))
+                .unwrap(),
+            group
+        );
+        // The counter must resolve to the same group as the record it bounds, or
+        // the guarded transaction would be rejected as cross-group.
+        assert_eq!(router.group_id(&usage).unwrap(), group);
+        assert_eq!(
+            router.group_id(&format!("{namespace}_usage")).unwrap(),
+            group
+        );
+    }
+    // Control keeps its one spelling, and `group_id` still short-circuits every
+    // `/sys/` key to it before the allowlist runs.
+    assert_eq!(
+        router.idempotency_namespace(None).unwrap(),
+        "/sys/idempotency/"
+    );
+    assert_eq!(router.group_id("/sys/idempotency/").unwrap(), 1);
+    assert_eq!(router.group_id("/sys/idempotency/_usage").unwrap(), 1);
+    // Noncanonical, control, and unconfigured group ids are all rejected: `g01`
+    // and `g+1` would be a second spelling, `g1` is control, `g0` is never a
+    // configured data group, and a bare `/idempotency/g2` could prefix-match
+    // `/idempotency/g20/...` in another group.
+    for key in [
+        "/idempotency/g01/record",
+        "/idempotency/g+1/record",
+        "/idempotency/g1/record",
+        "/idempotency/g0/record",
+        "/idempotency/g999/record",
+        "/idempotency/g/record",
+        "/idempotency/g2",
+        "/idempotency/g",
+    ] {
+        assert!(
+            matches!(router.group_id(key), Err(MetaError::Routing(_))),
+            "{key} must be rejected"
+        );
+    }
+    for group in [0u64, 1, 999] {
+        assert!(matches!(
+            router.group_idempotency_namespace(group),
+            Err(MetaError::Routing(_))
+        ));
+        assert!(matches!(
+            router.group_idempotency_usage_key(group),
+            Err(MetaError::Routing(_))
+        ));
+    }
+    // Two projects that share a group must share the record namespace and the
+    // counter, otherwise two writers would each pass admission against a
+    // different counter and together exceed the bound. Projects 1 and 4 both map
+    // to group 2 in this fixture.
+    assert_eq!(router.group_id_for_project(Some("1")).unwrap(), 2);
+    assert_eq!(router.group_id_for_project(Some("4")).unwrap(), 2);
+    assert_eq!(
+        router.group_idempotency_namespace_for_project("1").unwrap(),
+        router.group_idempotency_namespace_for_project("4").unwrap()
+    );
+    assert_eq!(
+        router
+            .group_idempotency_usage_key(router.group_id_for_project(Some("1")).unwrap())
+            .unwrap(),
+        router
+            .group_idempotency_usage_key(router.group_id_for_project(Some("4")).unwrap())
+            .unwrap()
+    );
+    // An unmapped or noncanonical project must not fall back to control.
+    assert!(matches!(
+        router.group_idempotency_namespace_for_project("3"),
+        Err(MetaError::Routing(_))
+    ));
+    assert!(matches!(
+        router.group_idempotency_namespace_for_project("01"),
+        Err(MetaError::Routing(_))
+    ));
+    // The group fan-out is only half the contract: commit one record into each
+    // group namespace through the node that leads it (group 2 leads on node 1,
+    // group 3 on node 2) and read it back. A group namespace missing from `scan`'s
+    // fan-out list would panic on the bare prefix instead of returning records.
+    for (group, node) in [(2u64, 1u32), (3, 2)] {
+        let namespace = router.group_idempotency_namespace(group).unwrap();
+        let key = format!("{namespace}subject-hash/key-hash");
+        routers[&node]
+            .execute(KvCommand::Put {
+                key: key.clone(),
+                value: key.as_bytes().to_vec(),
+            })
+            .unwrap();
+        assert_eq!(
+            routers[&node]
+                .scan_prefix(&namespace)
+                .iter()
+                .map(|(k, _)| k.clone())
+                .collect::<Vec<_>>(),
+            vec![key.clone()],
+            "group {group} record is not readable from its own group"
+        );
+    }
+    // `router` is built on node 1: group 2 is local and group 3 replicates in, so
+    // wait instead of assuming. The fan-out must cover every data group, not only
+    // the groups a project maps to.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let seen = router.scan("/idempotency/g").len();
+        if seen == 2 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "group scan saw {seen} of 2 records after 10 s; the fan-out list is \
+             probably missing the group idempotency namespace"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // A specific group namespace routes to exactly one group, not the fan-out.
+    assert_eq!(router.scan("/idempotency/g2/").len(), 1);
+    // A bare group prefix must fail closed rather than scan one arbitrary group.
+    for prefix in ["/idempotency/g", "/idempotency/g2", "/idempotency/g1/"] {
+        assert!(
+            matches!(
+                router.try_snapshot(&[], &[prefix.into()]),
+                Err(MetaError::Routing(_))
+            ),
+            "{prefix} must be rejected"
+        );
+    }
     // Singleton mode has one group, and `group_id` sends every key to it, so
     // project routing must do the same instead of inventing a second group.
     let singleton_router = GroupRouter::singleton(OpenRaftClient::new(
@@ -375,6 +523,16 @@ async fn multigroup_routing_body() {
             .unwrap(),
         0
     );
+    // A singleton router owns only control, so it has no group-scoped namespace:
+    // the constructors fail closed instead of minting a `g0` spelling of control.
+    assert!(matches!(
+        singleton_router.group_idempotency_namespace(0),
+        Err(MetaError::Routing(_))
+    ));
+    assert!(matches!(
+        singleton_router.group_idempotency_usage_key(2),
+        Err(MetaError::Routing(_))
+    ));
     assert_eq!(
         routers[&1].role_info_for_key("/db/1/key").unwrap().1,
         RoleState::Leader

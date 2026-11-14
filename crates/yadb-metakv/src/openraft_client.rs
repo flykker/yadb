@@ -13,6 +13,11 @@ use openraft::error::{CheckIsLeaderError, ClientWriteError, RaftError};
 /// Control-scope idempotency records live here. It is byte-identical to the
 /// prefix `record_key` in `yadbd` builds, so existing records stay readable.
 ///
+/// Control keeps this spelling and only this spelling. It is deliberately *not*
+/// `/idempotency/g<control>/`: the same group would then have two namespaces, and
+/// a writer that picked the other one would split the control records, and the
+/// counter guarding them, across two key spaces in one group.
+///
 /// `dead_code`: no production caller exists yet. The only consumer today is the
 /// multigroup routing test. The routing table entry in `group_id` and the
 /// `scan`/`snapshot_group` entries ARE live; these helpers and constants are the
@@ -27,6 +32,15 @@ const CONTROL_IDEMPOTENCY_NAMESPACE: &str = "/sys/idempotency/";
 /// subject and key hashes appended by the record writer.
 #[allow(dead_code)]
 const PROJECT_IDEMPOTENCY_NAMESPACE: &str = "/idempotency/";
+/// Group-scope records name their owning group directly:
+/// `/idempotency/g<group>/...`. A record and the admission counter that bounds
+/// it must be guarded in one transaction, and a transaction may not span groups,
+/// so the counter has to be addressable through the same group id as the record.
+///
+/// The `g` marker keeps the segment distinguishable from a decimal project id in
+/// the `/idempotency/` allowlist entry below, which also makes the two families
+/// impossible to confuse in `group_id`'s first-segment parse.
+const GROUP_IDEMPOTENCY_NAMESPACE: &str = "/idempotency/g";
 
 /// A project id is a canonical decimal `u32` in every project namespace; a
 /// noncanonical spelling would address the same group through a second key.
@@ -38,6 +52,20 @@ fn project_id(part: &str, key: &str) -> Result<u32, MetaError> {
         return Err(MetaError::Routing(format!(
             "noncanonical project key: {key}"
         )));
+    }
+    Ok(id)
+}
+
+/// A group id carried by a namespace is canonical decimal `u64`, for the same
+/// reason a project id is: a second spelling (`g01`, `g+1`) would address the
+/// same group through a second key, and `scan` would return both. The `g` marker
+/// lives in the namespace prefix, so only the digits are compared here.
+fn canonical_group(part: &str, key: &str) -> Result<u64, MetaError> {
+    let id: u64 = part
+        .parse()
+        .map_err(|_| MetaError::Routing(format!("invalid group key: {key}")))?;
+    if part != id.to_string() {
+        return Err(MetaError::Routing(format!("noncanonical group key: {key}")));
     }
     Ok(id)
 }
@@ -111,6 +139,10 @@ impl GroupRouter {
             "/s3-upload-sequence/",
             "/block/",
             "/block-write-sequence/",
+            // Must precede `/idempotency/`, or a group namespace would match the
+            // project entry and its `g` segment would be parsed as a project id,
+            // failing as noncanonical instead of routing to the named group.
+            GROUP_IDEMPOTENCY_NAMESPACE,
             "/idempotency/",
         ]
         .iter()
@@ -124,6 +156,14 @@ impl GroupRouter {
         ]
         .iter()
         .any(|p| key.starts_with(p));
+        if key.starts_with(GROUP_IDEMPOTENCY_NAMESPACE) {
+            // Same separator rule as a project prefix: a bare `/idempotency/g2`
+            // must not be able to match `/idempotency/g20/...` in another group.
+            if !rest.contains('/') {
+                return Err(MetaError::Routing(format!("invalid group key: {key}")));
+            }
+            return self.configured_group(canonical_group(part, key)?);
+        }
         if (sequence && rest.contains('/')) || (!sequence && !rest.contains('/')) {
             return Err(MetaError::Routing(format!("invalid project key: {key}")));
         }
@@ -132,6 +172,24 @@ impl GroupRouter {
             .get(&id)
             .copied()
             .ok_or_else(|| MetaError::Routing(format!("unmapped project: {id}")))
+    }
+    /// Resolve a group id carried by a namespace against the groups this router
+    /// actually owns. Failing closed matters twice: a caller must never mint a
+    /// key that `group_id` would reject, and a project-scope writer must never
+    /// compute a counter key that lands in a different group than the record it
+    /// guards.
+    ///
+    /// Control is addressed only as `/sys/idempotency/`. `g<control>` names a
+    /// group this router does own, so the id check alone would accept it; it is
+    /// rejected explicitly because two spellings of one group are a routing bug
+    /// waiting for a writer to pick the wrong one. Group 0 is never in `groups`
+    /// for a multi-group router, so `g0` fails the same check. A singleton router
+    /// owns only control, so it has no group-scoped namespace at all.
+    fn configured_group(&self, group: u64) -> Result<u64, MetaError> {
+        if group == self.control || !self.groups.contains_key(&group) {
+            return Err(MetaError::Routing(format!("unconfigured group: {group}")));
+        }
+        Ok(group)
     }
     /// Group that owns `project`'s namespace, or the control group when `project`
     /// is `None`. Fails closed when the project has no explicit group mapping:
@@ -172,6 +230,52 @@ impl GroupRouter {
         // send to a different group.
         self.group_id_for_project(Some(project))?;
         Ok(format!("{PROJECT_IDEMPOTENCY_NAMESPACE}{project}/"))
+    }
+    /// Key namespace for idempotency records owned by `group`, i.e.
+    /// `/idempotency/g<group>/`. The group id is resolved against this router
+    /// first, so a caller can never mint a namespace that `group_id` would reject
+    /// or send to a group other than the one it names.
+    ///
+    /// `dead_code`: prepared contract with no production consumer yet, see
+    /// `group_id_for_project`.
+    #[allow(dead_code)]
+    pub(crate) fn group_idempotency_namespace(&self, group: u64) -> Result<String, MetaError> {
+        self.configured_group(group)?;
+        Ok(format!("{GROUP_IDEMPOTENCY_NAMESPACE}{group}/"))
+    }
+    /// Admission counter key for `group`'s idempotency records:
+    /// `/idempotency/g<group>/_usage`.
+    ///
+    /// It must live in the same group as the records it bounds: the writer guards
+    /// the counter and the new record in one transaction, and `group_for` rejects
+    /// a transaction whose keys span groups. Deriving it from
+    /// `group_idempotency_namespace` keeps the two in one group by construction.
+    ///
+    /// `dead_code`: prepared contract with no production consumer yet, see
+    /// `group_id_for_project`.
+    #[allow(dead_code)]
+    pub(crate) fn group_idempotency_usage_key(&self, group: u64) -> Result<String, MetaError> {
+        Ok(format!(
+            "{}_usage",
+            self.group_idempotency_namespace(group)?
+        ))
+    }
+    /// Namespace of the group that owns `project`'s idempotency records. This is
+    /// the constructor a project-scope writer uses: it resolves the project with
+    /// `group_id_for_project` instead of requiring the caller to know the group
+    /// id, so two projects that share a group also share one record namespace and
+    /// one counter. An unmapped project is an error rather than a control-group
+    /// fallback, whose records would never be resolved back to the project.
+    ///
+    /// `dead_code`: prepared contract with no production consumer yet, see
+    /// `group_id_for_project`.
+    #[allow(dead_code)]
+    pub(crate) fn group_idempotency_namespace_for_project(
+        &self,
+        project: &str,
+    ) -> Result<String, MetaError> {
+        let group = self.group_id_for_project(Some(project))?;
+        self.group_idempotency_namespace(group)
     }
     fn group_for<'a, 'k>(
         &'a self,
@@ -235,11 +339,16 @@ impl GroupRouter {
                     // be able to match `/idempotency/10/...` in another group, so a
                     // project prefix has to carry its separator.
                     "/idempotency/",
+                    // Group prefixes need the identical rule: `/idempotency/g2`
+                    // could otherwise match `/idempotency/g20/...` in another
+                    // group. Both entries match a group prefix, and both reject
+                    // it for the same missing-separator reason.
+                    GROUP_IDEMPOTENCY_NAMESPACE,
                 ] {
                     if let Some(rest) = prefix.strip_prefix(namespace) {
                         if !rest.contains('/') {
                             return Err(MetaError::Routing(
-                                "project prefix must include trailing separator".into(),
+                                "namespace prefix must include trailing separator".into(),
                             ));
                         }
                     }
@@ -327,16 +436,31 @@ impl GroupRouter {
                 // single-group routing rejects a bare project prefix, and the
                 // `expect` below turns that into a panic.
                 "/idempotency/",
+                // A bare group prefix spans every data group for the same reason.
+                // Without this entry `scan("/idempotency/g")` reaches
+                // `try_snapshot`, whose separator rule rejects the bare prefix,
+                // and the `expect` below panics.
+                GROUP_IDEMPOTENCY_NAMESPACE,
             ]
             .contains(&prefix)
         {
+            // Project namespaces exist only in the groups their project maps to,
+            // so the `/idempotency/` fan-out uses `projects`. A group-scoped
+            // record can be written into any configured data group, including one
+            // that no project currently maps to, so its fan-out must cover every
+            // non-control group instead. Control is excluded: it is addressed only
+            // as `/sys/idempotency/`.
+            let ids: std::collections::BTreeSet<u64> = if prefix == GROUP_IDEMPOTENCY_NAMESPACE {
+                self.groups
+                    .keys()
+                    .copied()
+                    .filter(|id| *id != self.control)
+                    .collect()
+            } else {
+                self.projects.values().copied().collect()
+            };
             let mut values = BTreeMap::new();
-            for id in self
-                .projects
-                .values()
-                .copied()
-                .collect::<std::collections::BTreeSet<_>>()
-            {
+            for id in ids {
                 values.extend(
                     self.groups[&id]
                         .state
