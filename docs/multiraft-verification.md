@@ -199,6 +199,25 @@ construction, but no fault injection proves it), no concurrent same-key race
 across two nodes, no leader loss during the publication, and no quota exhaustion
 on a real project group — the counter's ceiling is covered by unit tests only.
 
+That was also exercised live on the three-process deployment (binary
+`b00018a9f092da23d3cfae818bc0e4ac7008dea659abca6336924bfeb7f87ddc`, built from
+`e246483`), against a 10 GiB volume with a real 4 KiB pattern written and read
+back first so the zeros afterwards prove the discard rather than an empty volume:
+keyed UNMAP 200, replay 200, different range 409, byte-different body of the same
+range 409, project `resolve` `committed`, fresh `resolve` `not_committed`/`fenced`,
+keyed UNMAP after the fence 409 `idempotency_key_fenced`, control-with-`project`
+and project-without-`project` 400, unaligned UNMAP 400. An admin subject that is
+not a project member is refused with 403 on block read and write, so admin rights
+do not imply membership. Issuing the write and the keyed UNMAP to followers
+forwarded them to the group leader (`x-yadb-leader-id: 3`) and the discard was
+visible from a third node; a replay from a third node also returned 200. After a
+clean supervisor stop and restart, the committed key still resolved `committed`,
+the fenced key still `not_committed`, the block still read as zeros, and a replay
+still returned 200, so the project records and their group counter survive a
+restart. This is still not evidence for the cases listed above: no fault
+injection, no concurrent same-key race, no leader kill mid-publication, and no
+quota exhaustion on a real group.
+
 
 Evidence for the fix is a `SIGSTOP`/`SIGCONT` experiment on the live cluster:
 pausing the control leader for about 1.2 s (below the 1500 ms preferred election
