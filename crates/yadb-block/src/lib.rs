@@ -54,6 +54,29 @@ pub struct VolumeExtentMap {
     pub blocks: BTreeMap<u64, BlobId>,
 }
 
+/// A publication transaction prepared by the engine and completed by the caller.
+///
+/// The engine owns the map guard and the map write. A caller that must commit
+/// something else atomically with the publication — an idempotency record, an
+/// admission counter — appends guards and ops here, and they are submitted as
+/// one `RevisionTxn`. If the caller adds a guard that fails, the map is not
+/// published either: there is no state in which the map advanced without the
+/// caller's record, or the record exists without the map.
+///
+/// Both guard lists are checked by the same Raft apply before any op runs, and
+/// every op commits under one cluster revision, so the two writes are atomic by
+/// construction. Nothing here may be split into a second transaction: a second
+/// `RevisionTxn` could commit alone.
+///
+/// The engine writes the map first, so a caller op that names the volume's map
+/// key would replace the publication (last write wins). Guard that key instead
+/// if the caller needs to constrain the map it observed.
+#[derive(Debug, Default)]
+pub struct MapPublication {
+    pub guards: Vec<RevisionGuard>,
+    pub ops: Vec<TxnOp>,
+}
+
 /// Thin-provisioned Copy-on-Write Virtual Block Device Engine (YDB NBS analog)
 /// backed by `PoolStriper` (`Mirror` or `ReedSolomon`) + `MetaKV` extent maps.
 pub struct BlockVolumeEngine<FS: StorageFs> {
@@ -128,17 +151,37 @@ impl<FS: StorageFs> BlockVolumeEngine<FS> {
         expected: u64,
         map: &VolumeExtentMap,
     ) -> Result<bool, BlockError> {
+        self.publish_map_with(key, expected, map, MapPublication::default())
+    }
+
+    // One guarded `RevisionTxn` for the map and whatever the caller appended.
+    // The engine's map guard and the caller's guards are evaluated in the same
+    // apply, before any op runs, so a failing caller guard also blocks the map
+    // write. A `CasConflict` is therefore a definite non-commit — nothing was
+    // applied — which is what makes the retry loops above safe.
+    fn publish_map_with(
+        &self,
+        key: String,
+        expected: u64,
+        map: &VolumeExtentMap,
+        extra: MapPublication,
+    ) -> Result<bool, BlockError> {
+        let mut guards = Vec::with_capacity(1 + extra.guards.len());
+        guards.push(RevisionGuard {
+            key: key.clone(),
+            expected_mod_revision: expected,
+        });
+        guards.extend(extra.guards);
+
+        let mut ops = Vec::with_capacity(1 + extra.ops.len());
+        ops.push(TxnOp::Put {
+            key,
+            value: serde_json::to_vec(map)?,
+        });
+        ops.extend(extra.ops);
+
         Ok(matches!(
-            self.meta.execute(KvCommand::RevisionTxn {
-                guards: vec![RevisionGuard {
-                    key: key.clone(),
-                    expected_mod_revision: expected
-                }],
-                ops: vec![TxnOp::Put {
-                    key,
-                    value: serde_json::to_vec(map)?
-                }],
-            })?,
+            self.meta.execute(KvCommand::RevisionTxn { guards, ops })?,
             KvResult::TxnOk { .. }
         ))
     }
@@ -263,6 +306,47 @@ impl<FS: StorageFs> BlockVolumeEngine<FS> {
         offset: u64,
         len: u64,
     ) -> Result<(), BlockError> {
+        self.unmap_at_with(pid, volume, size, offset, len, |_| {
+            MapPublication::default()
+        })
+    }
+
+    /// [`Self::unmap_at`] with caller-supplied guards and ops committed in the
+    /// same `RevisionTxn` as the map.
+    ///
+    /// `prepare` runs at most once per attempt, after the range and alignment
+    /// checks and after the discard is applied, with the map *as it will be
+    /// published*. That is the exact value the transaction commits, so a caller
+    /// can derive its record (and its response) from what becomes durable
+    /// rather than from a possibly stale pre-read.
+    ///
+    /// Conflict handling: a `CasConflict` means the guards were checked and
+    /// failed before any op was applied, i.e. a definite non-commit. Retrying
+    /// is safe for that reason, and errors are never retried because an error
+    /// (a lost sync, a lost leader) may have committed. The engine cannot tell
+    /// whether its own map guard or a caller guard conflicted, so a caller
+    /// conflict is retried like any other, within the same 32-attempt bound.
+    ///
+    /// Consequently `prepare` is re-invoked with a freshly read map and must be
+    /// safe to call several times: derive guards and ops from the map it is
+    /// handed (or from state it re-reads itself, such as the idempotency record
+    /// it is guarding), and keep all effects inside the transaction — a
+    /// conflict discards them. A caller whose guard can never be satisfied sees
+    /// `BlockError::Conflict` after the loop, which still means "not
+    /// committed"; it must re-read its own record to tell "a concurrent attempt
+    /// committed this request" from "state moved past us".
+    pub fn unmap_at_with<F>(
+        &self,
+        pid: u32,
+        volume: &str,
+        size: u64,
+        offset: u64,
+        len: u64,
+        mut prepare: F,
+    ) -> Result<(), BlockError>
+    where
+        F: FnMut(&VolumeExtentMap) -> MapPublication,
+    {
         if offset.checked_add(len).is_none_or(|end| end > size) {
             return Err(BlockError::OutOfBounds {
                 offset,
@@ -280,7 +364,11 @@ impl<FS: StorageFs> BlockVolumeEngine<FS> {
             let end = (offset + len) / bs;
             map.blocks
                 .retain(|index, _| *index < offset / bs || *index >= end);
-            if self.publish_map(key.clone(), revision, &map)? {
+            // Prepared only once the request is known to be publishable, and
+            // with the post-discard map: the caller's guards/ops join this
+            // attempt's transaction and nothing else.
+            let extra = prepare(&map);
+            if self.publish_map_with(key.clone(), revision, &map, extra)? {
                 return Ok(());
             }
         }
@@ -928,5 +1016,239 @@ mod tests {
             reopened.read_at(1, "disk", "data", 8192, 0, 4096).unwrap(),
             vec![0; 4096]
         );
+    }
+
+    // Identical pre-state (same map bytes, same generation) on two volumes: the
+    // entry point with an empty publication must land on the same map as the
+    // legacy call. Building the map directly avoids allocation-dependent
+    // generations, which differ per volume by design.
+    #[test]
+    fn unmap_with_empty_publication_matches_legacy_unmap() {
+        let fs = SimFs::new(8816);
+        let meta = LocalMetaKv::open_single_node(&fs, "meta", 1).unwrap();
+        let engine = BlockVolumeEngine::new(meta.clone(), 4096);
+        let seeded = VolumeExtentMap {
+            block_size: 4096,
+            generation: 7,
+            blocks: (0..3)
+                .map(|step| {
+                    (
+                        step,
+                        BlobId::new(1, 2, 7, step as u32 + 1, BLOCK_CHANNEL, 0),
+                    )
+                })
+                .collect(),
+        };
+        for volume in ["legacy", "entry"] {
+            meta.execute(KvCommand::Put {
+                key: BlockVolumeEngine::<SimFs>::meta_key(1, volume),
+                value: serde_json::to_vec(&seeded).unwrap(),
+            })
+            .unwrap();
+        }
+        engine.unmap_at(1, "legacy", 12288, 4096, 4096).unwrap();
+        engine
+            .unmap_at_with(1, "entry", 12288, 4096, 4096, |_| MapPublication::default())
+            .unwrap();
+        let legacy = engine.load_map(1, "legacy").unwrap();
+        let entry = engine.load_map(1, "entry").unwrap();
+        assert_eq!(entry.blocks, legacy.blocks);
+        assert_eq!(entry.generation, legacy.generation);
+        assert_eq!(entry.generation, 7);
+        assert_eq!(entry.block_size, legacy.block_size);
+        assert_eq!(entry.blocks.keys().copied().collect::<Vec<_>>(), vec![0, 2]);
+    }
+
+    // The map put and the caller's put carry the same cluster revision, which
+    // only one `Txn` apply can produce: two transactions would have two
+    // revisions. That is the proof this is one transaction, not two.
+    #[test]
+    fn satisfied_caller_guard_commits_map_and_record_in_one_transaction() {
+        let fs = SimFs::new(8817);
+        let meta = LocalMetaKv::open_single_node(&fs, "meta", 1).unwrap();
+        let engine = BlockVolumeEngine::new(meta.clone(), 4096);
+        engine.register_pool("data", pool(&fs));
+        engine
+            .write_at(1, "disk", "data", 16384, 0, &vec![3u8; 12288])
+            .unwrap();
+        let map_key = BlockVolumeEngine::<SimFs>::meta_key(1, "disk");
+        let before = engine.load_map_snapshot(1, "disk").unwrap();
+        let record = "/block-unmap/1/disk/op-1".to_string();
+        let mut seen = None;
+        engine
+            .unmap_at_with(1, "disk", 16384, 0, 4096, |map| {
+                seen = Some(map.clone());
+                MapPublication {
+                    guards: vec![RevisionGuard {
+                        key: record.clone(),
+                        expected_mod_revision: 0,
+                    }],
+                    ops: vec![TxnOp::Put {
+                        key: record.clone(),
+                        value: b"done".to_vec(),
+                    }],
+                }
+            })
+            .unwrap();
+
+        let after = meta.get(&map_key).unwrap();
+        let stored = meta.get(&record).unwrap();
+        assert_eq!(stored.value, b"done");
+        assert_eq!(
+            after.mod_revision, stored.mod_revision,
+            "map and record were not written by one transaction"
+        );
+        assert!(before.0 < after.mod_revision);
+        let map = engine.load_map(1, "disk").unwrap();
+        assert!(!map.blocks.contains_key(&0));
+        assert!(map.blocks.contains_key(&1));
+        // `prepare` saw the post-discard map, i.e. the value that committed.
+        let seen = seen.expect("prepare must be invoked for a publishable request");
+        assert!(!seen.blocks.contains_key(&0));
+        assert_eq!(seen.blocks, map.blocks);
+        assert_eq!(seen.generation, map.generation);
+    }
+
+    // Atomicity: the caller's guard is never satisfiable (absent key, revision
+    // 1), so the single guarded transaction must abort as a whole. Both halves
+    // are asserted separately so a failure names the half that leaked.
+    #[test]
+    fn failed_caller_guard_leaves_map_and_record_untouched() {
+        let fs = SimFs::new(8818);
+        let meta = LocalMetaKv::open_single_node(&fs, "meta", 1).unwrap();
+        let engine = BlockVolumeEngine::new(meta.clone(), 4096);
+        engine.register_pool("data", pool(&fs));
+        engine
+            .write_at(1, "disk", "data", 16384, 0, &vec![4u8; 12288])
+            .unwrap();
+        let map_key = BlockVolumeEngine::<SimFs>::meta_key(1, "disk");
+        let before = meta.get(&map_key).unwrap();
+        let record = "/block-unmap/1/disk/never".to_string();
+        let result = engine.unmap_at_with(1, "disk", 16384, 0, 8192, |_| MapPublication {
+            guards: vec![RevisionGuard {
+                key: record.clone(),
+                expected_mod_revision: 1,
+            }],
+            ops: vec![TxnOp::Put {
+                key: record.clone(),
+                value: b"done".to_vec(),
+            }],
+        });
+        assert!(
+            matches!(&result, Err(BlockError::Conflict)),
+            "a never-satisfiable caller guard must end in a definite non-commit, got {result:?}"
+        );
+        assert!(
+            meta.get(&record).is_none(),
+            "caller record leaked although the transaction never committed"
+        );
+        let after = meta.get(&map_key).unwrap();
+        assert_eq!(
+            after.mod_revision, before.mod_revision,
+            "map advanced although the caller's guard failed"
+        );
+        let before_map: VolumeExtentMap = serde_json::from_slice(&before.value).unwrap();
+        let after_map: VolumeExtentMap = serde_json::from_slice(&after.value).unwrap();
+        assert_eq!(
+            after_map.blocks, before_map.blocks,
+            "map contents changed although the caller's guard failed"
+        );
+        assert_eq!(after_map.generation, before_map.generation);
+    }
+
+    // Retry coverage: attempt 1 fails on a deliberately stale guard, attempt 2
+    // guards that the record is *still absent*. Success therefore proves the
+    // failed attempt wrote nothing at all, not merely that the map converged.
+    #[test]
+    fn caller_guard_conflict_retries_with_a_fresh_publication() {
+        let fs = SimFs::new(8819);
+        let meta = LocalMetaKv::open_single_node(&fs, "meta", 1).unwrap();
+        let engine = BlockVolumeEngine::new(meta.clone(), 4096);
+        engine.register_pool("data", pool(&fs));
+        engine
+            .write_at(1, "disk", "data", 16384, 0, &vec![5u8; 12288])
+            .unwrap();
+        let record = "/block-unmap/1/disk/op-7".to_string();
+        let poison = "/block-unmap/1/disk/poison".to_string();
+        let mut attempts = 0u32;
+        engine
+            .unmap_at_with(1, "disk", 16384, 0, 4096, |_| {
+                attempts += 1;
+                if attempts == 1 {
+                    MapPublication {
+                        guards: vec![
+                            RevisionGuard {
+                                key: poison.clone(),
+                                expected_mod_revision: 1,
+                            },
+                            RevisionGuard {
+                                key: record.clone(),
+                                expected_mod_revision: 0,
+                            },
+                        ],
+                        ops: vec![TxnOp::Put {
+                            key: record.clone(),
+                            value: b"first".to_vec(),
+                        }],
+                    }
+                } else {
+                    MapPublication {
+                        guards: vec![RevisionGuard {
+                            key: record.clone(),
+                            expected_mod_revision: 0,
+                        }],
+                        ops: vec![TxnOp::Put {
+                            key: record.clone(),
+                            value: b"second".to_vec(),
+                        }],
+                    }
+                }
+            })
+            .unwrap();
+        assert_eq!(
+            attempts, 2,
+            "a caller-guard conflict must be retried with a fresh prepare call"
+        );
+        assert_eq!(meta.get(&record).unwrap().value, b"second");
+        let map = engine.load_map(1, "disk").unwrap();
+        assert_eq!(map.blocks.keys().copied().collect::<Vec<_>>(), vec![1, 2]);
+    }
+
+    // Range and alignment rejections happen before `prepare` runs and before
+    // any transaction is built, so they cost neither a guard nor a map write.
+    #[test]
+    fn unmap_entry_point_rejects_range_and_alignment_before_preparing() {
+        let fs = SimFs::new(8820);
+        let meta = LocalMetaKv::open_single_node(&fs, "meta", 1).unwrap();
+        let engine = BlockVolumeEngine::new(meta.clone(), 4096);
+        let key = BlockVolumeEngine::<SimFs>::meta_key(1, "disk");
+        let mut prepared = 0u32;
+        for (size, offset, len) in [(10, 11, 0), (10, 9, 2), (u64::MAX, u64::MAX, 1)] {
+            let legacy = engine.unmap_at(1, "disk", size, offset, len).unwrap_err();
+            let entry = engine
+                .unmap_at_with(1, "disk", size, offset, len, |_| {
+                    prepared += 1;
+                    MapPublication::default()
+                })
+                .unwrap_err();
+            assert!(matches!(legacy, BlockError::OutOfBounds { .. }));
+            assert_eq!(legacy.to_string(), entry.to_string());
+        }
+        // In range but unaligned: still rejected, still before `prepare`.
+        let legacy = engine.unmap_at(1, "disk", 8192, 512, 4096).unwrap_err();
+        let entry = engine
+            .unmap_at_with(1, "disk", 8192, 512, 4096, |_| {
+                prepared += 1;
+                MapPublication::default()
+            })
+            .unwrap_err();
+        assert!(matches!(legacy, BlockError::Conflict));
+        assert_eq!(legacy.to_string(), entry.to_string());
+        assert_eq!(prepared, 0, "prepare ran for a request that cannot publish");
+        assert!(
+            meta.get(&key).is_none(),
+            "a rejected request must not build or commit a transaction"
+        );
+        assert!(meta.get("/block-write-sequence/1").is_none());
     }
 }
