@@ -415,10 +415,10 @@ fn read_full_or_eof(file: &mut File, buf: &mut [u8]) -> io::Result<bool> {
 /// Read the next frame without interpreting it.
 ///
 /// A frame is reported [`Frame::Torn`] only when the file ends in the middle of
-/// it. Every byte that is present is still validated by the caller, so a
-/// complete frame with bad magic, an impossible length or a checksum mismatch
-/// stays an error: those bytes were synced before being acknowledged, and
-/// discarding them would lose committed entries.
+/// it. A frame with a complete header is still validated by the caller, so bad
+/// magic, an impossible length or a checksum mismatch stays an error: those
+/// bytes were synced before being acknowledged, and discarding them would lose
+/// committed entries.
 fn read_frame(file: &mut File) -> io::Result<Frame> {
     let mut frame_header = [0; FRAME_HEADER_LEN];
     loop {
@@ -501,10 +501,16 @@ fn recover(file: &mut File, dir: &Path, identity: &ReplicaIdentity) -> io::Resul
                 // frame was fully written and synced before its acknowledgement.
                 // Batching several frames per sync would not weaken this, since
                 // a partial write still only leaves a partial *final* frame.
-                // It would break only if appends could overwrite or skip bytes
-                // of the log rather than extend it, or if a second writer
-                // bypassed the directory lock; compaction does not, because it
-                // publishes a synced temporary file with `rename`.
+                // The argument would fail if a second writer bypassed
+                // `OsDirectoryLock`, or if appends could overwrite or skip
+                // bytes of the log instead of extending it; `compact` does
+                // neither, because it publishes a synced temporary file with
+                // `rename`. It also cannot distinguish a torn frame from a
+                // frame whose length field was corrupted upward past the end of
+                // the file: that damage is repaired as a tail rather than
+                // rejected, because the two are byte-identical without a
+                // redundant length. No bytes followed by further bytes are ever
+                // discarded, so the prefix up to the last frame start survives.
                 file.set_len(valid_len)?;
                 file.sync_data()?;
                 File::open(dir)?.sync_all()?;
@@ -975,7 +981,7 @@ mod tests {
         file.write_all(&next[..torn]).unwrap();
         drop(file);
 
-        let mut reopened = DurableOpenRaftLog::open(&dir.0, &identity()).unwrap();
+        let reopened = DurableOpenRaftLog::open(&dir.0, &identity()).unwrap();
         assert_eq!(
             reopened.repaired_tail(),
             Some(TailRepair {
@@ -1007,7 +1013,8 @@ mod tests {
             .append_durable(&Record::Append(vec![entry(2)]))
             .unwrap();
         drop(store);
-        let second = header(&identity()).len() + encode(&Record::Vote(Vote::new(1, 1))).unwrap().len();
+        let second =
+            header(&identity()).len() + encode(&Record::Vote(Vote::new(1, 1))).unwrap().len();
         (dir.join("openraft.log"), second)
     }
 
@@ -1021,9 +1028,7 @@ mod tests {
         bytes[second + FRAME_HEADER_LEN + 5] ^= 0xff;
         fs::write(&path, &bytes).unwrap();
 
-        let error = DurableOpenRaftLog::open(&dir.0, &identity())
-            .err()
-            .unwrap();
+        let error = DurableOpenRaftLog::open(&dir.0, &identity()).err().unwrap();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert_eq!(error.to_string(), "OpenRaft log checksum mismatch");
         assert_eq!(fs::read(&path).unwrap(), bytes);
@@ -1037,9 +1042,7 @@ mod tests {
         bytes[second..second + 4].copy_from_slice(b"XXXX");
         fs::write(&path, &bytes).unwrap();
 
-        let error = DurableOpenRaftLog::open(&dir.0, &identity())
-            .err()
-            .unwrap();
+        let error = DurableOpenRaftLog::open(&dir.0, &identity()).err().unwrap();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert_eq!(error.to_string(), "invalid OpenRaft log frame");
         assert_eq!(fs::read(&path).unwrap(), bytes);
@@ -1087,6 +1090,7 @@ mod tests {
 
         let mut reopened = DurableOpenRaftLog::open(&dir.0, &identity()).unwrap();
         assert!(reopened.repaired_tail().is_some());
+        assert_eq!(fs::read(&path).unwrap(), prefix);
         assert_eq!(image(&mut reopened).await, expected);
     }
 
@@ -1526,25 +1530,64 @@ mod tests {
         assert!(DurableOpenRaftLog::open(&dir.0, &identity()).is_ok());
     }
 
-    #[test]
-    fn partial_write_poisoned_until_reopen_which_fails_closed() {
+    // `Fault::WritePartial` writes the first half of a frame and fails, which is
+    // exactly the artefact a crash between `write_all` and `sync_data` leaves:
+    // a complete header and a partial payload, with nothing after it. The frame
+    // was never acknowledged, so the reopen repairs it instead of failing.
+    #[tokio::test]
+    async fn partial_write_poisoned_until_reopen_which_repairs_the_torn_tail() {
         let dir = TempDir::new();
         let store = DurableOpenRaftLog::create(&dir.0, &identity()).unwrap();
         store
             .append_durable(&Record::Vote(Vote::new(1, 1)))
             .unwrap();
+        store
+            .append_durable(&Record::Append(vec![entry(0), entry(1)]))
+            .unwrap();
+        let path = dir.0.join("openraft.log");
+        let prefix = fs::read(&path).unwrap();
+        let torn = encode(&Record::Vote(Vote::new(2, 1))).unwrap();
+        assert!(torn.len() / 2 > FRAME_HEADER_LEN);
         store.inner.lock().unwrap().fault = Some(Fault::WritePartial);
         assert!(store
             .append_durable(&Record::Vote(Vote::new(2, 1)))
             .is_err());
+        // The live handle stays poisoned until it is reopened, even though the
+        // failure left only a repairable tail on disk.
         assert!(store
             .append_durable(&Record::Vote(Vote::new(3, 1)))
             .is_err());
         drop(store);
-        let path = dir.0.join("openraft.log");
-        let before = fs::read(&path).unwrap();
-        assert!(DurableOpenRaftLog::open(&dir.0, &identity()).is_err());
-        assert_eq!(fs::read(&path).unwrap(), before);
+        assert_eq!(
+            fs::read(&path).unwrap().len(),
+            prefix.len() + torn.len() / 2
+        );
+
+        let mut reopened = DurableOpenRaftLog::open(&dir.0, &identity()).unwrap();
+        assert_eq!(
+            reopened.repaired_tail(),
+            Some(TailRepair {
+                valid_len: prefix.len() as u64,
+                discarded: (torn.len() / 2) as u64,
+            })
+        );
+        assert_eq!(fs::read(&path).unwrap(), prefix);
+        assert_eq!(reopened.read_vote().await.unwrap(), Some(Vote::new(1, 1)));
+        assert_eq!(
+            reopened
+                .read_entries(0, 10)
+                .iter()
+                .map(|e| e.log_id.index)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+
+        // The repaired log is writable again, and the repair is not sticky.
+        reopened.save_vote(&Vote::new(2, 1)).await.unwrap();
+        drop(reopened);
+        let mut reopened = DurableOpenRaftLog::open(&dir.0, &identity()).unwrap();
+        assert_eq!(reopened.repaired_tail(), None);
+        assert_eq!(reopened.read_vote().await.unwrap(), Some(Vote::new(2, 1)));
     }
 
     #[tokio::test]
