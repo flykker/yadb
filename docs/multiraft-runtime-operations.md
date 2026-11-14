@@ -233,6 +233,19 @@ allow removal of its abandoned temporary image; other temporary artifacts requir
 their own format-specific recovery rules. Never apply a generic “delete *.tmp”
 repair to production data.
 
+Blob fragments follow the same rule at the data layer: a fragment that is present
+but fails its CRC32 is reported as corruption (`BlobError::CorruptData`, `422` on
+the internal VDisk route, `500` on the public object and block routes), never as
+`not found`. When enough healthy fragments remain the blob is reconstructed
+transparently and `POST /v1/pools/scrub` rewrites the damaged fragment; corruption
+is surfaced only when reconstruction is impossible, and then as corruption rather
+than as a fragment shortfall. Unreachable replicas are deliberately not promoted
+this way, because an offline node says nothing about the data and a promoted
+error would turn the consistent-read “map is not a GC fence” `503` into a `500`.
+Operationally: `404`/`NoSuchKey` means the object was never written or was
+deleted, while `422`/`500` with a corruption reason means it exists and must be
+repaired from a replica or a backup — never re-created silently.
+
 ## Required release integrations
 
 Daemon config validation/lifecycle tests, resource limits/compaction, consistent

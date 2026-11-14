@@ -628,6 +628,15 @@ impl<FS: StorageFs> PoolStriper<FS> {
 
     /// Reads and reconstructs `logical_id`, preferring zero-hop local replicas for `Mirror`
     /// and transparently tolerating corrupted or offline remote nodes via Reed-Solomon decoding.
+    ///
+    /// A replica that answers "corrupt" is a positive observation about the data and is
+    /// never reported as absence: a bit-rotted but fully present blob must not look like a
+    /// blob that was never written, or an operator cannot tell corruption from a missing
+    /// object at the API boundary. Corruption only wins when decoding could not produce a
+    /// payload from the healthy replicas, so a corrupt mirror copy still reads from a good
+    /// one. Offline replicas are deliberately *not* promoted this way: an unreachable node
+    /// says nothing about the data, and reporting it as a non-`NotFound` error would turn
+    /// the consistent-read path's "map is not a GC fence" `503` into a `500`.
     pub fn get_blob(&self, logical_id: BlobId) -> Result<Vec<u8>, BlobError> {
         let total = self.codec.scheme().total_parts();
 
@@ -640,73 +649,118 @@ impl<FS: StorageFs> PoolStriper<FS> {
             });
 
             let mut parts: Vec<Option<Vec<u8>>> = vec![None; total];
+            let mut corruption: Option<BlobError> = None;
             for idx in order {
                 let part_id = logical_id.with_part((idx + 1) as u8);
                 let slot_idx = self.select_slot(logical_id, idx);
-                if let Ok(bytes) = self.slots[slot_idx].get(part_id) {
-                    parts[idx] = Some(bytes);
-                    return self.codec.decode(&parts);
+                match self.slots[slot_idx].get(part_id) {
+                    Ok(bytes) => {
+                        parts[idx] = Some(bytes);
+                        return self.codec.decode(&parts);
+                    }
+                    Err(e @ BlobError::CorruptData { .. }) => {
+                        corruption.get_or_insert(e);
+                    }
+                    Err(_) => {}
                 }
             }
-            return Err(BlobError::NotFound(logical_id));
+            return Err(corruption.unwrap_or(BlobError::NotFound(logical_id)));
         }
 
         // Reed-Solomon: fetch fragments concurrently across cluster nodes if remote slots exist
         let mut parts: Vec<Option<Vec<u8>>> = vec![None; total];
+        let mut corruption: Option<BlobError> = None;
         if self.has_remote {
-            let fetched: Vec<Option<Vec<u8>>> = std::thread::scope(|s| {
+            let fetched: Vec<Result<Vec<u8>, BlobError>> = std::thread::scope(|s| {
                 let mut handles = Vec::with_capacity(total);
                 for idx in 0..total {
                     let part_id = logical_id.with_part((idx + 1) as u8);
                     let slot_idx = self.select_slot(logical_id, idx);
                     let slot = &self.slots[slot_idx];
-                    handles.push(s.spawn(move || slot.get(part_id).ok()));
+                    handles.push(s.spawn(move || slot.get(part_id)));
                 }
                 handles
                     .into_iter()
-                    .map(|h| h.join().ok().flatten())
+                    // A panicking fetch thread yields no fragment, which is what the
+                    // old `join().ok().flatten()` did; treat it as unavailable rather
+                    // than inventing an I/O cause.
+                    .map(|h| h.join().unwrap_or(Err(BlobError::NotFound(logical_id))))
                     .collect()
             });
-            parts = fetched;
+            for (idx, result) in fetched.into_iter().enumerate() {
+                match result {
+                    Ok(bytes) => parts[idx] = Some(bytes),
+                    Err(e @ BlobError::CorruptData { .. }) => {
+                        corruption.get_or_insert(e);
+                    }
+                    Err(_) => {}
+                }
+            }
         } else {
             for (idx, part_slot) in parts.iter_mut().enumerate() {
                 let part_id = logical_id.with_part((idx + 1) as u8);
                 let slot_idx = self.select_slot(logical_id, idx);
-                if let Ok(bytes) = self.slots[slot_idx].get(part_id) {
-                    *part_slot = Some(bytes);
+                match self.slots[slot_idx].get(part_id) {
+                    Ok(bytes) => *part_slot = Some(bytes),
+                    Err(e @ BlobError::CorruptData { .. }) => {
+                        corruption.get_or_insert(e);
+                    }
+                    Err(_) => {}
                 }
             }
         }
 
-        self.codec.decode(&parts)
+        match self.codec.decode(&parts) {
+            Ok(payload) => Ok(payload),
+            Err(e) => Err(corruption.unwrap_or(e)),
+        }
     }
 
     /// Deep-scrubs all fragments of `logical_id` across local and remote nodes (verifying CRC32)
     /// and reconstructs + rewrites any missing or bit-rotted fragments!
+    ///
+    /// A corrupt fragment is deliberately treated as *missing* for reconstruction: that is
+    /// what lets the scrub rewrite it from the healthy ones. It is only reported when the
+    /// payload cannot be reconstructed at all, and then as corruption rather than as
+    /// "insufficient fragments" — the damage was observed, not inferred from a shortfall.
     pub fn repair_blob(&self, logical_id: BlobId) -> Result<RepairReport, BlobError> {
         let total = self.codec.scheme().total_parts();
         let mut slots_data: Vec<Option<Vec<u8>>> = vec![None; total];
+        let mut corruption: Option<BlobError> = None;
 
         if self.has_remote {
-            slots_data = std::thread::scope(|s| {
+            let fetched: Vec<Result<Vec<u8>, BlobError>> = std::thread::scope(|s| {
                 let mut handles = Vec::with_capacity(total);
                 for idx in 0..total {
                     let part_id = logical_id.with_part((idx + 1) as u8);
                     let slot_idx = self.select_slot(logical_id, idx);
                     let slot = &self.slots[slot_idx];
-                    handles.push(s.spawn(move || slot.get(part_id).ok()));
+                    handles.push(s.spawn(move || slot.get(part_id)));
                 }
                 handles
                     .into_iter()
-                    .map(|h| h.join().ok().flatten())
+                    .map(|h| h.join().unwrap_or(Err(BlobError::NotFound(logical_id))))
                     .collect()
             });
+            for (idx, result) in fetched.into_iter().enumerate() {
+                match result {
+                    Ok(bytes) => slots_data[idx] = Some(bytes),
+                    Err(e @ BlobError::CorruptData { .. }) => {
+                        corruption.get_or_insert(e);
+                    }
+                    Err(_) => {}
+                }
+            }
         } else {
             for (idx, item) in slots_data.iter_mut().enumerate() {
                 let part_id = logical_id.with_part((idx + 1) as u8);
                 let slot_idx = self.select_slot(logical_id, idx);
-                if let Ok(bytes) = self.slots[slot_idx].get(part_id) {
-                    *item = Some(bytes);
+                match self.slots[slot_idx].get(part_id) {
+                    Ok(bytes) => *item = Some(bytes),
+                    Err(e @ BlobError::CorruptData { .. }) => {
+                        corruption.get_or_insert(e);
+                    }
+                    Err(_) => {}
                 }
             }
         }
@@ -719,7 +773,10 @@ impl<FS: StorageFs> PoolStriper<FS> {
             });
         }
 
-        let payload = self.codec.decode(&slots_data)?;
+        let payload = match self.codec.decode(&slots_data) {
+            Ok(payload) => payload,
+            Err(e) => return Err(corruption.unwrap_or(e)),
+        };
         let expected_fragments = self.codec.encode(&payload);
         let mut repaired_parts = 0usize;
 

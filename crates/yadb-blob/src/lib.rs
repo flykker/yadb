@@ -692,4 +692,134 @@ mod tests {
         assert_eq!(second_check.intact_parts, 6);
         assert_eq!(second_check.repaired_parts, 0);
     }
+
+    /// Builds a striper over `count` local domains holding one small blob each, so a
+    /// test can corrupt or remove individual fragments by domain name.
+    fn seeded_striper(
+        seed: u64,
+        scheme: ErasureScheme,
+        count: usize,
+        id: BlobId,
+        payload: &[u8],
+    ) -> (SimFs, PoolStriper<SimFs>) {
+        let fs = SimFs::new(seed);
+        let mut domains = Vec::new();
+        for i in 0..count {
+            domains.push(
+                VolumeStore::open(fs.clone(), format!("az{i}"), VolumeConfig::default()).unwrap(),
+            );
+        }
+        let striper = PoolStriper::new(scheme, domains).unwrap();
+        striper.put_blob(id, payload).unwrap();
+        (fs, striper)
+    }
+
+    fn corrupt_domain(fs: &SimFs, domain: &str) {
+        let files = fs.list_files(domain).unwrap();
+        assert_eq!(
+            files.len(),
+            1,
+            "{domain}: expected exactly one segment for the single seeded blob"
+        );
+        // Offset 45 lands inside the payload CRC region for a short fragment, the
+        // same offset the bitrot test above uses; a header byte would truncate
+        // instead of corrupting, which is a different finding.
+        fs.corrupt_byte(&format!("{domain}/{}", files[0]), 45)
+            .unwrap();
+    }
+
+    fn wipe_domain(fs: &SimFs, domain: &str) {
+        for seg in fs.list_files(domain).unwrap() {
+            fs.remove_file(&format!("{domain}/{seg}")).unwrap();
+        }
+    }
+
+    // S2: a fully present but bit-rotted blob must never be reported as absent.
+    // `PoolSlot::get` distinguishes 404 from 422, but `get_blob` used to drop every
+    // error with `if let Ok(..)` / `.ok()` and then answer `NotFound`, so an operator
+    // could not tell corruption from a missing object.
+    #[test]
+    fn corrupt_mirror_copies_are_reported_as_corruption_not_absence() {
+        let id = BlobId::new(9, 1, 1, 1, 2, 0);
+        let payload = b"mirror payload that is present but bit-rotted";
+        let (fs, striper) =
+            seeded_striper(3101, ErasureScheme::Mirror { replicas: 3 }, 3, id, payload);
+        for i in 0..3 {
+            corrupt_domain(&fs, &format!("az{i}"));
+        }
+        match striper.get_blob(id) {
+            Err(BlobError::CorruptData { .. }) => {}
+            Err(BlobError::NotFound(_)) => panic!(
+                "corruption was reported as absence: a present but damaged blob is not a \
+                 missing blob"
+            ),
+            other => panic!("expected CorruptData, got {other:?}"),
+        }
+    }
+
+    // The other half of S2: surfacing corruption must not cost availability. One
+    // damaged replica with a healthy one beside it still reads.
+    #[test]
+    fn corrupt_mirror_copy_still_reads_from_a_healthy_replica() {
+        let id = BlobId::new(9, 2, 1, 1, 2, 0);
+        let payload = b"mirror payload with one damaged replica";
+        let (fs, striper) =
+            seeded_striper(3102, ErasureScheme::Mirror { replicas: 3 }, 3, id, payload);
+        corrupt_domain(&fs, "az0");
+        assert_eq!(striper.get_blob(id).unwrap(), payload);
+    }
+
+    #[test]
+    fn corrupt_rs_fragments_beyond_the_reconstruction_threshold_report_corruption() {
+        let id = BlobId::new(9, 3, 1, 1, 2, 0);
+        let payload = b"Multi-tenant erasure-coded tablet SSTable block #0001";
+        // RS(4+2): corrupting three fragments leaves three healthy, below k=4, so
+        // the payload cannot be reconstructed. The shortfall is not the cause — the
+        // observed damage is — so the error must name corruption.
+        let (fs, striper) = seeded_striper(
+            3103,
+            ErasureScheme::ReedSolomon { k: 4, m: 2 },
+            6,
+            id,
+            payload,
+        );
+        for i in 0..3 {
+            corrupt_domain(&fs, &format!("az{i}"));
+        }
+        match striper.get_blob(id) {
+            Err(BlobError::CorruptData { .. }) => {}
+            Err(BlobError::InsufficientFragments { .. }) => panic!(
+                "damage was reported as a shortfall: the fragments were present and failed \
+                 their checksum"
+            ),
+            other => panic!("expected CorruptData, got {other:?}"),
+        }
+        // Repair cannot invent the missing shards either, and must not claim the
+        // fragments were merely short.
+        assert!(matches!(
+            striper.repair_blob(id),
+            Err(BlobError::CorruptData { .. })
+        ));
+    }
+
+    #[test]
+    fn corrupt_rs_fragment_within_threshold_still_reads_and_repairs() {
+        let id = BlobId::new(9, 4, 1, 1, 2, 0);
+        let payload = b"Multi-tenant erasure-coded tablet SSTable block #0001";
+        let (fs, striper) = seeded_striper(
+            3104,
+            ErasureScheme::ReedSolomon { k: 4, m: 2 },
+            6,
+            id,
+            payload,
+        );
+        corrupt_domain(&fs, "az0");
+        wipe_domain(&fs, "az3");
+        assert_eq!(striper.get_blob(id).unwrap(), payload);
+        // A corrupt fragment is still treated as missing for reconstruction, so the
+        // scrub rewrites it instead of refusing.
+        let report = striper.repair_blob(id).unwrap();
+        assert!(report.repaired_parts >= 1);
+        assert_eq!(striper.repair_blob(id).unwrap().intact_parts, 6);
+    }
 }
