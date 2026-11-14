@@ -1229,6 +1229,9 @@ function renderPools() {
             ${esc(p.status)} · ${p.online_slots}/${p.total_slots} slots online (min read: ${p.min_read_slots}, min write: ${p.min_write_slots}, repairs: ${p.total_repairs})
           </div>
         </div>
+        ${p.pending_repairs ? `<div style="font-size:12px;color:#8a5a00;margin:-2px 0 8px">
+          ${p.degraded_puts} write(s) acked with reduced redundancy · ${p.pending_repairs} blob(s) still queued for repair
+        </div>` : ""}
         <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:10px">${tiles}</div>
       </div>`;
     }).join("");

@@ -7,7 +7,7 @@ pub use erasure::{ErasureCodec, ErasureScheme};
 pub use id::BlobId;
 pub use pool::{
     BarrierRequest, BarrierResponse, PoolHealthSnapshot, PoolHealthState, PoolSlot, PoolStriper,
-    RepairReport, SlotHealthSnapshot,
+    RepairReport, RepairSweep, SlotHealthSnapshot,
 };
 pub use volume::{VolumeConfig, VolumeStats, VolumeStore};
 
@@ -60,6 +60,7 @@ pub enum BlobError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use yadb_io::{FaultConfig, SimFs, StorageFs, SyncFault};
 
     #[test]
@@ -732,6 +733,146 @@ mod tests {
         for seg in fs.list_files(domain).unwrap() {
             fs.remove_file(&format!("{domain}/{seg}")).unwrap();
         }
+    }
+
+    /// Mock VDisk that answers a fixed script of responses, one per request, and
+    /// reports the request lines it saw. Used to drive a slot that fails and then
+    /// recovers, which `SimFs` faults cannot model: a write fault poisons the
+    /// volume until reopen, and a transient peer failure must not require that.
+    fn scripted_vdisk(
+        responses: Vec<&'static str>,
+    ) -> (String, std::thread::JoinHandle<Vec<String>>) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let handle = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            for response in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut raw = Vec::new();
+                let mut buf = [0u8; 1024];
+                loop {
+                    let n = stream.read(&mut buf).unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    raw.extend_from_slice(&buf[..n]);
+                    if raw.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let text = String::from_utf8_lossy(&raw).to_string();
+                seen.push(text.lines().next().unwrap_or("").to_string());
+                stream.write_all(response.as_bytes()).unwrap();
+                stream.flush().unwrap();
+            }
+            seen
+        });
+        (addr, handle)
+    }
+
+    // S6: `put_blob` acked with fewer than all fragments and dropped the failures,
+    // so a pool that had lost a node kept writing with reduced or absent redundancy
+    // and nothing recorded which blobs needed healing.
+    #[test]
+    fn short_write_is_reported_as_degraded_and_queued_for_repair() {
+        let (addr, server) = scripted_vdisk(vec![
+            // put_blob: the fragment does not land.
+            "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            // repair_blob: the fragment is absent, so it must be rewritten.
+            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            // repair_blob: the rewrite lands.
+            "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        ]);
+        let fs = SimFs::new(7001);
+        let mut slots = Vec::new();
+        for i in 0..5 {
+            let store = Arc::new(
+                VolumeStore::open(fs.clone(), format!("az{i}"), VolumeConfig::default()).unwrap(),
+            );
+            slots.push(PoolSlot::local(i, format!("az{i}"), 1, None, store));
+        }
+        slots.push(PoolSlot::<SimFs>::remote("pool", 5, "az5", 2, addr, None));
+        let striper =
+            PoolStriper::from_slots("pool", ErasureScheme::ReedSolomon { k: 4, m: 2 }, slots)
+                .unwrap();
+
+        let id = BlobId::new(11, 1, 1, 1, 2, 0);
+        let payload = b"Multi-tenant erasure-coded tablet SSTable block #0001";
+        // Five of six fragments is still above the k=4 write quorum, so the write is
+        // acked — but with zero parity, which is exactly the state S6 describes.
+        striper.put_blob(id, payload).unwrap();
+        assert_eq!(striper.pending_repair_count(), 1);
+        let health = striper.health_snapshot(false);
+        assert_eq!(health.degraded_puts, 1);
+        assert_eq!(health.pending_repairs, 1);
+
+        let sweep = striper.repair_pending(16);
+        assert_eq!(sweep.attempted, 1);
+        assert_eq!(sweep.repaired_parts, 1);
+        assert_eq!(sweep.unrecoverable, 0);
+        assert_eq!(sweep.still_pending, 0);
+        assert_eq!(striper.pending_repair_count(), 0);
+
+        let seen = server.join().unwrap();
+        assert_eq!(seen.len(), 3);
+        assert!(seen[0].starts_with("PUT /internal/vdisk/pool/5/blob/"));
+        assert!(seen[1].starts_with("GET /internal/vdisk/pool/5/blob/"));
+        assert!(seen[2].starts_with("PUT /internal/vdisk/pool/5/blob/"));
+    }
+
+    // The other half: a repair that cannot rewrite the fragment must not be
+    // reported as success, and the blob must stay queued rather than be forgotten.
+    #[test]
+    fn unrepairable_degraded_write_stays_queued() {
+        let (addr, server) = scripted_vdisk(vec![
+            "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        ]);
+        let fs = SimFs::new(7002);
+        let mut slots = Vec::new();
+        for i in 0..5 {
+            let store = Arc::new(
+                VolumeStore::open(fs.clone(), format!("az{i}"), VolumeConfig::default()).unwrap(),
+            );
+            slots.push(PoolSlot::local(i, format!("az{i}"), 1, None, store));
+        }
+        slots.push(PoolSlot::<SimFs>::remote("pool", 5, "az5", 2, addr, None));
+        let striper =
+            PoolStriper::from_slots("pool", ErasureScheme::ReedSolomon { k: 4, m: 2 }, slots)
+                .unwrap();
+
+        let id = BlobId::new(11, 2, 1, 1, 2, 0);
+        let payload = b"Multi-tenant erasure-coded tablet SSTable block #0001";
+        striper.put_blob(id, payload).unwrap();
+        let sweep = striper.repair_pending(16);
+        assert_eq!(sweep.attempted, 1);
+        assert_eq!(sweep.repaired_parts, 0);
+        assert_eq!(sweep.unrecoverable, 1);
+        assert_eq!(sweep.still_pending, 1);
+        assert_eq!(striper.pending_repair_count(), 1);
+        server.join().unwrap();
+    }
+
+    // A fully redundant write must not enter the queue, or the queue would grow
+    // with every write and the signal would be worthless.
+    #[test]
+    fn full_redundancy_write_is_not_queued() {
+        let id = BlobId::new(11, 3, 1, 1, 2, 0);
+        let payload = b"Multi-tenant erasure-coded tablet SSTable block #0001";
+        let (_fs, striper) = seeded_striper(
+            7003,
+            ErasureScheme::ReedSolomon { k: 4, m: 2 },
+            6,
+            id,
+            payload,
+        );
+        assert_eq!(striper.pending_repair_count(), 0);
+        let health = striper.health_snapshot(false);
+        assert_eq!(health.degraded_puts, 0);
+        assert_eq!(health.pending_repairs, 0);
     }
 
     // S2: a fully present but bit-rotted blob must never be reported as absent.

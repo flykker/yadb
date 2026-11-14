@@ -261,6 +261,19 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   an injectable filesystem; test every outcome and poisoned-handle recovery.
 - [ ] Run separate-process crash/kill and OS/filesystem power-loss tests; document
   filesystem and hardware assumptions. In-process fault simulation is not proof.
+- [ ] Redundancy of acknowledged writes. `PoolStriper::put_blob` acks once
+  `min_write_quorum()` fragments land — `k` for Reed-Solomon 4+2, so an ack can
+  leave zero parity on disk — and previously dropped the failed parts with no
+  record, while the periodic scrub was assumed to heal them. A short write is now
+  recorded: the blob is queued in `pending_repairs`, `degraded_puts` counts it, and
+  `POST /v1/pools/scrub` / the leader's scrub tick calls `repair_pending` to rewrite
+  the missing fragments before the manifest scan (on OpenRaft too, since that part
+  needs no cross-group view). `PoolHealthSnapshot` reports both counters, and
+  `repair_blob` no longer returns `Ok` when a fragment it could not rewrite is
+  still missing. Open: the queue is in memory and per process, so a restart forgets
+  it and the backlog is rediscovered only by a full scrub; a write that acks
+  degraded is still acked, so the caller learns nothing at write time; and no test
+  exercises the queue through a real multi-node pool.
 - [ ] Idempotency and read-consistency contracts. A keyed `POST /v1/apply` is
   implemented (`Idempotency-Key`, the outcome record committed in the same
   `RevisionTxn` as the mutation, `POST /v1/idempotency/resolve`, and a replicated

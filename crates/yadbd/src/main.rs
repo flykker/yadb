@@ -35,6 +35,9 @@ const CONTROL_REFRESH_INTERVAL: Duration = Duration::from_millis(200);
 /// Maximum time an authorization decision may rely on the last confirmed
 /// control snapshot. After this, access fails closed until quorum is proven.
 const CONTROL_FRESHNESS_TTL: Duration = Duration::from_secs(2);
+/// Maximum blobs whose redundancy is repaired in one scrub tick. Bounds the work
+/// a single tick can do so a large backlog cannot stall the scrub loop.
+const DEGRADED_REPAIR_BATCH: usize = 256;
 const EMBEDDED_UI_HTML: &str = include_str!("ui/index.html");
 const EMBEDDED_SAMPLE_YAML: &str = include_str!("../../../examples/platform.yaml");
 
@@ -317,6 +320,10 @@ struct ScrubSummary {
     pub blobs_repaired: usize,
     pub fragments_repaired: usize,
     pub blobs_unrecoverable: usize,
+    /// Blobs queued because their write acked with fewer than all fragments.
+    pub degraded_puts_queued: usize,
+    /// Blobs still queued for redundancy repair after this pass.
+    pub degraded_puts_pending: usize,
     pub orphan_blobs_collected: usize,
     pub orphan_collection_error: Option<String>,
     pub pools: Vec<PoolHealthSnapshot>,
@@ -673,12 +680,30 @@ impl AppState {
     /// Scans all live SQL Tablet manifests, S3 Object manifests, and BlockVolume extent maps in `MetaKV`,
     /// verifies every fragment across cluster VDisks, and heals missing or bit-rotted fragments!
     fn scrub_all_pools(&self) -> ScrubSummary {
+        // Blobs whose write acked short of full redundancy are repaired first, and
+        // this part runs on every runtime including OpenRaft. It needs no metadata
+        // scan and no cross-group view: the queue holds ids this process wrote, and
+        // each repair reads and rewrites fragments in one already-mounted pool. The
+        // scan below stays disabled on OpenRaft because *that* is the unsafe part.
+        let pools_for_repair = self.pools.read().unwrap().clone();
+        let mut degraded_puts_queued = 0usize;
+        let mut degraded_puts_pending = 0usize;
+        for striper in pools_for_repair.values() {
+            let sweep = striper.repair_pending(DEGRADED_REPAIR_BATCH);
+            degraded_puts_queued += sweep.attempted;
+            degraded_puts_pending += sweep.still_pending;
+        }
+
         if self.meta.is_openraft() {
             // Global orphan scans are unsafe without per-group leader fencing.
-            return ScrubSummary {
+            let summary = ScrubSummary {
+                degraded_puts_queued,
+                degraded_puts_pending,
                 orphan_collection_error: Some("scrub disabled for experimental Multi-Raft".into()),
                 ..ScrubSummary::default()
             };
+            *self.last_scrub.write().unwrap() = Some(summary.clone());
+            return summary;
         }
         let mut live_blobs: BTreeSet<(String, BlobId)> = BTreeSet::new();
 
@@ -773,6 +798,8 @@ impl AppState {
             blobs_repaired,
             fragments_repaired,
             blobs_unrecoverable,
+            degraded_puts_queued,
+            degraded_puts_pending,
             orphan_blobs_collected,
             orphan_collection_error,
             pools: pools_health,

@@ -1,7 +1,8 @@
+use std::collections::BTreeSet;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -11,8 +12,23 @@ use crate::{BlobError, BlobId, ErasureCodec, ErasureScheme, VolumeStats, VolumeS
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepairReport {
+    /// Fragments readable after the repair, i.e. including the ones just rewritten.
     pub intact_parts: usize,
     pub repaired_parts: usize,
+}
+
+/// Outcome of one pass over blobs whose write landed short of full redundancy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepairSweep {
+    /// Blobs whose repair was attempted in this pass.
+    pub attempted: usize,
+    /// Fragments successfully rewritten (present again and verified).
+    pub repaired_parts: usize,
+    /// Blobs still queued afterwards, either because a shard is still missing or
+    /// because the payload could not be decoded at all.
+    pub still_pending: usize,
+    /// Blobs that could not be reconstructed in this pass.
+    pub unrecoverable: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -51,6 +67,12 @@ pub struct PoolHealthSnapshot {
     pub min_read_slots: usize,
     pub min_write_slots: usize,
     pub total_repairs: u64,
+    /// Writes acked with fewer than `total_slots` fragments, i.e. with reduced or
+    /// absent redundancy. Each one is queued for repair; a non-zero count means
+    /// the pool is serving but is not protecting new data as designed.
+    pub degraded_puts: u64,
+    /// Blobs still queued for redundancy repair.
+    pub pending_repairs: usize,
     pub slots: Vec<SlotHealthSnapshot>,
 }
 
@@ -472,6 +494,11 @@ pub struct PoolStriper<FS: StorageFs> {
     codec: ErasureCodec,
     slots: Vec<PoolSlot<FS>>,
     has_remote: bool,
+    /// Blobs whose write was acked with fewer than `total_parts()` fragments.
+    /// `put_blob` used to drop those failures, so a pool that lost a node would
+    /// silently keep acking writes with no redundancy and no record of it.
+    pending_repairs: Mutex<BTreeSet<BlobId>>,
+    degraded_puts: AtomicU64,
 }
 
 impl<FS: StorageFs> PoolStriper<FS> {
@@ -506,6 +533,8 @@ impl<FS: StorageFs> PoolStriper<FS> {
             codec,
             slots,
             has_remote,
+            pending_repairs: Mutex::new(BTreeSet::new()),
+            degraded_puts: AtomicU64::new(0),
         })
     }
 
@@ -551,6 +580,14 @@ impl<FS: StorageFs> PoolStriper<FS> {
 
     /// Encodes `payload` and writes fragments across failure-domain slots (in parallel over the network).
     /// Succeeds as long as at least `min_write_quorum()` fragments land durably.
+    ///
+    /// `Ok` here means "readable", not "fully redundant": for RS 4+2 the quorum is
+    /// exactly `k`, so an ack can leave zero parity fragments on disk. That was
+    /// previously invisible — the failed parts were dropped and a background scrub
+    /// was assumed to heal them, but nothing recorded *which* blobs needed healing.
+    /// Every short write now records the blob in `pending_repairs` (reported in
+    /// `health_snapshot`) and bumps `degraded_puts`, so the gap is observable and
+    /// `repair_pending` can close it without a full manifest scan.
     pub fn put_blob(&self, logical_id: BlobId, payload: &[u8]) -> Result<(), BlobError> {
         let fragments = self.codec.encode(payload);
         let min_write = self.min_write_quorum();
@@ -597,6 +634,10 @@ impl<FS: StorageFs> PoolStriper<FS> {
         }
 
         if ok_writes >= min_write {
+            if ok_writes < fragments.len() {
+                self.degraded_puts.fetch_add(1, Ordering::Relaxed);
+                self.pending_repairs.lock().unwrap().insert(logical_id);
+            }
             Ok(())
         } else {
             Err(last_err.unwrap_or(BlobError::InsufficientFragments {
@@ -604,6 +645,40 @@ impl<FS: StorageFs> PoolStriper<FS> {
                 required: min_write,
             }))
         }
+    }
+
+    /// Number of blobs queued because their write acked with reduced redundancy.
+    pub fn pending_repair_count(&self) -> usize {
+        self.pending_repairs.lock().unwrap().len()
+    }
+
+    /// Repairs every blob whose write landed short of full redundancy and drops
+    /// the ones that are whole again. Bounded by `limit` so a large backlog cannot
+    /// stall a single scrub tick; leftovers stay queued for the next pass.
+    ///
+    /// A blob is dequeued only when `repair_blob` reports all fragments intact.
+    /// Failures stay queued rather than being dropped, because the pool cannot
+    /// prove that a later write of the same id will be retried.
+    pub fn repair_pending(&self, limit: usize) -> RepairSweep {
+        let batch: Vec<BlobId> = {
+            let queue = self.pending_repairs.lock().unwrap();
+            queue.iter().take(limit).copied().collect()
+        };
+        let mut sweep = RepairSweep::default();
+        for id in batch {
+            sweep.attempted += 1;
+            match self.repair_blob(id) {
+                Ok(report) => {
+                    sweep.repaired_parts += report.repaired_parts;
+                    if report.intact_parts == self.codec.scheme().total_parts() {
+                        self.pending_repairs.lock().unwrap().remove(&id);
+                    }
+                }
+                Err(_) => sweep.unrecoverable += 1,
+            }
+        }
+        sweep.still_pending = self.pending_repair_count();
+        sweep
     }
 
     /// Tombstones every physical fragment. Success requires every target,
@@ -767,6 +842,9 @@ impl<FS: StorageFs> PoolStriper<FS> {
 
         let intact_parts = slots_data.iter().filter(|x| x.is_some()).count();
         if intact_parts == total {
+            // Whole again: any short-write backlog entry for this blob is closed,
+            // whether the repair came from this scrub or from a rewrite.
+            self.pending_repairs.lock().unwrap().remove(&logical_id);
             return Ok(RepairReport {
                 intact_parts,
                 repaired_parts: 0,
@@ -779,26 +857,35 @@ impl<FS: StorageFs> PoolStriper<FS> {
         };
         let expected_fragments = self.codec.encode(&payload);
         let mut repaired_parts = 0usize;
+        let mut last_put_err: Option<BlobError> = None;
 
         for (idx, slot_val) in slots_data.iter().enumerate() {
             if slot_val.is_none() {
                 let part_id = logical_id.with_part((idx + 1) as u8);
                 let slot_idx = self.select_slot(logical_id, idx);
-                if self.slots[slot_idx]
-                    .put(part_id, &expected_fragments[idx])
-                    .is_ok()
-                {
-                    self.slots[slot_idx]
-                        .metrics
-                        .repairs_ok
-                        .fetch_add(1, Ordering::Relaxed);
-                    repaired_parts += 1;
+                match self.slots[slot_idx].put(part_id, &expected_fragments[idx]) {
+                    Ok(()) => {
+                        self.slots[slot_idx]
+                            .metrics
+                            .repairs_ok
+                            .fetch_add(1, Ordering::Relaxed);
+                        repaired_parts += 1;
+                    }
+                    Err(e) => last_put_err = Some(e),
                 }
             }
         }
 
+        // The payload decodes, but a fragment could not be rewritten: the blob is
+        // still short of its designed redundancy. Report that as a failure so the
+        // scrub counts it as unrecoverable and the pending queue keeps it, instead
+        // of answering `Ok` with fewer parts than the scheme requires.
+        if let Some(err) = last_put_err {
+            return Err(err);
+        }
+
         Ok(RepairReport {
-            intact_parts,
+            intact_parts: intact_parts + repaired_parts,
             repaired_parts,
         })
     }
@@ -848,6 +935,8 @@ impl<FS: StorageFs> PoolStriper<FS> {
             min_read_slots,
             min_write_slots,
             total_repairs,
+            degraded_puts: self.degraded_puts.load(Ordering::Relaxed),
+            pending_repairs: self.pending_repairs.lock().unwrap().len(),
             slots: slot_snaps,
         }
     }
