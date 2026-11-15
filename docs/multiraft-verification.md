@@ -834,6 +834,33 @@ This is a local single-host run. It does not establish power-loss durability,
 multi-host behaviour, or that the OpenRaft log and state images survive a kill
 rather than a clean stop.
 
+### Live deployment on `YORLOG05` (2026-11-15)
+
+The `YORLOG05` format was never exercised against a real log before this run: the
+previous root's nine logs were `YORLOG04`, which the new binary refuses by design.
+A fresh root was provisioned from scratch (`scripts/yadb-local.py prepare`, binary
+`28a7fe2f…`) rather than migrated, and the following was observed:
+
+* all nine `metadata/*/log/openraft.log` files begin with `YORLOG05`, i.e. every
+  replica was created in the new format and the header word is actually written;
+* `/v1/apply` of the sample manifest created the cluster, two pools, the project,
+  a database, an object store and a block volume — seven entries committed through
+  the new frames;
+* a 4400-byte block write at offset 0 read back byte-identical from all three
+  nodes, three reads each, once the write had propagated;
+* clean `SIGTERM` stop with `exit_codes [0, 0, 0]` and all twelve ports released;
+* a fresh start logged **no** recovery line, which is the positive control for the
+  `RecoveryReport` path: a clean open must stay silent, or the new warning would
+  fire on every start and be ignored;
+* after that restart the block read back identically on all three nodes, so
+  `YORLOG05` frames replay correctly rather than merely being accepted.
+
+Not established: the same run did not kill the process mid-append, so the
+`repaired_tail` warning is still only covered by tests, not by a live torn tail on
+disk. The first read after the write returned zeros from the writing node before
+the entry had applied locally — the documented "reads are local-applied"
+limitation, not a `YORLOG05` effect.
+
 ## Required failure record format
 
 For each scenario preserve setup identities, voters, initial applied/log/purge
