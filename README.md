@@ -204,6 +204,29 @@ tablets; large tables/index hit sets can increase memory, CPU and apply latency.
 This is not a quorum read barrier: a follower/isolated node may return stale committed
 data. Linearizable reads and cross-portal read-your-writes are not promised.
 
+An explicit opt-in is available for a single quorum-confirmed view. Send
+`"consistent": true` in the query body:
+
+```bash
+curl -sS -H 'content-type: application/json' \
+  -d '{"sql":"SELECT * FROM accounts","consistent":true}' \
+  http://10.0.0.11:8080/db/billing/db/query
+```
+
+The script must contain only `SELECT`/`SHOW` statements; any other statement, a
+`session_id`, or `require_transaction` is rejected with `400` before a snapshot
+is taken, so a mutation can never reach this path. The engine takes exactly one
+`try_linearizable_snapshot` of the whole `/db/{project}/{db}/` prefix and serves
+the schema, shard manifests and secondary-index entries from that snapshot only:
+it does not consult the in-memory shard cache, the local applied state, or a
+second snapshot, and it does not retry. A table or shard missing from that
+snapshot is the same "not found"/empty result as on the default path. The cost
+is one quorum round trip plus copying the whole database namespace; omitting the
+flag (or sending `false`) keeps the default behaviour above unchanged. With
+OpenRaft metadata the request is forwarded to the project-group leader; with
+legacy metadata it fails with the documented routing error (`500`) instead of
+returning local data.
+
 Deterministic independent-engine tests preserve the complete pre-commit state
 through cross-shard writes and index-hit swaps. They cover absent shards, schema
 changes, unrelated writes, compaction, dropped indexes and own-write overlays.
@@ -245,6 +268,16 @@ an authenticated proxy in front if host-style virtual buckets are required. Conf
 AWS clients for path-style addressing. GET/Range responses are also limited to 16 MiB;
 presigned URLs, session tokens, native TLS, and a complete AWS S3 implementation are not
 provided yet. Credentials and object bytes require HTTPS termination or a trusted network.
+
+`GET` and range `GET` accept `?consistent=true`. The object manifest is then read
+through exactly one quorum-confirmed snapshot on the project-group leader and the
+chunks it names are fetched from the pool; the local applied manifest is never
+used as a fallback. A key absent from that snapshot is `404`. A chunk the pinned
+manifest names but that has since been collected is reported as `503` (the
+manifest is a point-in-time view, not a GC fence), never as zeros or a short
+body. The default (no flag) is unchanged: the locally applied manifest. With
+legacy metadata the request fails with the documented routing error (`500`)
+instead of returning local data.
 
 #### S3 failed-upload cleanup and retention
 

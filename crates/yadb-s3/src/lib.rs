@@ -110,8 +110,10 @@ enum UploadState {
 /// - Data chunks are striped across failure domains via `PoolStriper` (e.g. `ReedSolomon 4+2`)
 ///   without passing payload bytes through Raft.
 /// - Metadata (allocation, upload intent and manifest) is committed through Raft;
-///   payload bytes bypass Raft. Reads use the local MetaKV view; protocol handlers
-///   must provide any required quorum fence before serving that view.
+///   payload bytes bypass Raft. The default read methods use the local MetaKV view;
+///   protocol handlers must provide any required quorum fence before serving that
+///   view. The explicit `*_consistent` methods take one quorum-confirmed snapshot
+///   themselves and never fall back to local state.
 pub struct ObjectStoreEngine<FS: StorageFs> {
     meta: LocalMetaKv<FS>,
     pools: Arc<RwLock<BTreeMap<String, Arc<PoolStriper<FS>>>>>,
@@ -371,6 +373,46 @@ impl<FS: StorageFs> ObjectStoreEngine<FS> {
                 key: key.to_string(),
             })?;
         Ok(serde_json::from_slice(&kv.value)?)
+    }
+
+    /// Quorum-confirmed manifest lookup. Legacy metadata stores return a routing
+    /// error rather than the local applied view, so a caller that asked for a
+    /// consistent read never silently receives stale metadata.
+    pub fn head_object_consistent(
+        &self,
+        project_id: u32,
+        store: &str,
+        bucket: &str,
+        key: &str,
+    ) -> Result<ObjectManifest, S3Error> {
+        let mkey = Self::meta_key(project_id, store, bucket, key);
+        let snapshot = self.meta.try_linearizable_snapshot(&[mkey.clone()], &[])?;
+        let kv = snapshot.get(&mkey).ok_or_else(|| S3Error::ObjectNotFound {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+        })?;
+        Ok(serde_json::from_slice(&kv.value)?)
+    }
+
+    /// Quorum-confirmed full object read: one linearizable manifest snapshot,
+    /// then the chunks that manifest names. A manifest key absent from the
+    /// snapshot is `ObjectNotFound`; a chunk that the snapshot references but
+    /// that is gone surfaces as the underlying `BlobError`, never as zeros or a
+    /// silent skip. No fallback to the locally applied manifest is attempted.
+    pub fn get_object_consistent(
+        &self,
+        project_id: u32,
+        store: &str,
+        bucket: &str,
+        key: &str,
+    ) -> Result<(ObjectManifest, Vec<u8>), S3Error> {
+        let manifest = self.head_object_consistent(project_id, store, bucket, key)?;
+        if manifest.size == 0 {
+            return Ok((manifest, Vec::new()));
+        }
+        let end = manifest.size - 1;
+        let bytes = self.read_manifest_range(&manifest, 0, end)?;
+        Ok((manifest, bytes))
     }
 
     pub fn get_object(
@@ -1529,5 +1571,74 @@ mod tests {
             Err(S3Error::ObjectNotFound { .. })
         ));
         assert_eq!(s3.read_manifest_range(&new, 0, 2).unwrap(), b"new");
+    }
+
+    // The opt-in path must never fall back to the local applied manifest. On a
+    // legacy store it has no quorum-confirmed snapshot to offer, so it answers
+    // with the documented routing error even though the object is locally visible.
+    #[test]
+    fn consistent_get_refuses_legacy_meta_instead_of_returning_local_object() {
+        let meta_fs = SimFs::new(6300);
+        let disks: Vec<SimFs> = (0..3).map(|i| SimFs::new(6301 + i)).collect();
+        let s3 = engine(&meta_fs, &disks);
+        s3.put_object(
+            1,
+            "store",
+            "pool",
+            "bucket",
+            "key",
+            "text/plain",
+            b"payload",
+        )
+        .unwrap();
+
+        assert_eq!(
+            s3.get_object(1, "store", "bucket", "key").unwrap().1,
+            b"payload",
+            "the default path still serves the local applied state"
+        );
+        assert!(matches!(
+            s3.get_object_consistent(1, "store", "bucket", "key"),
+            Err(S3Error::Meta(MetaError::Routing(_)))
+        ));
+        assert!(matches!(
+            s3.head_object_consistent(1, "store", "bucket", "key"),
+            Err(S3Error::Meta(MetaError::Routing(_)))
+        ));
+    }
+
+    // A manifest pinned by a consistent read is a point-in-time view, not a GC
+    // fence: a chunk it names may be collected before the read fetches it. The
+    // read must then fail rather than return zeros or a short body.
+    // `read_manifest_range` is exactly the chunk fetch used by
+    // `get_object_consistent`, and the daemon maps this `BlobError` shape to 503
+    // on the consistent path.
+    #[test]
+    fn consistent_read_reports_a_missing_chunk_instead_of_partial_bytes() {
+        let meta_fs = SimFs::new(6310);
+        let disks: Vec<SimFs> = (0..3).map(|i| SimFs::new(6311 + i)).collect();
+        let s3 = engine(&meta_fs, &disks);
+        let payload: Vec<u8> = (0..9000u32).map(|i| (i % 251) as u8).collect();
+        let mf = s3
+            .put_object(
+                1,
+                "store",
+                "pool",
+                "bucket",
+                "key",
+                "application/octet-stream",
+                &payload,
+            )
+            .unwrap();
+        assert!(mf.chunks.len() >= 2);
+
+        let pool = s3.get_pool(&mf.pool).unwrap();
+        for chunk in &mf.chunks {
+            assert!(pool.delete(chunk.blob_id).unwrap());
+        }
+        assert!(matches!(
+            s3.read_manifest_range(&mf, 0, mf.size - 1),
+            Err(S3Error::Blob(BlobError::NotFound(_)))
+        ));
     }
 }

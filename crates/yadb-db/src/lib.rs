@@ -522,21 +522,19 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn collect_table_rows_at_boundaries(
-        &self,
+    /// Keys and prefixes that one row collection needs. They must all be read
+    /// from a single metadata snapshot: either the local applied one
+    /// (`meta.snapshot`) or the quorum-confirmed one used by
+    /// [`Self::execute_read_consistent`].
+    fn collection_scope(
         project_id: u32,
         db: &str,
         schema: &TableSchema,
         resolved_preds: &[(usize, Predicate)],
         tx: Option<&TxBuffer>,
-        after_shard_scan: impl FnMut(u32),
-        after_index_scan: impl FnOnce(),
-    ) -> Result<Vec<Vec<SqlValue>>, DbError> {
-        // Copy schema, shard references and candidate index entries under one local
-        // Raft-apply mutex. Never hold that mutex across fragment/network reads.
+    ) -> Result<(Vec<String>, Vec<String>), DbError> {
         let schema_key = Self::schema_key(project_id, db, &schema.table);
-        let mut keys = vec![schema_key.clone()];
+        let mut keys = vec![schema_key];
         let mut prefixes = Vec::new();
         let pk_predicate = resolved_preds.iter().find(|(col_i, pred)| {
             *col_i == schema.pk_index
@@ -576,7 +574,52 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
                 }
             }
         }
+        Ok((keys, prefixes))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn collect_table_rows_at_boundaries(
+        &self,
+        project_id: u32,
+        db: &str,
+        schema: &TableSchema,
+        resolved_preds: &[(usize, Predicate)],
+        tx: Option<&TxBuffer>,
+        after_shard_scan: impl FnMut(u32),
+        after_index_scan: impl FnOnce(),
+    ) -> Result<Vec<Vec<SqlValue>>, DbError> {
+        // Copy schema, shard references and candidate index entries under one local
+        // Raft-apply mutex. Never hold that mutex across fragment/network reads.
+        let (keys, prefixes) = Self::collection_scope(project_id, db, schema, resolved_preds, tx)?;
         let snapshot = self.meta.snapshot(&keys, &prefixes);
+        self.collect_table_rows_from_scope_snapshot(
+            project_id,
+            db,
+            schema,
+            resolved_preds,
+            tx,
+            &snapshot,
+            after_shard_scan,
+            after_index_scan,
+        )
+    }
+
+    /// Validates that the supplied snapshot really holds the schema this
+    /// statement was resolved against, then collects rows from that snapshot
+    /// only. A missing schema is a normal "table not found".
+    #[allow(clippy::too_many_arguments)]
+    fn collect_table_rows_from_scope_snapshot(
+        &self,
+        project_id: u32,
+        db: &str,
+        schema: &TableSchema,
+        resolved_preds: &[(usize, Predicate)],
+        tx: Option<&TxBuffer>,
+        snapshot: &MetaSnapshot,
+        after_shard_scan: impl FnMut(u32),
+        after_index_scan: impl FnOnce(),
+    ) -> Result<Vec<Vec<SqlValue>>, DbError> {
+        let schema_key = Self::schema_key(project_id, db, &schema.table);
         let schema_value = snapshot
             .get(&schema_key)
             .ok_or_else(|| DbError::TableNotFound(schema.table.clone()))?;
@@ -592,7 +635,7 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
             schema,
             resolved_preds,
             tx,
-            &snapshot,
+            snapshot,
             after_shard_scan,
             after_index_scan,
         )
@@ -1022,6 +1065,162 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
         Ok(last_result)
     }
 
+    /// Opt-in quorum-confirmed read of a `SELECT`/`SHOW` script.
+    ///
+    /// Exactly one linearizable snapshot of the whole `/db/{project}/{db}/`
+    /// namespace is taken, so schema, shard manifests and secondary-index
+    /// entries are all observed at the same revision. The read never consults
+    /// the local applied state, the in-memory shard cache, a session buffer or
+    /// a second snapshot, and it never retries: a failed snapshot is returned
+    /// to the caller unchanged.
+    ///
+    /// The whole namespace is covered by one prefix because one project
+    /// database lives in one Raft group. Mutating statements, `BEGIN`/`COMMIT`
+    /// and interactive sessions are refused here; they are never executed
+    /// through this path.
+    pub fn execute_read_consistent(
+        &self,
+        project_id: u32,
+        db: &str,
+        sql: &str,
+    ) -> Result<QueryResult, DbError> {
+        let stmts = parse_sql_script(sql)?;
+        for stmt in &stmts {
+            match stmt {
+                SqlStmt::Select { .. } | SqlStmt::ShowTables | SqlStmt::ShowIndexes { .. } => {}
+                _ => {
+                    return Err(DbError::InvalidQuery(
+                        "consistent reads support only SELECT and SHOW statements".into(),
+                    ))
+                }
+            }
+        }
+
+        let prefix = format!("/db/{project_id}/{db}/");
+        let snapshot = self.meta.try_linearizable_snapshot(&[], &[prefix])?;
+
+        let mut last_result = QueryResult {
+            columns: Vec::new(),
+            rows: Vec::new(),
+            rows_affected: 0,
+        };
+        for stmt in stmts {
+            last_result = self.execute_read_from_snapshot(project_id, db, &snapshot, stmt)?;
+        }
+        Ok(last_result)
+    }
+
+    /// Serves one read-only statement from an already captured snapshot. Any
+    /// key absent from the snapshot is treated exactly like a missing key in
+    /// the local path: an unknown table is `TableNotFound`, a missing shard or
+    /// index range yields no rows.
+    fn execute_read_from_snapshot(
+        &self,
+        project_id: u32,
+        db: &str,
+        snapshot: &MetaSnapshot,
+        stmt: SqlStmt,
+    ) -> Result<QueryResult, DbError> {
+        match stmt {
+            SqlStmt::ShowTables => {
+                let items = snapshot.scan_prefix(&Self::schema_prefix(project_id, db));
+                let mut rows = Vec::with_capacity(items.len());
+                for (_, kv) in items {
+                    let sc: TableSchema = serde_json::from_slice(&kv.value)?;
+                    rows.push(vec![
+                        SqlValue::Text(sc.table),
+                        SqlValue::Int(sc.shards as i64),
+                        SqlValue::Text(sc.wal_pool),
+                        SqlValue::Text(sc.data_pool),
+                        SqlValue::Int(sc.indexes.len() as i64),
+                    ]);
+                }
+                Ok(QueryResult {
+                    columns: vec![
+                        "table".into(),
+                        "shards".into(),
+                        "wal_pool".into(),
+                        "data_pool".into(),
+                        "indexes".into(),
+                    ],
+                    rows,
+                    rows_affected: 0,
+                })
+            }
+
+            SqlStmt::ShowIndexes { table } => {
+                let schema = Self::schema_from_snapshot(project_id, db, &table, snapshot)?;
+                Ok(Self::show_indexes_result(schema))
+            }
+
+            SqlStmt::Select {
+                table,
+                projection,
+                predicates,
+                group_by,
+                order_by,
+                limit,
+            } => {
+                let schema = Self::schema_from_snapshot(project_id, db, &table, snapshot)?;
+                let resolved_preds = Self::resolve_predicates(&schema, predicates, "WHERE")?;
+                let candidate_rows = self.collect_table_rows_from_scope_snapshot(
+                    project_id,
+                    db,
+                    &schema,
+                    &resolved_preds,
+                    None,
+                    snapshot,
+                    |_| {},
+                    || {},
+                )?;
+                Self::finish_select(
+                    &schema,
+                    candidate_rows,
+                    projection,
+                    group_by,
+                    order_by,
+                    limit,
+                )
+            }
+
+            _ => Err(DbError::InvalidQuery(
+                "consistent reads support only SELECT and SHOW statements".into(),
+            )),
+        }
+    }
+
+    fn schema_from_snapshot(
+        project_id: u32,
+        db: &str,
+        table: &str,
+        snapshot: &MetaSnapshot,
+    ) -> Result<TableSchema, DbError> {
+        let key = Self::schema_key(project_id, db, table);
+        let kv = snapshot
+            .get(&key)
+            .ok_or_else(|| DbError::TableNotFound(table.to_string()))?;
+        Ok(serde_json::from_slice(&kv.value)?)
+    }
+
+    fn show_indexes_result(schema: TableSchema) -> QueryResult {
+        let rows = schema
+            .indexes
+            .into_iter()
+            .map(|ix| {
+                vec![
+                    SqlValue::Text(ix.name),
+                    SqlValue::Text(schema.table.clone()),
+                    SqlValue::Text(ix.column),
+                ]
+            })
+            .collect();
+        QueryResult {
+            columns: vec!["index_name".into(), "table".into(), "column".into()],
+            rows,
+            rows_affected: 0,
+        }
+    }
+
     pub fn execute_stmt(
         &self,
         project_id: u32,
@@ -1122,22 +1321,7 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
 
             SqlStmt::ShowIndexes { table } => {
                 let schema = self.load_schema(project_id, db, &table)?;
-                let rows = schema
-                    .indexes
-                    .into_iter()
-                    .map(|ix| {
-                        vec![
-                            SqlValue::Text(ix.name),
-                            SqlValue::Text(schema.table.clone()),
-                            SqlValue::Text(ix.column),
-                        ]
-                    })
-                    .collect();
-                Ok(QueryResult {
-                    columns: vec!["index_name".into(), "table".into(), "column".into()],
-                    rows,
-                    rows_affected: 0,
-                })
+                Ok(Self::show_indexes_result(schema))
             }
 
             SqlStmt::CreateTable {
@@ -1475,113 +1659,14 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
                     &resolved_preds,
                     active_tx.as_ref(),
                 )?;
-
-                let items: Vec<SelectItem> = match projection {
-                    Projection::All => vec![SelectItem::Wildcard],
-                    Projection::Columns(cols) => cols
-                        .into_iter()
-                        .map(|name| SelectItem::Column { name, alias: None })
-                        .collect(),
-                    Projection::Items(it) => it,
-                };
-
-                let is_agg = !group_by.is_empty()
-                    || items
-                        .iter()
-                        .any(|it| matches!(it, SelectItem::Aggregate { .. }));
-
-                if is_agg {
-                    return Self::eval_aggregate_select(
-                        &schema,
-                        candidate_rows,
-                        &items,
-                        &group_by,
-                        order_by,
-                        limit,
-                    );
-                }
-
-                let mut rows = candidate_rows;
-
-                // Resolve non-aggregate projection columns & optional aliases
-                let mut out_cols = Vec::new();
-                let mut proj_idxs = Vec::new();
-                for item in items {
-                    match item {
-                        SelectItem::Wildcard => {
-                            for (i, c) in schema.columns.iter().enumerate() {
-                                out_cols.push(c.name.clone());
-                                proj_idxs.push(i);
-                            }
-                        }
-                        SelectItem::Column { name, alias } => {
-                            let pos = schema
-                                .columns
-                                .iter()
-                                .position(|c| c.name.eq_ignore_ascii_case(&name))
-                                .ok_or_else(|| {
-                                    DbError::InvalidQuery(format!(
-                                        "unknown column `{name}` in SELECT list"
-                                    ))
-                                })?;
-                            out_cols
-                                .push(alias.unwrap_or_else(|| schema.columns[pos].name.clone()));
-                            proj_idxs.push(pos);
-                        }
-                        SelectItem::Aggregate { .. } => unreachable!(),
-                    }
-                }
-
-                if let Some((ord_col, desc)) = order_by {
-                    if let Some(schema_pos) = schema
-                        .columns
-                        .iter()
-                        .position(|c| c.name.eq_ignore_ascii_case(&ord_col))
-                    {
-                        rows.sort_by(|a, b| {
-                            let cmp = a[schema_pos]
-                                .sql_cmp(&b[schema_pos])
-                                .unwrap_or(Ordering::Equal);
-                            if desc {
-                                cmp.reverse()
-                            } else {
-                                cmp
-                            }
-                        });
-                    } else if let Some(alias_pos) = out_cols
-                        .iter()
-                        .position(|c| c.eq_ignore_ascii_case(&ord_col))
-                    {
-                        let src_idx = proj_idxs[alias_pos];
-                        rows.sort_by(|a, b| {
-                            let cmp = a[src_idx].sql_cmp(&b[src_idx]).unwrap_or(Ordering::Equal);
-                            if desc {
-                                cmp.reverse()
-                            } else {
-                                cmp
-                            }
-                        });
-                    } else {
-                        return Err(DbError::InvalidQuery(format!(
-                            "unknown column `{ord_col}` in ORDER BY"
-                        )));
-                    }
-                }
-
-                if let Some(max_rows) = limit {
-                    rows.truncate(max_rows);
-                }
-
-                let projected_rows = rows
-                    .into_iter()
-                    .map(|row| proj_idxs.iter().map(|&i| row[i].clone()).collect())
-                    .collect();
-
-                Ok(QueryResult {
-                    columns: out_cols,
-                    rows: projected_rows,
-                    rows_affected: 0,
-                })
+                Self::finish_select(
+                    &schema,
+                    candidate_rows,
+                    projection,
+                    group_by,
+                    order_by,
+                    limit,
+                )
             }
 
             SqlStmt::Delete { table, predicates } => {
@@ -1685,6 +1770,122 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
                 })
             }
         }
+    }
+
+    /// Projects, aggregates, orders and limits already-collected rows. Shared by
+    /// the local applied-state path and the quorum-confirmed read path so both
+    /// produce identical result shapes.
+    fn finish_select(
+        schema: &TableSchema,
+        candidate_rows: Vec<Vec<SqlValue>>,
+        projection: Projection,
+        group_by: Vec<String>,
+        order_by: Option<(String, bool)>,
+        limit: Option<usize>,
+    ) -> Result<QueryResult, DbError> {
+        let items: Vec<SelectItem> = match projection {
+            Projection::All => vec![SelectItem::Wildcard],
+            Projection::Columns(cols) => cols
+                .into_iter()
+                .map(|name| SelectItem::Column { name, alias: None })
+                .collect(),
+            Projection::Items(it) => it,
+        };
+
+        let is_agg = !group_by.is_empty()
+            || items
+                .iter()
+                .any(|it| matches!(it, SelectItem::Aggregate { .. }));
+
+        if is_agg {
+            return Self::eval_aggregate_select(
+                schema,
+                candidate_rows,
+                &items,
+                &group_by,
+                order_by,
+                limit,
+            );
+        }
+
+        let mut rows = candidate_rows;
+
+        // Resolve non-aggregate projection columns & optional aliases
+        let mut out_cols = Vec::new();
+        let mut proj_idxs = Vec::new();
+        for item in items {
+            match item {
+                SelectItem::Wildcard => {
+                    for (i, c) in schema.columns.iter().enumerate() {
+                        out_cols.push(c.name.clone());
+                        proj_idxs.push(i);
+                    }
+                }
+                SelectItem::Column { name, alias } => {
+                    let pos = schema
+                        .columns
+                        .iter()
+                        .position(|c| c.name.eq_ignore_ascii_case(&name))
+                        .ok_or_else(|| {
+                            DbError::InvalidQuery(format!("unknown column `{name}` in SELECT list"))
+                        })?;
+                    out_cols.push(alias.unwrap_or_else(|| schema.columns[pos].name.clone()));
+                    proj_idxs.push(pos);
+                }
+                SelectItem::Aggregate { .. } => unreachable!(),
+            }
+        }
+
+        if let Some((ord_col, desc)) = order_by {
+            if let Some(schema_pos) = schema
+                .columns
+                .iter()
+                .position(|c| c.name.eq_ignore_ascii_case(&ord_col))
+            {
+                rows.sort_by(|a, b| {
+                    let cmp = a[schema_pos]
+                        .sql_cmp(&b[schema_pos])
+                        .unwrap_or(Ordering::Equal);
+                    if desc {
+                        cmp.reverse()
+                    } else {
+                        cmp
+                    }
+                });
+            } else if let Some(alias_pos) = out_cols
+                .iter()
+                .position(|c| c.eq_ignore_ascii_case(&ord_col))
+            {
+                let src_idx = proj_idxs[alias_pos];
+                rows.sort_by(|a, b| {
+                    let cmp = a[src_idx].sql_cmp(&b[src_idx]).unwrap_or(Ordering::Equal);
+                    if desc {
+                        cmp.reverse()
+                    } else {
+                        cmp
+                    }
+                });
+            } else {
+                return Err(DbError::InvalidQuery(format!(
+                    "unknown column `{ord_col}` in ORDER BY"
+                )));
+            }
+        }
+
+        if let Some(max_rows) = limit {
+            rows.truncate(max_rows);
+        }
+
+        let projected_rows = rows
+            .into_iter()
+            .map(|row| proj_idxs.iter().map(|&i| row[i].clone()).collect())
+            .collect();
+
+        Ok(QueryResult {
+            columns: out_cols,
+            rows: projected_rows,
+            rows_affected: 0,
+        })
     }
 
     fn resolve_predicates(
@@ -3636,5 +3837,181 @@ mod tests {
             .unwrap();
         assert_eq!(comp.rows[0][2], SqlValue::Int(3)); // 3 live rows remain
         assert_eq!(comp.rows[0][3], SqlValue::Int(0)); // Retain fragments for old readers.
+    }
+
+    fn consistent_engine() -> (SimFs, LocalMetaKv<SimFs>, DatabaseEngine<SimFs>) {
+        let fs = SimFs::new(9600);
+        let meta = LocalMetaKv::open_single_node(&fs, "meta", 1).unwrap();
+        let (wal, data) = make_pools(&fs);
+        let engine = DatabaseEngine::new(meta.clone(), 1024);
+        engine.register_pool("wal", wal);
+        engine.register_pool("data", data);
+        (fs, meta, engine)
+    }
+
+    // The opt-in path must never fall back to the local applied view. On a
+    // legacy store it has no quorum-confirmed snapshot to offer, so it answers
+    // with the documented routing error even though the row is locally visible.
+    #[test]
+    fn consistent_read_refuses_legacy_meta_instead_of_returning_local_state() {
+        let (_fs, _meta, engine) = consistent_engine();
+        engine
+            .execute_sql(
+                1,
+                "main",
+                "wal",
+                "data",
+                2,
+                "CREATE TABLE t (id INT PRIMARY KEY, name TEXT); \
+                 INSERT INTO t VALUES (1, 'a');",
+            )
+            .unwrap();
+        assert_eq!(
+            engine
+                .execute_sql(1, "main", "wal", "data", 2, "SELECT * FROM t")
+                .unwrap()
+                .rows
+                .len(),
+            1,
+            "the default path still serves the local applied state"
+        );
+
+        for sql in ["SELECT * FROM t", "SHOW TABLES", "SHOW INDEXES ON t"] {
+            assert!(
+                matches!(
+                    engine.execute_read_consistent(1, "main", sql),
+                    Err(DbError::Meta(MetaError::Routing(_)))
+                ),
+                "consistent `{sql}` must fail loudly on legacy metadata"
+            );
+        }
+    }
+
+    // Read-only validation happens before the snapshot is requested, so a
+    // mutating statement is refused as a bad request rather than reaching the
+    // (here unavailable) quorum path.
+    #[test]
+    fn consistent_read_rejects_mutating_statements_before_taking_a_snapshot() {
+        let (_fs, _meta, engine) = consistent_engine();
+        engine
+            .execute_sql(
+                1,
+                "main",
+                "wal",
+                "data",
+                2,
+                "CREATE TABLE t (id INT PRIMARY KEY, name TEXT);",
+            )
+            .unwrap();
+
+        for sql in [
+            "INSERT INTO t VALUES (1, 'a')",
+            "UPDATE t SET name = 'b' WHERE id = 1",
+            "DELETE FROM t WHERE id = 1",
+            "CREATE TABLE u (id INT PRIMARY KEY)",
+            "CREATE INDEX by_name ON t (name)",
+            "DROP INDEX by_name ON t",
+            "FLUSH TABLE t",
+            "COMPACT TABLE t",
+            "BEGIN",
+            "COMMIT",
+            "ROLLBACK",
+            "BEGIN; SELECT * FROM t; COMMIT",
+            "SELECT * FROM t; INSERT INTO t VALUES (2, 'b')",
+        ] {
+            assert!(
+                matches!(
+                    engine.execute_read_consistent(1, "main", sql),
+                    Err(DbError::InvalidQuery(_))
+                ),
+                "consistent `{sql}` must be refused as a read-only violation"
+            );
+        }
+    }
+
+    // The consistent path serves an already captured snapshot, so it must not
+    // observe later local writes, the in-memory shard cache or a second
+    // metadata read. This exercises exactly the function the consistent entry
+    // point calls once `try_linearizable_snapshot` returns; only the snapshot
+    // source differs (local applied state here, quorum-confirmed in OpenRaft).
+    #[test]
+    fn snapshot_read_serves_only_the_captured_view() {
+        let (_fs, meta, engine) = consistent_engine();
+        engine
+            .execute_sql(
+                1,
+                "main",
+                "wal",
+                "data",
+                2,
+                "CREATE TABLE t (id INT PRIMARY KEY, v INT); \
+                 INSERT INTO t VALUES (1, 10); \
+                 CREATE INDEX by_v ON t (v);",
+            )
+            .unwrap();
+
+        let captured = meta.snapshot(&[], &["/db/1/main/".to_string()]);
+
+        // Advance the local applied state and the engine's shard cache.
+        engine
+            .execute_sql(1, "main", "wal", "data", 2, "INSERT INTO t VALUES (2, 20);")
+            .unwrap();
+
+        let stmt = parse_sql("SELECT * FROM t").unwrap();
+        let from_snapshot = engine
+            .execute_read_from_snapshot(1, "main", &captured, stmt)
+            .unwrap();
+        assert_eq!(
+            from_snapshot.rows,
+            vec![vec![SqlValue::Int(1), SqlValue::Int(10)]]
+        );
+
+        // The index range is also read from the snapshot, not the live state.
+        let stmt = parse_sql("SELECT id FROM t WHERE v = 20").unwrap();
+        assert!(engine
+            .execute_read_from_snapshot(1, "main", &captured, stmt)
+            .unwrap()
+            .rows
+            .is_empty());
+
+        // The default read sees both rows.
+        assert_eq!(
+            engine
+                .execute_sql(1, "main", "wal", "data", 2, "SELECT * FROM t")
+                .unwrap()
+                .rows
+                .len(),
+            2
+        );
+    }
+
+    // Absence in the snapshot is a normal result, not an error: an empty
+    // namespace lists no tables and an unknown table is "not found", exactly
+    // like the local path treats a missing key.
+    #[test]
+    fn snapshot_read_of_an_empty_namespace_is_empty_not_an_error() {
+        let (_fs, meta, engine) = consistent_engine();
+        let empty = meta.snapshot(&[], &["/db/1/main/".to_string()]);
+
+        let shown = engine
+            .execute_read_from_snapshot(1, "main", &empty, SqlStmt::ShowTables)
+            .unwrap();
+        assert!(shown.rows.is_empty());
+        assert_eq!(
+            shown.columns,
+            vec!["table", "shards", "wal_pool", "data_pool", "indexes"]
+        );
+
+        let stmt = parse_sql("SELECT * FROM missing").unwrap();
+        assert!(matches!(
+            engine.execute_read_from_snapshot(1, "main", &empty, stmt),
+            Err(DbError::TableNotFound(t)) if t == "missing"
+        ));
+
+        let stmt = parse_sql("SHOW INDEXES ON missing").unwrap();
+        assert!(matches!(
+            engine.execute_read_from_snapshot(1, "main", &empty, stmt),
+            Err(DbError::TableNotFound(t)) if t == "missing"
+        ));
     }
 }
