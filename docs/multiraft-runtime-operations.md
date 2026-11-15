@@ -226,6 +226,28 @@ file/directory sync errors poison the store until validated reopen. These limits
 can stop an overloaded group and are not a substitute for capacity planning,
 backpressure, multi-group isolation or supported-host durability tests.
 
+The legacy metadata WAL distinguishes a torn tail from damage. A frame is
+truncated only when it provably runs past the end of the file: fewer bytes remain
+than a header needs, a short read at EOF, or a declared length past EOF. A
+complete frame with a bad magic, a bad header or payload checksum, or a payload
+that is not a `WalRecord` is `CorruptWal`, and the file is left byte-identical for
+inspection. Volume segments follow the same rule: a complete record header that
+fails its CRC or an unknown record kind refuses to open, because truncating there
+would drop later `TOMBSTONE`/`BARRIER` records and could resurrect deleted blobs.
+
+Two operational consequences are deliberate and not defects:
+
+* **The format is now `YADBWAL2`.** `YADBWAL1` files still replay under the old
+  tail rule and keep appending in their own format, so no existing file changes
+  behaviour on upgrade. A **rollback to a binary older than this change is
+  destructive**: it does not recognise `YADBWAL2` and will treat the whole log as a
+  tail and truncate it. Do not roll back a node that has written a `V2` log.
+* **A zero-filled tail now fails closed.** Some filesystems leave allocated but
+  unwritten zeros after a crash. Such a region is not one of the provable torn-tail
+  shapes, so the node refuses to start instead of truncating. That is the safe
+  direction — nothing is silently discarded — but it means a crash can require
+  operator action rather than automatic recovery.
+
 Reopen can re-sync visible bytes after a process-only failure; it cannot make
 missing acknowledged data reappear after a power loss, repair arbitrary damage,
 or prove that unknown operations aborted. A validated primary state image may

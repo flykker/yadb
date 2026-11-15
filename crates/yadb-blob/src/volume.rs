@@ -632,10 +632,12 @@ fn recover_segment<F: VirtualFile>(
         let expected_hdr_crc = u32::from_le_bytes([hdr[29], hdr[30], hdr[31], hdr[32]]);
         let actual_hdr_crc = crc32fast::hash(&hdr[0..29]);
         if rec_magic != RECORD_MAGIC || expected_hdr_crc != actual_hdr_crc {
-            // Corrupted tail record -> truncate cleanly at last valid boundary
-            file.set_len(pos)?;
-            file.sync_data()?;
-            break;
+            // A complete header is present, so this is damage to a record that
+            // may be followed by durable TOMBSTONE/BARRIER records. Truncating
+            // here would drop those markers and could resurrect deleted blobs,
+            // so refuse to open instead. A torn header write leaves fewer than
+            // RECORD_HEADER_LEN bytes and is handled above.
+            return Err(BlobError::InvalidSegment("corrupt record header"));
         }
 
         let kind = hdr[4];
@@ -693,9 +695,10 @@ fn recover_segment<F: VirtualFile>(
                 index.remove(&id);
             }
             _ => {
-                file.set_len(pos)?;
-                file.sync_data()?;
-                break;
+                // The kind is covered by the header checksum, so this is a
+                // format this reader cannot interpret, not a torn tail.
+                // Truncating would silently discard every later record.
+                return Err(BlobError::InvalidSegment("unknown record kind"));
             }
         }
 
