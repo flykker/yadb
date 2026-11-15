@@ -931,11 +931,21 @@ listener re-authenticates the SigV4 request first, forwards the proven subject
 through the internal gateway, and re-frames a gateway error as an S3 XML error,
 so the wire format does not change. A range end past the object is clamped to the
 object size (RFC 9110) by both paths, so a proxied `bytes=7-999` still answers
-`206` with `Content-Range: bytes 7-8/9` rather than a `416`. A read-only
-statement whose lease did not survive is refused with `503`; a statement that
-committed a write keeps its result even if the fence was lost, because the
-mutation is already durable and reporting it as failed would make the client
-retry a write that landed — the loss is logged and the lease is not cached. The
+`206` with `Content-Range: bytes 7-8/9` rather than a `416`. A native read also
+keeps its whole local contract: existence, `If-Match`/`If-None-Match` (evaluated
+against the ETag the leader actually returned, so a concurrent overwrite cannot
+turn a failed precondition into a `200`), an unsatisfiable range (`416` with
+`Content-Range: bytes */size`) and the 16 MiB rules (`400 InvalidRequest`) are
+decided before or after the forward with the same status, S3 error code and
+headers as a local read; `Last-Modified` and `Accept-Ranges` come back from the
+leader's manifest, and the internal `x-yadb-leader-id` hop header is removed. A
+read-only statement whose lease did not survive is refused with `503`; a
+statement that committed a write keeps its result even if the fence was lost,
+because the mutation is already durable and reporting it as failed would make the
+client retry a write that landed — the loss is logged and the lease is not
+cached. A request refused before it reads anything (a lost transaction answers
+`409`) does not take a reader lease at all, so a client cannot leave live leases
+behind by retrying an invalid statement. The
 post-commit auto-flush is likewise best-effort: the rows are already durable
 through the committed manifest and its WAL blobs, so a flush failure is logged
 and retried by a later statement instead of failing the committed transaction.
@@ -967,8 +977,12 @@ module (`admission_is_closed_while_a_pass_holds_the_collector_record`,
 `a_superseded_collector_cannot_renew_delete_or_release_the_record`,
 `a_renewed_lease_keeps_its_ownership_and_extends_its_ttl`,
 `a_write_whose_lease_was_reaped_does_not_publish` in `yadb-block`). The proxied
-read path is covered by `proxy_response_preserves_allowlisted_entity_headers_and_rejects_duplicates`
-and `range_end_past_the_size_is_clamped_but_a_start_past_it_is_refused`. Byte
+read path is covered by `proxy_response_preserves_allowlisted_entity_headers_and_rejects_duplicates`,
+`range_end_past_the_size_is_clamped_but_a_start_past_it_is_refused`,
+`a_forwarded_read_keeps_the_local_conditional_contract`,
+`a_forwarded_read_keeps_the_local_range_and_size_rules`,
+`map_error_frames_gateway_range_errors_as_s3_errors` and
+`map_error_frames_gateway_bad_requests_as_invalid_request`. Byte
 counts are real bytes on disk across the three slots of an in-process mirror
 pool, measured before and after one pass:
 
@@ -1018,8 +1032,21 @@ Range GET through a follower answered `206` with `Content-Range: bytes 0-4/11`,
 and a missing key on a follower answered `404` with the S3 XML error rather than
 the gateway's JSON. Two block overwrites plus those reads left one live reader
 lease, the pass refused, and the next pass reclaimed 96 fragments / 396,483
-bytes with the block, the S3 object and the 602 rows still intact. Gates on this
-tree: `yadbd --bins` **66/66**, `yadb-metakv` **169/169**, `yadb-block`
+bytes with the block, the S3 object and the 602 rows still intact. A third run on
+the same cluster closed the review findings: a native follower GET returned the
+same `200` body, `ETag`, `Last-Modified` and `Accept-Ranges: bytes` as the leader
+and no internal `x-yadb-leader-id`; a failed `If-Match` answered `412
+PreconditionFailed`, a matching `If-None-Match` answered `304`, `Range:
+bytes=900-999` on the 11-byte object answered `416 InvalidRange` with
+`Content-Range: bytes */11` on both leader and follower, and a missing key
+answered `404 NoSuchKey` with `<Message>object not found</Message>` instead of
+the gateway's JSON envelope. Three `require_transaction` queries with an unknown
+session answered `409` and left `leases_live: 0`, so a refused statement no
+longer parks a reader lease. After one 64 KiB block overwrite plus reads through
+all three paths the pass refused on `2 live lease(s) (2 reader, 0 writer)` and
+the next pass reclaimed 48 fragments / 198,192 bytes with the block, the S3
+object and the 602 rows intact. Gates on this tree: `yadbd --bins` **70/70**,
+`yadb-metakv` **169/169**, `yadb-block`
 **25/25**, `yadb-db` **46/46**, `yadb-s3` **26/26**, `cargo fmt --all --
 --check` clean, `tests/protocols.py` **16/16** and
 `tests/protocols.py --native-clients` **17/17** on the legacy three-node

@@ -48,6 +48,77 @@ async fn discard_read_lease(app: &AppState, lease: Option<yadb_metakv::GcLease>)
         let _ = tokio::task::spawn_blocking(move || app.end_read_lease(&lease)).await;
     }
 }
+
+/// The `If-Match`/`If-None-Match` decision of the native listener, applied to
+/// the ETag a read actually produced.
+///
+/// A proxied read evaluates it against the leader's response, not against the
+/// follower's local manifest: the object can be overwritten between the two, and
+/// a conditional request must never return bytes that violate its condition.
+fn evaluate_conditions(headers: &HeaderMap, etag: &str) -> Option<Response> {
+    if headers
+        .get(header::IF_MATCH)
+        .is_some_and(|v| v.as_bytes() != etag.as_bytes())
+    {
+        return Some(err(
+            StatusCode::PRECONDITION_FAILED,
+            "PreconditionFailed",
+            "ETag mismatch",
+        ));
+    }
+    if headers
+        .get(header::IF_NONE_MATCH)
+        .is_some_and(|v| v.as_bytes() == etag.as_bytes())
+    {
+        return Some(StatusCode::NOT_MODIFIED.into_response());
+    }
+    None
+}
+
+/// The range and size rules the native listener applies to a GET.
+///
+/// A read that is forwarded must satisfy them *before* it leaves the node: the
+/// internal gateway has no 16 MiB limit and answers its own JSON error
+/// vocabulary, so a request the local handler would refuse has to be refused
+/// here with the local status and headers (`416 InvalidRange` with
+/// `Content-Range: bytes */size`, or `400 InvalidRequest`).
+fn preflight_range(headers: &HeaderMap, size: u64) -> Result<Option<(u64, u64)>, Response> {
+    let range = match headers.get(header::RANGE).and_then(|v| v.to_str().ok()) {
+        Some(value) => match parse_range_header(value, size) {
+            Some(range) => Some(range),
+            None => {
+                let mut response = err(
+                    StatusCode::RANGE_NOT_SATISFIABLE,
+                    "InvalidRange",
+                    "range not satisfiable",
+                );
+                response.headers_mut().insert(
+                    header::CONTENT_RANGE,
+                    format!("bytes */{size}").parse().unwrap(),
+                );
+                return Err(response);
+            }
+        },
+        None => None,
+    };
+    if size > 16 * 1024 * 1024 && range.is_none() {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "InvalidRequest",
+            "use Range for objects over 16 MiB",
+        ));
+    }
+    if let Some((start, end)) = range {
+        if end - start + 1 > 16 * 1024 * 1024 {
+            return Err(err(
+                StatusCode::BAD_REQUEST,
+                "InvalidRequest",
+                "range exceeds 16 MiB",
+            ));
+        }
+    }
+    Ok(range)
+}
 fn query(raw: &str) -> io::Result<Vec<(String, String)>> {
     if raw.is_empty() {
         return Ok(Vec::new());
@@ -531,6 +602,25 @@ pub async fn handle(State(st): State<S3State>, request: Request) -> Response {
             // read runs locally under the lease taken below. HEAD reads no
             // fragments, so it needs no fence and stays local.
             if method == Method::GET && !st.app.meta.is_openraft() {
+                // Validate against local metadata first. The manifest read takes
+                // no lease (only the fragment fetch does), and applying the local
+                // contract here keeps `404`, `304`, `412`, `416` and the 16 MiB
+                // rules identical whether the read is served here or forwarded.
+                let engine = st.app.s3.clone();
+                let (p, s, b, k) = (pid, st.store.clone(), bucket.to_string(), key.to_string());
+                let head =
+                    match tokio::task::spawn_blocking(move || engine.head_object(p, &s, &b, &k))
+                        .await
+                    {
+                        Ok(Ok(head)) => head,
+                        _ => return err(StatusCode::NOT_FOUND, "NoSuchKey", "object not found"),
+                    };
+                if let Some(response) = evaluate_conditions(&headers, &head.etag) {
+                    return response;
+                }
+                if let Err(response) = preflight_range(&headers, head.size) {
+                    return response;
+                }
                 let mut forwarded = gateway_headers.clone();
                 if let Some(secret) = st.app.subject_secret.as_deref() {
                     match subject_signature(secret, &subject).parse() {
@@ -571,6 +661,21 @@ pub async fn handle(State(st): State<S3State>, request: Request) -> Response {
                     // because the gateway answers JSON and a native S3 client
                     // parses the wire format.
                     if response.status().is_success() {
+                        if let Some(etag) = response
+                            .headers()
+                            .get(header::ETAG)
+                            .and_then(|v| v.to_str().ok())
+                        {
+                            // Re-check against the version actually read: the
+                            // preflight above only saw the follower's manifest.
+                            if let Some(conditional) = evaluate_conditions(&headers, etag) {
+                                return conditional;
+                            }
+                        }
+                        let mut response = response;
+                        // The internal hop's identity is not part of the native
+                        // wire format.
+                        response.headers_mut().remove("x-yadb-leader-id");
                         return response;
                     }
                     return map_error(response).await;
@@ -608,29 +713,11 @@ pub async fn handle(State(st): State<S3State>, request: Request) -> Response {
                         return err(StatusCode::NOT_FOUND, "NoSuchKey", "object not found");
                     }
                 };
-            if headers
-                .get(header::IF_MATCH)
-                .is_some_and(|v| v.as_bytes() != head.etag.as_bytes())
-            {
+            if let Some(response) = evaluate_conditions(&headers, &head.etag) {
                 discard_read_lease(&st.app, read_lease.take()).await;
-                return err(
-                    StatusCode::PRECONDITION_FAILED,
-                    "PreconditionFailed",
-                    "ETag mismatch",
-                );
+                return response;
             }
-            if headers
-                .get(header::IF_NONE_MATCH)
-                .is_some_and(|v| v.as_bytes() == head.etag.as_bytes())
-            {
-                discard_read_lease(&st.app, read_lease.take()).await;
-                return StatusCode::NOT_MODIFIED.into_response();
-            }
-            let modified =
-                chrono::DateTime::from_timestamp(head.last_modified.min(i64::MAX as u64) as i64, 0)
-                    .unwrap_or_default()
-                    .format("%a, %d %b %Y %H:%M:%S GMT")
-                    .to_string();
+            let modified = crate::http_date(head.last_modified);
             if method == Method::HEAD {
                 discard_read_lease(&st.app, read_lease.take()).await;
                 return Response::builder()
@@ -642,41 +729,13 @@ pub async fn handle(State(st): State<S3State>, request: Request) -> Response {
                     .body(axum::body::Body::empty())
                     .unwrap();
             }
-            let mut range = None;
-            if let Some(v) = headers.get(header::RANGE).and_then(|v| v.to_str().ok()) {
-                range = parse_range_header(v, head.size);
-                if range.is_none() {
+            let range = match preflight_range(&headers, head.size) {
+                Ok(range) => range,
+                Err(response) => {
                     discard_read_lease(&st.app, read_lease.take()).await;
-                    let mut r = err(
-                        StatusCode::RANGE_NOT_SATISFIABLE,
-                        "InvalidRange",
-                        "range not satisfiable",
-                    );
-                    r.headers_mut().insert(
-                        header::CONTENT_RANGE,
-                        format!("bytes */{}", head.size).parse().unwrap(),
-                    );
-                    return r;
+                    return response;
                 }
-            }
-            if head.size > 16 * 1024 * 1024 && range.is_none() {
-                discard_read_lease(&st.app, read_lease.take()).await;
-                return err(
-                    StatusCode::BAD_REQUEST,
-                    "InvalidRequest",
-                    "use Range for objects over 16 MiB",
-                );
-            }
-            if let Some((a, b)) = range {
-                if b - a + 1 > 16 * 1024 * 1024 {
-                    discard_read_lease(&st.app, read_lease.take()).await;
-                    return err(
-                        StatusCode::BAD_REQUEST,
-                        "InvalidRequest",
-                        "range exceeds 16 MiB",
-                    );
-                }
-            }
+            };
             let engine = st.app.s3.clone();
             let snapshot = head.clone();
             let read = tokio::task::spawn_blocking(move || {
@@ -755,20 +814,27 @@ async fn map_error(response: Response) -> Response {
     // would tell an S3 client that a failed write is safe to retry.
     let outcome = response.headers().get("x-yadb-write-outcome").cloned();
     let retry = response.headers().get("x-yadb-retry").cloned();
+    let content_range = response.headers().get(header::CONTENT_RANGE).cloned();
     let body = axum::body::to_bytes(response.into_body(), 65536)
         .await
         .unwrap_or_default();
-    let mut mapped = err(
-        status,
-        if status == StatusCode::FORBIDDEN {
-            "AccessDenied"
-        } else if status == StatusCode::NOT_FOUND {
-            "NoSuchKey"
-        } else {
-            "ServiceUnavailable"
-        },
-        &String::from_utf8_lossy(&body),
-    );
+    let code = match status {
+        StatusCode::FORBIDDEN => "AccessDenied",
+        StatusCode::NOT_FOUND => "NoSuchKey",
+        StatusCode::BAD_REQUEST => "InvalidRequest",
+        StatusCode::RANGE_NOT_SATISFIABLE => "InvalidRange",
+        _ => "ServiceUnavailable",
+    };
+    // The gateway answers `{"error": "..."}`. An S3 client reads an S3 message,
+    // so unwrap that envelope instead of quoting the JSON into `<Message>`.
+    let message = serde_json::from_slice::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_owned))
+        .unwrap_or_else(|| String::from_utf8_lossy(&body).to_string());
+    let mut mapped = err(status, code, &message);
+    if let Some(value) = content_range {
+        mapped.headers_mut().insert(header::CONTENT_RANGE, value);
+    }
     if let Some(value) = outcome {
         mapped.headers_mut().insert("x-yadb-write-outcome", value);
     }
@@ -826,5 +892,113 @@ mod tests {
         assert_eq!(mapped.status(), StatusCode::FORBIDDEN);
         assert!(mapped.headers().get("x-yadb-write-outcome").is_none());
         assert!(mapped.headers().get("x-yadb-retry").is_none());
+    }
+
+    fn request_headers(pairs: &[(&'static str, &'static str)]) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        for (name, value) in pairs {
+            map.insert(*name, value.parse().unwrap());
+        }
+        map
+    }
+
+    #[test]
+    fn a_forwarded_read_keeps_the_local_conditional_contract() {
+        // The decision is applied to the ETag the read actually produced, so a
+        // concurrent overwrite cannot turn a failed If-Match into a 200.
+        assert_eq!(
+            evaluate_conditions(&request_headers(&[("if-match", "\"b\"")]), "\"a\"")
+                .unwrap()
+                .status(),
+            StatusCode::PRECONDITION_FAILED
+        );
+        assert_eq!(
+            evaluate_conditions(&request_headers(&[("if-none-match", "\"a\"")]), "\"a\"")
+                .unwrap()
+                .status(),
+            StatusCode::NOT_MODIFIED
+        );
+        assert!(evaluate_conditions(&request_headers(&[("if-match", "\"a\"")]), "\"a\"").is_none());
+        assert!(
+            evaluate_conditions(&request_headers(&[("if-none-match", "\"b\"")]), "\"a\"").is_none()
+        );
+        assert!(evaluate_conditions(&request_headers(&[]), "\"a\"").is_none());
+    }
+
+    #[test]
+    fn a_forwarded_read_keeps_the_local_range_and_size_rules() {
+        // A clamp is accepted, exactly as the local read answers it.
+        assert_eq!(
+            preflight_range(&request_headers(&[("range", "bytes=7-999")]), 9).ok(),
+            Some(Some((7, 8)))
+        );
+        // An unsatisfiable range is the local `416` with its Content-Range, not
+        // a `503` from the internal gateway.
+        let refused = preflight_range(&request_headers(&[("range", "bytes=900-999")]), 9)
+            .expect_err("start past the size is unsatisfiable");
+        assert_eq!(refused.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(refused.headers()[header::CONTENT_RANGE], "bytes */9");
+        // A full read over the wire cap, and a range over it, are the local
+        // `400 InvalidRequest` rather than a proxy failure.
+        let cap = 16 * 1024 * 1024;
+        assert_eq!(
+            preflight_range(&request_headers(&[]), cap + 1)
+                .expect_err("a full read over 16 MiB is refused")
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            preflight_range(&request_headers(&[("range", "bytes=0-")]), cap + 1)
+                .expect_err("a range over 16 MiB is refused")
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(preflight_range(&request_headers(&[]), cap).ok(), Some(None));
+        assert_eq!(
+            preflight_range(&request_headers(&[("range", "bytes=0-")]), cap).ok(),
+            Some(Some((0, cap - 1)))
+        );
+    }
+
+    #[tokio::test]
+    async fn map_error_frames_gateway_range_errors_as_s3_errors() {
+        let mut response =
+            crate::api_err(StatusCode::RANGE_NOT_SATISFIABLE, "invalid Range header");
+        response
+            .headers_mut()
+            .insert(header::CONTENT_RANGE, "bytes */9".parse().unwrap());
+        let mapped = map_error(response).await;
+        assert_eq!(mapped.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(mapped.headers()[header::CONTENT_RANGE], "bytes */9");
+        let body = axum::body::to_bytes(mapped.into_body(), 65536)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("<Code>InvalidRange</Code>"), "{body}");
+        // The gateway's JSON envelope is unwrapped, not quoted into <Message>.
+        assert!(
+            body.contains("<Message>invalid Range header</Message>"),
+            "{body}"
+        );
+        assert!(!body.contains("&quot;"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn map_error_frames_gateway_bad_requests_as_invalid_request() {
+        let mapped = map_error(crate::api_err(
+            StatusCode::BAD_REQUEST,
+            "use Range for objects over 16 MiB",
+        ))
+        .await;
+        assert_eq!(mapped.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(mapped.into_body(), 65536)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("<Code>InvalidRequest</Code>"), "{body}");
+        assert!(
+            body.contains("<Message>use Range for objects over 16 MiB</Message>"),
+            "{body}"
+        );
     }
 }

@@ -382,12 +382,20 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   working instead of failing every statement on a follower. The native S3 wire
   listener does the same for GET after it has verified SigV4, forwarding the
   proven subject through the internal gateway and re-framing a gateway error as
-  an S3 XML error; HEAD needs no fence and stays local. A range end past the
-  object is clamped to its size (RFC 9110) on both paths, so a proxied
+  an S3 XML error; HEAD needs no fence and stays local. The native read keeps
+  its local contract across that hop: `If-Match`/`If-None-Match` are decided
+  against the ETag the leader returned (so a concurrent overwrite cannot turn a
+  failed precondition into a `200`), an unsatisfiable range is the local `416
+  InvalidRange` with `Content-Range: bytes */size`, the 16 MiB rules are the
+  local `400 InvalidRequest`, `Last-Modified` and `Accept-Ranges` come from the
+  leader's manifest, and the internal hop header is stripped. A range end past
+  the object is clamped to its size (RFC 9110) on both paths, so a proxied
   `bytes=7-999` answers `206` with the clamped slice instead of `416`. A
   read-only statement whose lease was lost is refused with `503`, but a statement
   that committed a write keeps its result: the mutation is already durable, and
-  reporting it as failed would make the client retry a write that landed. The
+  reporting it as failed would make the client retry a write that landed. A
+  statement refused before it reads anything (a lost transaction answers `409`)
+  takes no reader lease, so retrying an invalid statement cannot park leases. The
   post-commit auto-flush is best-effort for the same reason. The legacy forwarder
   retries only a definite `409 not Raft leader`; a transport error is retried
   only for `GET`/`HEAD`. `/s3-retired/` is
@@ -413,7 +421,14 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   exercised on the same cluster: GET and HEAD answered on all three nodes, a
   native Range GET through a follower answered `206` with `Content-Range: bytes
   0-4/11`, and a missing key on a follower answered `404` with the S3 XML error
-  rather than the gateway's JSON. Two block overwrites plus those reads left one
+  rather than the gateway's JSON. A third run on the same cluster checked the
+  follower contract: the same `200` body, `ETag`, `Last-Modified` and
+  `Accept-Ranges: bytes` as the leader and no `x-yadb-leader-id`; a failed
+  `If-Match` answered `412`, a matching `If-None-Match` answered `304`, and
+  `Range: bytes=900-999` on the 11-byte object answered `416 InvalidRange` with
+  `Content-Range: bytes */11` on both nodes. Three `require_transaction` queries
+  with an unknown session answered `409` and left `leases_live: 0`. Two block
+  overwrites plus those reads left one
   live reader lease; the pass refused, and the next pass reclaimed 96 fragments /
   396,483 bytes with the block, the S3 object and the 602 rows still intact.
   `tests/protocols.py --native-clients` passed 17/17. A crash between the
@@ -437,7 +452,11 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   `a_renewed_lease_keeps_its_ownership_and_extends_its_ttl`,
   `a_write_whose_lease_was_reaped_does_not_publish`,
   `proxy_response_preserves_allowlisted_entity_headers_and_rejects_duplicates`,
-  `range_end_past_the_size_is_clamped_but_a_start_past_it_is_refused`).
+  `range_end_past_the_size_is_clamped_but_a_start_past_it_is_refused`,
+  `a_forwarded_read_keeps_the_local_conditional_contract`,
+  `a_forwarded_read_keeps_the_local_range_and_size_rules`,
+  `map_error_frames_gateway_range_errors_as_s3_errors`,
+  `map_error_frames_gateway_bad_requests_as_invalid_request`).
 - [x] Bound the metadata Raft log. The legacy Raft log is now checkpointed and
   compacted: `metakv/checkpoint.json` holds the durable state image (atomic
   write: tmp, `sync_data`, rename, `sync_dir`), `raft.wal` is rewritten through

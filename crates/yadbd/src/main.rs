@@ -1748,6 +1748,15 @@ fn parse_range_header(val: &str, total_size: u64) -> Option<(u64, u64)> {
     Some((start, end.min(total_size - 1)))
 }
 
+/// Formats a manifest timestamp as an HTTP date, the same way the native S3
+/// listener does, so a proxied read keeps `Last-Modified`.
+pub(crate) fn http_date(timestamp: u64) -> String {
+    chrono::DateTime::from_timestamp(timestamp.min(i64::MAX as u64) as i64, 0)
+        .unwrap_or_default()
+        .format("%a, %d %b %Y %H:%M:%S GMT")
+        .to_string()
+}
+
 async fn handle_ui() -> Html<&'static str> {
     Html(EMBEDDED_UI_HTML)
 }
@@ -3330,6 +3339,23 @@ async fn handle_db_query(
         )
     };
 
+    let db_engine = st.db.clone();
+    // Refuse a lost transaction before taking the reader lease: this check reads
+    // no fragment, and an early return after `begin_read_lease` would keep the
+    // lease live until it expires, making collection refuse for no reason.
+    if req.require_transaction {
+        let session = req.session_id.as_ref().map(|id| format!("{subject}#{id}"));
+        if !session
+            .as_ref()
+            .is_some_and(|s| db_engine.has_session(project_id, &database, s))
+        {
+            return api_err(
+                StatusCode::CONFLICT,
+                "transaction lost on leader change; ROLLBACK and restart",
+            );
+        }
+    }
+
     // Fence the statement against collection: a scan reads SST/WAL fragments by
     // the ids its tablet manifest names, and a concurrent compaction makes those
     // fragments unreferenced while the scan is still reading them. A write takes
@@ -3341,20 +3367,6 @@ async fn handle_db_query(
             Ok(Ok(lease)) => reader_lease = Some(lease),
             Ok(Err(error)) => return api_err(StatusCode::SERVICE_UNAVAILABLE, error.to_string()),
             Err(error) => return api_err(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
-        }
-    }
-
-    let db_engine = st.db.clone();
-    if req.require_transaction {
-        let session = req.session_id.as_ref().map(|id| format!("{subject}#{id}"));
-        if !session
-            .as_ref()
-            .is_some_and(|s| db_engine.has_session(project_id, &database, s))
-        {
-            return api_err(
-                StatusCode::CONFLICT,
-                "transaction lost on leader change; ROLLBACK and restart",
-            );
         }
     }
     let sql_raw = req.sql;
@@ -4607,19 +4619,22 @@ async fn handle_s3_get(
                     })
                     .await;
                     match res {
-                        Ok(Ok((mf, bytes))) => (
-                            StatusCode::PARTIAL_CONTENT,
-                            [
-                                (header::CONTENT_TYPE, mf.content_type),
-                                (header::ETAG, mf.etag),
-                                (
-                                    header::CONTENT_RANGE,
-                                    format!("bytes {start}-{end}/{}", mf.size),
-                                ),
-                            ],
-                            bytes,
-                        )
-                            .into_response(),
+                        Ok(Ok((mf, bytes))) => {
+                            let content_range = format!("bytes {start}-{end}/{}", mf.size);
+                            let last_modified = http_date(mf.last_modified);
+                            (
+                                StatusCode::PARTIAL_CONTENT,
+                                [
+                                    (header::CONTENT_TYPE, mf.content_type),
+                                    (header::ETAG, mf.etag),
+                                    (header::CONTENT_RANGE, content_range),
+                                    (header::LAST_MODIFIED, last_modified),
+                                    (header::ACCEPT_RANGES, "bytes".to_string()),
+                                ],
+                                bytes,
+                            )
+                                .into_response()
+                        }
                         Ok(Err(S3Error::InvalidRange { .. })) => {
                             api_err(StatusCode::RANGE_NOT_SATISFIABLE, "range out of bounds")
                         }
@@ -4627,7 +4642,16 @@ async fn handle_s3_get(
                         Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
                     }
                 }
-                None => api_err(StatusCode::RANGE_NOT_SATISFIABLE, "invalid Range header"),
+                None => {
+                    // Keep the size hint a native client uses to retry, so a
+                    // forwarded 416 looks like the local one.
+                    let mut response =
+                        api_err(StatusCode::RANGE_NOT_SATISFIABLE, "invalid Range header");
+                    if let Ok(value) = format!("bytes */{}", head.size).parse() {
+                        response.headers_mut().insert(header::CONTENT_RANGE, value);
+                    }
+                    response
+                }
             },
             Err(S3Error::ObjectNotFound { .. }) => {
                 api_err(StatusCode::NOT_FOUND, "object not found")
@@ -4640,15 +4664,20 @@ async fn handle_s3_get(
             tokio::task::spawn_blocking(move || s3.get_object(project_id, &store, &bucket, &key))
                 .await;
         match res {
-            Ok(Ok((mf, bytes))) => (
-                StatusCode::OK,
-                [
-                    (header::CONTENT_TYPE, mf.content_type),
-                    (header::ETAG, mf.etag),
-                ],
-                bytes,
-            )
-                .into_response(),
+            Ok(Ok((mf, bytes))) => {
+                let last_modified = http_date(mf.last_modified);
+                (
+                    StatusCode::OK,
+                    [
+                        (header::CONTENT_TYPE, mf.content_type),
+                        (header::ETAG, mf.etag),
+                        (header::LAST_MODIFIED, last_modified),
+                        (header::ACCEPT_RANGES, "bytes".to_string()),
+                    ],
+                    bytes,
+                )
+                    .into_response()
+            }
             Ok(Err(S3Error::ObjectNotFound { .. })) => {
                 api_err(StatusCode::NOT_FOUND, "object not found")
             }
