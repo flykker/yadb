@@ -3348,16 +3348,30 @@ async fn handle_block_read(
         };
     }
     if q.consistent {
-        // Reached only when the node has legacy metadata: the OpenRaft branch
-        // above returns for every consistent request it can serve. Legacy
-        // metadata has no quorum-confirmed extent map, and the old code fenced
-        // an empty transaction and then read the locally applied map, which
-        // silently served a stale view — the exact degradation this option
-        // exists to refuse. Answer "not available here" instead.
-        return api_err(
-            StatusCode::NOT_IMPLEMENTED,
-            "consistent reads require OpenRaft metadata; this node cannot take a quorum-confirmed snapshot",
-        );
+        // Legacy metadata cannot take a quorum-confirmed *snapshot*, but it can
+        // fence: an empty `Txn` is a no-op proposal that returns only once this
+        // node has applied every entry committed before it, so the local map read
+        // below observes at least that revision. The iSCSI READ path always asks
+        // for this (`consistent=true`), so it is a real barrier rather than a
+        // silent fallback to stale state. A failed fence is an error, never a read.
+        if let Some(resp) = maybe_forward_write(
+            &st,
+            &headers,
+            Some(&project),
+            "GET",
+            format!(
+                "{}?offset={}&len={}&consistent=true",
+                block_path(&project, &volume),
+                q.offset,
+                q.len
+            ),
+            "application/octet-stream".into(),
+            Bytes::new(),
+        )
+        .await
+        {
+            return resp;
+        }
     }
     let subject = extract_subject(&headers, st.subject_secret.as_deref());
     let (project_id, pool_name, size_bytes) = {
@@ -3370,6 +3384,23 @@ async fn handle_block_read(
             Err(resp) => return resp,
         }
     };
+
+    if q.consistent {
+        let meta = st.meta.clone();
+        let fence = tokio::task::spawn_blocking(move || {
+            meta.execute(KvCommand::Txn {
+                guards: vec![],
+                ops: vec![],
+            })
+        })
+        .await;
+        if !matches!(fence, Ok(Ok(yadb_metakv::KvResult::TxnOk { .. }))) {
+            return api_err(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "read quorum unavailable or metadata changed",
+            );
+        }
+    }
 
     let blk = st.block.clone();
     let res = tokio::task::spawn_blocking(move || {

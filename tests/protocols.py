@@ -1014,10 +1014,30 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
             isolated.query("INSERT INTO wire VALUES (99,999);", fail=True)
             isolated.close()
 
-            # Restore only one follower first: two out of three form a quorum.
+            # Restore only one follower first: two out of three form a Raft
+            # quorum, so metadata commits again, but every pool is striped over
+            # all three failure domains. A write therefore needs the missing
+            # domain and is refused rather than acknowledged without redundancy.
             i = stopped[0]
             nodes[i-1] = start_node(i)
             wait(19000+i)
+            deadline = time.monotonic()+20
+            while time.monotonic() < deadline:
+                result = signed(19200+leader, "PUT", "/invoices-2026/quorum-restored", b"recovered")
+                if result[0] == 503:
+                    break
+                time.sleep(.1)
+            assert result[0] == 503, result
+            assert signed(19200+leader, "GET", "/invoices-2026/restart")[2] == b"durable object"
+            assert signed(19200+leader, "GET", "/invoices-2026/quorum-restored")[0] == 404
+            check = Pg(19100+leader)
+            assert check.rows("SELECT balance FROM wire WHERE id=1;") == [["90"]]
+            check.close()
+            i = stopped[1]
+            nodes[i-1] = start_node(i)
+            wait(19000+i)
+            # Full redundancy is back, so the same refused write is accepted and
+            # becomes readable.
             deadline = time.monotonic()+20
             while True:
                 result = signed(19200+leader, "PUT", "/invoices-2026/quorum-restored", b"recovered")
@@ -1025,15 +1045,8 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
                     break
                 assert time.monotonic() < deadline, result
                 time.sleep(.1)
-            assert signed(19200+leader, "GET", "/invoices-2026/restart")[2] == b"durable object"
             assert signed(19200+leader, "GET", "/invoices-2026/quorum-restored")[2] == b"recovered"
-            check = Pg(19100+leader)
-            assert check.rows("SELECT balance FROM wire WHERE id=1;") == [["90"]]
-            check.close()
-            i = stopped[1]
-            nodes[i-1] = start_node(i)
-            wait(19000+i)
-            print("PASS quorum loss: no SQL/S3 acknowledgement without peers; majority recovery")
+            print("PASS quorum loss: no SQL/S3 acknowledgement without peers; writes return with full redundancy")
 
             # Partition the live leader from both peers in both directions.
             # Direct client ports stay reachable on all three processes.
@@ -1065,10 +1078,15 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
                 assert time.monotonic() < deadline, statuses
                 time.sleep(.1)
             new = leaders[0]
-            result = signed(19200+new, "PUT", "/invoices-2026/partition-majority", b"majority")
-            assert result[0] == 200, result
+            # A Raft majority exists, so metadata commits, but the third failure
+            # domain is unreachable across the partition. Every pool is striped
+            # over all three domains, so a data write is refused on the majority
+            # side too, exactly as on the minority side.
+            refused = signed(19200+new, "PUT", "/invoices-2026/partition-majority", b"majority")
+            assert not 200 <= refused[0] < 300, refused
             majority_pg = Pg(19100+new)
-            majority_pg.query("INSERT INTO wire VALUES (97,997);")
+            majority_pg.s.settimeout(10)
+            majority_pg.query("INSERT INTO wire VALUES (97,997);", fail=True)
             majority_pg.close()
             assert all(p.poll() is None for p in nodes)
             for proxy in proxies.values():
@@ -1080,12 +1098,27 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
                     break
                 assert time.monotonic() < deadline, statuses
                 time.sleep(.1)
-            assert signed(19200+old, "GET", "/invoices-2026/partition-majority")[2] == b"majority"
             assert signed(19200+old, "GET", "/invoices-2026/restart")[2] == b"durable object"
+            # Neither refusal was acknowledged, so neither may appear later.
+            assert signed(19200+old, "GET", "/invoices-2026/partition-majority")[0] == 404
+            # With the partition healed every domain is reachable again, so the
+            # same refused write is accepted and becomes visible everywhere.
+            deadline = time.monotonic()+20
+            while True:
+                result = signed(19200+new, "PUT", "/invoices-2026/partition-majority", b"majority")
+                if result[0] == 200:
+                    break
+                assert time.monotonic() < deadline, result
+                time.sleep(.1)
+            deadline = time.monotonic()+20
+            while signed(19200+old, "GET", "/invoices-2026/partition-majority")[2] != b"majority":
+                assert time.monotonic() < deadline, "rejoined node did not catch up"
+                time.sleep(.1)
             reunited_pg = Pg(19100+old)
-            assert reunited_pg.rows("SELECT balance FROM wire WHERE id=97;") == [["997"]]
+            assert reunited_pg.rows("SELECT balance FROM wire WHERE id=1;") == [["90"]]
+            assert reunited_pg.rows("SELECT balance FROM wire WHERE id=97;") == []
             reunited_pg.close()
-            print("PASS live bidirectional partition: minority rejected, majority elected, rejoined")
+            print("PASS live bidirectional partition: both sides refuse writes without a full domain set; heal restores them")
 
             leader = json.loads(request(19002, "GET", "/raft/status")[2])["leader_id"]
             survivor = next(i for i in range(1, 4) if i != leader)
@@ -1096,9 +1129,26 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
             nodes[leader-1].wait(timeout=10)
             # Existing session survives storage leader loss if its gateway did not die;
             # a dead gateway requires initiator multipath to a different session.
-            alive.write(b"D"*512)
-            assert alive.read() == b"D"*512
-            assert signed(19200+survivor, "PUT", "/invoices-2026/after-failover", b"ok")[0] == 200
+            # Reads still work: the surviving replicas hold every committed
+            # fragment. Writes do not: the pools are striped over all three
+            # failure domains, so a write is refused until the node returns.
+            deadline = time.monotonic()+20
+            while True:
+                try:
+                    assert alive.read() == b"C"*512
+                    break
+                except AssertionError as e:
+                    assert time.monotonic() < deadline, e
+                    time.sleep(.1)
+            try:
+                alive.write(b"D"*512)
+                raise AssertionError("block write acknowledged with a failure domain offline")
+            except AssertionError as e:
+                assert "acknowledged" not in str(e), e
+            assert alive.read() == b"C"*512
+            refused = signed(19200+survivor, "PUT", "/invoices-2026/after-failover", b"ok")
+            assert not 200 <= refused[0] < 300, refused
+            assert signed(19200+survivor, "GET", "/invoices-2026/after-failover")[0] == 404
             p = Pg(19100+survivor)
             assert p.rows("SELECT balance FROM wire WHERE id=1;") == [["90"]]
             tx.query("COMMIT;", fail=True)
@@ -1106,7 +1156,18 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
             assert tx.rows("SELECT balance FROM wire WHERE id=1;") == [["90"]]
             tx.close()
             p.close()
-            print("PASS leader SIGKILL: surviving iSCSI portal, pgwire and S3 remain usable")
+            # Full redundancy is back: the refused write is accepted and readable.
+            nodes[leader-1] = start_node(leader)
+            wait(19000+leader)
+            deadline = time.monotonic()+20
+            while True:
+                result = signed(19200+survivor, "PUT", "/invoices-2026/after-failover", b"ok")
+                if result[0] == 200:
+                    break
+                assert time.monotonic() < deadline, result
+                time.sleep(.1)
+            assert signed(19200+survivor, "GET", "/invoices-2026/after-failover")[2] == b"ok"
+            print("PASS leader SIGKILL: surviving replicas serve reads, writes are refused until full redundancy returns")
         except Exception:
             print("Failure diagnostics: node Raft status and recent peer proxy events")
             for i in range(1, 4):
