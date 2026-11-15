@@ -48,6 +48,9 @@ const EMBEDDED_SAMPLE_YAML: &str = include_str!("../../../examples/platform.yaml
     about = "YADB Unified Storage, SQL, S3 & Block Node Daemon"
 )]
 struct Args {
+    /// Inspect one stopped replica without modifying its files.
+    #[arg(long, exclusive = true)]
+    verify_replica: Option<PathBuf>,
     #[arg(long, default_value = "127.0.0.1:8420")]
     listen: String,
 
@@ -4118,6 +4121,29 @@ fn refuse_if_backup_in_progress(data_dir: &std::path::Path) -> Result<(), String
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+    if let Some(dir) = &args.verify_replica {
+        use yadb_metakv::replica_inspection::{read_replica_identity, verify_replica};
+        match read_replica_identity(dir) {
+            Ok(identity) => {
+                let verdict = verify_replica(dir, &identity);
+                println!("{}", serde_json::to_string(&verdict)?);
+                if !verdict.restorable {
+                    eprintln!("{}", verdict.reason);
+                    std::process::exit(4);
+                }
+            }
+            Err(_) => {
+                let reason = "invalid or unreadable replica descriptor";
+                println!(
+                    "{}",
+                    serde_json::json!({"group": null, "node": null, "first_index": null, "last_index": null, "last_purged": null, "applied": null, "snapshot": null, "entry_count": 0, "torn_tail": false, "restorable": false, "reason": reason, "membership_differs_from_descriptor": null})
+                );
+                eprintln!("{reason}");
+                std::process::exit(4);
+            }
+        }
+        return Ok(());
+    }
     check_experimental_openraft_config(args.experimental_openraft_config.as_deref())
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     let client_openraft = args.metadata_runtime == "openraft";
