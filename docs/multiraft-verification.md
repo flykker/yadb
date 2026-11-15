@@ -231,7 +231,14 @@ number of tables, shards and secondary indexes through
 metadata transactions; making the script keyed requires threading the record and
 its counter into that transaction. A handler-level record committed separately
 from the data would reintroduce exactly the ambiguity the key exists to remove,
-so the gap is stated rather than papered over.
+so the gap is stated rather than papered over. A SQL write *without* a key is
+deliberately still accepted: requiring one would stop `psql`, the pgwire
+protocol and every existing script from writing at all, and an unkeyed write is
+the pre-existing contract rather than a new hole. The review that asked for a
+mandatory key is answered here: the key is opt-in for SQL, mandatory nowhere, and
+a client that wants an ambiguous write to be resolvable must use the block or S3
+path, or supply the key and accept the 501 that says the guarantee is not there
+yet.
 
 That was also exercised live on the three-process deployment (binary
 `b00018a9f092da23d3cfae818bc0e4ac7008dea659abca6336924bfeb7f87ddc`, built from
@@ -898,10 +905,27 @@ reader publishes its lease first and then refuses with `503` if its applied
 revision is behind that watermark. Without it, a lagging follower could serve a
 manifest committed before the mark — one whose fragments the pass already
 deleted — because its local applied view is not the leader's. A node reuses one
-reader lease while it has more than 15 s of life left, so a `SELECT` does not
-write two Raft entries each and a node stops blocking collection one TTL after
-its last read. There is no grace period and no "recent enough" rule; a fence that
-cannot be read is a refusal.
+reader lease, renewing it at the start of each read, so a `SELECT` does not write
+two Raft entries each and a node stops blocking collection one TTL after its last
+read. There is no grace period and no "recent enough" rule; a fence that cannot
+be read is a refusal.
+
+**Admission is a transaction, not a check.** Publishing a reader or writer record
+guards two keys at once: its own never-reused id slot, and the collector record
+being absent. A lease therefore either exists before the pass re-checks the fence
+or loses its CAS, so no read or write can be admitted between the check and the
+first deletion. Every record also carries the `mod_revision` it was published at
+as an ownership token: renewal, release and `Drop` are CAS-guarded by it, so a
+holder that lost its record cannot extend it, delete it, or delete the record of
+the pass that took over. A pass renews its collector record before the watermark,
+before its first deletion and before each pool, and stops deleting when a renewal
+loses. A write joins its lease's guard to the transaction that publishes the map
+or manifest, so a writer that stalled past its lease is refused instead of
+publishing fragments a pass has already reclaimed; a read verifies its lease
+after fetching and answers `503` if it did not survive, because a pass may have
+reaped the expired record and reclaimed what was just read. Since only the
+metadata leader can publish a lease, a legacy follower proxies reads to the
+leader (carrying the caller's `Range` header) instead of serving them unfenced.
 
 Deletion is per pool: an id is swept only when a mounted slot of that pool holds
 it and no manifest names it. Where a channel allocates `(owner, generation)`
@@ -910,16 +934,25 @@ dead generation in the group is strictly below every live one, the collector
 writes one durable generation barrier per slot; elsewhere it writes an exact
 per-fragment tombstone, because the SQL channels derive the owner id from the
 table name and restart the generation at zero, so a permanent barrier would
-fence a recreated tablet. Compaction is the last step: the active segment is
+fence a recreated tablet. An allocation still in flight cannot be caught by a
+barrier: a reservation writes no fragment, so it is never part of the dead set,
+and the fragments it later appends exist only while its writer lease is live.
+Compaction is the last step: the active segment is
 sealed only when it carries garbage and is mostly garbage or large enough to
 roll soon, then sealed segments are compacted, so the bytes the barriers freed
 actually leave the filesystem. Ordering is durable fence → durable
 barrier/tombstone → deletion → compaction, every step is idempotent, and a rerun
 recomputes the mark from committed metadata.
 
-**Evidence.** Nine acceptance tests in `crates/yadbd/src/gc.rs` and two handler
-tests in `yadbd`'s security suite. Byte counts are real bytes on disk across the
-three slots of an in-process mirror pool, measured before and after one pass:
+**Evidence.** Nine acceptance tests in `crates/yadbd/src/gc.rs`, two handler
+tests in `yadbd`'s security suite, and five fence tests in `yadb-metakv`'s `gc`
+module (`admission_is_closed_while_a_pass_holds_the_collector_record`,
+`a_lost_lease_cannot_release_or_guard_its_successors_record`,
+`a_superseded_collector_cannot_renew_delete_or_release_the_record`,
+`a_renewed_lease_keeps_its_ownership_and_extends_its_ttl`,
+`a_write_whose_lease_was_reaped_does_not_publish` in `yadb-block`). Byte counts
+are real bytes on disk across the three slots of an in-process mirror pool,
+measured before and after one pass:
 
 | Scenario | Before | After | Live set | Fragments deleted |
 | --- | --- | --- | --- | --- |
@@ -947,10 +980,24 @@ barriers_applied: 1` and the directory fell to 905,359 bytes, with the region
 still reading back byte-identical and the 413 SQL rows intact. A pass issued
 immediately after a read refused with `1 live lease(s) (1 reader, 0 writer)` and
 freed nothing, which is the intended "each node must be read-idle for one TTL"
-behaviour. `yadbd --bins` **63/63**,
-`yadb-blob` **26/26**, `yadb-s3` **24/24**, `yadb-block` **33/33**,
-`yadb-db` **26/26**, and `tests/protocols.py` **16/16** on the legacy three-node
-cluster.
+behaviour.
+
+The fence revision was re-run live on a second three-node cluster (ports
+22000-22300): a `POST /db/billing/ledger/query` and an S3 GET sent to a
+*follower* both answered `200` through the proxy (previously `503 node is not
+Raft leader`), an S3 range GET through a follower answered `206` with the exact
+`Range` slice, and a 64 KiB block written on the leader read back byte-identical
+through a follower. A pass issued right after those reads refused with
+`2 live lease(s) (2 reader, 0 writer)`; the same request 40 s later reported
+`blobs_live: 107, fragments_deleted: 48, bytes_reclaimed: 198,192,
+barriers_applied: 1`, and an immediate rerun reported `fragments_deleted: 0,
+bytes_reclaimed: 0, barriers_applied: 0`. After a clean stop/start the 602 SQL
+rows, the S3 object and the block contents were all intact, and the first pass
+after the restart refused on the two pre-restart reader records until they
+expired — no manual cleanup was needed. Gates on this tree: `yadbd --bins`
+**64/64**, `yadb-metakv` **169/169**, `yadb-block` **25/25**, `yadb-db`
+**46/46**, `yadb-s3` **26/26**, `cargo fmt --all -- --check` clean, and
+`tests/protocols.py` **16/16** on the legacy three-node cluster.
 
 **Open.** The collector is legacy-only: on Multi-Raft both endpoints refuse with
 `garbage collection disabled for Multi-Raft: no single atomic cross-group

@@ -32,11 +32,6 @@ mod protocols;
 
 const CONTROL_STATE_KEY: &str = "/sys/control_plane_state";
 
-/// A cached reader lease is reused only while it has at least this much life
-/// left, so the read that uses it cannot outlive the record it is fenced by any
-/// sooner than a freshly published one would.
-const READ_LEASE_REUSE_MARGIN_MS: u64 = 15_000;
-
 /// How often the leader's periodic repair scan also runs a collection pass.
 /// Collection takes the exclusive collector lease for its whole duration, so a
 /// per-scan pass would keep an explicit `POST /v1/pools/gc` refused.
@@ -486,22 +481,24 @@ impl AppState {
     ///
     /// The record is kept for the next statement instead of being deleted: one
     /// published record fences every read on this node, and a fresh record per
-    /// statement would put two Raft entries in the log for every `SELECT`. A
-    /// reused lease needs no watermark check, because the record being live is
-    /// what makes a pass refuse — no pass can have raised the watermark since it
-    /// was published.
+    /// statement would put two Raft entries in the log for every `SELECT`.
+    ///
+    /// A cached record is *renewed*, not merely checked: a read must start with a
+    /// full TTL in front of it, otherwise a slow read would run past the fence it
+    /// published. Renewal also refuses when the record was reaped or replaced, so
+    /// a stale cached lease is never used as a fence.
     ///
     /// Blocking; call from `spawn_blocking`.
     fn begin_read_lease(&self, project_id: u32) -> Result<yadb_metakv::GcLease, MetaError> {
         let mut cached = self.reader_lease.lock().unwrap();
         if let Some(lease) = cached.take() {
-            if lease.expires_at_ms > yadb_metakv::gc::now_ms() + READ_LEASE_REUSE_MARGIN_MS {
-                return Ok(lease);
-            }
-            // Too close to expiry to cover another read: drop the record now so a
-            // pass can run sooner, then publish a fresh one.
-            if let Err(error) = yadb_metakv::gc::release(&self.meta, &lease) {
-                eprintln!("reader lease release failed: {error}");
+            match yadb_metakv::gc::renew(&self.meta, &lease, yadb_metakv::gc::DEFAULT_TTL_MS) {
+                Ok(renewed) => return Ok(renewed),
+                Err(error) => {
+                    // The record expired and was reaped (or taken over): publish a
+                    // fresh one below instead of reading under a lost fence.
+                    eprintln!("reader lease renewal failed, publishing a fresh one: {error}");
+                }
             }
         }
         let lease = yadb_metakv::gc::acquire(
@@ -523,11 +520,20 @@ impl AppState {
         Ok(lease)
     }
 
-    /// Keeps the lease for the next read instead of deleting it. The record
-    /// expires on its own, so a crashed node still stops blocking collection;
-    /// an idle node stops blocking it one TTL after its last read.
-    fn end_read_lease(&self, lease: &yadb_metakv::GcLease) {
+    /// Ends a read: proves the fence still held, then keeps the record for the
+    /// next read instead of deleting it. The record expires on its own, so a
+    /// crashed node still stops blocking collection; an idle node stops blocking
+    /// it one TTL after its last read.
+    ///
+    /// The proof is not cosmetic. A read that outlived its lease can no longer
+    /// claim that no pass ran while it was fetching fragments: a pass that reaped
+    /// the expired record could have reclaimed exactly those fragments, so the
+    /// answer it produced may be incomplete. The caller must refuse rather than
+    /// return it. A dead record is not cached either — it is already gone.
+    fn end_read_lease(&self, lease: &yadb_metakv::GcLease) -> Result<(), MetaError> {
+        yadb_metakv::gc::ensure_live(&self.meta, lease)?;
         *self.reader_lease.lock().unwrap() = Some(lease.clone());
+        Ok(())
     }
 
     /// Establish a fresh lease on demand, e.g. immediately after restart
@@ -1168,6 +1174,7 @@ struct ProxyResponse {
 }
 
 /// Raw HTTP/1.1 forwarding helper used by Followers to transparently proxy client writes to the Raft Leader.
+#[allow(clippy::too_many_arguments)]
 fn proxy_http_to_peer(
     peer_addr: &str,
     method: &str,
@@ -1177,6 +1184,7 @@ fn proxy_http_to_peer(
     content_type: &str,
     body: &[u8],
     idempotency_key: Option<&str>,
+    range: Option<&str>,
 ) -> Result<ProxyResponse, std::io::Error> {
     let clean = peer_addr
         .trim()
@@ -1198,8 +1206,14 @@ fn proxy_http_to_peer(
     let key_header = idempotency_key
         .map(|key| format!("Idempotency-Key: {key}\r\n"))
         .unwrap_or_default();
+    // A proxied read must ask the leader for the same byte range the caller
+    // asked for: without this header the leader would answer 200 with the whole
+    // object (or block) instead of the requested 206 slice.
+    let range_header = range
+        .map(|range| format!("Range: {range}\r\n"))
+        .unwrap_or_default();
     let req = format!(
-        "{method} {path_and_query} HTTP/1.1\r\nHost: {clean}\r\nx-yadb-subject: {subject}\r\n{signature_header}{key_header}x-yadb-forwarded: 1\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "{method} {path_and_query} HTTP/1.1\r\nHost: {clean}\r\nx-yadb-subject: {subject}\r\n{signature_header}{key_header}{range_header}x-yadb-forwarded: 1\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
     stream.write_all(req.as_bytes())?;
@@ -1542,6 +1556,10 @@ async fn maybe_forward_write(
         .get("idempotency-key")
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
+    let range = headers
+        .get(header::RANGE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
 
     let openraft = meta.is_openraft();
     let outcome = tokio::task::spawn_blocking(move || {
@@ -1572,6 +1590,7 @@ async fn maybe_forward_write(
                 &content_type,
                 &body,
                 idempotency_key.as_deref(),
+                range.as_deref(),
             )
             .map(|response| Some((target, response)))
             .map_err(|_| {
@@ -1618,6 +1637,7 @@ async fn maybe_forward_write(
                 &content_type,
                 &body,
                 idempotency_key.as_deref(),
+                range.as_deref(),
             ) {
                 Ok(ref response)
                     if response.code == 409
@@ -3218,7 +3238,18 @@ async fn handle_db_query(
     // A quorum-confirmed read must run on the project-group leader. A legacy
     // node cannot serve it at all, so it is not forwarded: the engine answers
     // with the documented routing error instead of a stale local read.
-    if has_writes || req.force_leader || (consistent && st.meta.is_openraft()) {
+    //
+    // Every legacy read is forwarded as well, for a different reason: the reader
+    // lease that fences it is a metadata write, and only the leader can publish
+    // one. A follower that served the read locally would have to run unfenced,
+    // and one that published the lease would fail on every statement. Proxying
+    // keeps default reads working and fenced; on the leader this returns `None`
+    // and the statement runs locally.
+    if has_writes
+        || req.force_leader
+        || (consistent && st.meta.is_openraft())
+        || !st.meta.is_openraft()
+    {
         if let Ok(raw_body) = serde_json::to_vec(&req) {
             if let Some(proxied) = maybe_forward_write(
                 &st,
@@ -3309,11 +3340,23 @@ async fn handle_db_query(
     })
     .await;
 
-    // The statement has finished reading (or failed); release the fence. A failed
-    // release only delays the next collection pass until the lease expires.
+    // The statement has finished reading (or failed); prove the fence held for
+    // the whole statement and keep it for the next one. A read that outlived its
+    // lease may have had its fragments reclaimed underneath it, so its answer is
+    // refused rather than returned: the client retries (with an Idempotency-Key
+    // for a mutation) instead of acting on a result nobody can vouch for.
     if let Some(lease) = reader_lease.take() {
         let st_fence = st.clone();
-        let _ = tokio::task::spawn_blocking(move || st_fence.end_read_lease(&lease)).await;
+        let verified = tokio::task::spawn_blocking(move || st_fence.end_read_lease(&lease)).await;
+        if matches!(&exec, Ok(Ok(_))) {
+            match verified {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    return api_err(StatusCode::SERVICE_UNAVAILABLE, error.to_string())
+                }
+                Err(error) => return api_err(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+            }
+        }
     }
 
     match exec {
@@ -3533,6 +3576,30 @@ async fn handle_block_read(
             return resp;
         }
     }
+    if !st.meta.is_openraft() {
+        // A legacy read publishes a reader lease, and only the leader can publish
+        // one, so a follower proxies the read instead of serving it unfenced (or
+        // failing on the lease). On the leader this is `None` and the read runs
+        // locally under the lease taken below.
+        if let Some(resp) = maybe_forward_write(
+            &st,
+            &headers,
+            Some(&project),
+            "GET",
+            format!(
+                "{}?offset={}&len={}",
+                block_path(&project, &volume),
+                q.offset,
+                q.len
+            ),
+            "application/octet-stream".into(),
+            Bytes::new(),
+        )
+        .await
+        {
+            return resp;
+        }
+    }
     let subject = extract_subject(&headers, st.subject_secret.as_deref());
     let (project_id, pool_name, size_bytes) = {
         let cp = match st.control_for_authorization_async().await {
@@ -3570,13 +3637,13 @@ async fn handle_block_read(
             }) {
                 Ok(yadb_metakv::KvResult::TxnOk { .. }) => Ok(lease),
                 Ok(_) => {
-                    st_fence.end_read_lease(&lease);
+                    let _ = st_fence.end_read_lease(&lease);
                     Err(MetaError::Routing(
                         "read quorum unavailable or metadata changed".into(),
                     ))
                 }
                 Err(error) => {
-                    st_fence.end_read_lease(&lease);
+                    let _ = st_fence.end_read_lease(&lease);
                     Err(error)
                 }
             }
@@ -3596,11 +3663,16 @@ async fn handle_block_read(
     .await;
 
     // The fragments named by the pinned map have been fetched (or the read
-    // failed); the fence is no longer needed. A failed release only delays the
-    // next collection pass until the lease expires.
+    // failed). Proving the fence held is part of the read: a lease that expired
+    // mid-read let a pass reclaim what was just read, so the bytes are not
+    // returned.
     if let Some(lease) = reader_lease.take() {
         let st_fence = st.clone();
-        let _ = tokio::task::spawn_blocking(move || st_fence.end_read_lease(&lease)).await;
+        match tokio::task::spawn_blocking(move || st_fence.end_read_lease(&lease)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return api_err(StatusCode::SERVICE_UNAVAILABLE, error.to_string()),
+            Err(error) => return api_err(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+        }
     }
 
     match res {
@@ -4434,6 +4506,35 @@ async fn handle_s3_get(
         return s3_get_consistent(st, project_id, store, bucket, key, range_hdr).await;
     }
 
+    if !st.meta.is_openraft() {
+        // A legacy read publishes a reader lease, and only the leader can publish
+        // one. A follower therefore proxies the read (with its Range header)
+        // instead of serving it unfenced; on the leader this returns `None` and
+        // the read runs locally under the lease taken below.
+        if let Some(resp) = maybe_forward_write(
+            &st,
+            &headers,
+            Some(&project),
+            "GET",
+            format!(
+                "/s3/{}/{}/{}/{}",
+                protocols::url(&project),
+                protocols::url(&store),
+                protocols::url(&bucket),
+                key.split('/')
+                    .map(protocols::url)
+                    .collect::<Vec<_>>()
+                    .join("/")
+            ),
+            "application/octet-stream".into(),
+            Bytes::new(),
+        )
+        .await
+        {
+            return resp;
+        }
+    }
+
     // Fence the chunk read against collection. The manifest read and the chunk
     // fetch must both happen under one lease: an overwrite or delete retires the
     // previous manifest, so the chunks this read is about to fetch can become
@@ -4509,8 +4610,14 @@ async fn handle_s3_get(
     };
 
     let st_fence = st.clone();
-    let _ = tokio::task::spawn_blocking(move || st_fence.end_read_lease(&lease)).await;
-    response
+    match tokio::task::spawn_blocking(move || st_fence.end_read_lease(&lease)).await {
+        Ok(Ok(())) => response,
+        // The manifest read and the chunk fetch both happened under this lease;
+        // if it did not survive them, a pass may have reclaimed the chunks in
+        // between and the answer cannot be vouched for.
+        Ok(Err(error)) => api_err(StatusCode::SERVICE_UNAVAILABLE, error.to_string()),
+        Err(error) => api_err(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+    }
 }
 
 /// Quorum-confirmed GET. The manifest comes from exactly one linearizable

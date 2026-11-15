@@ -82,11 +82,26 @@ pub struct GcLease {
     /// any live lease and does not try to reason about this value.
     pub revision: u64,
     pub expires_at_ms: u64,
+    /// The metadata `mod_revision` of this record at the moment it was published,
+    /// filled in by the acquirer (never read back from the record itself). It is
+    /// the ownership token for every later operation on the lease: a renewal,
+    /// release or publication guard that carries a stale value loses the CAS
+    /// instead of touching a record that now belongs to somebody else.
+    #[serde(default)]
+    pub mod_revision: u64,
 }
 
 impl GcLease {
     pub fn is_live_at(&self, now_ms: u64) -> bool {
         self.expires_at_ms > now_ms
+    }
+
+    /// A guard that only matches this exact publication of the record.
+    pub fn guard(&self) -> RevisionGuard {
+        RevisionGuard {
+            key: lease_key(self),
+            expected_mod_revision: self.mod_revision,
+        }
     }
 }
 
@@ -136,17 +151,67 @@ impl<'a, FS: StorageFs> GcLeaseGuard<'a, FS> {
         &self.key
     }
 
+    /// A transaction guard that only commits while this exact lease record is
+    /// still the one this holder published.
+    ///
+    /// Publication paths join this guard to the transaction that names the
+    /// fragments they appended. A writer whose lease expired (or was reaped) can
+    /// then no longer publish a manifest over fragments a pass has already
+    /// reclaimed: the transaction loses its CAS and the write is refused.
+    pub fn guard(&self) -> RevisionGuard {
+        RevisionGuard {
+            key: self.key.clone(),
+            expected_mod_revision: self.lease.mod_revision,
+        }
+    }
+
+    /// Extends the lease to a full `ttl_ms` from now, refusing if this holder no
+    /// longer owns the record.
+    ///
+    /// Long writes and reads call this before the step that must stay fenced
+    /// (the publication transaction, the fragment fetch), so a slow operation
+    /// does not silently run past the lifetime its fence promised.
+    pub fn renew(&mut self, ttl_ms: u64) -> Result<(), MetaError> {
+        let mut next = self.lease.clone();
+        next.expires_at_ms = now_ms().saturating_add(ttl_ms.max(1));
+        let value = serde_json::to_vec(&next)?;
+        match self.meta.execute(KvCommand::RevisionTxn {
+            guards: vec![self.guard()],
+            ops: vec![TxnOp::Put {
+                key: self.key.clone(),
+                value,
+            }],
+        })? {
+            KvResult::TxnOk { revision, .. } => {
+                next.mod_revision = revision;
+                self.lease = next;
+                Ok(())
+            }
+            KvResult::CasConflict { .. } => Err(MetaError::Routing(format!(
+                "gc {} lease {} is no longer held by this operation; refusing to continue under a fence that was lost",
+                kind_name(self.lease.kind),
+                self.lease.id
+            ))),
+            other => Err(MetaError::Routing(format!(
+                "gc lease renewal returned an unexpected result: {other:?}"
+            ))),
+        }
+    }
+
+    /// Verifies the record is still the one this holder published.
+    pub fn ensure_live(&self) -> Result<(), MetaError> {
+        ensure_live(self.meta, &self.lease)
+    }
+
     /// Releases the record and reports the outcome. On error the lease stays in
     /// metadata until it expires, which blocks collection but never unblocks a
     /// deletion that should not happen.
     pub fn release(mut self) -> Result<(), MetaError> {
-        let result = self.meta.execute(KvCommand::Delete {
-            key: self.key.clone(),
-        });
+        let result = release(self.meta, &self.lease);
         if result.is_ok() {
             self.key.clear();
         }
-        result.map(|_| ())
+        result
     }
 }
 
@@ -155,9 +220,41 @@ impl<FS: StorageFs> Drop for GcLeaseGuard<'_, FS> {
         if self.key.is_empty() {
             return;
         }
-        let _ = self.meta.execute(KvCommand::Delete {
-            key: std::mem::take(&mut self.key),
-        });
+        // Guarded like an explicit release: a lease that expired and was reaped
+        // must not have its key deleted after a later holder republished it.
+        let _ = release(self.meta, &self.lease);
+    }
+}
+
+fn kind_name(kind: LeaseKind) -> &'static str {
+    match kind {
+        LeaseKind::Reader => "reader",
+        LeaseKind::Writer => "writer",
+        LeaseKind::Collector => "collector",
+    }
+}
+
+/// True while this exact publication of the lease record is still in metadata.
+///
+/// A reader calls this after fetching fragments: if its lease expired mid-read,
+/// a pass may have deleted what it just read, so the read is refused instead of
+/// returning a possibly incomplete answer.
+pub fn ensure_live<FS: StorageFs>(
+    meta: &LocalMetaKv<FS>,
+    lease: &GcLease,
+) -> Result<(), MetaError> {
+    let current = meta.get(&lease_key(lease));
+    let owned = current
+        .as_ref()
+        .is_some_and(|kv| kv.mod_revision == lease.mod_revision && lease.mod_revision != 0);
+    if owned {
+        Ok(())
+    } else {
+        Err(MetaError::Routing(format!(
+            "gc {} lease {} was lost (expired or reaped) while it was in use; the operation is refused rather than completed under a fence that no longer holds",
+            kind_name(lease.kind),
+            lease.id
+        )))
     }
 }
 
@@ -232,6 +329,20 @@ pub fn reader_is_safe<FS: StorageFs>(meta: &LocalMetaKv<FS>) -> Result<(), MetaE
     Ok(())
 }
 
+/// Publishes one reader or writer lease record.
+///
+/// The transaction is guarded on two keys at once: the lease's own (never
+/// reused) id slot, and the collector record being **absent**. That second guard
+/// is what makes admission mutually exclusive with a collection pass:
+///
+/// * a reader/writer that publishes before the collector does is visible to the
+///   collector's post-acquisition fence check, so the pass refuses;
+/// * one that publishes after it can only succeed if the collector record is
+///   gone, and if the collector published in between the guard loses the CAS.
+///
+/// A plain "read the collector record, then publish" sequence would not be
+/// enough: the collector could publish between the read and the write, take its
+/// mark, and then delete fragments the lease was supposed to protect.
 fn put_lease<FS: StorageFs>(
     meta: &LocalMetaKv<FS>,
     kind: LeaseKind,
@@ -246,37 +357,67 @@ fn put_lease<FS: StorageFs>(
             "the collector lease must be acquired with acquire_collector".into(),
         ));
     }
-    let id = new_lease_id();
-    let key = format!("{}{}", kind.prefix(), id);
-    let lease = GcLease {
-        id: id.clone(),
-        kind,
-        project_id,
-        revision,
-        expires_at_ms: now_ms().saturating_add(ttl_ms.max(1)),
-    };
-    let value = serde_json::to_vec(&lease)?;
-    // A lease record must be durable before the holder reads or writes any
-    // fragment: an acknowledged lease that is only in memory would let the
-    // collector delete underneath it after a leader change.
-    match meta.execute(KvCommand::RevisionTxn {
-        guards: vec![RevisionGuard {
-            key: key.clone(),
-            expected_mod_revision: 0,
-        }],
-        ops: vec![TxnOp::Put {
-            key: key.clone(),
-            value,
-        }],
-    })? {
-        KvResult::TxnOk { .. } => Ok((key, lease)),
-        KvResult::CasConflict { .. } => Err(MetaError::Routing(
-            "gc lease id collided with a live record".into(),
-        )),
-        other => Err(MetaError::Routing(format!(
-            "gc lease publication returned an unexpected result: {other:?}"
-        ))),
+    for _ in 0..2 {
+        let id = new_lease_id();
+        let key = format!("{}{}", kind.prefix(), id);
+        let mut lease = GcLease {
+            id: id.clone(),
+            kind,
+            project_id,
+            revision,
+            expires_at_ms: now_ms().saturating_add(ttl_ms.max(1)),
+            mod_revision: 0,
+        };
+        let value = serde_json::to_vec(&lease)?;
+        // A lease record must be durable before the holder reads or writes any
+        // fragment: an acknowledged lease that is only in memory would let the
+        // collector delete underneath it after a leader change.
+        match meta.execute(KvCommand::RevisionTxn {
+            guards: vec![
+                RevisionGuard {
+                    key: key.clone(),
+                    expected_mod_revision: 0,
+                },
+                RevisionGuard {
+                    key: COLLECTOR_KEY.into(),
+                    expected_mod_revision: 0,
+                },
+            ],
+            ops: vec![TxnOp::Put {
+                key: key.clone(),
+                value,
+            }],
+        })? {
+            KvResult::TxnOk { revision, .. } => {
+                // Every key written by one transaction shares its revision, so
+                // this is the record's own `mod_revision` without a read-back.
+                lease.mod_revision = revision;
+                return Ok((key, lease));
+            }
+            KvResult::CasConflict { .. } => {
+                // Either the id collided (astronomically unlikely) or a
+                // collection pass holds the collector record. Reap an expired
+                // collector record and retry once; otherwise refuse, because
+                // publishing now would race the pass.
+                if live_collector(meta).is_some() {
+                    return Err(MetaError::Routing(
+                        "garbage collection is running; the read or write was refused rather than \
+                         admitted while fragments are being reclaimed"
+                            .into(),
+                    ));
+                }
+                reap_expired(meta, now_ms());
+            }
+            other => {
+                return Err(MetaError::Routing(format!(
+                    "gc lease publication returned an unexpected result: {other:?}"
+                )))
+            }
+        }
     }
+    Err(MetaError::Routing(
+        "gc lease publication kept losing its guard; refusing to read or write".into(),
+    ))
 }
 
 /// Key of a lease record. Collector leases are addressed by their fixed key, so
@@ -302,13 +443,74 @@ pub fn acquire<FS: StorageFs>(
     Ok(lease)
 }
 
-/// Removes a lease published by [`acquire`]. An error leaves the record until it
-/// expires, which blocks collection but never unblocks a deletion.
+/// Removes a lease published by [`acquire`], but only while it is still the
+/// record that holder published.
+///
+/// A record that is already gone, or whose `mod_revision` no longer matches (it
+/// expired, was reaped, and possibly republished by somebody else), is not ours
+/// to delete: reporting success is correct, deleting would remove a successor's
+/// fence.
 pub fn release<FS: StorageFs>(meta: &LocalMetaKv<FS>, lease: &GcLease) -> Result<(), MetaError> {
-    meta.execute(KvCommand::Delete {
-        key: lease_key(lease),
-    })
-    .map(|_| ())
+    if lease.mod_revision == 0 {
+        return Err(MetaError::Routing(
+            "refusing to release a lease without the revision it was published at".into(),
+        ));
+    }
+    let key = lease_key(lease);
+    match meta.get(&key) {
+        None => return Ok(()),
+        Some(kv) if kv.mod_revision != lease.mod_revision => return Ok(()),
+        Some(_) => {}
+    }
+    match meta.execute(KvCommand::RevisionTxn {
+        guards: vec![lease.guard()],
+        ops: vec![TxnOp::Delete { key }],
+    })? {
+        KvResult::TxnOk { .. } | KvResult::CasConflict { .. } => Ok(()),
+        other => Err(MetaError::Routing(format!(
+            "gc lease release returned an unexpected result: {other:?}"
+        ))),
+    }
+}
+
+/// Extends a lease published by [`acquire`] to a full `ttl_ms` from now.
+///
+/// Returns the updated record (with its new `mod_revision`). Refuses when this
+/// holder no longer owns the record, so a caller can distinguish "renewed" from
+/// "my fence is gone" and abort instead of continuing under an expired lease.
+pub fn renew<FS: StorageFs>(
+    meta: &LocalMetaKv<FS>,
+    lease: &GcLease,
+    ttl_ms: u64,
+) -> Result<GcLease, MetaError> {
+    if lease.mod_revision == 0 {
+        return Err(MetaError::Routing(
+            "refusing to renew a lease without the revision it was published at".into(),
+        ));
+    }
+    let mut next = lease.clone();
+    next.expires_at_ms = now_ms().saturating_add(ttl_ms.max(1));
+    let value = serde_json::to_vec(&next)?;
+    match meta.execute(KvCommand::RevisionTxn {
+        guards: vec![lease.guard()],
+        ops: vec![TxnOp::Put {
+            key: lease_key(lease),
+            value,
+        }],
+    })? {
+        KvResult::TxnOk { revision, .. } => {
+            next.mod_revision = revision;
+            Ok(next)
+        }
+        KvResult::CasConflict { .. } => Err(MetaError::Routing(format!(
+            "gc {} lease {} is no longer held by this operation",
+            kind_name(lease.kind),
+            lease.id
+        ))),
+        other => Err(MetaError::Routing(format!(
+            "gc lease renewal returned an unexpected result: {other:?}"
+        ))),
+    }
 }
 
 /// Publishes a reader lease. Callers must hold it across the metadata read *and*
@@ -335,6 +537,25 @@ pub fn acquire_writer<FS: StorageFs>(
     Ok(GcLeaseGuard { meta, key, lease })
 }
 
+/// A writer lease on the legacy runtime, or `None` on Multi-Raft.
+///
+/// Collection refuses on Multi-Raft (`sweep` has no cross-group snapshot), so
+/// there is nothing for a lease to fence there, and `/gc-lease/` is not a routed
+/// namespace: publishing one would fail with an unknown-namespace routing error
+/// and break every write. The legacy runtime, where collection does run, still
+/// gets a real lease.
+pub fn acquire_writer_if_legacy<FS: StorageFs>(
+    meta: &LocalMetaKv<FS>,
+    project_id: u32,
+    revision: u64,
+    ttl_ms: u64,
+) -> Result<Option<GcLeaseGuard<'_, FS>>, MetaError> {
+    if meta.is_openraft() {
+        return Ok(None);
+    }
+    acquire_writer(meta, project_id, revision, ttl_ms).map(Some)
+}
+
 /// The collector lease. Only one pass may hold it at a time; a pass that cannot
 /// acquire it must refuse rather than run concurrently with another.
 pub struct CollectorGuard<'a, FS: StorageFs> {
@@ -348,14 +569,74 @@ impl<'a, FS: StorageFs> CollectorGuard<'a, FS> {
         &self.lease
     }
 
+    /// Extends the collector record, refusing if this pass no longer owns it.
+    ///
+    /// A pass is allowed to take arbitrarily long between its fence check and its
+    /// last deletion only while it keeps proving it is still the pass that owns
+    /// the record. Renewal is that proof: if the record expired and was taken
+    /// over, this fails and the caller must stop deleting.
+    pub fn renew(&mut self, ttl_ms: u64) -> Result<(), MetaError> {
+        let mut next = self.lease.clone();
+        next.expires_at_ms = now_ms().saturating_add(ttl_ms.max(1));
+        let value = serde_json::to_vec(&next)?;
+        match self.meta.execute(KvCommand::RevisionTxn {
+            guards: vec![self.lease.guard()],
+            ops: vec![TxnOp::Put {
+                key: self.key.clone(),
+                value,
+            }],
+        })? {
+            KvResult::TxnOk { revision, .. } => {
+                next.mod_revision = revision;
+                self.lease = next;
+                Ok(())
+            }
+            KvResult::CasConflict { .. } => Err(MetaError::Routing(
+                "this collection pass lost the collector lease; no further fragment is deleted"
+                    .into(),
+            )),
+            other => Err(MetaError::Routing(format!(
+                "collector lease renewal returned an unexpected result: {other:?}"
+            ))),
+        }
+    }
+
+    /// Verifies this pass still owns the record without extending it.
+    pub fn ensure_owned(&self) -> Result<(), MetaError> {
+        ensure_live(self.meta, &self.lease)
+    }
+
     pub fn release(mut self) -> Result<(), MetaError> {
-        let result = self.meta.execute(KvCommand::Delete {
-            key: self.key.clone(),
-        });
+        let result = self.guarded_release();
         if result.is_ok() {
             self.key.clear();
         }
-        result.map(|_| ())
+        result
+    }
+
+    fn guarded_release(&self) -> Result<(), MetaError> {
+        match self.meta.get(&self.key) {
+            None => Ok(()),
+            Some(kv) if kv.mod_revision != self.lease.mod_revision => Err(MetaError::Routing(
+                "the collector lease is no longer held by this pass; leaving the record in place"
+                    .into(),
+            )),
+            Some(_) => match self.meta.execute(KvCommand::RevisionTxn {
+                guards: vec![self.lease.guard()],
+                ops: vec![TxnOp::Delete {
+                    key: self.key.clone(),
+                }],
+            })? {
+                KvResult::TxnOk { .. } => Ok(()),
+                KvResult::CasConflict { .. } => Err(MetaError::Routing(
+                    "the collector lease changed while it was being released; leaving the record in place"
+                        .into(),
+                )),
+                other => Err(MetaError::Routing(format!(
+                    "collector lease release returned an unexpected result: {other:?}"
+                ))),
+            },
+        }
     }
 }
 
@@ -364,9 +645,9 @@ impl<FS: StorageFs> Drop for CollectorGuard<'_, FS> {
         if self.key.is_empty() {
             return;
         }
-        let _ = self.meta.execute(KvCommand::Delete {
-            key: std::mem::take(&mut self.key),
-        });
+        // Ownership-guarded: a pass that lost the record must not delete the
+        // record of the pass that took over.
+        let _ = self.guarded_release();
     }
 }
 
@@ -382,6 +663,7 @@ fn read_lease(key: &str, value: &[u8]) -> GcLease {
                 project_id: 0,
                 revision: 0,
                 expires_at_ms: u64::MAX,
+                mod_revision: 0,
             }
         }
     }
@@ -446,10 +728,26 @@ pub fn live_leases<FS: StorageFs>(meta: &LocalMetaKv<FS>) -> Result<Vec<GcLease>
 
 /// The current collector lease, if one is live. An expired record is reaped and
 /// reported as absent so a crashed pass cannot block collection forever.
+///
+/// Reaping matters for admission as well as for collection: reader and writer
+/// leases are only published while this key is absent, so an expired record left
+/// in place would refuse every read and write until somebody removed it.
 pub fn live_collector<FS: StorageFs>(meta: &LocalMetaKv<FS>) -> Option<GcLease> {
     let value = meta.get(COLLECTOR_KEY)?;
     let lease = read_lease(COLLECTOR_KEY, &value.value);
-    lease.is_live_at(now_ms()).then_some(lease)
+    if lease.is_live_at(now_ms()) {
+        return Some(lease);
+    }
+    let _ = meta.execute(KvCommand::RevisionTxn {
+        guards: vec![RevisionGuard {
+            key: COLLECTOR_KEY.into(),
+            expected_mod_revision: value.mod_revision,
+        }],
+        ops: vec![TxnOp::Delete {
+            key: COLLECTOR_KEY.into(),
+        }],
+    });
+    None
 }
 
 /// Acquires the collector lease, refusing when another pass already holds it.
@@ -461,12 +759,13 @@ pub fn acquire_collector<FS: StorageFs>(
     ttl_ms: u64,
 ) -> Result<CollectorGuard<'_, FS>, MetaError> {
     let id = new_lease_id();
-    let lease = GcLease {
+    let mut lease = GcLease {
         id,
         kind: LeaseKind::Collector,
         project_id: 0,
         revision: meta.revision(),
         expires_at_ms: now_ms().saturating_add(ttl_ms.max(1)),
+        mod_revision: 0,
     };
     let value = serde_json::to_vec(&lease)?;
     match meta.execute(KvCommand::RevisionTxn {
@@ -479,11 +778,14 @@ pub fn acquire_collector<FS: StorageFs>(
             value,
         }],
     })? {
-        KvResult::TxnOk { .. } => Ok(CollectorGuard {
-            meta,
-            key: COLLECTOR_KEY.into(),
-            lease,
-        }),
+        KvResult::TxnOk { revision, .. } => {
+            lease.mod_revision = revision;
+            Ok(CollectorGuard {
+                meta,
+                key: COLLECTOR_KEY.into(),
+                lease,
+            })
+        }
         KvResult::CasConflict { .. } => Err(MetaError::Routing(
             "another garbage collection pass holds the collector lease".into(),
         )),
@@ -512,6 +814,150 @@ mod tests {
         assert_eq!(live[0].project_id, 7);
         reader.release().unwrap();
         assert!(live_leases(&meta).unwrap().is_empty());
+    }
+
+    #[test]
+    fn admission_is_closed_while_a_pass_holds_the_collector_record() {
+        let meta = meta();
+        let collector = acquire_collector(&meta, 0, DEFAULT_TTL_MS).unwrap();
+
+        // A reader or writer published now would be invisible to the mark the
+        // pass is about to take, so both are refused instead.
+        let Err(refused) = acquire_reader(&meta, 1, 1, DEFAULT_TTL_MS) else {
+            panic!("admission must be closed while a pass holds the collector record");
+        };
+        assert!(
+            refused
+                .to_string()
+                .contains("garbage collection is running"),
+            "{refused}"
+        );
+        let Err(refused) = acquire_writer(&meta, 1, 1, DEFAULT_TTL_MS) else {
+            panic!("admission must be closed while a pass holds the collector record");
+        };
+        assert!(
+            refused
+                .to_string()
+                .contains("garbage collection is running"),
+            "{refused}"
+        );
+        assert!(
+            meta.scan_prefix(READER_PREFIX).is_empty()
+                && meta.scan_prefix(WRITER_PREFIX).is_empty(),
+            "a refused admission must not leave a record behind"
+        );
+
+        // Once the pass is gone, admission reopens.
+        collector.release().unwrap();
+        let reader = acquire_reader(&meta, 1, 1, DEFAULT_TTL_MS).unwrap();
+        reader.release().unwrap();
+        let writer = acquire_writer(&meta, 1, 1, DEFAULT_TTL_MS).unwrap();
+        writer.release().unwrap();
+    }
+
+    #[test]
+    fn a_lost_lease_cannot_release_or_guard_its_successors_record() {
+        let meta = meta();
+        let mut lease = acquire_writer(&meta, 1, 1, DEFAULT_TTL_MS).unwrap();
+        let key = lease.key().to_string();
+        let stale = lease.lease().clone();
+
+        // Simulate the record expiring, being reaped, and the key being taken
+        // over by a later holder (same key, later revision).
+        let mut successor = stale.clone();
+        successor.id = "successor".into();
+        meta.execute(KvCommand::Put {
+            key: key.clone(),
+            value: serde_json::to_vec(&successor).unwrap(),
+        })
+        .unwrap();
+
+        // The stale holder can neither prove its fence nor extend it.
+        assert!(lease.ensure_live().is_err());
+        assert!(lease.renew(DEFAULT_TTL_MS).is_err());
+        // A publication guarded by the stale lease loses its CAS.
+        assert!(matches!(
+            meta.execute(KvCommand::RevisionTxn {
+                guards: vec![stale.guard()],
+                ops: vec![TxnOp::Put {
+                    key: "/db/1/proof".into(),
+                    value: b"published".to_vec(),
+                }],
+            })
+            .unwrap(),
+            KvResult::CasConflict { .. }
+        ));
+        assert!(meta.get("/db/1/proof").is_none());
+
+        // Releasing through the stale value is a no-op, not a deletion.
+        assert!(release(&meta, &stale).is_ok());
+        assert!(meta.get(&key).is_some());
+        // Dropping the guard must not delete the successor's record either.
+        drop(lease);
+        assert!(
+            meta.get(&key).is_some(),
+            "a lost lease must never delete the record that replaced it"
+        );
+    }
+
+    #[test]
+    fn a_renewed_lease_keeps_its_ownership_and_extends_its_ttl() {
+        let meta = meta();
+        let guard = acquire_writer(&meta, 1, 1, 1).unwrap();
+        let lease = guard.lease().clone();
+        let first = lease.mod_revision;
+        assert!(first > 0, "the publication revision is the ownership token");
+        let renewed = renew(&meta, &lease, DEFAULT_TTL_MS).unwrap();
+        assert!(
+            renewed.mod_revision > first,
+            "renewal republishes the record"
+        );
+        assert!(renewed.expires_at_ms > lease.expires_at_ms);
+        assert!(ensure_live(&meta, &renewed).is_ok());
+        // The superseded token no longer owns the record.
+        assert!(ensure_live(&meta, &lease).is_err());
+        assert!(renew(&meta, &lease, DEFAULT_TTL_MS).is_err());
+        // Renewing a lease that was never published is refused rather than
+        // silently treated as ownership.
+        let mut unpublished = renewed.clone();
+        unpublished.mod_revision = 0;
+        assert!(renew(&meta, &unpublished, DEFAULT_TTL_MS).is_err());
+    }
+
+    #[test]
+    fn a_superseded_collector_cannot_renew_delete_or_release_the_record() {
+        let meta = meta();
+        let collector = acquire_collector(&meta, 0, DEFAULT_TTL_MS).unwrap();
+        let stale = collector.lease().clone();
+
+        // Another pass took the record over (the previous one expired and was
+        // reaped). Every operation of the superseded pass must now refuse: it may
+        // not extend its fence, may not delete, and may not remove the record.
+        let mut successor = stale.clone();
+        successor.id = "successor".into();
+        meta.execute(KvCommand::Put {
+            key: COLLECTOR_KEY.into(),
+            value: serde_json::to_vec(&successor).unwrap(),
+        })
+        .unwrap();
+
+        let mut collector = collector;
+        assert!(collector.ensure_owned().is_err());
+        let renewed = collector.renew(DEFAULT_TTL_MS);
+        assert!(
+            renewed
+                .unwrap_err()
+                .to_string()
+                .contains("lost the collector lease"),
+            "renewal must report the lost fence"
+        );
+        assert!(collector.release().is_err());
+        assert!(
+            meta.get(COLLECTOR_KEY).is_some(),
+            "the successor's record must survive the superseded pass"
+        );
+        // `release` consumed the guard only on success, so Drop runs too.
+        assert!(live_collector(&meta).is_some());
     }
 
     #[test]
@@ -565,9 +1011,12 @@ mod tests {
         })
         .unwrap();
         assert!(live_collector(&meta).is_none());
-        // A fresh pass can take over an expired record.
-        let value = meta.get(COLLECTOR_KEY).unwrap();
-        let third = acquire_collector(&meta, value.mod_revision, DEFAULT_TTL_MS).unwrap();
+        // The expired record is reaped, not merely ignored: leaving it in place
+        // would refuse every reader and writer, which are only admitted while
+        // this key is absent. A fresh pass therefore takes it from the absent
+        // state.
+        assert!(meta.get(COLLECTOR_KEY).is_none());
+        let third = acquire_collector(&meta, 0, DEFAULT_TTL_MS).unwrap();
         third.release().unwrap();
     }
 

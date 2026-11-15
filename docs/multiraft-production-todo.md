@@ -352,18 +352,37 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   writers a 300 s lease between the fragment append and the publication that
   names it; the collector re-checks the fence immediately before its mark, so a
   read or write that started first is seen. A node keeps one reader lease and
-  reuses it while it has more than 15 s of life left: a fresh record per
-  statement would put two Raft entries in the log for every `SELECT`, and the
-  live record already blocks a pass. Reuse also means a node stops blocking
-  collection one TTL after its last read, so a pass needs about 30 s without
-  reads on each node rather than a microsecond gap. The pass raises a durable
+  reuses it, renewing it at the start of each read: a fresh record per statement
+  would put two Raft entries in the log for every `SELECT`, and the live record
+  already blocks a pass. Reuse also means a node stops blocking collection one
+  TTL after its last read, so a pass needs about 30 s without reads on each node
+  rather than a microsecond gap.
+  Admission and collection are mutually exclusive *by transaction*, not by a
+  read-then-write sequence: publishing a reader or writer record guards two keys
+  at once (the record's own never-reused id slot, and the collector record being
+  absent), so a lease either exists before the pass checks the fence or loses its
+  CAS. Every record carries the `mod_revision` it was published at as an
+  ownership token: renewal, release and drop are CAS-guarded by it, so a holder
+  that lost its record cannot extend it, delete it, or delete the record of the
+  pass that took over. A pass renews its own collector record before the
+  watermark, before the first deletion and before each pool, and stops deleting
+  if a renewal loses. A write joins its lease's guard to the transaction that
+  publishes the map or manifest, so a writer that stalled past its lease is
+  refused instead of publishing fragments a pass has already reclaimed; a read
+  verifies its lease after fetching and answers `503` if it did not survive the
+  read, because a pass may have reaped the expired record and reclaimed what was
+  just read. The pass raises a durable
   `/gc/watermark` to the revision of its mark before it re-checks the fence; a
   reader publishes its lease first and then refuses with `503` if its applied
   revision is behind that watermark, which is the case a lease alone cannot
   cover — a lagging follower can still hold a manifest whose fragments a
-  completed pass already reclaimed. `/s3-retired/` is deliberately not
-  live: a retired manifest is unreachable to reads, so its chunks are exactly
-  what an overwrite or delete made garbage (the records themselves are kept).
+  completed pass already reclaimed. Because only the leader can publish a lease,
+  a legacy follower no longer serves a read locally: it proxies the request (with
+  its `Range` header) to the leader, which is also what keeps default reads
+  working instead of failing every statement on a follower. `/s3-retired/` is
+  deliberately not live: a retired manifest is unreachable to reads, so its
+  chunks are exactly what an overwrite or delete made garbage (the records
+  themselves are kept).
   Measured in the daemon suite (bytes on disk, before → after): repeated block
   overwrite 9,513,240 → 198,339 (live set 196,608, 2,256 fragments deleted);
   table flush plus compaction 228,765 → 42,369 (live 20,739, 651 fragments);
@@ -382,9 +401,16 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   busy node refuses rather than waits for a quiet window, and there is no
   grace-period scheduling; `/s3-retired/` records are retained indefinitely; the
   300 s writer TTL is the only bound on a crashed writer blocking collection; a
-  read that outlives its own 30 s lease is not fenced (nothing refreshes it
-  mid-read); and no test runs a real multi-node pool, so remote enumeration,
-  remote barriers and remote compaction are only exercised in-process.
+  legacy follower's proxied read is limited by the forwarding wire cap (16 MiB
+  of body, the same limit keyed writes already have), so a larger block or object
+  read must go to the leader directly; and no test runs a real multi-node pool,
+  so remote enumeration, remote barriers and remote compaction are only exercised
+  in-process. The admission fence, ownership-guarded renewal/release and the
+  publication guard are covered by unit tests (`admission_is_closed_while_a_pass_holds_the_collector_record`,
+  `a_lost_lease_cannot_release_or_guard_its_successors_record`,
+  `a_superseded_collector_cannot_renew_delete_or_release_the_record`,
+  `a_renewed_lease_keeps_its_ownership_and_extends_its_ttl`,
+  `a_write_whose_lease_was_reaped_does_not_publish`).
 - [x] Bound the metadata Raft log. The legacy Raft log is now checkpointed and
   compacted: `metakv/checkpoint.json` holds the durable state image (atomic
   write: tmp, `sync_data`, rename, `sync_dir`), `raft.wal` is rewritten through
