@@ -504,6 +504,57 @@ and `POST /v1/idempotency/resolve` with `{"scope":"control","key":"<key>"}` answ
 `committed`, `not_committed`, or `unknown`. Keys are not supported on SQL, S3 or
 block writes (501), and the record set has no quota yet.
 
+## Local dev cluster
+
+`scripts/yadb-dev.py` starts a persistent three-node **legacy-runtime** cluster on
+loopback with the PostgreSQL, S3 and iSCSI listeners enabled, so real clients can be
+used against it. It is separate from `scripts/yadb-local.py`, which provisions an
+OpenRaft-only cluster with no client protocols. Build the daemon once, then:
+
+```bash
+cargo build -p yadbd --offline --locked -j 2
+
+# First start also applies examples/platform.yaml and prints every endpoint,
+# the credentials path and the generated password.
+python3 scripts/yadb-dev.py start
+python3 scripts/yadb-dev.py status      # compares state.json with live PIDs and ports
+python3 scripts/yadb-dev.py logs --lines 50
+
+# stop and start again: same data dirs, peers and Raft token; manifests are not re-applied
+python3 scripts/yadb-dev.py stop
+python3 scripts/yadb-dev.py start
+```
+
+Ports derive from one `--port-base` (default `18000`): HTTP `base+0..2`, PostgreSQL
+`base+100..102`, S3 `base+200..202`, iSCSI `base+300..302`. The base is recorded in
+`state.json` on first start and must be reused for that root; use a new `--root` for a
+second cluster. The default root is
+`/data/data/com.foxdebug.acodefree/cache/opencode/yadb-dev`. Start refuses if any
+derived port is bound, if state says running and the PIDs are alive, or if a recorded
+process is missing; the last case needs an explicit `--force`. It never wipes data,
+never re-initialises an existing directory and never retries an `apply` whose outcome
+is unknown. Credentials live in `<root>/credentials.json` (mode 0600, user `backend`,
+database `billing/ledger`); the legacy runtime needs no `--admin-subject`, so
+`/v1/apply` keeps its historical loopback behaviour.
+
+```bash
+# psql, including the extended protocol (\bind)
+PGPASSWORD=<printed password> PGSSLMODE=disable \
+  psql -h 127.0.0.1 -p 18100 -U backend -d billing/ledger -c 'SELECT 1;'
+printf 'SELECT id FROM t WHERE id = $1 \\bind 1 \\g\n' | \
+  PGPASSWORD=<printed password> PGSSLMODE=disable \
+  psql -h 127.0.0.1 -p 18100 -U backend -d billing/ledger
+
+# AWS CLI (path-style addressing is required)
+AWS_ACCESS_KEY_ID=backend AWS_SECRET_ACCESS_KEY=<printed password> \
+AWS_DEFAULT_REGION=us-east-1 AWS_EC2_METADATA_DISABLED=true \
+  aws --endpoint-url http://127.0.0.1:18200 s3 cp ./file s3://invoices-2026/dev/file
+```
+
+The iSCSI target is `iqn.2026-11.io.yadb:billing:vm-root` on `base+300..302` with
+CHAP user `backend`; discovery advertises all three portals. These listeners are
+cleartext on loopback: keep them local and treat the whole root as secret.
+
 ## Quickstart
 
 ```bash
