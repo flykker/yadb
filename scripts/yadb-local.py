@@ -394,6 +394,14 @@ def node_command(root, http_base, node, peers):
 def run(root):
     os.umask(0o077)
     root = root.resolve(strict=True)
+    marker = root / '.yadb-backup-in-progress'
+    try:
+        marker.lstat()
+    except FileNotFoundError:
+        pass
+    else:
+        raise RuntimeError(f'Deployment root is under an offline backup ({marker}); '
+                           'finish or explicitly discard the backup and remove the marker.')
     with (root / 'supervisor.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         statepath = root / 'state.json'

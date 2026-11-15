@@ -4103,6 +4103,18 @@ async fn handle_pools_scrub(State(st): State<AppState>, headers: HeaderMap) -> R
     }
 }
 
+fn refuse_if_backup_in_progress(data_dir: &std::path::Path) -> Result<(), String> {
+    let marker = data_dir.join(".yadb-backup-in-progress");
+    match std::fs::symlink_metadata(&marker) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("cannot inspect backup marker {}: {e}", marker.display())),
+        Ok(_) => Err(format!(
+            "deployment root is under an offline backup ({}); finish or explicitly discard the backup and remove the marker",
+            marker.display()
+        )),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
@@ -4148,6 +4160,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let data_dir = args.data_dir.clone().unwrap_or_else(|| {
         PathBuf::from("/data/data/com.foxdebug.acodefree/cache/opencode/yadbd-data")
     });
+    refuse_if_backup_in_progress(&data_dir)?;
     if !client_openraft
         && (data_dir.join(".yadb-openraft-runtime.json").exists()
             || data_dir.join(".yadb-openraft-runtime.pending").exists())
@@ -4477,6 +4490,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod security_tests {
     use super::*;
+
+    #[test]
+    fn backup_marker_refuses_startup() {
+        let dir = std::env::temp_dir().join(format!(
+            "yadbd-backup-marker-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        assert!(refuse_if_backup_in_progress(&dir).is_ok());
+        let marker = dir.join(".yadb-backup-in-progress");
+        std::fs::write(&marker, b"backup").unwrap();
+        assert!(refuse_if_backup_in_progress(&dir)
+            .unwrap_err()
+            .contains(marker.to_str().unwrap()));
+        std::fs::remove_file(marker).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
 
     #[test]
     fn idempotency_validation_and_fingerprint() {
