@@ -166,7 +166,6 @@ impl MetaStateMachine {
 
     /// Export only durable key/value state. Watch channels are runtime-owned
     /// and intentionally are not part of a restart or snapshot image.
-    #[cfg(any(test, feature = "openraft-storage"))]
     pub(crate) fn durable_snapshot(&self) -> MetaSnapshot {
         MetaSnapshot {
             revision: self.revision,
@@ -175,12 +174,14 @@ impl MetaStateMachine {
     }
 
     /// Restore durable state and discard pre-restart watchers.
-    #[cfg(any(test, feature = "openraft-storage"))]
     pub(crate) fn restore_durable_snapshot(&mut self, snapshot: MetaSnapshot) {
         self.revision = snapshot.revision;
         self.kv = snapshot.values;
         self.watchers.clear();
-        self.deferred = None;
+        #[cfg(any(test, feature = "openraft-storage"))]
+        {
+            self.deferred = None;
+        }
     }
 
     /// Replace durable data while retaining runtime-owned watch subscriptions.

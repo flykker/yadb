@@ -45,6 +45,15 @@ pub enum MetaError {
     #[error("corrupt Raft WAL: {0}")]
     CorruptWal(&'static str),
 
+    #[error("corrupt metadata checkpoint: {0}")]
+    Checkpoint(String),
+
+    #[error("peer {0} is behind the compacted log base; adding or re-seeding a node needs an install-snapshot path that does not exist")]
+    PeerBehindCompactedBase(u32),
+
+    #[error("metadata log compaction failed ({0}); this node refuses further work until it is restarted")]
+    CompactionFailed(String),
+
     #[error("node is not Raft leader (known leader: {leader:?})")]
     NotLeader { leader: Option<u32> },
 
@@ -211,6 +220,7 @@ mod tests {
                 prev_log_term: 0,
                 entries: vec![],
                 leader_commit: 0,
+                compaction_floor: 0,
             })
             .unwrap();
         let rpc = RaftRpc::AppendEntries {
@@ -227,6 +237,7 @@ mod tests {
                 },
             }],
             leader_commit: 1,
+            compaction_floor: 0,
         };
         fs.set_faults(FaultConfig {
             sync_data_fault: SyncFault::BeforePersist,
@@ -281,6 +292,7 @@ mod tests {
                 prev_log_term: 0,
                 entries: vec![],
                 leader_commit: 0,
+                compaction_floor: 0,
             };
             follower.step(heartbeat).unwrap(); // persist term before faulting log
             let rpc = RaftRpc::AppendEntries {
@@ -297,6 +309,7 @@ mod tests {
                     },
                 }],
                 leader_commit: 1,
+                compaction_floor: 0,
             };
             fs.set_faults(faults);
             assert!(matches!(follower.step(rpc.clone()), Err(MetaError::Io(_))));
@@ -358,6 +371,7 @@ mod tests {
                     prev_log_term: 0,
                     entries: vec![],
                     leader_commit: 0,
+                    compaction_floor: 0,
                 }),
                 Err(MetaError::StorageUnavailable)
             ));
@@ -555,6 +569,7 @@ mod tests {
                 prev_log_term: term,
                 entries: vec![],
                 leader_commit: common + 2,
+                compaction_floor: 0,
             })
             .unwrap();
         assert!(
