@@ -182,22 +182,56 @@ unchanged; `POST /v1/idempotency/resolve` returned `committed` for the used key 
 establish: no response-loss injection, no leader kill during a keyed apply, no
 follower-forwarded keyed apply, and no quota behaviour, because no quota exists.
 
-Project-scope idempotency exists for block UNMAP only, and its live and
-integration evidence is narrower than the control scope's. The integration test
-`three_daemons_forward_http_to_different_group_leaders` drives it through the
-real daemon: an unproven identity gets 401 and a verified non-member 403 before
-any record exists; the same key in two projects produces two independent records;
-a replay returns 200 and the recorded response; the same key with a different
-range or a byte-different JSON body of the same range returns 409
-`idempotency_key_conflict`; `resolve` with `scope: project` returns `committed`
-from the project group; a fenced key returns `not_committed` and a later keyed
-UNMAP with it returns 409 `idempotency_key_fenced`; a control payload carrying
-`project`, a project payload without it, and an unknown scope all return 400. The
-legacy runtime refuses a keyed UNMAP with 501. What this does not establish: no
-crash between map publication and record (they are one transaction by
-construction, but no fault injection proves it), no concurrent same-key race
-across two nodes, no leader loss during the publication, and no quota exhaustion
-on a real project group — the counter's ceiling is covered by unit tests only.
+Project-scope idempotency exists for block UNMAP, block write and S3 object
+PUT/DELETE. Its live and integration evidence is narrower than the control
+scope's. The integration test
+`three_daemons_forward_http_to_different_group_leaders` drives the UNMAP path
+through the real daemon: an unproven identity gets 401 and a verified non-member
+403 before any record exists; the same key in two projects produces two
+independent records; a replay returns 200 and the recorded response; the same key
+with a different range or a byte-different JSON body of the same range returns
+409 `idempotency_key_conflict`; `resolve` with `scope: project` returns
+`committed` from the project group; a fenced key returns `not_committed` and a
+later keyed UNMAP with it returns 409 `idempotency_key_fenced`; a control payload
+carrying `project`, a project payload without it, and an unknown scope all return
+400. The legacy runtime refuses a keyed UNMAP with 501.
+
+Block write and S3 PUT/DELETE share the same contract and the same record
+namespace and counter, but their evidence is in-process only. Block write
+publishes through `BlockVolumeEngine::write_at_with`; S3 PUT/DELETE publish or
+retire the manifest through `ObjectStoreEngine::put_object_with` /
+`delete_object_with`. In both cases the record and the admission counter are
+appended to the *same* guarded `RevisionTxn` as the map/manifest mutation, so a
+caller guard that cannot be satisfied leaves neither half. The engine tests prove
+that by comparing `mod_revision` of the mutation and the record after a
+successful keyed call, and by asserting that a never-satisfiable caller guard
+leaves the map/object unchanged and no record behind. A write's immutable
+fragments are staged before the publication: a refusal, conflict or crash before
+the publication leaves them unreferenced, and the orphan scan reclaims them (for
+S3 the `Prepared` intent is the collectable handle). No test injects a crash
+between the fragment write and the publication, and the tests assert the
+contract, not that a partially written fragment is unreadable.
+
+The S3 replay reproduces the gateway's success shape exactly: 200 with the
+`etag`/`size`/`chunks`/`pool` JSON body and the `ETag` header for PUT, and 200
+with `{"deleted": …}` for DELETE (the wire protocol wraps the same responses as
+200 + `ETag` and 204 respectively). What this does not establish: no real S3
+client exercised a replay, no crash was injected between map/manifest publication
+and the record (they are one transaction by construction), no concurrent same-key
+race across two nodes, no leader loss during the publication, and no quota
+exhaustion on a real project group — the counter's ceiling is covered by unit
+tests only. The keyed S3 wire path additionally depends on a configured
+`--subject-secret` (the gateway mints the internal subject signature from the
+SigV4-authenticated identity), which no daemon test exercises.
+
+SQL writes are deliberately still not keyed: `POST /db/{project}/db/query` with
+an `Idempotency-Key` and a write script returns 501. A script can mutate any
+number of tables, shards and secondary indexes through
+`DatabaseEngine::commit_tx_buffer_at_boundaries`, and each of those builds its own
+metadata transactions; making the script keyed requires threading the record and
+its counter into that transaction. A handler-level record committed separately
+from the data would reintroduce exactly the ambiguity the key exists to remove,
+so the gap is stated rather than papered over.
 
 That was also exercised live on the three-process deployment (binary
 `b00018a9f092da23d3cfae818bc0e4ac7008dea659abca6336924bfeb7f87ddc`, built from

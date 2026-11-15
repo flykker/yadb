@@ -2146,6 +2146,67 @@ fn block_unmap_fingerprint(project_id: u32, volume: &str, body: &[u8]) -> String
     sha256_hex(&encoded)
 }
 
+/// Fingerprint of a keyed block write.
+///
+/// The target is named by immutable project id plus volume name, the offset is
+/// included explicitly because it is a query parameter rather than part of the
+/// body, and the body is hashed exactly as received. Every field is
+/// length-prefixed, so a decimal offset cannot run into the body bytes and two
+/// requests that merely parse to the same values cannot share a digest. The
+/// operation tag keeps this domain separate from `block_unmap_fingerprint`: the
+/// same key reused for a write and an unmap is a conflict, not a replay.
+fn block_write_fingerprint(project_id: u32, volume: &str, offset: u64, body: &[u8]) -> String {
+    let project = project_id.to_string();
+    let offset = offset.to_string();
+    let mut encoded = Vec::new();
+    for field in [
+        b"yadb-project-idempotency-v1".as_slice(),
+        b"PUT".as_slice(),
+        b"block-write".as_slice(),
+        project.as_bytes(),
+        volume.as_bytes(),
+        offset.as_bytes(),
+        body,
+    ] {
+        encoded.extend_from_slice(&(field.len() as u64).to_be_bytes());
+        encoded.extend_from_slice(field);
+    }
+    sha256_hex(&encoded)
+}
+
+/// Fingerprint of a keyed S3 object mutation.
+///
+/// `method`/`operation` keep PUT and DELETE in separate domains (and separate
+/// from the block domains), and the body is hashed as received; DELETE hashes an
+/// empty body. Length-prefixing every field makes store, bucket and key
+/// unambiguous even though S3 keys may contain any separator.
+fn s3_object_fingerprint(
+    method: &str,
+    operation: &str,
+    project_id: u32,
+    store: &str,
+    bucket: &str,
+    key: &str,
+    body: &[u8],
+) -> String {
+    let project = project_id.to_string();
+    let mut encoded = Vec::new();
+    for field in [
+        b"yadb-project-idempotency-v1".as_slice(),
+        method.as_bytes(),
+        operation.as_bytes(),
+        project.as_bytes(),
+        store.as_bytes(),
+        bucket.as_bytes(),
+        key.as_bytes(),
+        body,
+    ] {
+        encoded.extend_from_slice(&(field.len() as u64).to_be_bytes());
+        encoded.extend_from_slice(field);
+    }
+    sha256_hex(&encoded)
+}
+
 /// The record and admission counter for one project group, read in a single
 /// quorum-confirmed snapshot.
 ///
@@ -2229,11 +2290,10 @@ async fn s3_wire_dispatch(
     State(st): State<protocols::s3::S3State>,
     req: axum::extract::Request,
 ) -> Response {
-    if (req.method() == axum::http::Method::PUT || req.method() == axum::http::Method::DELETE)
-        && req.headers().contains_key("idempotency-key")
-    {
-        return unsupported_idempotency();
-    }
+    // Keyed PUT/DELETE are not refused here: the wire protocol forwards the
+    // header to the same gateway handlers the JSON routes use, so a replay
+    // returns the recorded response through the normal success wrapper (200 +
+    // ETag for PUT, 204 for DELETE).
     protocols::s3::handle(State(st), req).await
 }
 
@@ -2962,6 +3022,15 @@ async fn handle_db_query(
 
     let has_writes = script_has_writes(&stmts);
     if headers.contains_key("idempotency-key") {
+        // SQL writes are deliberately still unkeyed. A script can mutate any
+        // number of tables, shards and secondary indexes through
+        // `DatabaseEngine::commit_tx_buffer_at_boundaries`, which builds its own
+        // metadata transactions; keying it means threading the record and its
+        // counter into *that* transaction (or proving the script's visible
+        // effects are recoverable from one), not appending ops here. Until then
+        // the honest answer is 501 rather than a record that commits separately
+        // from the data. Read-only scripts are refused separately because a key
+        // on them would be meaningless rather than unsupported.
         return if has_writes {
             unsupported_idempotency()
         } else {
@@ -3104,7 +3173,12 @@ async fn handle_block_write(
     body: Bytes,
 ) -> Response {
     if headers.contains_key("idempotency-key") {
-        return unsupported_idempotency();
+        // A legacy runtime has no record store, so the key is refused before
+        // authorization, parsing or any mutation, exactly like keyed UNMAP.
+        if !st.meta.is_openraft() {
+            return unsupported_idempotency();
+        }
+        return keyed_block_write(&st, &headers, &project, &volume, q.offset, &body).await;
     }
     if let Some(proxied) = maybe_forward_write(
         &st,
@@ -3623,6 +3697,240 @@ async fn keyed_block_unmap(
     }
 }
 
+/// Keyed block write: the extent-map publication and the idempotency record
+/// commit in one guarded `RevisionTxn` (`BlockVolumeEngine::write_at_with`).
+///
+/// The new fragments are written before the publication, so a refusal, an
+/// exhausted retry bound or a crash before the publication leaves them
+/// unreferenced. They are immutable garbage that the orphan scan reclaims; no
+/// rollback is attempted. The response body depends only on the request
+/// (`bytes_written` is the body length the engine reports), so it is built and
+/// recorded before the transaction and replayed verbatim afterwards.
+async fn keyed_block_write(
+    st: &AppState,
+    headers: &HeaderMap,
+    project: &str,
+    volume: &str,
+    offset: u64,
+    body: &Bytes,
+) -> Response {
+    let key = match idempotency_header(headers) {
+        Ok(Some(key)) => key,
+        Ok(None) => unreachable!("the keyed path is chosen from this header"),
+        Err(e) => return e,
+    };
+    // A project record is keyed by subject, so an unproven identity has no
+    // scope to be idempotent in (same rule as keyed UNMAP).
+    let Some(subject) = verified_subject(headers, st.subject_secret.as_deref()) else {
+        return ControlAdminError::Unverified.into_response();
+    };
+    if let Some(resp) = maybe_forward_write(
+        st,
+        headers,
+        Some(project),
+        "PUT",
+        format!("{}?offset={}", block_path(project, volume), offset),
+        "application/octet-stream".into(),
+        body.clone(),
+    )
+    .await
+    {
+        return resp;
+    }
+    let (pid, pool_name, size) = {
+        let cp = match st.control_for_authorization_async().await {
+            Ok(cp) => cp,
+            Err(e) => return e.into_response(),
+        };
+        match resolve_block_target(&cp, project, volume, &subject, Role::ReadWrite) {
+            Ok(v) => v,
+            Err(r) => return r,
+        }
+    };
+    let scope = match project_idempotency_scope(st, pid).await {
+        Ok(scope) => scope,
+        Err(resp) => return resp,
+    };
+    let record_key = project_record_key(&scope.records, &subject, &key);
+    let fingerprint = block_write_fingerprint(pid, volume, offset, body);
+    // Fast path: an existing record replays without touching the volume.
+    let pre = {
+        let meta = st.meta.clone();
+        let record_key = record_key.clone();
+        let usage_key = scope.usage_key.clone();
+        match tokio::task::spawn_blocking(move || {
+            read_project_apply_snapshot(&meta, &record_key, &usage_key)
+        })
+        .await
+        {
+            Ok(Ok(snapshot)) => snapshot,
+            Ok(Err(e)) => return api_err(StatusCode::SERVICE_UNAVAILABLE, e),
+            Err(e) => return api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        }
+    };
+    if let Some(record) = pre.record {
+        return replay_record(record, &fingerprint);
+    }
+    if pre.usage.records >= MAX_IDEMPOTENCY_RECORDS {
+        // Cheap refusal before any fragment is written; the exact byte budget is
+        // re-checked once the record is serialized, inside the map transaction.
+        return idempotency_quota_response();
+    }
+    let response_body = match serde_json::to_vec(&serde_json::json!({
+        "offset": offset,
+        "bytes_written": body.len(),
+    })) {
+        Ok(body) => body,
+        Err(e) => return api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+    let record = IdempotencyRecord {
+        version: 1,
+        fingerprint: fingerprint.clone(),
+        outcome: "committed".into(),
+        response: Some(RecordedResponse {
+            status: StatusCode::OK.as_u16(),
+            headers: BTreeMap::from([("content-type".into(), "application/json".into())]),
+            body_base64: BASE64.encode(response_body),
+        }),
+    };
+    let encoded = match serde_json::to_vec(&record) {
+        Ok(encoded) => encoded,
+        Err(e) => return api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+    // The engine retries a guard conflict up to its own bound and cannot tell
+    // which guard failed, so the closure re-reads the record and the counter on
+    // every attempt. A record that appeared means a concurrent attempt already
+    // won this key; a stale counter revision would only spin.
+    //
+    // Every refusal returns `Err` from `prepare`, which propagates out of
+    // `write_at_with` immediately without another attempt, and the captured
+    // response is what the handler returns. `Conflict` is used only because the
+    // engine needs an error to propagate; the outer match takes the captured
+    // response before it treats the failure as a map conflict.
+    let abort: std::sync::Arc<std::sync::Mutex<Option<Response>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
+    let abort_in = abort.clone();
+    let block = st.block.clone();
+    let meta = st.meta.clone();
+    let volume_owned = volume.to_owned();
+    let pool_in = pool_name.clone();
+    let record_key_in = record_key.clone();
+    let usage_key_in = scope.usage_key.clone();
+    let fingerprint_in = fingerprint.clone();
+    let body_in = body.clone();
+    let res = tokio::task::spawn_blocking(move || {
+        block.write_at_with(
+            pid,
+            &volume_owned,
+            &pool_in,
+            size,
+            offset,
+            &body_in,
+            |_map: &yadb_block::VolumeExtentMap| {
+                let snapshot = match meta
+                    .try_linearizable_snapshot(&[record_key_in.clone(), usage_key_in.clone()], &[])
+                {
+                    Ok(snapshot) => snapshot,
+                    Err(e) => {
+                        *abort_in.lock().unwrap() =
+                            Some(api_err(StatusCode::SERVICE_UNAVAILABLE, e.to_string()));
+                        return Err(BlockError::Conflict);
+                    }
+                };
+                if let Some(kv) = snapshot.get(&record_key_in) {
+                    let response = match serde_json::from_slice::<IdempotencyRecord>(&kv.value) {
+                        Ok(record) => replay_record(record, &fingerprint_in),
+                        Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+                    };
+                    *abort_in.lock().unwrap() = Some(response);
+                    return Err(BlockError::Conflict);
+                }
+                let (usage, usage_revision) = match snapshot.get(&usage_key_in) {
+                    Some(kv) => match decode_usage(&kv.value) {
+                        Ok(usage) => (usage, kv.mod_revision),
+                        Err(e) => {
+                            *abort_in.lock().unwrap() =
+                                Some(api_err(StatusCode::INTERNAL_SERVER_ERROR, e));
+                            return Err(BlockError::Conflict);
+                        }
+                    },
+                    None => (
+                        IdempotencyUsage {
+                            version: 1,
+                            ..IdempotencyUsage::default()
+                        },
+                        0,
+                    ),
+                };
+                let (record_op, usage_op) =
+                    match admission_writes(&usage, &usage_key_in, &record_key_in, &encoded) {
+                        Ok(ops) => ops,
+                        Err(response) => {
+                            *abort_in.lock().unwrap() = Some(response);
+                            return Err(BlockError::Conflict);
+                        }
+                    };
+                Ok(yadb_block::MapPublication {
+                    guards: vec![
+                        yadb_metakv::RevisionGuard {
+                            key: record_key_in.clone(),
+                            expected_mod_revision: 0,
+                        },
+                        yadb_metakv::RevisionGuard {
+                            key: usage_key_in.clone(),
+                            expected_mod_revision: usage_revision,
+                        },
+                    ],
+                    ops: vec![record_op, usage_op],
+                })
+            },
+        )
+    })
+    .await;
+    match res {
+        Ok(Ok(_written)) => replay_record(record, &fingerprint),
+        Ok(Err(BlockError::Conflict)) => {
+            if let Some(response) = abort.lock().unwrap().take() {
+                return response;
+            }
+            // A definite non-commit: re-read the record to tell "a concurrent
+            // attempt committed this key" from "the map moved under us". Never
+            // retry the write blindly.
+            let meta = st.meta.clone();
+            let record_key_in = record_key.clone();
+            let record_key_read = record_key.clone();
+            match tokio::task::spawn_blocking(move || {
+                meta.try_linearizable_snapshot(&[record_key_in], &[])
+                    .map_err(|e| e.to_string())
+            })
+            .await
+            {
+                Ok(Ok(snapshot)) => match snapshot.get(&record_key_read) {
+                    Some(kv) => match serde_json::from_slice::<IdempotencyRecord>(&kv.value) {
+                        Ok(record) => replay_record(record, &fingerprint),
+                        Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+                    },
+                    None => api_err(
+                        StatusCode::CONFLICT,
+                        "block map changed; re-read the volume and retry",
+                    ),
+                },
+                _ => api_err(StatusCode::SERVICE_UNAVAILABLE, "quorum unavailable"),
+            }
+        }
+        Ok(Err(e @ BlockError::OutOfBounds { .. })) => {
+            api_err(StatusCode::RANGE_NOT_SATISFIABLE, e.to_string())
+        }
+        Ok(Err(BlockError::Meta(me))) => meta_err_resp(st, me),
+        Ok(Err(BlockError::Blob(BlobError::RedundancyNotMet { .. }))) => api_err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "storage pool cannot reach full redundancy; the write was refused",
+        ),
+        Ok(Err(e)) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
 // ============================================================================
 // S3 ObjectStore Gateway (`/s3/{project}/{store}/{bucket}[/{*key}]`)
 // ============================================================================
@@ -3695,7 +4003,12 @@ async fn handle_s3_put(
     body: Bytes,
 ) -> Response {
     if headers.contains_key("idempotency-key") {
-        return unsupported_idempotency();
+        // A legacy runtime has no record store, so the key is refused before
+        // authorization or any fragment write.
+        if !st.meta.is_openraft() {
+            return unsupported_idempotency();
+        }
+        return keyed_s3_put(&st, &headers, &project, &store, &bucket, &key, &body).await;
     }
     let content_type = headers
         .get(header::CONTENT_TYPE)
@@ -3863,7 +4176,10 @@ async fn handle_s3_delete(
     Path((project, store, bucket, key)): Path<(String, String, String, String)>,
 ) -> Response {
     if headers.contains_key("idempotency-key") {
-        return unsupported_idempotency();
+        if !st.meta.is_openraft() {
+            return unsupported_idempotency();
+        }
+        return keyed_s3_delete(&st, &headers, &project, &store, &bucket, &key).await;
     }
     if let Some(proxied) = maybe_forward_write(
         &st,
@@ -3908,6 +4224,497 @@ async fn handle_s3_delete(
     match res {
         Ok(Ok(existed)) => Json(serde_json::json!({ "deleted": existed })).into_response(),
         Ok(Err(S3Error::Meta(me))) => meta_err_resp(&st, me),
+        Ok(Err(e)) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+/// Keyed S3 PUT: the manifest publication, its retirement of the previous
+/// manifest, the intent deletion, the idempotency record and the admission
+/// counter all commit in one guarded `RevisionTxn`
+/// (`ObjectStoreEngine::put_object_with`).
+///
+/// The response is derived from the manifest that is about to be published, so
+/// the replayed body is exactly the `etag`/`size`/`chunks`/`pool` JSON and the
+/// `ETag` header the success path returns — never an invented S3 XML shape.
+/// Fragments and the upload intent are written before the publication; a
+/// refusal or a conflict leaves them unreferenced for the orphan scan, and
+/// nothing rolls them back.
+async fn keyed_s3_put(
+    st: &AppState,
+    headers: &HeaderMap,
+    project: &str,
+    store: &str,
+    bucket: &str,
+    key: &str,
+    body: &Bytes,
+) -> Response {
+    let key_id = match idempotency_header(headers) {
+        Ok(Some(key)) => key,
+        Ok(None) => unreachable!("the keyed path is chosen from this header"),
+        Err(e) => return e,
+    };
+    let Some(subject) = verified_subject(headers, st.subject_secret.as_deref()) else {
+        return ControlAdminError::Unverified.into_response();
+    };
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream")
+        .to_string();
+    if let Some(resp) = maybe_forward_write(
+        st,
+        headers,
+        Some(project),
+        "PUT",
+        format!(
+            "/s3/{}/{}/{}/{}",
+            protocols::url(project),
+            protocols::url(store),
+            protocols::url(bucket),
+            key.split('/')
+                .map(protocols::url)
+                .collect::<Vec<_>>()
+                .join("/")
+        ),
+        content_type.clone(),
+        body.clone(),
+    )
+    .await
+    {
+        return resp;
+    }
+    let (pid, pool_name) = {
+        let cp = match st.control_for_authorization_async().await {
+            Ok(cp) => cp,
+            Err(e) => return e.into_response(),
+        };
+        match resolve_s3_target(&cp, project, store, bucket, &subject, Role::ReadWrite) {
+            Ok(v) => v,
+            Err(resp) => return resp,
+        }
+    };
+    let scope = match project_idempotency_scope(st, pid).await {
+        Ok(scope) => scope,
+        Err(resp) => return resp,
+    };
+    let record_key = project_record_key(&scope.records, &subject, &key_id);
+    let fingerprint = s3_object_fingerprint("PUT", "s3-put", pid, store, bucket, key, body);
+    // Fast path: replay without writing a fragment or an intent.
+    let pre = {
+        let meta = st.meta.clone();
+        let record_key = record_key.clone();
+        let usage_key = scope.usage_key.clone();
+        match tokio::task::spawn_blocking(move || {
+            read_project_apply_snapshot(&meta, &record_key, &usage_key)
+        })
+        .await
+        {
+            Ok(Ok(snapshot)) => snapshot,
+            Ok(Err(e)) => return api_err(StatusCode::SERVICE_UNAVAILABLE, e),
+            Err(e) => return api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        }
+    };
+    if let Some(record) = pre.record {
+        return replay_record(record, &fingerprint);
+    }
+    if pre.usage.records >= MAX_IDEMPOTENCY_RECORDS {
+        return idempotency_quota_response();
+    }
+    // `prepare` runs immediately before the single publication attempt, so the
+    // record and counter are read at the moment of the transaction. A record
+    // that appeared means a concurrent attempt already won this key. The
+    // refusal is reported through the captured response; `ConcurrentModification`
+    // is only the error the engine needs to propagate.
+    let abort: std::sync::Arc<std::sync::Mutex<Option<Response>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
+    let record_out: std::sync::Arc<std::sync::Mutex<Option<IdempotencyRecord>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
+    let abort_in = abort.clone();
+    let record_out_in = record_out.clone();
+    let meta = st.meta.clone();
+    let record_key_in = record_key.clone();
+    let usage_key_in = scope.usage_key.clone();
+    let fingerprint_in = fingerprint.clone();
+    let s3 = st.s3.clone();
+    let store_in = store.to_owned();
+    let pool_in = pool_name.clone();
+    let bucket_in = bucket.to_owned();
+    let key_in = key.to_owned();
+    let content_type_in = content_type.clone();
+    let body_in = body.clone();
+    let res = tokio::task::spawn_blocking(move || {
+        s3.put_object_with(
+            pid,
+            &store_in,
+            &pool_in,
+            &bucket_in,
+            &key_in,
+            &content_type_in,
+            &body_in,
+            |manifest: &yadb_s3::ObjectManifest| {
+                let snapshot = match meta
+                    .try_linearizable_snapshot(&[record_key_in.clone(), usage_key_in.clone()], &[])
+                {
+                    Ok(snapshot) => snapshot,
+                    Err(e) => {
+                        *abort_in.lock().unwrap() =
+                            Some(api_err(StatusCode::SERVICE_UNAVAILABLE, e.to_string()));
+                        return Err(S3Error::ConcurrentModification);
+                    }
+                };
+                if let Some(kv) = snapshot.get(&record_key_in) {
+                    let response = match serde_json::from_slice::<IdempotencyRecord>(&kv.value) {
+                        Ok(record) => replay_record(record, &fingerprint_in),
+                        Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+                    };
+                    *abort_in.lock().unwrap() = Some(response);
+                    return Err(S3Error::ConcurrentModification);
+                }
+                let (usage, usage_revision) = match snapshot.get(&usage_key_in) {
+                    Some(kv) => match decode_usage(&kv.value) {
+                        Ok(usage) => (usage, kv.mod_revision),
+                        Err(e) => {
+                            *abort_in.lock().unwrap() =
+                                Some(api_err(StatusCode::INTERNAL_SERVER_ERROR, e));
+                            return Err(S3Error::ConcurrentModification);
+                        }
+                    },
+                    None => (
+                        IdempotencyUsage {
+                            version: 1,
+                            ..IdempotencyUsage::default()
+                        },
+                        0,
+                    ),
+                };
+                // Exactly what `handle_s3_put` returns on success, including
+                // the ETag header, so a replay is indistinguishable.
+                let response_body = match serde_json::to_vec(&serde_json::json!({
+                    "etag": manifest.etag,
+                    "size": manifest.size,
+                    "chunks": manifest.chunks.len(),
+                    "pool": manifest.pool,
+                })) {
+                    Ok(body) => body,
+                    Err(e) => {
+                        *abort_in.lock().unwrap() =
+                            Some(api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
+                        return Err(S3Error::ConcurrentModification);
+                    }
+                };
+                let record = IdempotencyRecord {
+                    version: 1,
+                    fingerprint: fingerprint_in.clone(),
+                    outcome: "committed".into(),
+                    response: Some(RecordedResponse {
+                        status: StatusCode::OK.as_u16(),
+                        headers: BTreeMap::from([
+                            ("content-type".into(), "application/json".into()),
+                            ("etag".into(), manifest.etag.clone()),
+                        ]),
+                        body_base64: BASE64.encode(response_body),
+                    }),
+                };
+                let encoded = match serde_json::to_vec(&record) {
+                    Ok(encoded) => encoded,
+                    Err(e) => {
+                        *abort_in.lock().unwrap() =
+                            Some(api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
+                        return Err(S3Error::ConcurrentModification);
+                    }
+                };
+                let (record_op, usage_op) =
+                    match admission_writes(&usage, &usage_key_in, &record_key_in, &encoded) {
+                        Ok(ops) => ops,
+                        Err(response) => {
+                            *abort_in.lock().unwrap() = Some(response);
+                            return Err(S3Error::ConcurrentModification);
+                        }
+                    };
+                *record_out_in.lock().unwrap() = Some(record);
+                Ok(yadb_s3::ObjectPublication {
+                    guards: vec![
+                        yadb_metakv::RevisionGuard {
+                            key: record_key_in.clone(),
+                            expected_mod_revision: 0,
+                        },
+                        yadb_metakv::RevisionGuard {
+                            key: usage_key_in.clone(),
+                            expected_mod_revision: usage_revision,
+                        },
+                    ],
+                    ops: vec![record_op, usage_op],
+                })
+            },
+        )
+    })
+    .await;
+    match res {
+        Ok(Ok(_manifest)) => match record_out.lock().unwrap().take() {
+            Some(record) => replay_record(record, &fingerprint),
+            None => api_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "idempotency record was not prepared",
+            ),
+        },
+        Ok(Err(S3Error::ConcurrentModification)) => {
+            if let Some(response) = abort.lock().unwrap().take() {
+                return response;
+            }
+            // A definite non-commit: re-read the record to tell "a concurrent
+            // attempt committed this key" from "the object moved under us".
+            let meta = st.meta.clone();
+            let record_key_in = record_key.clone();
+            let record_key_read = record_key.clone();
+            match tokio::task::spawn_blocking(move || {
+                meta.try_linearizable_snapshot(&[record_key_in], &[])
+                    .map_err(|e| e.to_string())
+            })
+            .await
+            {
+                Ok(Ok(snapshot)) => match snapshot.get(&record_key_read) {
+                    Some(kv) => match serde_json::from_slice::<IdempotencyRecord>(&kv.value) {
+                        Ok(record) => replay_record(record, &fingerprint),
+                        Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+                    },
+                    None => api_err(
+                        StatusCode::CONFLICT,
+                        "object changed; re-read the object and retry",
+                    ),
+                },
+                _ => api_err(StatusCode::SERVICE_UNAVAILABLE, "quorum unavailable"),
+            }
+        }
+        Ok(Err(S3Error::Meta(me))) => meta_err_resp(st, me),
+        Ok(Err(S3Error::Blob(BlobError::RedundancyNotMet { .. }))) => api_err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "storage pool cannot reach full redundancy; the write was refused",
+        ),
+        Ok(Err(e)) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+/// Keyed S3 DELETE: the manifest deletion, its retirement tombstone and the
+/// idempotency record commit in one guarded `RevisionTxn`
+/// (`ObjectStoreEngine::delete_object_with`).
+///
+/// The recorded body is the same `{"deleted": …}` JSON the success path
+/// returns, derived from the existence read that also guards the deletion.
+async fn keyed_s3_delete(
+    st: &AppState,
+    headers: &HeaderMap,
+    project: &str,
+    store: &str,
+    bucket: &str,
+    key: &str,
+) -> Response {
+    let key_id = match idempotency_header(headers) {
+        Ok(Some(key)) => key,
+        Ok(None) => unreachable!("the keyed path is chosen from this header"),
+        Err(e) => return e,
+    };
+    let Some(subject) = verified_subject(headers, st.subject_secret.as_deref()) else {
+        return ControlAdminError::Unverified.into_response();
+    };
+    if let Some(resp) = maybe_forward_write(
+        st,
+        headers,
+        Some(project),
+        "DELETE",
+        format!(
+            "/s3/{}/{}/{}/{}",
+            protocols::url(project),
+            protocols::url(store),
+            protocols::url(bucket),
+            key.split('/')
+                .map(protocols::url)
+                .collect::<Vec<_>>()
+                .join("/")
+        ),
+        "application/octet-stream".to_string(),
+        Bytes::new(),
+    )
+    .await
+    {
+        return resp;
+    }
+    let (pid, _) = {
+        let cp = match st.control_for_authorization_async().await {
+            Ok(cp) => cp,
+            Err(e) => return e.into_response(),
+        };
+        match resolve_s3_target(&cp, project, store, bucket, &subject, Role::ReadWrite) {
+            Ok(v) => v,
+            Err(resp) => return resp,
+        }
+    };
+    let scope = match project_idempotency_scope(st, pid).await {
+        Ok(scope) => scope,
+        Err(resp) => return resp,
+    };
+    let record_key = project_record_key(&scope.records, &subject, &key_id);
+    let fingerprint = s3_object_fingerprint("DELETE", "s3-delete", pid, store, bucket, key, &[]);
+    let pre = {
+        let meta = st.meta.clone();
+        let record_key = record_key.clone();
+        let usage_key = scope.usage_key.clone();
+        match tokio::task::spawn_blocking(move || {
+            read_project_apply_snapshot(&meta, &record_key, &usage_key)
+        })
+        .await
+        {
+            Ok(Ok(snapshot)) => snapshot,
+            Ok(Err(e)) => return api_err(StatusCode::SERVICE_UNAVAILABLE, e),
+            Err(e) => return api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        }
+    };
+    if let Some(record) = pre.record {
+        return replay_record(record, &fingerprint);
+    }
+    if pre.usage.records >= MAX_IDEMPOTENCY_RECORDS {
+        return idempotency_quota_response();
+    }
+    let abort: std::sync::Arc<std::sync::Mutex<Option<Response>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
+    let record_out: std::sync::Arc<std::sync::Mutex<Option<IdempotencyRecord>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
+    let abort_in = abort.clone();
+    let record_out_in = record_out.clone();
+    let meta = st.meta.clone();
+    let record_key_in = record_key.clone();
+    let usage_key_in = scope.usage_key.clone();
+    let fingerprint_in = fingerprint.clone();
+    let s3 = st.s3.clone();
+    let store_in = store.to_owned();
+    let bucket_in = bucket.to_owned();
+    let key_in = key.to_owned();
+    let res = tokio::task::spawn_blocking(move || {
+        s3.delete_object_with(pid, &store_in, &bucket_in, &key_in, |existed: bool| {
+            let snapshot = match meta
+                .try_linearizable_snapshot(&[record_key_in.clone(), usage_key_in.clone()], &[])
+            {
+                Ok(snapshot) => snapshot,
+                Err(e) => {
+                    *abort_in.lock().unwrap() =
+                        Some(api_err(StatusCode::SERVICE_UNAVAILABLE, e.to_string()));
+                    return Err(S3Error::ConcurrentModification);
+                }
+            };
+            if let Some(kv) = snapshot.get(&record_key_in) {
+                let response = match serde_json::from_slice::<IdempotencyRecord>(&kv.value) {
+                    Ok(record) => replay_record(record, &fingerprint_in),
+                    Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+                };
+                *abort_in.lock().unwrap() = Some(response);
+                return Err(S3Error::ConcurrentModification);
+            }
+            let (usage, usage_revision) = match snapshot.get(&usage_key_in) {
+                Some(kv) => match decode_usage(&kv.value) {
+                    Ok(usage) => (usage, kv.mod_revision),
+                    Err(e) => {
+                        *abort_in.lock().unwrap() =
+                            Some(api_err(StatusCode::INTERNAL_SERVER_ERROR, e));
+                        return Err(S3Error::ConcurrentModification);
+                    }
+                },
+                None => (
+                    IdempotencyUsage {
+                        version: 1,
+                        ..IdempotencyUsage::default()
+                    },
+                    0,
+                ),
+            };
+            let response_body = match serde_json::to_vec(&serde_json::json!({
+                "deleted": existed,
+            })) {
+                Ok(body) => body,
+                Err(e) => {
+                    *abort_in.lock().unwrap() =
+                        Some(api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
+                    return Err(S3Error::ConcurrentModification);
+                }
+            };
+            let record = IdempotencyRecord {
+                version: 1,
+                fingerprint: fingerprint_in.clone(),
+                outcome: "committed".into(),
+                response: Some(RecordedResponse {
+                    status: StatusCode::OK.as_u16(),
+                    headers: BTreeMap::from([("content-type".into(), "application/json".into())]),
+                    body_base64: BASE64.encode(response_body),
+                }),
+            };
+            let encoded = match serde_json::to_vec(&record) {
+                Ok(encoded) => encoded,
+                Err(e) => {
+                    *abort_in.lock().unwrap() =
+                        Some(api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
+                    return Err(S3Error::ConcurrentModification);
+                }
+            };
+            let (record_op, usage_op) =
+                match admission_writes(&usage, &usage_key_in, &record_key_in, &encoded) {
+                    Ok(ops) => ops,
+                    Err(response) => {
+                        *abort_in.lock().unwrap() = Some(response);
+                        return Err(S3Error::ConcurrentModification);
+                    }
+                };
+            *record_out_in.lock().unwrap() = Some(record);
+            Ok(yadb_s3::ObjectPublication {
+                guards: vec![
+                    yadb_metakv::RevisionGuard {
+                        key: record_key_in.clone(),
+                        expected_mod_revision: 0,
+                    },
+                    yadb_metakv::RevisionGuard {
+                        key: usage_key_in.clone(),
+                        expected_mod_revision: usage_revision,
+                    },
+                ],
+                ops: vec![record_op, usage_op],
+            })
+        })
+    })
+    .await;
+    match res {
+        Ok(Ok(_existed)) => match record_out.lock().unwrap().take() {
+            Some(record) => replay_record(record, &fingerprint),
+            None => api_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "idempotency record was not prepared",
+            ),
+        },
+        Ok(Err(S3Error::ConcurrentModification)) => {
+            if let Some(response) = abort.lock().unwrap().take() {
+                return response;
+            }
+            let meta = st.meta.clone();
+            let record_key_in = record_key.clone();
+            let record_key_read = record_key.clone();
+            match tokio::task::spawn_blocking(move || {
+                meta.try_linearizable_snapshot(&[record_key_in], &[])
+                    .map_err(|e| e.to_string())
+            })
+            .await
+            {
+                Ok(Ok(snapshot)) => match snapshot.get(&record_key_read) {
+                    Some(kv) => match serde_json::from_slice::<IdempotencyRecord>(&kv.value) {
+                        Ok(record) => replay_record(record, &fingerprint),
+                        Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+                    },
+                    None => api_err(
+                        StatusCode::CONFLICT,
+                        "object changed; re-read the object and retry",
+                    ),
+                },
+                _ => api_err(StatusCode::SERVICE_UNAVAILABLE, "quorum unavailable"),
+            }
+        }
+        Ok(Err(S3Error::Meta(me))) => meta_err_resp(st, me),
         Ok(Err(e)) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
         Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
@@ -4996,6 +5803,96 @@ mod security_tests {
         assert_eq!(
             block_unmap_fingerprint(7, "disk", one),
             block_unmap_fingerprint(7, "disk", one)
+        );
+    }
+
+    #[test]
+    fn block_write_fingerprint_covers_offset_and_received_bytes() {
+        let one = b"first-payload";
+        // Same request, same digest.
+        assert_eq!(
+            block_write_fingerprint(7, "disk", 4096, one),
+            block_write_fingerprint(7, "disk", 4096, one)
+        );
+        // The body is hashed as received, so two byte-different bodies conflict
+        // even if they carry the same bytes once parsed.
+        assert_ne!(
+            block_write_fingerprint(7, "disk", 4096, b"one"),
+            block_write_fingerprint(7, "disk", 4096, b"two")
+        );
+        // The offset is a query parameter, so it must be in the fingerprint
+        // explicitly: the same body at another offset is another request.
+        assert_ne!(
+            block_write_fingerprint(7, "disk", 4096, one),
+            block_write_fingerprint(7, "disk", 8192, one)
+        );
+        // The target is part of the fingerprint.
+        assert_ne!(
+            block_write_fingerprint(7, "disk", 4096, one),
+            block_write_fingerprint(7, "other", 4096, one)
+        );
+        assert_ne!(
+            block_write_fingerprint(7, "disk", 4096, one),
+            block_write_fingerprint(8, "disk", 4096, one)
+        );
+        // Domain separation: a key reused across a write and an unmap of the
+        // same volume must conflict rather than replay the wrong response.
+        assert_ne!(
+            block_write_fingerprint(7, "disk", 0, br#"{"offset":0,"len":4096}"#),
+            block_unmap_fingerprint(7, "disk", br#"{"offset":0,"len":4096}"#)
+        );
+        // Length prefixes keep the offset from running into the body: shifting
+        // a digit into the payload must not collide.
+        assert_ne!(
+            block_write_fingerprint(7, "disk", 1, b"2"),
+            block_write_fingerprint(7, "disk", 12, b"")
+        );
+    }
+
+    #[test]
+    fn s3_fingerprint_covers_operation_target_and_body() {
+        let body = b"payload";
+        // Same request, same digest.
+        assert_eq!(
+            s3_object_fingerprint("PUT", "s3-put", 7, "store", "bucket", "a/b", body),
+            s3_object_fingerprint("PUT", "s3-put", 7, "store", "bucket", "a/b", body)
+        );
+        // PUT and DELETE are different operations even for the same target.
+        assert_ne!(
+            s3_object_fingerprint("PUT", "s3-put", 7, "store", "bucket", "a/b", body),
+            s3_object_fingerprint("DELETE", "s3-delete", 7, "store", "bucket", "a/b", b"")
+        );
+        // The body is hashed as received (DELETE hashes an empty body).
+        assert_ne!(
+            s3_object_fingerprint("PUT", "s3-put", 7, "store", "bucket", "a/b", b"one"),
+            s3_object_fingerprint("PUT", "s3-put", 7, "store", "bucket", "a/b", b"two")
+        );
+        assert_ne!(
+            s3_object_fingerprint("DELETE", "s3-delete", 7, "store", "bucket", "a/b", b""),
+            s3_object_fingerprint("DELETE", "s3-delete", 7, "store", "bucket", "a/b", b"x")
+        );
+        // Every path component is part of the target; a key may contain "/",
+        // so the fields are length-prefixed rather than joined.
+        assert_ne!(
+            s3_object_fingerprint("PUT", "s3-put", 7, "store", "bucket", "a/b", body),
+            s3_object_fingerprint("PUT", "s3-put", 7, "store", "bucket", "a/bc", body)
+        );
+        assert_ne!(
+            s3_object_fingerprint("PUT", "s3-put", 7, "store", "bucket", "a/b", body),
+            s3_object_fingerprint("PUT", "s3-put", 7, "other", "bucket", "a/b", body)
+        );
+        assert_ne!(
+            s3_object_fingerprint("PUT", "s3-put", 7, "store", "bucket", "a/b", body),
+            s3_object_fingerprint("PUT", "s3-put", 7, "store", "other", "a/b", body)
+        );
+        assert_ne!(
+            s3_object_fingerprint("PUT", "s3-put", 7, "store", "bucket", "a/b", body),
+            s3_object_fingerprint("PUT", "s3-put", 8, "store", "bucket", "a/b", body)
+        );
+        // Domain separation from the block fingerprints.
+        assert_ne!(
+            s3_object_fingerprint("PUT", "s3-put", 7, "disk", "bucket", "a/b", body),
+            block_write_fingerprint(7, "disk", 0, body)
         );
     }
 

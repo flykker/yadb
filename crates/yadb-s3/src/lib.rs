@@ -79,6 +79,25 @@ pub struct ObjectSummary {
     pub last_modified: u64,
 }
 
+/// Extra guards and ops a caller commits in the same `RevisionTxn` as the
+/// manifest publication or deletion.
+///
+/// This is the S3 counterpart of `yadb_block::MapPublication`: the engine owns
+/// the manifest/intent guards and ops, the caller appends its own (an
+/// idempotency record and its admission counter, in practice), and all of them
+/// are checked and applied by one Raft apply under one cluster revision. A
+/// failing caller guard therefore aborts the manifest write too — there is no
+/// state in which the object advanced without the record, or the record exists
+/// without the object.
+///
+/// Nothing here may be split into a second transaction: a second `RevisionTxn`
+/// could commit alone.
+#[derive(Debug, Default)]
+pub struct ObjectPublication {
+    pub guards: Vec<RevisionGuard>,
+    pub ops: Vec<TxnOp>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct UploadIntent {
     upload_id: String,
@@ -219,6 +238,49 @@ impl<FS: StorageFs> ObjectStoreEngine<FS> {
         content_type: &str,
         payload: &[u8],
     ) -> Result<ObjectManifest, S3Error> {
+        self.put_object_with(
+            project_id,
+            store,
+            pool_name,
+            bucket,
+            key,
+            content_type,
+            payload,
+            |_| Ok(ObjectPublication::default()),
+        )
+    }
+
+    /// [`Self::put_object`] with caller-supplied guards and ops appended to the
+    /// manifest-publication transaction.
+    ///
+    /// `prepare` receives the manifest *as it will be published* — the same
+    /// etag, size, chunk list and pool the success path returns — so a caller
+    /// can record exactly the response it is about to send. It is invoked once,
+    /// after the intent exists and the fragments are written, immediately before
+    /// the single publication attempt. The engine does not retry a publication
+    /// (`ConcurrentModification` is returned), so a caller must re-read its own
+    /// record on that error to tell "a concurrent attempt committed this key"
+    /// from "the object moved under us"; it must never retry the put blindly.
+    ///
+    /// Fragments and the intent are written before the publication, as in
+    /// [`Self::put_object`]. A refusal, a conflict, or a crash before the
+    /// publication leaves them unreferenced: the intent is collectable by the
+    /// orphan scan and the fragments are reclaimed with it. Nothing rolls the
+    /// fragments back.
+    pub fn put_object_with<F>(
+        &self,
+        project_id: u32,
+        store: &str,
+        pool_name: &str,
+        bucket: &str,
+        key: &str,
+        content_type: &str,
+        payload: &[u8],
+        mut prepare: F,
+    ) -> Result<ObjectManifest, S3Error>
+    where
+        F: FnMut(&ObjectManifest) -> Result<ObjectPublication, S3Error>,
+    {
         let pool = self.get_pool(pool_name)?;
         let mkey = Self::meta_key(project_id, store, bucket, key);
         let allocation_id = self.reserve_upload(project_id)?;
@@ -283,16 +345,37 @@ impl<FS: StorageFs> ObjectStoreEngine<FS> {
             last_modified: unix_seconds(),
         };
 
-        self.publish_upload(project_id, store, &manifest, &intent_key)?;
+        let extra = prepare(&manifest)?;
+        self.publish_upload_with(project_id, store, &manifest, &intent_key, extra)?;
         Ok(manifest)
     }
 
+    // Used by the tests that publish a hand-built manifest; production paths go
+    // through `publish_upload_with` so a caller can append guards and ops.
+    #[cfg(test)]
     fn publish_upload(
         &self,
         project_id: u32,
         store: &str,
         manifest: &ObjectManifest,
         intent_key: &str,
+    ) -> Result<(), S3Error> {
+        self.publish_upload_with(
+            project_id,
+            store,
+            manifest,
+            intent_key,
+            ObjectPublication::default(),
+        )
+    }
+
+    fn publish_upload_with(
+        &self,
+        project_id: u32,
+        store: &str,
+        manifest: &ObjectManifest,
+        intent_key: &str,
+        extra: ObjectPublication,
     ) -> Result<(), S3Error> {
         let mkey = Self::meta_key(project_id, store, &manifest.bucket, &manifest.key);
         // The previous manifest and its guard MUST come from the same read.
@@ -335,19 +418,22 @@ impl<FS: StorageFs> ObjectStoreEngine<FS> {
         {
             return Err(S3Error::ConcurrentModification);
         }
-        let result = self.meta.execute(KvCommand::RevisionTxn {
-            guards: vec![
-                RevisionGuard {
-                    key: intent_key.to_string(),
-                    expected_mod_revision: current_intent.mod_revision,
-                },
-                RevisionGuard {
-                    key: mkey.clone(),
-                    expected_mod_revision: previous.as_ref().map_or(0, |v| v.mod_revision),
-                },
-            ],
-            ops,
-        })?;
+        let mut guards = vec![
+            RevisionGuard {
+                key: intent_key.to_string(),
+                expected_mod_revision: current_intent.mod_revision,
+            },
+            RevisionGuard {
+                key: mkey.clone(),
+                expected_mod_revision: previous.as_ref().map_or(0, |v| v.mod_revision),
+            },
+        ];
+        guards.extend(extra.guards);
+        ops.extend(extra.ops);
+        // The caller's guards are evaluated by the same apply, before any op
+        // runs, so a failing caller guard also blocks the manifest write and
+        // the intent deletion.
+        let result = self.meta.execute(KvCommand::RevisionTxn { guards, ops })?;
         if !matches!(result, KvResult::TxnOk { .. }) {
             return Err(S3Error::ConcurrentModification);
         }
@@ -444,8 +530,34 @@ impl<FS: StorageFs> ObjectStoreEngine<FS> {
         bucket: &str,
         key: &str,
     ) -> Result<bool, S3Error> {
+        self.delete_object_with(project_id, store, bucket, key, |_| {
+            Ok(ObjectPublication::default())
+        })
+    }
+
+    /// [`Self::delete_object`] with caller-supplied guards and ops appended to
+    /// the deletion transaction.
+    ///
+    /// `prepare` receives whether the object existed in the same read whose
+    /// revision guards the delete, so a caller can record exactly the
+    /// `{"deleted": …}` answer the success path returns. It is invoked once,
+    /// immediately before the single attempt; a `ConcurrentModification` is a
+    /// definite non-commit and the caller must re-read its own record rather
+    /// than retry blindly.
+    pub fn delete_object_with<F>(
+        &self,
+        project_id: u32,
+        store: &str,
+        bucket: &str,
+        key: &str,
+        mut prepare: F,
+    ) -> Result<bool, S3Error>
+    where
+        F: FnMut(bool) -> Result<ObjectPublication, S3Error>,
+    {
         let mkey = Self::meta_key(project_id, store, bucket, key);
         let previous = self.meta.get(&mkey);
+        let existed = previous.is_some();
         let mut ops = vec![yadb_metakv::TxnOp::Delete { key: mkey.clone() }];
         if let Some(value) = &previous {
             let manifest: ObjectManifest = serde_json::from_slice(&value.value)?;
@@ -455,14 +567,15 @@ impl<FS: StorageFs> ObjectStoreEngine<FS> {
                 value: serde_json::to_vec(&manifest)?,
             });
         }
-        match self.meta.execute(KvCommand::RevisionTxn {
-            guards: vec![RevisionGuard {
-                key: mkey,
-                expected_mod_revision: previous.as_ref().map_or(0, |v| v.mod_revision),
-            }],
-            ops,
-        })? {
-            KvResult::TxnOk { .. } => Ok(previous.is_some()),
+        let extra = prepare(existed)?;
+        let mut guards = vec![RevisionGuard {
+            key: mkey,
+            expected_mod_revision: previous.as_ref().map_or(0, |v| v.mod_revision),
+        }];
+        guards.extend(extra.guards);
+        ops.extend(extra.ops);
+        match self.meta.execute(KvCommand::RevisionTxn { guards, ops })? {
+            KvResult::TxnOk { .. } => Ok(existed),
             _ => Err(S3Error::ConcurrentModification),
         }
     }
@@ -1529,5 +1642,218 @@ mod tests {
             Err(S3Error::ObjectNotFound { .. })
         ));
         assert_eq!(s3.read_manifest_range(&new, 0, 2).unwrap(), b"new");
+    }
+
+    // The manifest and the caller record carry one cluster revision, which only
+    // a single transaction can produce, and `prepare` saw the manifest that
+    // committed (so a recorded response cannot describe a different object).
+    #[test]
+    fn keyed_put_commits_manifest_and_record_in_one_transaction() {
+        let meta_fs = SimFs::new(6104);
+        let disks = [SimFs::new(6105), SimFs::new(6106), SimFs::new(6107)];
+        let s3 = engine(&meta_fs, &disks);
+        let record = "/s3-put/1/store/bucket/key/op-1".to_string();
+        let mut seen = None;
+        let manifest = s3
+            .put_object_with(
+                1,
+                "store",
+                "pool",
+                "bucket",
+                "key",
+                "text/plain",
+                b"keyed-payload",
+                |mf| {
+                    seen = Some(mf.clone());
+                    Ok(ObjectPublication {
+                        guards: vec![RevisionGuard {
+                            key: record.clone(),
+                            expected_mod_revision: 0,
+                        }],
+                        ops: vec![TxnOp::Put {
+                            key: record.clone(),
+                            value: b"done".to_vec(),
+                        }],
+                    })
+                },
+            )
+            .unwrap();
+        let stored = s3.meta.get(&record).unwrap();
+        let mkey = ObjectStoreEngine::<SimFs>::meta_key(1, "store", "bucket", "key");
+        let published = s3.meta.get(&mkey).unwrap();
+        assert_eq!(stored.value, b"done");
+        assert_eq!(
+            published.mod_revision, stored.mod_revision,
+            "manifest and record were not written by one transaction"
+        );
+        let seen = seen.expect("prepare must be invoked");
+        assert_eq!(seen.etag, manifest.etag);
+        assert_eq!(seen.size, manifest.size);
+        assert_eq!(seen.chunks, manifest.chunks);
+        assert_eq!(seen.pool, manifest.pool);
+        assert_eq!(
+            s3.get_object(1, "store", "bucket", "key").unwrap().1,
+            b"keyed-payload"
+        );
+    }
+
+    // Atomicity: an unsatisfiable caller guard must abort the whole apply, so
+    // neither the manifest nor the record appears. The fragments and intent were
+    // already written; they stay unreferenced and the orphan scan reclaims them.
+    #[test]
+    fn failed_caller_guard_leaves_manifest_and_record_unpublished() {
+        let meta_fs = SimFs::new(6108);
+        let disks = [SimFs::new(6109), SimFs::new(6110), SimFs::new(6111)];
+        let s3 = engine(&meta_fs, &disks);
+        let record = "/s3-put/1/store/bucket/key/never".to_string();
+        let result = s3.put_object_with(
+            1,
+            "store",
+            "pool",
+            "bucket",
+            "key",
+            "text/plain",
+            b"refused",
+            |_| {
+                Ok(ObjectPublication {
+                    guards: vec![RevisionGuard {
+                        key: record.clone(),
+                        expected_mod_revision: 1,
+                    }],
+                    ops: vec![TxnOp::Put {
+                        key: record.clone(),
+                        value: b"done".to_vec(),
+                    }],
+                })
+            },
+        );
+        assert!(matches!(result, Err(S3Error::ConcurrentModification)));
+        assert!(
+            s3.meta.get(&record).is_none(),
+            "caller record leaked although the transaction never committed"
+        );
+        assert!(matches!(
+            s3.head_object(1, "store", "bucket", "key"),
+            Err(S3Error::ObjectNotFound { .. })
+        ));
+        // The intent survived the refusal, so the orphan scan can reclaim it
+        // (and its fragments) once its grace elapses.
+        advance_revisions(&s3);
+        assert_eq!(s3.collect_orphans_at(1, u64::MAX).unwrap(), 1);
+    }
+
+    #[test]
+    fn keyed_delete_commits_tombstone_and_record_in_one_transaction() {
+        let meta_fs = SimFs::new(6112);
+        let disks = [SimFs::new(6113), SimFs::new(6114), SimFs::new(6115)];
+        let s3 = engine(&meta_fs, &disks);
+        s3.put_object(1, "store", "pool", "bucket", "key", "text/plain", b"value")
+            .unwrap();
+        let record = "/s3-delete/1/store/bucket/key/op-1".to_string();
+        let mkey = ObjectStoreEngine::<SimFs>::meta_key(1, "store", "bucket", "key");
+        let before = s3.meta.get(&mkey).unwrap();
+        let mut seen = None;
+        let existed = s3
+            .delete_object_with(1, "store", "bucket", "key", |existed| {
+                seen = Some(existed);
+                Ok(ObjectPublication {
+                    guards: vec![RevisionGuard {
+                        key: record.clone(),
+                        expected_mod_revision: 0,
+                    }],
+                    ops: vec![TxnOp::Put {
+                        key: record.clone(),
+                        value: b"done".to_vec(),
+                    }],
+                })
+            })
+            .unwrap();
+        assert!(existed);
+        assert_eq!(seen, Some(true), "prepare must see the guarded existence");
+        let stored = s3.meta.get(&record).unwrap();
+        assert!(
+            s3.meta.get(&mkey).is_none(),
+            "manifest survived a committed delete"
+        );
+        assert!(matches!(
+            s3.head_object(1, "store", "bucket", "key"),
+            Err(S3Error::ObjectNotFound { .. })
+        ));
+        assert_eq!(stored.value, b"done");
+        // The retirement tombstone and the record are in that same revision.
+        let retired = ObjectStoreEngine::<SimFs>::retired_key(
+            1,
+            "store",
+            "bucket",
+            "key",
+            before.mod_revision,
+        );
+        assert_eq!(
+            s3.meta.get(&retired).unwrap().mod_revision,
+            stored.mod_revision
+        );
+    }
+
+    #[test]
+    fn failed_caller_guard_leaves_object_and_delete_record_untouched() {
+        let meta_fs = SimFs::new(6116);
+        let disks = [SimFs::new(6117), SimFs::new(6118), SimFs::new(6119)];
+        let s3 = engine(&meta_fs, &disks);
+        s3.put_object(1, "store", "pool", "bucket", "key", "text/plain", b"value")
+            .unwrap();
+        let mkey = ObjectStoreEngine::<SimFs>::meta_key(1, "store", "bucket", "key");
+        let before = s3.meta.get(&mkey).unwrap();
+        let record = "/s3-delete/1/store/bucket/key/never".to_string();
+        let result = s3.delete_object_with(1, "store", "bucket", "key", |_| {
+            Ok(ObjectPublication {
+                guards: vec![RevisionGuard {
+                    key: record.clone(),
+                    expected_mod_revision: 1,
+                }],
+                ops: vec![TxnOp::Put {
+                    key: record.clone(),
+                    value: b"done".to_vec(),
+                }],
+            })
+        });
+        assert!(matches!(result, Err(S3Error::ConcurrentModification)));
+        assert!(s3.meta.get(&record).is_none());
+        assert_eq!(
+            s3.meta.get(&mkey).unwrap().mod_revision,
+            before.mod_revision
+        );
+        assert_eq!(
+            s3.get_object(1, "store", "bucket", "key").unwrap().1,
+            b"value"
+        );
+    }
+
+    // A refusal from `prepare` is reported without a transaction and without
+    // publishing; it is not retried.
+    #[test]
+    fn put_prepare_refusal_publishes_nothing() {
+        let meta_fs = SimFs::new(6120);
+        let disks = [SimFs::new(6121), SimFs::new(6122), SimFs::new(6123)];
+        let s3 = engine(&meta_fs, &disks);
+        let mut attempts = 0u32;
+        let result = s3.put_object_with(
+            1,
+            "store",
+            "pool",
+            "bucket",
+            "key",
+            "text/plain",
+            b"refused",
+            |_| {
+                attempts += 1;
+                Err(S3Error::PoolNotMounted("refused".into()))
+            },
+        );
+        assert!(matches!(result, Err(S3Error::PoolNotMounted(_))));
+        assert_eq!(attempts, 1);
+        assert!(matches!(
+            s3.head_object(1, "store", "bucket", "key"),
+            Err(S3Error::ObjectNotFound { .. })
+        ));
     }
 }

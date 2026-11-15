@@ -280,24 +280,37 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   implemented (`Idempotency-Key`, the outcome record committed in the same
   `RevisionTxn` as the mutation, `POST /v1/idempotency/resolve`, and a replicated
   `10_000`-record / `8 MiB` admission counter at `/sys/idempotency/_usage` that
-  refuses with `429` before planning). Keyed block UNMAP is implemented too: the
-  record is project-scoped (`/idempotency/<project-id>/…`), the counter is
-  group-scoped (`/idempotency/g<group-id>/_usage`) because a transaction cannot
-  span groups, and both join the extent-map publication in one `RevisionTxn`
-  (`BlockVolumeEngine::unmap_at_with`). `resolve` accepts a project scope and
-  fences in the project group. SQL, S3 object PUT/DELETE and block PUT still
-  reject a key with 501. Reads mostly still serve the locally applied state:
+  refuses with `429` before planning). Three project-scope data paths are keyed:
+  block UNMAP, block write and S3 object PUT/DELETE. For all three the record is
+  project-scoped (`/idempotency/<project-id>/…`), the counter is group-scoped
+  (`/idempotency/g<group-id>/_usage`) because a transaction cannot span groups,
+  and the record, its counter update and the data mutation are appended to *one*
+  guarded `RevisionTxn`: `BlockVolumeEngine::unmap_at_with` /
+  `write_at_with` and `ObjectStoreEngine::put_object_with` /
+  `delete_object_with`. A caller guard that fails aborts the whole apply, so
+  there is no state in which the map/object advanced without the record or the
+  record exists without the mutation. `resolve` accepts a project scope and
+  fences in the project group. Block writes and S3 PUTs stage immutable
+  fragments before that transaction; a refused, conflicted or crashed write
+  therefore leaves unreferenced fragments (and, for S3, a `Prepared` intent)
+  that the orphan scan reclaims. Nothing rolls fragments back. SQL writes are
+  still **not** keyed: `POST /db/{project}/db/query` returns 501 for a keyed
+  write script, because a script can mutate any number of tables, shards and
+  secondary indexes through `DatabaseEngine::commit_tx_buffer_at_boundaries`,
+  and keying it requires threading the record into *that* transaction rather
+  than appending ops to one handler-level transaction. That is deliberately a
+  separate change.
+  Reads mostly still serve the locally applied state:
   `LocalMetaKv::try_linearizable_snapshot` is consumed only by OpenRaft block
   reads with `consistent=true` (and the iSCSI read path), which forward to the
   project-group leader and fail rather than return a stale or partially collected
   volume.
   `docs/multiraft-idempotency-design.md` holds the full contract and the blockers
-  that prevent the remaining scopes: SQL/S3/block PUT still cannot publish all
-  visible effects and a bounded response in one guarded transaction (they stage
-  before publishing), and a linearizable read needs one pinned snapshot per read
-  path. The group-scoped counter also means projects that share a group share one
-  budget, which is intended but not yet exercised with a real second project on
-  the same group.
+  that prevented the remaining scopes before this change; the SQL blocker above
+  is the one that remains. A linearizable read still needs one pinned snapshot
+  per read path. The group-scoped counter also means projects that share a group
+  share one budget, which is intended but not yet exercised with a real second
+  project on the same group.
 - [ ] Consistent backup and restore. Nothing is implemented.
   `docs/multiraft-backup-restore-design.md` designs a whole-deployment artifact
   and a restore into a new root, and records why raw `cp -a` of live data, a
