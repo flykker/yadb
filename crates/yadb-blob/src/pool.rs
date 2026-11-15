@@ -569,9 +569,13 @@ impl<FS: StorageFs> PoolStriper<FS> {
     /// single failure domain still leaves the payload reconstructible. A short
     /// write is refused with `BlobError::RedundancyNotMet` and counted in
     /// `refused_puts`; the fragments that did land are never published, so a
-    /// caller that saw the error holds no reference to them and the orphan scan
-    /// collects them. Refusing is deliberate: an ack that only means "readable"
-    /// would let a client believe data survived a node loss when it cannot.
+    /// caller that saw the error holds no reference to them. They are *not*
+    /// reclaimed automatically: the only orphan collection implemented is scoped
+    /// to the S3 namespace and is disabled on Multi-Raft, so unreferenced
+    /// fragments from a refused write — like those from a copy-on-write block
+    /// replacement — accumulate until a pool-wide collector exists. Refusing is
+    /// deliberate: an ack that only means "readable" would let a client believe
+    /// data survived a node loss when it cannot.
     pub fn put_blob(&self, logical_id: BlobId, payload: &[u8]) -> Result<(), BlobError> {
         let fragments = self.codec.encode(payload);
         let required = self.min_write_quorum();
