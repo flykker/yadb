@@ -75,8 +75,8 @@ deployment cannot reach the unauthenticated branch.
   Ed25519 public key through an authenticated inventory. Reject duplicates,
   missing voters, mismatched local signing keys and unapproved identities.
 * Provision secret files and locked storage directories with restrictive owner
-  permissions and protected parent directories; verify symlink/replacement and
-  backup access policies. Current adapters assume cooperating local processes:
+  permissions and protected parent directories; verify symlink and replacement
+  protections. Current adapters assume cooperating local processes:
   advisory locks do not defend against a privileged attacker or replaced paths.
 * Use a dedicated internal listener reachable only by intended peer networks.
   Bind addresses explicitly, apply firewall rules and verify client networks
@@ -156,7 +156,8 @@ cannot authenticate through stale listeners, resumed sessions or old handlers.
 ## Compromise or revocation incident
 
 1. Network-isolate the affected node and stop the listeners on all
-   peers; preserve logs, configuration digests and a consistent data backup.
+   peers; preserve logs, configuration digests and a copy of the affected data
+   directories as evidence before any recovery step.
 2. Do not assume revoking a TLS leaf alone is sufficient: the attacker may possess
    the envelope signing key, an active session or write access to local files.
 3. Remove/replace all compromised trust material consistently using the offline
@@ -167,10 +168,10 @@ cannot authenticate through stale listeners, resumed sessions or old handlers.
 4. Review acknowledged/unknown proposals and replica integrity. Raft is not BFT:
    do not assume an authorized malicious peer could not corrupt application state.
 5. Membership removal requires a validated OpenRaft reconfiguration protocol or
-   a separately approved fenced restore. Deleting a voter from the transport map
-   is not a consensus membership change and may destroy availability.
-6. If quorum or provenance cannot be established, remain fail-closed and restore
-   under the migration/backup authority protocol; never force a stale singleton.
+   a separately approved, offline state import. Deleting a voter from the transport
+   map is not a consensus membership change and may destroy availability.
+6. If quorum or provenance cannot be established, remain fail-closed and recover
+   under the migration authority protocol; never force a stale singleton.
 
 ## Evidence still required
 

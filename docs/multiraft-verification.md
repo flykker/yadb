@@ -943,8 +943,8 @@ acknowledgment on a different failure domain. Exercise at least:
   tails, corrupt lengths/checksums, real ENOSPC and sync EIO, poisoned-handle reopen.
 * Entire-cluster restart, one failed disk, follower snapshot recovery, quorum
   loss/recovery, stale leader return and divergent surviving replicas.
-* Repeated cutover/backup-restore failure boundaries only after a migration tool
-  implements the specified authority protocol.
+* Repeated cutover failure boundaries only after a migration tool implements the
+  specified authority protocol.
 
 The acceptance oracle must compare all externally acknowledged commands, respect
 atomic multi-key results and classify unknown outcomes without inventing aborts.

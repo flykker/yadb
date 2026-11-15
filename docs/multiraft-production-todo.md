@@ -194,8 +194,8 @@ pass nor the test setup change closes production gates or resolves the historica
 process catch-up regression.
 
 This changes the earlier legacy-only test-routing policy, not the production
-acceptance criteria. Existing data migration, backup/restore, durability/security
-qualification and multi-group design remain separate incomplete gates.
+acceptance criteria. Existing data migration, durability/security qualification
+and multi-group design remain separate incomplete gates.
 
 A second flaky MetaKV test was diagnosed rather than retried.
 `openraft_persistent_cluster_recovers_lagging_follower_via_snapshot` failed about
@@ -327,12 +327,11 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   per read path. The group-scoped counter also means projects that share a group
   share one budget, which is intended but not yet exercised with a real second
   project on the same group.
-- [ ] Consistent backup and restore. Nothing is implemented.
-  `docs/multiraft-backup-restore-design.md` designs a whole-deployment artifact
-  and a restore into a new root, and records why raw `cp -a` of live data, a
-  `state.json`-only copy and a Raft snapshot alone are not backups. Its hardest
-  unsolved problem is a cluster-wide fence that drains delayed and forwarded
-  mutations so independently captured group states form one consistent cut.
+
+Backup and restore are **out of scope by owner decision**, not an oversight: no
+command, artifact format, fence or validator exists, and none is planned. A lost
+data root is a lost deployment. Reintroducing the capability requires its own
+design; the removed draft is not kept in the tree.
 
 ## 2. Network and security
 
@@ -460,7 +459,7 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
 ## 4. Migration and release
 
 - [ ] Specify legacy-to-OpenRaft migration, fencing, cutover, rollback limits,
-  backups, compatibility and versioned formats. Validate with realistic data.
+  compatibility and versioned formats. Validate with realistic data.
   The draft in `multiraft-migration.md` defines required manifest fields,
   authority states and a recovery matrix. It is not an implemented migration
   tool; external fencing authority and exact state import remain blockers.

@@ -176,10 +176,10 @@ The initial runtime does not change existing allocators. Future allocation may
 reserve disjoint ranges from a durable authority and persist the high-water mark
 before use, so the control path is amortized, not contacted for each fragment.
 This is not yet an approved algorithm: specify namespace encoding and exhaustion,
-range ownership, crashes, stale nodes, restore, backup and migration first. No
+range ownership, crashes, stale nodes and migration first. No
 range is usable after an ambiguous reservation. IDs, counters and all retained
-fragments must remain collision-free across cutover and restoration; partial
-restore or a cloned cluster must not silently reuse a live namespace.
+fragments must remain collision-free across cutover and import; a partial
+import or a cloned cluster must not silently reuse a live namespace.
 
 ## Staged implementation and acceptance gates
 
@@ -230,7 +230,7 @@ safety for arbitrary durable corruption. Legacy behavior is unchanged.
    existing atomicity and unknown-outcome behavior. Add manual moves, then
    automated placement and leader balancing. Design split/merge only afterwards.
 
-## Cutover and restore requirements
+## Cutover and import requirements
 
 The proposed versioned states, manifest requirements and fail-closed recovery
 matrix are specified in [multiraft-migration.md](multiraft-migration.md).
@@ -238,14 +238,14 @@ That document is a draft protocol, not an implemented migration tool or permissi
 to switch traffic; fencing authority and import semantics remain release blockers.
 
 Before cutover, develop a versioned offline migration with a coordinated stop of
-all writers, consistent metadata + blob backup, manifest and counter validation,
+all writers, consistent metadata + blob export, manifest and counter validation,
 and an explicit durable commit point. Import metadata and allocator high-water
 marks without reusing existing BlobIds; retain old fragments. Validate routing,
 group contents and invariants before opening writes. A failed/ambiguous cutover
 must have a documented fail-closed recovery procedure; do not run old and new
 writers together. Rollback after new-format writes requires a separately designed
-consistent restore, not simply starting old binaries. No rolling upgrade or
-downgrade is promised. Restore must coordinate metadata, fragments and allocation
+consistent re-import, not simply starting old binaries. No rolling upgrade or
+downgrade is promised. Cutover must coordinate metadata, fragments and allocation
 namespaces and address any divergent surviving cluster before reopening writes.
 
 ## Verification matrix
@@ -260,9 +260,9 @@ namespaces and address any divergent surviving cluster before reopening writes.
   finalize; recovery with unavailable coordinator; duplicate messages; readers,
   index scans and schema change racing with partial finalization; no mixed result.
 * Directory/placement: stale routes and incarnations, failure at every lifecycle
-  step, snapshot install and membership transitions, restore and cutover faults.
+  step, snapshot install, membership transitions and cutover faults.
 * Allocation: concurrent range reservations, ambiguous outcomes, exhaustion,
-  split/move, restart, backup/restore and coexistence with historical BlobIds.
+  split/move, restart and coexistence with historical BlobIds.
 * Existing workspace regressions and three-node native PostgreSQL/S3/iSCSI E2E
   remain required. Simulated persistence endpoints do not prove arbitrary partial
   writeback, real ENOSPC, hardware power loss or kernel multipath/KVM behavior.

@@ -192,8 +192,8 @@ YADB uses ordinary filesystems; raw PDisk and NBD are not project goals.
   generation fencing, recovery, observability and controlled migration.
 - [ ] Design and test Raft snapshots/log compaction and lagging-node recovery;
   safely change cluster membership and storage-pool placement.
-- [ ] Implement/test backup and restore, capacity management, disk replacement,
-  safe upgrades, operational runbooks and resource/tenant quota enforcement.
+- [ ] Implement/test capacity management, disk replacement, safe upgrades,
+  operational runbooks and resource/tenant quota enforcement.
 - [ ] Secure internal RPC and client connections, define credential rotation,
   expose metrics and alerts for quorum, latency, degradation and capacity.
 - [ ] Expand PostgreSQL, S3 and iSCSI compatibility according to actual client

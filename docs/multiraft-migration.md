@@ -21,7 +21,7 @@ cross-group transaction/read protocol; it is not part of v1.
   listener, administrative tool and background maintenance path, including old
   binaries that cannot read a new-format fence record. Require an external
   deployment/network fence and verification that fenced processes are stopped.
-* A metadata-only backup is insufficient. Preserve referenced fragments, retained
+* A metadata-only export is insufficient. Preserve referenced fragments, retained
   historical fragments, volume tombstones/barriers and allocator high-water
   marks together. Never classify unknown blobs as garbage during migration.
 * Source revisions, per-key versions and modification revisions must survive
@@ -41,8 +41,8 @@ cross-group transaction/read protocol; it is not part of v1.
 An eventual strict, bounded decoder must reject unknown versions and fields,
 duplicate identities/paths, invalid numbers, unsafe paths, missing files and
 inconsistent checksums before allowing an import. SHA-256 detects corruption;
-it is not authorization. Authenticate the manifest and backup provenance with
-an operator-controlled signing key and separately provisioned trust roots.
+it is not authorization. Authenticate the manifest and source-image provenance
+with an operator-controlled signing key and separately provisioned trust roots.
 
 Required fields (not an implemented serialization contract):
 
@@ -56,13 +56,13 @@ Required fields (not an implemented serialization contract):
 | `allocators` | Every namespace/channel/counter and high-water mark, including retained/unpublished allocations |
 | `fragments` | Pool/VDisk identities and generations; exact fragment inventory, lengths, hashes, tombstones and barrier positions |
 | `validation` | Invariant-check version and reports, missing/unavailable fragments and explicit rejection result |
-| `backup` | Complete immutable backup ID, locations and verified restore-test report |
+| `source_image` | Complete immutable export ID, locations and validation report |
 | `authorization` | Operator approval of this exact manifest digest, fence epoch and destination identity |
 
 Choose maximum manifest size, inventory sharding and canonical encoding before
 implementation. Hash raw persisted bytes or a specified canonical encoding;
 ordinary JSON object ordering is not a signing contract. Inventory paths must
-be relative, normalized and confined to a locked backup root; reject symlinks
+be relative, normalized and confined to a locked export root; reject symlinks
 and path traversal rather than trust file names in a signed manifest.
 
 ## State transitions and durable authority
@@ -74,15 +74,17 @@ ownership throughout. The journal records evidence, not an independent right
 to open a listener: the external fence must remain in force.
 
 1. **PREPARED** — inventory source and destination; reject unsupported versions,
-   degraded/missing data or failed prerequisites. Test the backup restore before
-   authorizing cutover. No source mutation and no destination client traffic.
+   degraded/missing data or failed prerequisites. Validate that the export image
+   is complete and readable before authorizing cutover. No source mutation and
+   no destination client traffic.
 2. **SOURCE_FENCED** — block and stop all writers/maintenance, including stale
    peers; verify all reachable source replicas agree on the committed/applied
    state used for export. An uncertain source commit requires investigation,
    not selection of the largest local log. Keep uncommitted tails out of export.
-3. **BACKUP_VERIFIED** — capture consistent metadata and immutable fragment
+3. **EXPORT_VERIFIED** — capture consistent metadata and immutable fragment
    inventory while fenced, validate checksums and allocator bounds, persist the
-   signed manifest and independent backup. Missing evidence blocks progress.
+   signed manifest and independent copy of the image. Missing evidence blocks
+   progress.
 4. **IMPORTED** — initialize only explicitly reserved empty destination paths,
    import the exact application state through the future offline import API,
    and retain the source fence. Any partial destination is quarantined; resume
@@ -113,11 +115,11 @@ authority protocol and its failure recovery remain design blockers.
 | Fenced, no committed cutover | Keep destination closed; verify journal, manifest and external authority before explicitly reopening the unchanged source |
 | Unknown or disagreeing cutover authority | Keep both runtimes write-disabled; recover the authority, do not choose by wall clock or highest local state |
 | Committed cutover, no proven destination write | Do not automatically reopen source; an explicit, separately fenced reversal protocol is still required |
-| Any possible destination write | No binary downgrade or old-directory restart; stop/fence destination and restore a new consistent metadata+fragment backup using a separately validated recovery procedure |
+| Any possible destination write | No binary downgrade or old-directory restart; stop/fence destination and re-import a consistent metadata+fragment image using a separately validated recovery procedure |
 
-Restoring a backup to a cloned cluster must allocate a new cluster/incarnation
+Importing a source image into a cloned cluster must allocate a new cluster/incarnation
 and enforce a fragment allocation namespace that cannot collide with surviving
-writers. Resetting counters or changing only a hostname is unsafe. Never restore
+writers. Resetting counters or changing only a hostname is unsafe. Never import
 metadata alone over live fragment pools, delete retained data, or allow a
 divergent surviving cluster to share allocation authority.
 

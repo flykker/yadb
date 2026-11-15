@@ -228,7 +228,7 @@ start against existing deployments. The separate empty loopback test is describe
   Partial creation remains fail-closed and needs diagnosis.
 
 The marker is a guard for a fresh test deployment, not an export/import format,
-cluster-wide writer fence, backup manifest or migration/cutover authority.
+cluster-wide writer fence or migration/cutover authority.
 
 ## Addresses and identity
 
@@ -277,8 +277,8 @@ merely by agreeing to this work or running local integration tests.
   catch-up regression, resource isolation, lifecycle, security and host durability
   gates remain tracked separately.
 * Returning to legacy after OpenRaft writes is not a rollback. Legacy has not
-  received those writes; use a separately reviewed migration/restore procedure
-  or discard only explicitly disposable test data after authorization.
+  received those writes; use a separately reviewed migration procedure or
+  discard only explicitly disposable test data after authorization.
 
 ## Required verification before calling the test switch complete
 

@@ -221,7 +221,7 @@ before retrying.
 | Partial bootstrap | Preserve artifacts and diagnose; do not auto-create missing files or initialize again |
 | Replica identity/voters mismatch | Stop and verify the intended configuration and provenance; never rewrite the descriptor to fit |
 | Unsupported log version | Preserve the original bytes; use a separately reviewed migration or explicit disposable-test reprovisioning, not silent replay |
-| Corrupt/truncated log tail or state image | Preserve raw evidence, stop serving, and recover from validated replicas/backups through an approved procedure; automatic truncation is not implemented |
+| Corrupt/truncated log tail or state image | Preserve raw evidence, stop serving, and recover from validated replicas through an approved procedure; automatic truncation is not implemented |
 | Write/sync/rename/directory-sync error | Treat the operation outcome as unknown; the handle is poisoned, and further participation requires reopen/recovery |
 | Quorum unavailable | Restore legitimate peers/connectivity; never reduce voters, accept singleton writes or treat timeout as abort |
 | Certificate/pin/signing-key rejection | Keep listener fail-closed; follow the credential incident runbook, never disable TLS verification |
@@ -274,18 +274,17 @@ this way, because an offline node says nothing about the data and a promoted
 error would turn the consistent-read “map is not a GC fence” `503` into a `500`.
 Operationally: `404`/`NoSuchKey` means the object was never written or was
 deleted, while `422`/`500` with a corruption reason means it exists and must be
-repaired from a replica or a backup — never re-created silently.
+repaired from a replica — never re-created silently.
 
 ## Required release integrations
 
-Daemon config validation/lifecycle tests, resource limits/compaction, consistent
-backup and restore, replica replacement, explicit trust rotation, operator
-commands, current-quorum/read barriers, multi-process failure coverage and
-filesystem/hardware durability qualification remain tracked in
-`multiraft-production-todo.md`. See also `multiraft-verification.md`,
-`multiraft-security-operations.md`, `multiraft-migration.md`,
-`multiraft-idempotency-design.md` (idempotency and the read barrier) and
-`multiraft-backup-restore-design.md` (backup/restore design; nothing implemented).
+Daemon config validation/lifecycle tests, resource limits/compaction, replica
+replacement, explicit trust rotation, operator commands, current-quorum/read
+barriers, multi-process failure coverage and filesystem/hardware durability
+qualification remain tracked in `multiraft-production-todo.md`. See also
+`multiraft-verification.md`, `multiraft-security-operations.md`,
+`multiraft-migration.md` and `multiraft-idempotency-design.md` (idempotency and
+the read barrier).
 
 Idempotency is implemented for `POST /v1/apply` and, at project scope, for block
 UNMAP (`POST /block/{project}/{volume}/unmap`). A keyed apply commits its outcome
