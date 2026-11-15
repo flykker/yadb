@@ -29,6 +29,10 @@ pub struct RepairSweep {
     pub still_pending: usize,
     /// Blobs that could not be reconstructed in this pass.
     pub unrecoverable: usize,
+    /// Blobs that were reconstructed but whose redundancy is still short: the
+    /// payload is readable, a fragment rewrite did not land. Distinct from
+    /// `unrecoverable` because no data is lost.
+    pub still_degraded: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -672,6 +676,11 @@ impl<FS: StorageFs> PoolStriper<FS> {
                     sweep.repaired_parts += report.repaired_parts;
                     if report.intact_parts == self.codec.scheme().total_parts() {
                         self.pending_repairs.lock().unwrap().remove(&id);
+                    } else {
+                        // The payload decoded, so no data is lost, but a fragment
+                        // rewrite did not land. Keep it queued and report the
+                        // distinction: a readable blob is not "unrecoverable".
+                        sweep.still_degraded += 1;
                     }
                 }
                 Err(_) => sweep.unrecoverable += 1,
@@ -857,33 +866,29 @@ impl<FS: StorageFs> PoolStriper<FS> {
         };
         let expected_fragments = self.codec.encode(&payload);
         let mut repaired_parts = 0usize;
-        let mut last_put_err: Option<BlobError> = None;
 
         for (idx, slot_val) in slots_data.iter().enumerate() {
             if slot_val.is_none() {
                 let part_id = logical_id.with_part((idx + 1) as u8);
                 let slot_idx = self.select_slot(logical_id, idx);
-                match self.slots[slot_idx].put(part_id, &expected_fragments[idx]) {
-                    Ok(()) => {
-                        self.slots[slot_idx]
-                            .metrics
-                            .repairs_ok
-                            .fetch_add(1, Ordering::Relaxed);
-                        repaired_parts += 1;
-                    }
-                    Err(e) => last_put_err = Some(e),
+                if self.slots[slot_idx]
+                    .put(part_id, &expected_fragments[idx])
+                    .is_ok()
+                {
+                    self.slots[slot_idx]
+                        .metrics
+                        .repairs_ok
+                        .fetch_add(1, Ordering::Relaxed);
+                    repaired_parts += 1;
                 }
             }
         }
 
-        // The payload decodes, but a fragment could not be rewritten: the blob is
-        // still short of its designed redundancy. Report that as a failure so the
-        // scrub counts it as unrecoverable and the pending queue keeps it, instead
-        // of answering `Ok` with fewer parts than the scheme requires.
-        if let Some(err) = last_put_err {
-            return Err(err);
-        }
-
+        // A failed rewrite is not reported as an error: the payload decoded, so the
+        // blob is readable and no data is lost — only its redundancy is still short.
+        // Callers compare `intact_parts` with the scheme's part count to see that,
+        // which is why `intact_parts` counts fragments *after* the repair. Calling
+        // this an error would make the scrub report a readable blob as unrecoverable.
         Ok(RepairReport {
             intact_parts: intact_parts + repaired_parts,
             repaired_parts,

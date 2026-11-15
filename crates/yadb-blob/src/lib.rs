@@ -874,7 +874,7 @@ mod tests {
         let id = BlobId::new(11, 1, 1, 1, 2, 0);
         let payload = b"Multi-tenant erasure-coded tablet SSTable block #0001";
         // Five of six fragments is still above the k=4 write quorum, so the write is
-        // acked — but with zero parity, which is exactly the state S6 describes.
+        // acked — but with less than the intended redundancy.
         striper.put_blob(id, payload).unwrap();
         assert_eq!(striper.pending_repair_count(), 1);
         let health = striper.health_snapshot(false);
@@ -887,6 +887,7 @@ mod tests {
         assert_eq!(sweep.attempted, 1);
         assert_eq!(sweep.repaired_parts, 1);
         assert_eq!(sweep.unrecoverable, 0);
+        assert_eq!(sweep.still_degraded, 0);
         assert_eq!(sweep.still_pending, 0);
         assert_eq!(striper.pending_repair_count(), 0);
         // The fragment really is on the peer now, and the blob is whole.
@@ -906,10 +907,9 @@ mod tests {
         vdisk.stop();
     }
 
-    // The other half: a repair that cannot rewrite the fragment must not be
-    // reported as success, and the blob must stay queued rather than be forgotten.
+    // A failed rewrite leaves a readable blob degraded and queued, not lost.
     #[test]
-    fn unrepairable_degraded_write_stays_queued() {
+    fn readable_but_unredundant_blob_stays_queued() {
         let vdisk = MockVdisk::start();
         vdisk.fail_puts.store(true, Ordering::Relaxed);
         let addr = vdisk.addr.clone();
@@ -933,14 +933,21 @@ mod tests {
         let sweep = striper.repair_pending(16);
         assert_eq!(sweep.attempted, 1);
         assert_eq!(sweep.repaired_parts, 0);
-        assert_eq!(sweep.unrecoverable, 1);
+        assert_eq!(sweep.unrecoverable, 0);
+        assert_eq!(sweep.still_degraded, 1);
         assert_eq!(sweep.still_pending, 1);
+        assert_eq!(striper.get_blob(id).unwrap(), payload);
         assert_eq!(striper.pending_repair_count(), 1);
+
+        let report = striper.repair_blob(id).unwrap();
+        assert_eq!(report.intact_parts, 5);
+        assert_eq!(report.repaired_parts, 0);
 
         // Once the peer accepts writes again, the next pass closes the queue.
         vdisk.fail_puts.store(false, Ordering::Relaxed);
         let sweep = striper.repair_pending(16);
         assert_eq!(sweep.repaired_parts, 1);
+        assert_eq!(sweep.still_degraded, 0);
         assert_eq!(sweep.still_pending, 0);
         assert_eq!(striper.pending_repair_count(), 0);
         vdisk.stop();

@@ -324,6 +324,10 @@ struct ScrubSummary {
     pub degraded_puts_queued: usize,
     /// Blobs still queued for redundancy repair after this pass.
     pub degraded_puts_pending: usize,
+    /// Blobs that were reconstructed but whose redundancy is still short: the
+    /// payload reads fine, only a fragment rewrite did not land. Distinct from
+    /// `blobs_unrecoverable`, where data is actually lost.
+    pub degraded_puts_still_degraded: usize,
     pub orphan_blobs_collected: usize,
     pub orphan_collection_error: Option<String>,
     pub pools: Vec<PoolHealthSnapshot>,
@@ -688,10 +692,12 @@ impl AppState {
         let pools_for_repair = self.pools.read().unwrap().clone();
         let mut degraded_puts_queued = 0usize;
         let mut degraded_puts_pending = 0usize;
+        let mut degraded_puts_still_degraded = 0usize;
         for striper in pools_for_repair.values() {
             let sweep = striper.repair_pending(DEGRADED_REPAIR_BATCH);
             degraded_puts_queued += sweep.attempted;
             degraded_puts_pending += sweep.still_pending;
+            degraded_puts_still_degraded += sweep.still_degraded;
         }
 
         if self.meta.is_openraft() {
@@ -699,6 +705,7 @@ impl AppState {
             let summary = ScrubSummary {
                 degraded_puts_queued,
                 degraded_puts_pending,
+                degraded_puts_still_degraded,
                 orphan_collection_error: Some("scrub disabled for experimental Multi-Raft".into()),
                 ..ScrubSummary::default()
             };
@@ -800,6 +807,7 @@ impl AppState {
             blobs_unrecoverable,
             degraded_puts_queued,
             degraded_puts_pending,
+            degraded_puts_still_degraded,
             orphan_blobs_collected,
             orphan_collection_error,
             pools: pools_health,
