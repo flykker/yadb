@@ -312,7 +312,9 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   requires the applied log ID to be in the log or covered by the snapshot or
   `last_purged`; and `scripts/yadb-local.py backup <root> <dest>`, which requires a
   stopped deployment, a free supervisor lock and nine free replica locks, validates
-  all nine replicas, refuses a stored membership that disagrees with the descriptor,
+  all nine replicas, refuses a stored membership that disagrees with the descriptor
+  and a log that ends in a torn frame (whose bytes cannot distinguish an
+  interrupted append from an upward-corrupted length),
   copies with per-file SHA-256, and writes `COMPLETE` last. Blob GC and the scrub
   cannot run during the copy for the trivial reason that no daemon can start at all,
   which is why increment 1 needs no separate refusal for them — that requirement
