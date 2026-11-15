@@ -219,7 +219,7 @@ before retrying.
 | Certificate/pin/signing-key rejection | Keep listener fail-closed; follow the credential incident runbook, never disable TLS verification |
 | Snapshot exceeds transport capacity | Stop growth/recover under an approved plan; do not discard retained logs or raise isolated limits without end-to-end capacity tests |
 
-The checkpoint-capable experimental log format is `YORLOG04`. Its fixed limits
+The checkpoint-capable experimental log format is `YORLOG05`. Its fixed limits
 are 32 MiB for the active file, 1024 frames, 4096 live entries and 8 MiB for the
 serialized retained checkpoint. Replacement temporarily uses extra disk space;
 file/directory sync errors poison the store until validated reopen. These limits

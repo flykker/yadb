@@ -44,8 +44,9 @@ An experimental opt-in file-backed OpenRaft log/vote prototype uses framed recor
 CRC, serialized writes, `sync_data()` before `LogFlushed`, reopen replay, matching
 overlap preservation with explicit truncation for conflicts, cooperative OS
 directory locking, and fail-closed malformed-tail handling. Corrected replay rules
-and checkpoint capability use `YORLOG04` and reject the prior experimental
-`YORLOG02`/`YORLOG03` formats unchanged;
+and checkpoint capability use `YORLOG05`, whose frame header is self-checking
+over `magic||len||payload_crc`, and reject the prior experimental
+`YORLOG02`/`YORLOG03`/`YORLOG04` formats unchanged;
 no automatic migration is implemented.
 It is not production storage: the opt-in daemon integration does not close the
 storage-contract gate, and the separate experimental state-machine and snapshot

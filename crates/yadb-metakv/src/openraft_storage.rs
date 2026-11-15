@@ -21,10 +21,16 @@ use crate::openraft_runtime::YadbRaftTypeConfig as C;
 
 // Version 02 used suffix-replacing append; version 03 lacks checkpoints.
 // Neither format is migrated or reinterpreted by this experimental store.
-const MAGIC: &[u8; 8] = b"YORLOG04";
+// Version 05 makes the frame header self-checking: 04 carried a payload CRC but
+// an unprotected length, so a length damaged upward was byte-identical to a torn
+// tail and got repaired by truncating away every acknowledged frame after it.
+const MAGIC: &[u8; 8] = b"YORLOG05";
 const IDENTITY_LEN: usize = 44;
 const FRAME_MAGIC: &[u8; 4] = b"YORF";
-const FRAME_HEADER_LEN: usize = 12;
+/// `magic`, `len`, `payload_crc` and `header_crc` over the first three.
+const FRAME_HEADER_LEN: usize = 16;
+/// Bytes of the header covered by its own checksum.
+const FRAME_HEADER_CHECKED_LEN: usize = 12;
 const MAX_FRAME_PAYLOAD: usize = 16 * 1024 * 1024;
 // A checkpoint must fit a single frame. Physical log and replay are bounded
 // independently; temporary replacement can briefly double disk usage.
@@ -201,6 +207,10 @@ fn frame_payload(payload: Vec<u8>) -> io::Result<Vec<u8>> {
     frame.extend_from_slice(FRAME_MAGIC);
     frame.extend_from_slice(&len.to_le_bytes());
     frame.extend_from_slice(&crc32fast::hash(&payload).to_le_bytes());
+    // Covers magic, len and payload_crc. Without it a damaged `len` is
+    // indistinguishable from a frame that never finished reaching disk, and the
+    // only safe reading of that ambiguity is the one that loses data.
+    frame.extend_from_slice(&crc32fast::hash(&frame[..FRAME_HEADER_CHECKED_LEN]).to_le_bytes());
     frame.extend_from_slice(&payload);
     Ok(frame)
 }
@@ -451,10 +461,11 @@ fn read_full_or_eof(file: &mut File, buf: &mut [u8]) -> io::Result<bool> {
 /// Read the next frame without interpreting it.
 ///
 /// A frame is reported [`Frame::Torn`] only when the file ends in the middle of
-/// it. A frame with a complete header is still validated by the caller, so bad
-/// magic, an impossible length or a checksum mismatch stays an error: those
-/// bytes were synced before being acknowledged, and discarding them would lose
-/// committed entries.
+/// it. A complete header is validated before its length is used: bad magic or a
+/// header checksum mismatch is an error, because those bytes were synced before
+/// being acknowledged and discarding them would lose committed entries. The
+/// header checksum is what makes a damaged `len` detectable, so the only way to
+/// reach a length past EOF is a payload that genuinely never reached disk.
 fn read_frame(file: &mut File) -> io::Result<Frame> {
     let mut frame_header = [0; FRAME_HEADER_LEN];
     loop {
@@ -477,12 +488,21 @@ fn read_frame(file: &mut File) -> io::Result<Frame> {
     if &frame_header[..4] != FRAME_MAGIC {
         return Err(invalid("invalid OpenRaft log frame"));
     }
+    let stored_header_crc = u32::from_le_bytes(frame_header[12..16].try_into().unwrap());
+    if crc32fast::hash(&frame_header[..FRAME_HEADER_CHECKED_LEN]) != stored_header_crc {
+        // The framing bytes damaged themselves. A frame cut short by a torn
+        // write leaves fewer than a full header and is handled above, so this
+        // cannot be a tail: report it instead of discarding the frames after it.
+        return Err(invalid("OpenRaft log frame header checksum mismatch"));
+    }
     let len = u32::from_le_bytes(frame_header[4..8].try_into().unwrap()) as usize;
     if len > MAX_FRAME_PAYLOAD {
         return Err(invalid("OpenRaft log frame exceeds limit"));
     }
     let mut payload = vec![0; len];
     if !read_full_or_eof(file, &mut payload)? {
+        // The header proved the length, so the payload simply never reached the
+        // file: the final, unacknowledged append.
         return Ok(Frame::Torn);
     }
     Ok(Frame::Complete {
@@ -541,12 +561,10 @@ fn recover(file: &mut File, dir: &Path, identity: &ReplicaIdentity) -> io::Resul
                 // `OsDirectoryLock`, or if appends could overwrite or skip
                 // bytes of the log instead of extending it; `compact` does
                 // neither, because it publishes a synced temporary file with
-                // `rename`. It also cannot distinguish a torn frame from a
-                // frame whose length field was corrupted upward past the end of
-                // the file: that damage is repaired as a tail rather than
-                // rejected, because the two are byte-identical without a
-                // redundant length. No bytes followed by further bytes are ever
-                // discarded, so the prefix up to the last frame start survives.
+                // `rename`. The frame header is self-checking, so a length
+                // damaged upward is caught as corruption rather than repaired as
+                // a tail: reaching this branch means the header was intact and
+                // the declared payload genuinely does not exist.
                 file.set_len(valid_len)?;
                 file.sync_data()?;
                 File::open(dir)?.sync_all()?;
@@ -1149,11 +1167,13 @@ mod tests {
         let store = DurableOpenRaftLog::create(&dir.0, &identity()).unwrap();
         drop(store);
         let path = dir.0.join("openraft.log");
+        let mut header = Vec::new();
+        header.extend_from_slice(FRAME_MAGIC);
+        header.extend_from_slice(&((MAX_FRAME_PAYLOAD as u32) + 1).to_le_bytes());
+        header.extend_from_slice(&0u32.to_le_bytes());
+        header.extend_from_slice(&crc32fast::hash(&header).to_le_bytes());
         let mut file = OpenOptions::new().append(true).open(&path).unwrap();
-        file.write_all(FRAME_MAGIC).unwrap();
-        file.write_all(&((MAX_FRAME_PAYLOAD as u32) + 1).to_le_bytes())
-            .unwrap();
-        file.write_all(&0u32.to_le_bytes()).unwrap();
+        file.write_all(&header).unwrap();
         drop(file);
         let before = fs::read(&path).unwrap();
         assert_eq!(
@@ -1164,6 +1184,47 @@ mod tests {
             io::ErrorKind::InvalidData
         );
         assert_eq!(fs::read(path).unwrap(), before);
+    }
+
+    // The defect that made S1 worth fixing in the legacy WAL, in the OpenRaft
+    // log: a length damaged upward in a *non-final* frame used to look exactly
+    // like a torn tail, so `open` truncated there and silently dropped every
+    // acknowledged frame after it while reporting success. The header checksum
+    // is what separates the two, and this asserts the file is left untouched.
+    #[test]
+    fn upward_corrupted_length_in_the_middle_is_refused_not_truncated() {
+        let dir = TempDir::new();
+        let mut store = DurableOpenRaftLog::create(&dir.0, &identity()).unwrap();
+        for index in 0..3 {
+            store
+                .append_durable(&Record::Append(vec![entry(index)]))
+                .unwrap();
+        }
+        drop(store);
+        let path = dir.0.join("openraft.log");
+        let mut bytes = fs::read(&path).unwrap();
+        // Byte 4..8 of the first frame is its `len`; the header checksum no
+        // longer matches once it is grown.
+        let frame_start = header(&identity()).len();
+        let stored =
+            u32::from_le_bytes(bytes[frame_start + 4..frame_start + 8].try_into().unwrap());
+        bytes[frame_start + 4..frame_start + 8].copy_from_slice(&(stored + 4096).to_le_bytes());
+        fs::write(&path, &bytes).unwrap();
+        let damaged = fs::read(&path).unwrap();
+
+        let error = DurableOpenRaftLog::open(&dir.0, &identity())
+            .err()
+            .expect("a damaged length must not be repaired as a tail");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            error.to_string().contains("header checksum"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            damaged,
+            "refusing must not rewrite the log"
+        );
     }
 
     // `coverage()` feeds the state-machine rebuild decision, so it must agree
@@ -1723,7 +1784,9 @@ mod tests {
         drop(store);
         let path = dir.0.join("openraft.log");
         let original = fs::read(&path).unwrap();
-        for magic in [b"YORLOG02", b"YORLOG03"] {
+        // A pre-fix binary would read a 05 frame as a torn tail and truncate it,
+        // so the format is versioned rather than silently reinterpreted.
+        for magic in [b"YORLOG02", b"YORLOG03", b"YORLOG04"] {
             let mut bytes = original.clone();
             bytes[..8].copy_from_slice(magic);
             let checksum_offset = header(&identity()).len() - 4;

@@ -438,7 +438,7 @@ A subsequent full `--offline --locked -j 2 --workspace --all-features` test run
 passed: 109 MetaKV tests, 11 daemon tests and all other workspace tests. It includes
 the first bounded-log checkpoint tests, explicit listener drain/byte-budget tests,
 snapshot catch-up in the three-process test, and experimental daemon create/status/
-shutdown/reopen. Later `YORLOG04` format/serialization changes, local-certificate
+shutdown/reopen. Later `YORLOG05` format/serialization changes, local-certificate
 preflight validation and the TCP-proxy partition scenario then required rerunning
 the integrated gates; see the subsequent results and current status above.
 
@@ -694,9 +694,59 @@ A complete frame with bad magic, an impossible length or a CRC mismatch is still
 `InvalidData` and leaves the file byte-identical. `partial_write_poisoned_until_
 reopen_which_fails_closed` asserted the bug and was replaced by
 `..._which_repairs_the_torn_tail`; four tests were added. `yadb-metakv` 124 → 128,
-all passing. Residual, documented in `recover`: a length field corrupted *upward*
-in a non-final frame is byte-identical to a torn tail and is repaired rather than
-rejected, dropping the frames after it.
+all passing. The residual recorded here at the time — a length field corrupted
+*upward* in a non-final frame being byte-identical to a torn tail — is closed by
+`YORLOG05` below.
+
+**S4 residual closed — the OpenRaft frame header is self-checking
+(`YORLOG05`).** `YORLOG04` frames carried `magic`, `len` and `payload_crc` in 12
+bytes, so `len` itself was unprotected: grown past the end of the file it looked
+exactly like a torn tail, `recover` truncated there, and every acknowledged frame
+after it was discarded while the group reported a successful start. That is the
+defect S1 fixed in the legacy WAL and in `yadb-blob` segments, left open in the
+metadata log itself. Frames now carry a fourth header word, `crc32(magic||len||
+payload_crc)`, and the file magic is bumped to `YORLOG05`, so a pre-fix binary
+refuses the file instead of truncating it. `read_frame` validates the header
+checksum before it trusts `len`, which makes "the payload never reached disk" the
+only way to observe a length past EOF. `yadb-metakv` 149 → 150;
+`upward_corrupted_length_in_the_middle_is_refused_not_truncated` asserts
+`InvalidData` with a message naming the header checksum and a byte-identical file,
+and the format-rejection test now covers `YORLOG02`, `03` and `04`. What this does
+not prove: `SimFs`/hand-patched bytes are not real device damage, and no migration
+from `YORLOG04` exists, so an existing experimental log must be analysed, never
+rewritten in place.
+
+**S5 — a corrupt OpenRaft state image is rebuilt from the log, or refused.** A
+single damaged byte in `state/state.json` made `DurableMetaStateMachine::open`
+fail, so the replica could not start even when its log still held every entry;
+the only recourse was a manual `rm`, which is the silent reinitialisation this
+project forbids. `open_or_rebuild(dir, identity, coverage)` rebuilds **only** on
+`InvalidData` from `read_image`, and **only** when the log provably replays from
+the start. `LogCoverage` carries both facts and requires both: `last_purged ==
+None` **and** `first_index == 0` (`LogCoverage::replays_from_start`,
+`openraft_storage.rs:117-126`). A purge marker alone is not enough, because
+`prepare_append` permits a fresh, unpurged log to begin at a snapshot boundary
+after `InstallSnapshot`; replaying that into an empty machine would silently lose
+the prefix, and `apply` would accept the first entry because `expected` is `None`
+when `applied` is `None`. Corrupt bytes are never truncated or rewritten: they are
+renamed to `state.json.corrupt` (then `.1`, `.2`, … so earlier evidence survives)
+with a directory sync, and the empty image is published through `state.json.tmp`
+plus rename plus directory sync. A crash between the rename and the publish leaves
+no `state.json`, so the next open fails closed with the evidence intact. A corrupt
+image with a purged or front-holed log is `Err(InvalidData)` and the file is
+byte-identical afterwards. `yadb-metakv` 149 → 150 covers the rebuild, the
+refusal, the numbered evidence files and the empty-log case.
+
+**Startup recovery is reported, not silent.** Both repairs above change durable
+state during `open`: a torn tail is truncated and a corrupt image is renamed
+aside and replaced. Neither was surfaced outside tests, so a daemon could start
+looking healthy after recovering and an operator could not tell a clean start from
+a repaired one. `PersistentGroup::open` now records what it repaired in a
+`RecoveryReport` (empty for `create` and for a clean open), and `yadbd` prints one
+line per repair when a group starts — group, node, discarded bytes, and the path
+the corrupt image was preserved as. Tests assert a clean reopen reports nothing
+and that an appended partial frame header is reported with the exact discarded
+length and truncated durably.
 
 **S6 — degraded acknowledged writes (default build).** `put_blob` acks at
 `min_write_quorum()`, which is `k` for RS 4+2, so an ack could leave zero parity on
