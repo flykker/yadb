@@ -5,6 +5,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -14,6 +15,26 @@ from unittest import mock
 spec = importlib.util.spec_from_file_location('yadb_local', Path(__file__).with_name('yadb-local.py'))
 local = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(local)
+
+
+def fake_daemon_script(**overrides):
+    """A stand-in for `yadbd --verify-replica` that reports the real descriptor.
+
+    The real daemon reads `replica.json`, so a fake that always answered group 1 /
+    node 1 would hide a manifest that does not cover all nine replicas.
+    """
+    return ('#!/usr/bin/env python3\n'
+            'import json, sys\n'
+            'version, group, node, voters = json.load(open(sys.argv[sys.argv.index("--verify-replica") + 1] + "/replica.json"))\n'
+            'verdict = {"group": group, "node": node, "first_index": 0, "last_index": None,\n'
+            '           "last_purged": None, "applied": None, "snapshot": None, "entry_count": 0,\n'
+            '           "torn_tail": False, "restorable": True, "reason": "",\n'
+            '           "membership_differs_from_descriptor": None}\n'
+            f'verdict.update(json.loads({json.dumps(json.dumps(overrides))}))\n'
+            'print(json.dumps(verdict))\n'
+            "if not verdict['restorable']:\n"
+            "    sys.stderr.write(verdict['reason'] + '\\n')\n"
+            '    sys.exit(4)\n')
 
 
 class FakeChild:
@@ -290,7 +311,7 @@ class BackupTest(unittest.TestCase):
         self.addCleanup(os.umask, os.umask(0o077))
         parent = Path(self.temp.name)
         (parent / 'target/debug').mkdir(parents=True)
-        (parent / 'target/debug/yadbd').write_text('#!/usr/bin/env python3\nimport json\nprint(json.dumps({"group": 1, "node": 1, "first_index": None, "last_index": None, "last_purged": None, "applied": None, "snapshot": None, "entry_count": 0, "torn_tail": False, "restorable": True, "reason": None, "membership_differs_from_descriptor": None}))\n')
+        (parent / 'target/debug/yadbd').write_text(fake_daemon_script())
         self.root = parent / 'cluster'
         self.dest = parent / 'backup'
         with mock.patch.object(local, 'REPO', parent), mock.patch.object(local, 'check_ports'), \
@@ -313,19 +334,8 @@ class BackupTest(unittest.TestCase):
             return local.backup(self.root, self.dest)
 
     def fake_verdict(self, **overrides):
-        """Replace the stand-in daemon with one that prints a chosen verdict."""
-        verdict = {'group': 1, 'node': 1, 'first_index': None, 'last_index': None,
-                   'last_purged': None, 'applied': None, 'snapshot': None, 'entry_count': 0,
-                   'torn_tail': False, 'restorable': True, 'reason': '',
-                   'membership_differs_from_descriptor': None}
-        verdict.update(overrides)
-        script = ('#!/usr/bin/env python3\n'
-                  'import json, sys\n'
-                  f'verdict = json.loads({json.dumps(json.dumps(verdict))})\n'
-                  'print(json.dumps(verdict))\n'
-                  "if not verdict['restorable']:\n"
-                  "    sys.stderr.write(verdict['reason'] + '\\n')\n"
-                  '    sys.exit(4)\n')
+        """Replace the stand-in daemon with one that reports chosen verdict fields."""
+        script = fake_daemon_script(**overrides)
         for path in (Path(self.temp.name) / 'target/debug/yadbd', self.root / 'bin/yadbd'):
             path.write_text(script)
             path.chmod(0o700)
@@ -436,6 +446,140 @@ class BackupTest(unittest.TestCase):
             json.dumps([1, {'cluster': [2] * 16, 'group': 1, 'incarnation': 1}, 1, [1, 2, 3]]))
         self.assertEqual(self.run_backup(), 4)
         self.assertFalse(self.dest.exists())
+
+
+class RestoreTest(unittest.TestCase):
+    """Restore is in place: the runtime marker binds absolute paths."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.addCleanup(os.umask, os.umask(0o077))
+        parent = Path(self.temp.name)
+        (parent / 'target/debug').mkdir(parents=True)
+        (parent / 'target/debug/yadbd').write_text(fake_daemon_script())
+        self.root = parent / 'cluster'
+        self.artifact = parent / 'artifact'
+        with mock.patch.object(local, 'REPO', parent), mock.patch.object(local, 'check_ports'), \
+                mock.patch.object(local.subprocess, 'run'), contextlib.redirect_stdout(io.StringIO()):
+            local.prepare(self.root)
+        (self.root / 'state.json').write_text(json.dumps({'phase': 'stopped', 'pids': []}))
+        for node in range(1, 4):
+            (self.root / 'data' / f'node-{node}').mkdir()
+            for group in range(1, 4):
+                replica = self.root / 'metadata' / f'{node}-{group}'
+                replica.mkdir()
+                (replica / 'log').write_bytes(b'replica')
+                descriptor = [1, {'cluster': [1] * 16, 'group': group, 'incarnation': 1}, node, [1, 2, 3]]
+                (replica / 'replica.json').write_text(json.dumps(descriptor))
+        self.assertEqual(self.run_backup(), 0)
+
+    def quiet(self):
+        return mock.patch.object(local, 'port_open', return_value=False), \
+            mock.patch.object(local, 'http_health', return_value=False), \
+            contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO())
+
+    def run_backup(self):
+        port_open, http_health, out, err = self.quiet()
+        with port_open, http_health, out, err:
+            return local.backup(self.root, self.artifact)
+
+    def run_restore(self, target=None, expected=None):
+        port_open, http_health, out, err = self.quiet()
+        with port_open, http_health, out, err:
+            return local.restore(self.artifact, target or self.root, expected)
+
+    def destroy_root(self):
+        # Disaster recovery starts from a root that no longer exists. Recreating
+        # the same absolute path is what keeps the runtime marker valid.
+        shutil.rmtree(self.root)
+
+    def rewrite_manifest(self, mutate):
+        manifest = json.loads((self.artifact / 'manifest.json').read_bytes())
+        mutate(manifest)
+        data = (json.dumps(manifest, indent=2) + '\n').encode()
+        digest = hashlib.sha256(data).hexdigest()
+        (self.artifact / 'manifest.json').write_bytes(data)
+        (self.artifact / 'manifest.sha256').write_text(digest + '\n')
+        (self.artifact / 'COMPLETE').write_text(digest + '\n')
+
+    def test_restores_in_place_and_marks_complete(self):
+        self.destroy_root()
+        self.assertEqual(self.run_restore(), 0)
+        digest = hashlib.sha256((self.artifact / 'manifest.json').read_bytes()).hexdigest()
+        self.assertEqual((self.root / 'RESTORE_COMPLETE').read_text().split('\n')[0], digest)
+        self.assertFalse((self.root / 'RESTORE_INCOMPLETE').exists())
+        # Both gates must be gone, otherwise the restored root cannot start.
+        self.assertFalse((self.root / '.yadb-backup-in-progress').exists())
+        self.assertEqual(json.loads((self.root / 'state.json').read_text()), {'phase': 'stopped'})
+
+    def test_different_path_refused_and_not_created(self):
+        # A copy at another path is a second identity, not a restore: the daemon
+        # binds the absolute root and metadata paths into its runtime marker.
+        other = Path(self.temp.name) / 'elsewhere'
+        self.assertEqual(self.run_restore(target=other), 2)
+        self.assertFalse(other.exists())
+
+    def test_manifest_hash_mismatch_refused_without_writing(self):
+        self.destroy_root()
+        (self.artifact / 'manifest.sha256').write_text('0' * 64 + '\n')
+        self.assertEqual(self.run_restore(), 4)
+        self.assertFalse(self.root.exists())
+
+    def test_payload_byte_mismatch_refused_before_writing(self):
+        # The payload is hashed before the target is created, so a corrupted
+        # artifact is refused without leaving a directory behind.
+        self.destroy_root()
+        target = next((self.artifact / 'payload').rglob('*.json'))
+        target.write_bytes(b'{}')
+        self.assertEqual(self.run_restore(), 4)
+        self.assertFalse(self.root.exists())
+
+    def test_copy_failure_retains_markers_and_incomplete(self):
+        # A failure after the markers are down must leave the root both marked
+        # incomplete and unstartable, because it holds a partial payload.
+        self.destroy_root()
+        with mock.patch.object(local.os, 'write', side_effect=OSError('disk full')):
+            self.assertEqual(self.run_restore(), 5)
+        self.assertTrue((self.root / 'RESTORE_INCOMPLETE').exists())
+        self.assertFalse((self.root / 'RESTORE_COMPLETE').exists())
+        self.assertTrue((self.root / '.yadb-backup-in-progress').exists())
+
+    def test_incomplete_artifact_refused(self):
+        (self.artifact / 'INCOMPLETE').write_text('copy failed\n')
+        self.destroy_root()
+        self.assertEqual(self.run_restore(), 3)
+        self.assertFalse(self.root.exists())
+
+    def test_recorded_torn_tail_refused(self):
+        self.rewrite_manifest(lambda m: m['replicas'][0].update(torn_tail=True))
+        self.destroy_root()
+        self.assertEqual(self.run_restore(), 4)
+        self.assertFalse(self.root.exists())
+
+    def test_recorded_membership_difference_refused(self):
+        self.rewrite_manifest(lambda m: m['replicas'][0].update(
+            membership_differs_from_descriptor={'descriptor_voters': [1, 2, 3], 'stored_voters': [1, 2]}))
+        self.destroy_root()
+        self.assertEqual(self.run_restore(), 4)
+        self.assertFalse(self.root.exists())
+
+    def test_nonempty_target_refused_and_unchanged(self):
+        (self.root / 'keep').write_text('mine')
+        self.assertEqual(self.run_restore(), 2)
+        self.assertEqual([p.name for p in self.root.iterdir() if p.name == 'keep'], ['keep'])
+        self.assertEqual((self.root / 'keep').read_text(), 'mine')
+
+    def test_wrong_expected_digest_refused(self):
+        self.destroy_root()
+        self.assertEqual(self.run_restore(expected='0' * 64), 2)
+        self.assertFalse(self.root.exists())
+
+    def test_expected_digest_accepted(self):
+        digest = hashlib.sha256((self.artifact / 'manifest.json').read_bytes()).hexdigest()
+        self.destroy_root()
+        self.assertEqual(self.run_restore(expected=digest), 0)
+        self.assertTrue((self.root / 'RESTORE_COMPLETE').exists())
 
 
 class RunLogsDirectoryTest(unittest.TestCase):

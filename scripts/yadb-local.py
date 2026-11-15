@@ -8,7 +8,7 @@ import hashlib
 import hmac
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import secrets
 import shutil
 import signal
@@ -745,6 +745,247 @@ def backup(root, dest):
         return code
 
 
+def read_artifact(artifact):
+    """Prove the artifact is complete and self-consistent, without trusting it.
+
+    Returns the decoded manifest and its digest. The digest is not
+    authenticated: `--expected-sha256` is how an operator supplies the value
+    from a trusted channel, and a replaced manifest plus matching hash is
+    undetectable here.
+    """
+    artifact = Path(artifact)
+    incomplete = artifact / 'INCOMPLETE'
+    if incomplete.exists() or incomplete.is_symlink():
+        raise BackupError(f'artifact is marked INCOMPLETE: {incomplete.read_text().strip()}', 3)
+    complete = artifact / 'COMPLETE'
+    try:
+        recorded = complete.read_text().strip()
+    except OSError as error:
+        raise BackupError(f'artifact has no COMPLETE record: {error}', 3) from error
+    if len(recorded) != 64 or any(c not in '0123456789abcdef' for c in recorded):
+        raise BackupError(f'COMPLETE does not hold one SHA-256 digest: {complete}', 4)
+    data = (artifact / 'manifest.json').read_bytes()
+    digest = hashlib.sha256(data).hexdigest()
+    stated = (artifact / 'manifest.sha256').read_text().strip()
+    if not stated == digest == recorded:
+        raise BackupError('manifest.json, manifest.sha256 and COMPLETE disagree', 4)
+    try:
+        manifest = json.loads(data)
+    except ValueError as error:
+        raise BackupError(f'manifest is not JSON: {error}', 4) from error
+    if not isinstance(manifest, dict) or manifest.get('version') != 1:
+        raise BackupError('unsupported manifest version', 4)
+    return manifest, digest
+
+
+def verified_payload(artifact, manifest):
+    """Return the declared files after proving the payload is exactly them."""
+    payload = Path(artifact) / 'payload'
+    declared = {}
+    entries = manifest.get('files')
+    if not isinstance(entries, list):
+        raise BackupError('manifest does not list payload files', 4)
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise BackupError('manifest file entry is not an object', 4)
+        relative = entry.get('path')
+        if not isinstance(relative, str):
+            raise BackupError('manifest file entry has no path', 4)
+        pure = PurePosixPath(relative)
+        if pure.is_absolute() or not pure.parts or '..' in pure.parts or relative in declared:
+            raise BackupError(f'unsafe or duplicate payload path: {relative}', 4)
+        if type(entry.get('size')) is not int or entry['size'] < 0:
+            raise BackupError(f'payload entry has no valid size: {relative}', 4)
+        if not isinstance(entry.get('sha256'), str) or len(entry['sha256']) != 64:
+            raise BackupError(f'payload entry has no valid hash: {relative}', 4)
+        if type(entry.get('mode')) is not int or not 0 <= entry['mode'] <= 0o7777:
+            raise BackupError(f'payload entry has no valid mode: {relative}', 4)
+        declared[relative] = entry
+    if not declared:
+        raise BackupError('manifest declares no payload files', 4)
+    # The payload must be exactly the manifest: a missing file is a truncated
+    # artifact, and an extra one is content nobody validated or hashed.
+    actual = set()
+    for path in payload.rglob('*'):
+        info = path.lstat()
+        if stat.S_ISDIR(info.st_mode):
+            continue
+        if not stat.S_ISREG(info.st_mode):
+            raise BackupError(f'artifact holds a symlink or special file: {path}', 4)
+        if info.st_nlink != 1:
+            raise BackupError(f'artifact holds a hard-linked file: {path}', 4)
+        actual.add(path.relative_to(payload).as_posix())
+    if actual != set(declared):
+        missing = sorted(set(declared) - actual)[:3]
+        extra = sorted(actual - set(declared))[:3]
+        raise BackupError(f'payload does not match manifest; missing={missing} extra={extra}', 4)
+    for relative, entry in declared.items():
+        data = (payload / relative).read_bytes()
+        if len(data) != entry['size'] or hashlib.sha256(data).hexdigest() != entry['sha256']:
+            raise BackupError(f'payload file does not match its recorded hash: {relative}', 4)
+    return declared
+
+
+def verify_recorded_replicas(manifest):
+    """Re-check the verdicts backup recorded, so a bad artifact cannot pass."""
+    replicas = manifest.get('replicas')
+    if not isinstance(replicas, list) or len(replicas) != 9:
+        raise BackupError('manifest must record nine replica verdicts', 4)
+    seen = set()
+    for verdict in replicas:
+        if not isinstance(verdict, dict):
+            raise BackupError('manifest replica verdict is not an object', 4)
+        if verdict.get('restorable') is not True:
+            raise BackupError(f"artifact records a replica that is not restorable: {verdict.get('reason')}", 4)
+        if verdict.get('torn_tail') is not False:
+            raise BackupError('artifact records a replica with a torn log tail', 4)
+        if verdict.get('membership_differs_from_descriptor') is not None:
+            raise BackupError('artifact records a membership that disagrees with its descriptor', 4)
+        group = verdict.get('group')
+        group_id = group.get('group') if isinstance(group, dict) else None
+        node = verdict.get('node')
+        if type(group_id) is not int or group_id not in (1, 2, 3) or type(node) is not int or node not in (1, 2, 3):
+            raise BackupError('artifact records an unknown group or node', 4)
+        seen.add((group_id, node))
+    if len(seen) != 9:
+        raise BackupError('artifact does not cover all nine replicas', 4)
+
+
+def restore(artifact, target, expected_sha256=None):
+    """Restore a COMPLETE artifact in place, over a destroyed root.
+
+    In place only: `experimental_openraft.rs` binds the absolute client root and
+    every absolute metadata path into `.yadb-openraft-runtime.json`, so a copy at
+    another path is refused by the daemon as a marker mismatch. That refusal is
+    what stops a second copy of one identity from running, so this command does
+    not rewrite paths to defeat it.
+    """
+    os.umask(0o077)
+    created = False
+    finished = False
+    markers = []
+    digest = ''
+    timestamp = ''
+    try:
+        artifact = artifact.resolve(strict=True)
+        manifest, digest = read_artifact(artifact)
+        if expected_sha256 is not None and expected_sha256.strip().lower() != digest:
+            raise BackupError('artifact digest does not match --expected-sha256', 2)
+        declared = verified_payload(artifact, manifest)
+        verify_recorded_replicas(manifest)
+        source_root = manifest.get('source_root')
+        if not isinstance(source_root, str) or not source_root:
+            raise BackupError('manifest does not record its source root', 4)
+        absolute = target.parent.resolve(strict=True) / target.name
+        if absolute != Path(source_root).resolve():
+            raise BackupError(
+                f'restore is in place only: the artifact was taken from {source_root}, not '
+                f'{absolute}. The runtime marker binds absolute paths, so a copy at another '
+                'path is a different deployment, not a restore.', 2)
+        if absolute.exists():
+            if not absolute.is_dir() or any(absolute.iterdir()):
+                raise BackupError(f'target exists and is not empty: {absolute}', 2)
+        else:
+            absolute.mkdir(mode=0o700)
+        created = True
+        timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        record = (f'{digest}\n{timestamp}\n').encode()
+        # Both markers go down before the first byte is copied. RESTORE_INCOMPLETE
+        # records that the root is mid-restore; the backup marker makes the daemon
+        # and `run` refuse to start it, so a crash cannot leave a half-copied root
+        # that looks startable.
+        markers = [absolute / 'RESTORE_INCOMPLETE', absolute / '.yadb-backup-in-progress']
+        for path in markers:
+            durable_write(path, record)
+        sync_dir(absolute)
+        directories = {absolute}
+        for relative in sorted(declared):
+            entry = declared[relative]
+            destination = absolute / relative
+            destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            directories.add(destination.parent)
+            source_fd = os.open(artifact / 'payload' / relative, os.O_RDONLY | os.O_NOFOLLOW)
+            try:
+                info = os.fstat(source_fd)
+                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                    raise BackupError(f'artifact payload file is not a plain file: {relative}', 4)
+                output_fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                try:
+                    # Hash the bytes actually written, not the bytes the manifest
+                    # claims, so a payload swapped after verification is caught.
+                    written_hash = hashlib.sha256()
+                    size = 0
+                    while True:
+                        block = os.read(source_fd, 1024 * 1024)
+                        if not block:
+                            break
+                        written_hash.update(block)
+                        size += len(block)
+                        view = memoryview(block)
+                        while view:
+                            view = view[os.write(output_fd, view):]
+                    if size != entry['size'] or written_hash.hexdigest() != entry['sha256']:
+                        raise BackupError(f'copied bytes do not match the manifest: {relative}', 4)
+                    os.fchmod(output_fd, entry['mode'])
+                    os.fsync(output_fd)
+                finally:
+                    os.close(output_fd)
+            finally:
+                os.close(source_fd)
+        for directory in sorted(directories, key=lambda p: len(p.parts), reverse=True):
+            sync_dir(directory)
+        metadata = absolute / 'metadata'
+        replicas = sorted(metadata.iterdir())
+        if len(replicas) != 9 or any(not stat.S_ISDIR(path.lstat().st_mode) for path in replicas):
+            raise BackupError('restored root does not hold nine replica directories', 4)
+        # Validate the bytes that are now on disk, not the verdicts backup recorded.
+        for path in replicas:
+            result = subprocess.run([str(absolute / 'bin/yadbd'), '--verify-replica', str(path)],
+                                    capture_output=True, text=True)
+            if result.returncode != 0:
+                raise BackupError(f'restored replica failed validation: {path}: {result.stderr.strip()}', 4)
+            verdict = json.loads(result.stdout)
+            if (verdict.get('restorable') is not True or verdict.get('torn_tail') is not False
+                    or verdict.get('membership_differs_from_descriptor') is not None):
+                raise BackupError(f'restored replica is not clean: {path}: {verdict.get("reason")}', 4)
+        # The artifact's PIDs belong to the dead deployment. Keeping them would let
+        # a recycled PID make `status` report a running deployment that is not one.
+        temporary = absolute / 'state.json.restore'
+        with temporary.open('xb') as output:
+            output.write(json.dumps({'phase': 'stopped'}).encode() + b'\n')
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, absolute / 'state.json')
+        sync_dir(absolute)
+        for path in markers:
+            path.unlink()
+            sync_dir(absolute)
+        durable_write(absolute / 'RESTORE_COMPLETE', record)
+        sync_dir(absolute)
+        finished = True
+        print(f'Restored: {absolute}\nSHA-256: {digest}')
+        return 0
+    except (BackupError, OSError, ValueError, KeyError, TypeError) as error:
+        code = error.code if isinstance(error, BackupError) else 5
+        if created:
+            if finished:
+                try:
+                    (target.parent.resolve(strict=True) / target.name / 'RESTORE_COMPLETE').unlink()
+                except OSError:
+                    pass
+            # A root whose restore failed must never look complete or startable.
+            for path in markers:
+                try:
+                    if not path.exists() and not path.is_symlink():
+                        durable_write(path, (f'{digest}\n{timestamp}\n').encode())
+                except OSError:
+                    pass
+            print(f'Restore retained at {target}: {error}', file=sys.stderr)
+        else:
+            print(f'Restore refused: {error}', file=sys.stderr)
+        return code
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest='command', required=True)
@@ -757,6 +998,10 @@ def main():
     backup_parser = sub.add_parser('backup')
     backup_parser.add_argument('root', type=Path)
     backup_parser.add_argument('dest', type=Path)
+    restore_parser = sub.add_parser('restore')
+    restore_parser.add_argument('artifact', type=Path)
+    restore_parser.add_argument('target', type=Path)
+    restore_parser.add_argument('--expected-sha256', help='digest obtained from a trusted channel')
     args = parser.parse_args()
     if args.command == 'prepare':
         prepare(args.root, args.port_base)
@@ -767,6 +1012,8 @@ def main():
             sys.exit(1)
     elif args.command == 'backup':
         sys.exit(backup(args.root, args.dest))
+    elif args.command == 'restore':
+        sys.exit(restore(args.artifact, args.target, args.expected_sha256))
     else:
         verify(args.root.resolve(strict=True))
 
