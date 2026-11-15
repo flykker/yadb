@@ -765,6 +765,8 @@ def read_artifact(artifact):
     if len(recorded) != 64 or any(c not in '0123456789abcdef' for c in recorded):
         raise BackupError(f'COMPLETE does not hold one SHA-256 digest: {complete}', 4)
     data = (artifact / 'manifest.json').read_bytes()
+    if len(data) > 64 * 1024 * 1024:
+        raise BackupError('manifest is implausibly large', 4)
     digest = hashlib.sha256(data).hexdigest()
     stated = (artifact / 'manifest.sha256').read_text().strip()
     if not stated == digest == recorded:
@@ -820,8 +822,18 @@ def verified_payload(artifact, manifest):
         extra = sorted(actual - set(declared))[:3]
         raise BackupError(f'payload does not match manifest; missing={missing} extra={extra}', 4)
     for relative, entry in declared.items():
-        data = (payload / relative).read_bytes()
-        if len(data) != entry['size'] or hashlib.sha256(data).hexdigest() != entry['sha256']:
+        # Stream: a payload can hold multi-gigabyte volume files, and reading one
+        # into memory would fail on a healthy artifact.
+        digest = hashlib.sha256()
+        size = 0
+        with (payload / relative).open('rb') as input_file:
+            while True:
+                block = input_file.read(1024 * 1024)
+                if not block:
+                    break
+                digest.update(block)
+                size += len(block)
+        if size != entry['size'] or digest.hexdigest() != entry['sha256']:
             raise BackupError(f'payload file does not match its recorded hash: {relative}', 4)
     return declared
 

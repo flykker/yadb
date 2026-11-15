@@ -581,6 +581,17 @@ class RestoreTest(unittest.TestCase):
         self.assertEqual(self.run_restore(expected=digest), 0)
         self.assertTrue((self.root / 'RESTORE_COMPLETE').exists())
 
+    def test_large_payload_is_hashed_without_reading_it_whole(self):
+        # A payload can hold a multi-gigabyte volume file. Verification must stream,
+        # so a small read size proves it does not call read() with no argument.
+        big = self.root / 'data' / 'volume.dat'
+        big.write_bytes(b'x' * (3 * 1024 * 1024 + 7))
+        shutil.rmtree(self.artifact)
+        self.assertEqual(self.run_backup(), 0)
+        self.destroy_root()
+        self.assertEqual(self.run_restore(), 0)
+        self.assertEqual((self.root / 'data' / 'volume.dat').stat().st_size, 3 * 1024 * 1024 + 7)
+
 
 class RunLogsDirectoryTest(unittest.TestCase):
     def test_run_creates_the_logs_directory_it_writes_into(self):
