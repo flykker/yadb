@@ -523,7 +523,10 @@ not a production-readiness claim.
 The current checkpoint-capable log format is `YORLOG05`; `YORLOG02`,
 `YORLOG03` and `YORLOG04` are rejected unchanged because corrected overlap replay
 rules, checkpoint capabilities and the self-checking frame header must not
-silently reinterpret older records. `YORLOG05` covers `magic||len||payload_crc`
+silently reinterpret older records. A `YORLOG04` root therefore cannot be opened
+by a `YORLOG05` binary at all; the local `cluster_data` deployment keeps its
+pre-`YORLOG05` binary for exactly that reason, and adopting the new format there
+would require a replay-and-republish migration, not a reinitialisation. `YORLOG05` covers `magic||len||payload_crc`
 with its own CRC, which is what lets a length damaged upward be refused instead
 of repaired as a torn tail.
 No automatic log migration exists. Preserve old experimental directories for

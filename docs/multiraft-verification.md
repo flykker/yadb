@@ -716,6 +716,15 @@ not prove: `SimFs`/hand-patched bytes are not real device damage, and no migrati
 from `YORLOG04` exists, so an existing experimental log must be analysed, never
 rewritten in place.
 
+Operational consequence, checked against the live root: all nine
+`metadata/*/log/openraft.log` files under `/public/cluster_data` begin with
+`YORLOG04`, and a `YORLOG05` binary refuses them before any listener binds. That
+is the intended fail-closed behaviour, and it means the deployed binary in
+`cluster_data/bin/` (`ca07b340…`) must stay on the pre-`YORLOG05` build until that
+root is retired. Reinitialising it to adopt the new format is the silent data loss
+this project forbids; the migration path, if one is ever wanted, has to replay
+`YORLOG04` and republish as `YORLOG05` in a new file with the old bytes preserved.
+
 **S5 — a corrupt OpenRaft state image is rebuilt from the log, or refused.** A
 single damaged byte in `state/state.json` made `DurableMetaStateMachine::open`
 fail, so the replica could not start even when its log still held every entry;
