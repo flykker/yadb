@@ -3164,6 +3164,7 @@ async fn handle_db_query(
         }
         Ok(Err(
             e @ (DbError::InvalidQuery(_)
+            | DbError::UnrecognizedSetting(_)
             | DbError::TableAlreadyExists(_)
             | DbError::IndexAlreadyExists(_, _)
             | DbError::DuplicatePrimaryKey(_)),

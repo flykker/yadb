@@ -30,8 +30,9 @@ fn after_dml_collection() {
 }
 
 pub use sql::{
-    parse_sql, parse_sql_script, script_has_writes, AggFunc, ArithOp, AssignExpr, CmpOp, ColumnDef,
-    ColumnType, Predicate, Projection, SelectItem, SqlStmt, SqlValue,
+    eval_scalar_select, parse_sql, parse_sql_script, parse_sql_value, script_has_writes,
+    setting_default, AggFunc, ArithOp, AssignExpr, CmpOp, ColumnDef, ColumnType, Predicate,
+    Projection, ScalarContext, ScalarExpr, ScalarFunc, SelectExpr, SelectItem, SqlStmt, SqlValue,
 };
 pub use tablet::{CompactionReport, DataShardTablet, PreparedShardCommit, TabletManifest};
 
@@ -54,6 +55,9 @@ pub enum DbError {
 
     #[error("SQL error: {0}")]
     InvalidQuery(String),
+
+    #[error("unrecognized configuration parameter \"{0}\"")]
+    UnrecognizedSetting(String),
 
     #[error("table `{0}` already exists")]
     TableAlreadyExists(String),
@@ -1018,6 +1022,13 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
         let stmts = parse_sql_script(sql)?;
         let _serial = self.query_lock.lock().unwrap();
         let session_key = session_subject.map(|subj| format!("{project_id}:{db}:{subj}"));
+        // The gateway identifies a session as `{subject}#{id}`; the part before
+        // the separator is the authenticated subject, which is what
+        // `current_user` answers with.
+        let session_user = session_subject
+            .map(|subj| subj.split('#').next().unwrap_or(subj))
+            .filter(|subj| !subj.is_empty())
+            .unwrap_or("yadb");
 
         let mut active_tx: Option<TxBuffer> = if let Some(sk) = &session_key {
             self.sessions.lock().unwrap().remove(sk)
@@ -1040,6 +1051,7 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
                 data_pool,
                 default_shards,
                 &mut active_tx,
+                session_user,
                 stmt,
             ) {
                 Ok(res) => {
@@ -1239,6 +1251,7 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
             data_pool,
             default_shards,
             &mut active_tx,
+            "yadb",
             stmt,
         )
     }
@@ -1252,6 +1265,7 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
         data_pool: &str,
         default_shards: u32,
         active_tx: &mut Option<TxBuffer>,
+        session_user: &str,
         stmt: SqlStmt,
     ) -> Result<QueryResult, DbError> {
         match stmt {
@@ -1290,6 +1304,36 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
                     rows: Vec::new(),
                     rows_affected: 0,
                 })
+            }
+
+            // `SET`/`RESET`/`SHOW` are session statements: the pgwire frontend
+            // owns the per-connection parameter map. Reaching the engine means
+            // a caller asked for storage work, so refuse rather than pretend
+            // the setting took effect somewhere it cannot be observed.
+            SqlStmt::Set { .. }
+            | SqlStmt::SetDefault { .. }
+            | SqlStmt::Reset { .. }
+            | SqlStmt::ShowSetting { .. } => {
+                Err(DbError::InvalidQuery(
+                    "SET/RESET/SHOW are session statements and are only supported on a pgwire connection"
+                        .into(),
+                ))
+            }
+
+            SqlStmt::ShowAll => Err(DbError::InvalidQuery(
+                "SHOW ALL is not supported; SHOW <name> answers one parameter".into(),
+            )),
+
+            SqlStmt::SelectNoFrom { items } => {
+                let settings = BTreeMap::new();
+                sql::eval_scalar_select(
+                    &items,
+                    &ScalarContext {
+                        database: db,
+                        user: session_user,
+                        settings: &settings,
+                    },
+                )
             }
 
             SqlStmt::ShowTables => {
