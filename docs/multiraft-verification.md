@@ -772,6 +772,41 @@ This is a local single-host run. It does not establish power-loss durability,
 multi-host behaviour, or that the OpenRaft log and state images survive a kill
 rather than a clean stop.
 
+### Live offline backup and in-place restore (2026-11-15)
+
+`main` at `f2313b2` (feature build `ca07b340…`) on the stopped three-process root.
+The cycle was run once, in this order, with the results recorded:
+
+1. `yadbd --verify-replica` on all nine replica directories: all `restorable`,
+   `torn_tail: false`, `membership_differs_from_descriptor: null`, applied ids
+   9/21/4 for the three groups. Every file under `metadata/` was byte-identical
+   before and after the nine inspections and no file was created — the read-only
+   property, checked on real data rather than in a unit test.
+2. `scripts/yadb-local.py backup cluster_data /public/backup-inc1`: exit `0`,
+   digest `876cb505…`. The manifest records `identity_source: "legacy"` and
+   `deployment_id: null` because this root predates `config/identity.json`; the
+   cluster UUID is taken from the nine descriptors. 71 payload files, each hash
+   verified against the copy, `manifest.sha256` and `COMPLETE` both equal to the
+   digest of the exact manifest bytes. No marker remained afterwards.
+3. Copying the payload to a **different** path and starting it failed with
+   `multi-group runtime marker mismatch` — the expected refusal, since
+   `.yadb-openraft-runtime.json` binds absolute paths.
+4. `scripts/yadb-local.py restore backup-inc1 cluster_data` over the deleted root:
+   exit `0`, `RESTORE_COMPLETE` written, both markers removed, `state.json`
+   rewritten to `{"phase": "stopped"}`. All nine `openraft.log`, `state.json` and
+   `replica.json` files are byte-identical to the pre-restore root.
+5. Starting the restored root: three leaders per node, log ids 9/21/4 and the same
+   leaders as before the backup. Block reads answered on all three nodes; a PUT at
+   offset 4096 succeeded and read back from a different node; a clean `SIGTERM`
+   stop left `exit_codes [0, 0, 0]`; a second `backup` of the restored root
+   succeeded.
+
+What this does not establish: that the artifact survives a crash at a copy
+boundary (no interruption was injected outside the unit tests), that the digest is
+authenticated, that no second copy of the identity is running, that the blob bytes
+belong to the metadata cut, or that any of it holds under power loss. It is one
+observation on one host, not a repeatable suite.
+
 ## Required failure record format
 
 For each scenario preserve setup identities, voters, initial applied/log/purge

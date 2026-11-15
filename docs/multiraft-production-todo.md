@@ -299,31 +299,40 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   path. The group-scoped counter also means projects that share a group share one
   budget, which is intended but not yet exercised with a real second project on
   the same group.
-- [ ] Consistent backup and restore. Offline capture is partly implemented; restore
-  is not implemented at all, so no artifact has ever been restored.
+- [ ] Consistent backup and restore. Offline capture and in-place restore exist;
+  restore into a different root does not, and cannot work while the daemon binds
+  absolute paths.
   `docs/multiraft-backup-restore-design.md` designs a whole-deployment artifact
-  and a restore into a new root, and records why raw `cp -a` of live data, a
-  `state.json`-only copy and a Raft snapshot alone are not backups.
+  and a restore, and records why raw `cp -a` of live data, a `state.json`-only copy
+  and a Raft snapshot alone are not backups.
   What exists: a durable `.yadb-backup-in-progress` marker that makes `yadbd` and
   the supervisor's `run` refuse to start, read while holding `supervisor.lock` so a
   paused `run` cannot start after a backup began; a strictly read-only replica
   validator (`yadbd --verify-replica`, exit `4` on refusal) that replays the log
   without repairing it and decodes the image without publishing a rebuild, and
   requires the applied log ID to be in the log or covered by the snapshot or
-  `last_purged`; and `scripts/yadb-local.py backup <root> <dest>`, which requires a
+  `last_purged`; `scripts/yadb-local.py backup <root> <dest>`, which requires a
   stopped deployment, a free supervisor lock and nine free replica locks, validates
   all nine replicas, refuses a stored membership that disagrees with the descriptor
   and a log that ends in a torn frame (whose bytes cannot distinguish an
   interrupted append from an upward-corrupted length),
-  copies with per-file SHA-256, and writes `COMPLETE` last. Blob GC and the scrub
-  cannot run during the copy for the trivial reason that no daemon can start at all,
-  which is why increment 1 needs no separate refusal for them — that requirement
-  belongs to the online variant.
-  Open: no restore path, so `restorable` means "passed these checks"; the artifact
-  digest is not authenticated, so a replaced manifest and hash cannot be detected;
-  the cluster-wide fence that would allow an online cut is designed but not
-  implemented, and identity duplication after restore has no solution yet
-  (nothing carries a monotonic deployment generation).
+  copies with per-file SHA-256, and writes `COMPLETE` last; and
+  `scripts/yadb-local.py restore <artifact> <target>`, which verifies the artifact
+  against its own digest, writes both markers before copying, hashes the bytes it
+  actually writes, re-validates the copied tree with `--verify-replica`, rewrites
+  `state.json` to `stopped` and writes `RESTORE_COMPLETE` last. Blob GC and the
+  scrub cannot run during the copy for the trivial reason that no daemon can start
+  at all, which is why increment 1 needs no separate refusal for them — that
+  requirement belongs to the online variant.
+  Open: restore is in place only — `.yadb-openraft-runtime.json` binds the absolute
+  root and metadata paths, so a copy at another path is refused, and a new-root
+  restore needs a deployment generation in that marker plus a fence that survives
+  it; the artifact digest is not authenticated, so a replaced manifest and hash
+  cannot be detected; `restore` proves the local path is unoccupied, not that no
+  other copy of the identity is running; the blob bytes are not proven to belong to
+  the metadata cut; and the cluster-wide fence that would allow an online cut is
+  designed but not implemented, and identity duplication after restore has no
+  solution yet (nothing carries a monotonic deployment generation).
 
 ## 2. Network and security
 
