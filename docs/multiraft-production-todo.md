@@ -383,12 +383,18 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   listener does the same for GET after it has verified SigV4, forwarding the
   proven subject through the internal gateway and re-framing a gateway error as
   an S3 XML error; HEAD needs no fence and stays local. The native read keeps
-  its local contract across that hop: `If-Match`/`If-None-Match` are decided
-  against the ETag the leader returned (so a concurrent overwrite cannot turn a
-  failed precondition into a `200`), an unsatisfiable range is the local `416
-  InvalidRange` with `Content-Range: bytes */size`, the 16 MiB rules are the
-  local `400 InvalidRequest`, `Last-Modified` and `Accept-Ranges` come from the
-  leader's manifest, and the internal hop header is stripped. A range end past
+  its local contract across that hop, because the node that reads the manifest
+  decides it: existence, `If-Match`/`If-None-Match`, the range and the 16 MiB
+  rule are all evaluated on the leader against the one manifest whose fragments
+  are then fetched, so a follower's lagging applied state can never refuse or
+  mis-slice a read the leader can serve. The follower forwards `Range`,
+  `If-Match` and `If-None-Match`; a failed precondition is `412`, a matching
+  `If-None-Match` is a bodyless `304`, an unsatisfiable range is `416
+  InvalidRange` with `Content-Range: bytes */size`, a read over 16 MiB is `400
+  InvalidRequest` before any fragment is read, `Last-Modified` and
+  `Accept-Ranges` come from that manifest, and the internal hop header is
+  stripped. The gateway `/s3/...` GET shares the same decision (it also answers
+  conditional requests now) and reads one manifest per request. A range end past
   the object is clamped to its size (RFC 9110) on both paths, so a proxied
   `bytes=7-999` answers `206` with the clamped slice instead of `416`. A
   read-only statement whose lease was lost is refused with `503`, but a statement
@@ -424,10 +430,11 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   rather than the gateway's JSON. A third run on the same cluster checked the
   follower contract: the same `200` body, `ETag`, `Last-Modified` and
   `Accept-Ranges: bytes` as the leader and no `x-yadb-leader-id`; a failed
-  `If-Match` answered `412`, a matching `If-None-Match` answered `304`, and
-  `Range: bytes=900-999` on the 11-byte object answered `416 InvalidRange` with
-  `Content-Range: bytes */11` on both nodes. Three `require_transaction` queries
-  with an unknown session answered `409` and left `leases_live: 0`. Two block
+  `If-Match` answered `412`, a matching `If-None-Match` answered a bodyless
+  `304`, and `Range: bytes=900-999` on the 11-byte object answered `416
+  InvalidRange` with `Content-Range: bytes */11` on both nodes; the gateway
+  `/s3/...` path answered the same three statuses. Three `require_transaction`
+  queries with an unknown session answered `409` and left `leases_live: 0`. Two block
   overwrites plus those reads left one
   live reader lease; the pass refused, and the next pass reclaimed 96 fragments /
   396,483 bytes with the block, the S3 object and the 602 rows still intact.
@@ -453,8 +460,9 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   `a_write_whose_lease_was_reaped_does_not_publish`,
   `proxy_response_preserves_allowlisted_entity_headers_and_rejects_duplicates`,
   `range_end_past_the_size_is_clamped_but_a_start_past_it_is_refused`,
-  `a_forwarded_read_keeps_the_local_conditional_contract`,
-  `a_forwarded_read_keeps_the_local_range_and_size_rules`,
+  `a_read_applies_the_local_conditional_contract`,
+  `a_read_applies_the_local_range_and_size_rules`,
+  `proxy_response_accepts_a_bodyless_304_without_content_length`,
   `map_error_frames_gateway_range_errors_as_s3_errors`,
   `map_error_frames_gateway_bad_requests_as_invalid_request`).
 - [x] Bound the metadata Raft log. The legacy Raft log is now checkpointed and

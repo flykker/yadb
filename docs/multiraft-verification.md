@@ -925,20 +925,24 @@ publishing fragments a pass has already reclaimed; a read verifies its lease
 after fetching and answers `503` if it did not survive, because a pass may have
 reaped the expired record and reclaimed what was just read. Since only the
 metadata leader can publish a lease, a legacy follower proxies reads to the
-leader (carrying the caller's `Range` header) instead of serving them unfenced.
+leader (carrying the caller's `Range` and conditional headers) instead of
+serving them unfenced.
 Both the gateway and the native S3 listener proxy on a follower: the native
 listener re-authenticates the SigV4 request first, forwards the proven subject
 through the internal gateway, and re-frames a gateway error as an S3 XML error,
-so the wire format does not change. A range end past the object is clamped to the
+so the wire format does not change. The node that reads the manifest decides the
+read: `If-Match`/`If-None-Match`, existence, the range and the 16 MiB rule are
+all evaluated against the one manifest whose fragments are then fetched, on the
+leader. A follower's applied metadata can lag, so it never answers those
+questions itself; it only forwards. A range end past the object is clamped to the
 object size (RFC 9110) by both paths, so a proxied `bytes=7-999` still answers
-`206` with `Content-Range: bytes 7-8/9` rather than a `416`. A native read also
-keeps its whole local contract: existence, `If-Match`/`If-None-Match` (evaluated
-against the ETag the leader actually returned, so a concurrent overwrite cannot
-turn a failed precondition into a `200`), an unsatisfiable range (`416` with
-`Content-Range: bytes */size`) and the 16 MiB rules (`400 InvalidRequest`) are
-decided before or after the forward with the same status, S3 error code and
-headers as a local read; `Last-Modified` and `Accept-Ranges` come back from the
-leader's manifest, and the internal `x-yadb-leader-id` hop header is removed. A
+`206` with `Content-Range: bytes 7-8/9` rather than a `416`, an unsatisfiable
+range answers the local `416 InvalidRange` with `Content-Range: bytes */size`, a
+failed precondition answers `412`, a matching `If-None-Match` answers a bodyless
+`304`, and a read over 16 MiB answers `400 InvalidRequest` before any fragment is
+fetched. `Last-Modified` and `Accept-Ranges` come from that manifest and the
+internal `x-yadb-leader-id` hop header is removed, so a follower response is the
+one a local read would have produced. A
 read-only statement whose lease did not survive is refused with `503`; a
 statement that committed a write keeps its result even if the fence was lost,
 because the mutation is already durable and reporting it as failed would make the
@@ -978,9 +982,10 @@ module (`admission_is_closed_while_a_pass_holds_the_collector_record`,
 `a_renewed_lease_keeps_its_ownership_and_extends_its_ttl`,
 `a_write_whose_lease_was_reaped_does_not_publish` in `yadb-block`). The proxied
 read path is covered by `proxy_response_preserves_allowlisted_entity_headers_and_rejects_duplicates`,
+`proxy_response_accepts_a_bodyless_304_without_content_length`,
 `range_end_past_the_size_is_clamped_but_a_start_past_it_is_refused`,
-`a_forwarded_read_keeps_the_local_conditional_contract`,
-`a_forwarded_read_keeps_the_local_range_and_size_rules`,
+`a_read_applies_the_local_conditional_contract`,
+`a_read_applies_the_local_range_and_size_rules`,
 `map_error_frames_gateway_range_errors_as_s3_errors` and
 `map_error_frames_gateway_bad_requests_as_invalid_request`. Byte
 counts are real bytes on disk across the three slots of an in-process mirror
@@ -1036,16 +1041,19 @@ bytes with the block, the S3 object and the 602 rows still intact. A third run o
 the same cluster closed the review findings: a native follower GET returned the
 same `200` body, `ETag`, `Last-Modified` and `Accept-Ranges: bytes` as the leader
 and no internal `x-yadb-leader-id`; a failed `If-Match` answered `412
-PreconditionFailed`, a matching `If-None-Match` answered `304`, `Range:
-bytes=900-999` on the 11-byte object answered `416 InvalidRange` with
-`Content-Range: bytes */11` on both leader and follower, and a missing key
-answered `404 NoSuchKey` with `<Message>object not found</Message>` instead of
-the gateway's JSON envelope. Three `require_transaction` queries with an unknown
-session answered `409` and left `leases_live: 0`, so a refused statement no
+PreconditionFailed`, a matching `If-None-Match` answered a bodyless `304` with no
+`Content-Type`, `Range: bytes=900-999` on the 11-byte object answered `416
+InvalidRange` with `Content-Range: bytes */11` on both leader and follower, and a
+missing key answered `404 NoSuchKey` with `<Message>object not found</Message>`
+instead of the gateway's JSON envelope. The same conditions on the gateway path
+(`/s3/...`) answered `304`, `412` and `416` with the same `Content-Range`, so the
+gateway and the native listener now share one decision. Three
+`require_transaction` queries with an unknown session answered `409` and left
+`leases_live: 0`, so a refused statement no
 longer parks a reader lease. After one 64 KiB block overwrite plus reads through
 all three paths the pass refused on `2 live lease(s) (2 reader, 0 writer)` and
-the next pass reclaimed 48 fragments / 198,192 bytes with the block, the S3
-object and the 602 rows intact. Gates on this tree: `yadbd --bins` **70/70**,
+the next pass reclaimed 48 fragments / 198,291 bytes with the block, the S3
+object and the 602 rows intact. Gates on this tree: `yadbd --bins` **71/71**,
 `yadb-metakv` **169/169**, `yadb-block`
 **25/25**, `yadb-db` **46/46**, `yadb-s3` **26/26**, `cargo fmt --all --
 --check` clean, `tests/protocols.py` **16/16** and

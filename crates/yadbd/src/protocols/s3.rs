@@ -49,75 +49,46 @@ async fn discard_read_lease(app: &AppState, lease: Option<yadb_metakv::GcLease>)
     }
 }
 
-/// The `If-Match`/`If-None-Match` decision of the native listener, applied to
-/// the ETag a read actually produced.
-///
-/// A proxied read evaluates it against the leader's response, not against the
-/// follower's local manifest: the object can be overwritten between the two, and
-/// a conditional request must never return bytes that violate its condition.
-fn evaluate_conditions(headers: &HeaderMap, etag: &str) -> Option<Response> {
-    if headers
-        .get(header::IF_MATCH)
-        .is_some_and(|v| v.as_bytes() != etag.as_bytes())
-    {
-        return Some(err(
+/// Renders the shared conditional decision as the native wire response.
+fn condition_refusal(headers: &HeaderMap, etag: &str) -> Option<Response> {
+    match crate::evaluate_conditions(headers, etag) {
+        crate::Conditional::Passed => None,
+        crate::Conditional::Failed => Some(err(
             StatusCode::PRECONDITION_FAILED,
             "PreconditionFailed",
             "ETag mismatch",
-        ));
+        )),
+        crate::Conditional::NotModified => Some(StatusCode::NOT_MODIFIED.into_response()),
     }
-    if headers
-        .get(header::IF_NONE_MATCH)
-        .is_some_and(|v| v.as_bytes() == etag.as_bytes())
-    {
-        return Some(StatusCode::NOT_MODIFIED.into_response());
-    }
-    None
 }
 
-/// The range and size rules the native listener applies to a GET.
-///
-/// A read that is forwarded must satisfy them *before* it leaves the node: the
-/// internal gateway has no 16 MiB limit and answers its own JSON error
-/// vocabulary, so a request the local handler would refuse has to be refused
-/// here with the local status and headers (`416 InvalidRange` with
-/// `Content-Range: bytes */size`, or `400 InvalidRequest`).
-fn preflight_range(headers: &HeaderMap, size: u64) -> Result<Option<(u64, u64)>, Response> {
-    let range = match headers.get(header::RANGE).and_then(|v| v.to_str().ok()) {
-        Some(value) => match parse_range_header(value, size) {
-            Some(range) => Some(range),
-            None => {
-                let mut response = err(
-                    StatusCode::RANGE_NOT_SATISFIABLE,
-                    "InvalidRange",
-                    "range not satisfiable",
-                );
-                response.headers_mut().insert(
-                    header::CONTENT_RANGE,
-                    format!("bytes */{size}").parse().unwrap(),
-                );
-                return Err(response);
-            }
-        },
-        None => None,
-    };
-    if size > 16 * 1024 * 1024 && range.is_none() {
-        return Err(err(
+/// Renders the shared range decision as the native wire response.
+fn range_slice(headers: &HeaderMap, size: u64) -> Result<Option<(u64, u64)>, Response> {
+    let range_hdr = headers.get(header::RANGE).and_then(|v| v.to_str().ok());
+    match crate::range_decision(range_hdr, size) {
+        crate::RangeDecision::Serve(range) => Ok(range),
+        crate::RangeDecision::Unsatisfiable => {
+            let mut response = err(
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                "InvalidRange",
+                "range not satisfiable",
+            );
+            response.headers_mut().insert(
+                header::CONTENT_RANGE,
+                format!("bytes */{size}").parse().unwrap(),
+            );
+            Err(response)
+        }
+        crate::RangeDecision::TooLarge => Err(err(
             StatusCode::BAD_REQUEST,
             "InvalidRequest",
-            "use Range for objects over 16 MiB",
-        ));
+            if range_hdr.is_some() {
+                "range exceeds 16 MiB"
+            } else {
+                "use Range for objects over 16 MiB"
+            },
+        )),
     }
-    if let Some((start, end)) = range {
-        if end - start + 1 > 16 * 1024 * 1024 {
-            return Err(err(
-                StatusCode::BAD_REQUEST,
-                "InvalidRequest",
-                "range exceeds 16 MiB",
-            ));
-        }
-    }
-    Ok(range)
 }
 fn query(raw: &str) -> io::Result<Vec<(String, String)>> {
     if raw.is_empty() {
@@ -594,33 +565,17 @@ pub async fn handle(State(st): State<S3State>, request: Request) -> Response {
             }
         }
         Method::GET | Method::HEAD => {
-            // A legacy read is fenced by a reader lease, and only the metadata
-            // leader can publish one. A follower therefore forwards the request
-            // it has already authenticated (with its `Range` header) to the
-            // leader's gateway route instead of serving its own copy unfenced or
-            // failing on the lease. On the leader this returns `None` and the
-            // read runs locally under the lease taken below. HEAD reads no
-            // fragments, so it needs no fence and stays local.
+            // A legacy read is fenced by a reader lease, and only the
+            // metadata leader can publish one. A follower therefore forwards
+            // the request it has already authenticated, together with the
+            // `Range` and conditional headers, to the leader's gateway. The
+            // leader decides existence, `If-Match`/`If-None-Match`, the range
+            // and the 16 MiB rule from the one manifest it reads under its
+            // lease, so a follower's lagging metadata cannot refuse or
+            // mis-slice a read the leader can serve. On the leader this returns
+            // `None` and the read runs locally under the lease taken below.
+            // HEAD reads no fragments, so it needs no fence and stays local.
             if method == Method::GET && !st.app.meta.is_openraft() {
-                // Validate against local metadata first. The manifest read takes
-                // no lease (only the fragment fetch does), and applying the local
-                // contract here keeps `404`, `304`, `412`, `416` and the 16 MiB
-                // rules identical whether the read is served here or forwarded.
-                let engine = st.app.s3.clone();
-                let (p, s, b, k) = (pid, st.store.clone(), bucket.to_string(), key.to_string());
-                let head =
-                    match tokio::task::spawn_blocking(move || engine.head_object(p, &s, &b, &k))
-                        .await
-                    {
-                        Ok(Ok(head)) => head,
-                        _ => return err(StatusCode::NOT_FOUND, "NoSuchKey", "object not found"),
-                    };
-                if let Some(response) = evaluate_conditions(&headers, &head.etag) {
-                    return response;
-                }
-                if let Err(response) = preflight_range(&headers, head.size) {
-                    return response;
-                }
                 let mut forwarded = gateway_headers.clone();
                 if let Some(secret) = st.app.subject_secret.as_deref() {
                     match subject_signature(secret, &subject).parse() {
@@ -632,8 +587,10 @@ pub async fn handle(State(st): State<S3State>, request: Request) -> Response {
                         }
                     }
                 }
-                if let Some(range) = headers.get(header::RANGE) {
-                    forwarded.insert(header::RANGE, range.clone());
+                for name in [header::RANGE, header::IF_MATCH, header::IF_NONE_MATCH] {
+                    if let Some(value) = headers.get(&name) {
+                        forwarded.insert(name, value.clone());
+                    }
                 }
                 let gateway_path = format!(
                     "/s3/{}/{}/{}/{}",
@@ -656,26 +613,18 @@ pub async fn handle(State(st): State<S3State>, request: Request) -> Response {
                 )
                 .await
                 {
-                    // A successful read is returned as-is (body, ETag and
-                    // Content-Range). A failure is re-framed as an S3 XML error,
-                    // because the gateway answers JSON and a native S3 client
-                    // parses the wire format.
+                    let mut response = response;
+                    // The internal hop's identity is not part of the native
+                    // wire format, and a 304 has no representation.
+                    response.headers_mut().remove("x-yadb-leader-id");
+                    if response.status() == StatusCode::NOT_MODIFIED {
+                        response.headers_mut().remove(header::CONTENT_TYPE);
+                        return response;
+                    }
+                    // A failure is re-framed as an S3 XML error, because the
+                    // gateway answers JSON and a native S3 client parses the
+                    // wire format.
                     if response.status().is_success() {
-                        if let Some(etag) = response
-                            .headers()
-                            .get(header::ETAG)
-                            .and_then(|v| v.to_str().ok())
-                        {
-                            // Re-check against the version actually read: the
-                            // preflight above only saw the follower's manifest.
-                            if let Some(conditional) = evaluate_conditions(&headers, etag) {
-                                return conditional;
-                            }
-                        }
-                        let mut response = response;
-                        // The internal hop's identity is not part of the native
-                        // wire format.
-                        response.headers_mut().remove("x-yadb-leader-id");
                         return response;
                     }
                     return map_error(response).await;
@@ -713,7 +662,7 @@ pub async fn handle(State(st): State<S3State>, request: Request) -> Response {
                         return err(StatusCode::NOT_FOUND, "NoSuchKey", "object not found");
                     }
                 };
-            if let Some(response) = evaluate_conditions(&headers, &head.etag) {
+            if let Some(response) = condition_refusal(&headers, &head.etag) {
                 discard_read_lease(&st.app, read_lease.take()).await;
                 return response;
             }
@@ -729,7 +678,7 @@ pub async fn handle(State(st): State<S3State>, request: Request) -> Response {
                     .body(axum::body::Body::empty())
                     .unwrap();
             }
-            let range = match preflight_range(&headers, head.size) {
+            let range = match range_slice(&headers, head.size) {
                 Ok(range) => range,
                 Err(response) => {
                     discard_read_lease(&st.app, read_lease.take()).await;
@@ -823,6 +772,7 @@ async fn map_error(response: Response) -> Response {
         StatusCode::NOT_FOUND => "NoSuchKey",
         StatusCode::BAD_REQUEST => "InvalidRequest",
         StatusCode::RANGE_NOT_SATISFIABLE => "InvalidRange",
+        StatusCode::PRECONDITION_FAILED => "PreconditionFailed",
         _ => "ServiceUnavailable",
     };
     // The gateway answers `{"error": "..."}`. An S3 client reads an S3 message,
@@ -903,67 +853,88 @@ mod tests {
     }
 
     #[test]
-    fn a_forwarded_read_keeps_the_local_conditional_contract() {
-        // The decision is applied to the ETag the read actually produced, so a
+    fn a_read_applies_the_local_conditional_contract() {
+        // The decision is shared by the native listener and the gateway, and is
+        // applied to the ETag of the manifest the bytes came from, so a
         // concurrent overwrite cannot turn a failed If-Match into a 200.
+        assert!(matches!(
+            crate::evaluate_conditions(&request_headers(&[("if-match", "\"b\"")]), "\"a\""),
+            crate::Conditional::Failed
+        ));
+        assert!(matches!(
+            crate::evaluate_conditions(&request_headers(&[("if-none-match", "\"a\"")]), "\"a\""),
+            crate::Conditional::NotModified
+        ));
+        assert!(matches!(
+            crate::evaluate_conditions(&request_headers(&[("if-match", "\"a\"")]), "\"a\""),
+            crate::Conditional::Passed
+        ));
+        assert!(matches!(
+            crate::evaluate_conditions(&request_headers(&[("if-none-match", "\"b\"")]), "\"a\""),
+            crate::Conditional::Passed
+        ));
+        assert!(matches!(
+            crate::evaluate_conditions(&request_headers(&[]), "\"a\""),
+            crate::Conditional::Passed
+        ));
+        // The native rendering of that decision.
         assert_eq!(
-            evaluate_conditions(&request_headers(&[("if-match", "\"b\"")]), "\"a\"")
+            condition_refusal(&request_headers(&[("if-match", "\"b\"")]), "\"a\"")
                 .unwrap()
                 .status(),
             StatusCode::PRECONDITION_FAILED
         );
         assert_eq!(
-            evaluate_conditions(&request_headers(&[("if-none-match", "\"a\"")]), "\"a\"")
+            condition_refusal(&request_headers(&[("if-none-match", "\"a\"")]), "\"a\"")
                 .unwrap()
                 .status(),
             StatusCode::NOT_MODIFIED
         );
-        assert!(evaluate_conditions(&request_headers(&[("if-match", "\"a\"")]), "\"a\"").is_none());
-        assert!(
-            evaluate_conditions(&request_headers(&[("if-none-match", "\"b\"")]), "\"a\"").is_none()
-        );
-        assert!(evaluate_conditions(&request_headers(&[]), "\"a\"").is_none());
+        assert!(condition_refusal(&request_headers(&[]), "\"a\"").is_none());
     }
 
     #[test]
-    fn a_forwarded_read_keeps_the_local_range_and_size_rules() {
+    fn a_read_applies_the_local_range_and_size_rules() {
         // A clamp is accepted, exactly as the local read answers it.
         assert_eq!(
-            preflight_range(&request_headers(&[("range", "bytes=7-999")]), 9).ok(),
+            range_slice(&request_headers(&[("range", "bytes=7-999")]), 9).ok(),
             Some(Some((7, 8)))
         );
         // An unsatisfiable range is the local `416` with its Content-Range, not
         // a `503` from the internal gateway.
-        let refused = preflight_range(&request_headers(&[("range", "bytes=900-999")]), 9)
+        let refused = range_slice(&request_headers(&[("range", "bytes=900-999")]), 9)
             .expect_err("start past the size is unsatisfiable");
         assert_eq!(refused.status(), StatusCode::RANGE_NOT_SATISFIABLE);
         assert_eq!(refused.headers()[header::CONTENT_RANGE], "bytes */9");
         // A full read over the wire cap, and a range over it, are the local
         // `400 InvalidRequest` rather than a proxy failure.
-        let cap = 16 * 1024 * 1024;
+        let cap = crate::S3_READ_CAP;
+        let full = range_slice(&request_headers(&[]), cap + 1)
+            .expect_err("a full read over 16 MiB is refused");
+        assert_eq!(full.status(), StatusCode::BAD_REQUEST);
+        let ranged = range_slice(&request_headers(&[("range", "bytes=0-")]), cap + 1)
+            .expect_err("a range over 16 MiB is refused");
+        assert_eq!(ranged.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(range_slice(&request_headers(&[]), cap).ok(), Some(None));
         assert_eq!(
-            preflight_range(&request_headers(&[]), cap + 1)
-                .expect_err("a full read over 16 MiB is refused")
-                .status(),
-            StatusCode::BAD_REQUEST
-        );
-        assert_eq!(
-            preflight_range(&request_headers(&[("range", "bytes=0-")]), cap + 1)
-                .expect_err("a range over 16 MiB is refused")
-                .status(),
-            StatusCode::BAD_REQUEST
-        );
-        assert_eq!(preflight_range(&request_headers(&[]), cap).ok(), Some(None));
-        assert_eq!(
-            preflight_range(&request_headers(&[("range", "bytes=0-")]), cap).ok(),
+            range_slice(&request_headers(&[("range", "bytes=0-")]), cap).ok(),
             Some(Some((0, cap - 1)))
         );
+        // The shared decision itself, including the empty-object case.
+        assert!(matches!(
+            crate::range_decision(Some("bytes=0-0"), 0),
+            crate::RangeDecision::Unsatisfiable
+        ));
+        assert!(matches!(
+            crate::range_decision(Some("items=0-1"), 9),
+            crate::RangeDecision::Unsatisfiable
+        ));
     }
 
     #[tokio::test]
     async fn map_error_frames_gateway_range_errors_as_s3_errors() {
         let mut response =
-            crate::api_err(StatusCode::RANGE_NOT_SATISFIABLE, "invalid Range header");
+            crate::api_err(StatusCode::RANGE_NOT_SATISFIABLE, "range not satisfiable");
         response
             .headers_mut()
             .insert(header::CONTENT_RANGE, "bytes */9".parse().unwrap());
@@ -977,7 +948,7 @@ mod tests {
         assert!(body.contains("<Code>InvalidRange</Code>"), "{body}");
         // The gateway's JSON envelope is unwrapped, not quoted into <Message>.
         assert!(
-            body.contains("<Message>invalid Range header</Message>"),
+            body.contains("<Message>range not satisfiable</Message>"),
             "{body}"
         );
         assert!(!body.contains("&quot;"), "{body}");

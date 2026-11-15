@@ -1186,6 +1186,8 @@ fn proxy_http_to_peer(
     body: &[u8],
     idempotency_key: Option<&str>,
     range: Option<&str>,
+    if_match: Option<&str>,
+    if_none_match: Option<&str>,
 ) -> Result<ProxyResponse, std::io::Error> {
     let clean = peer_addr
         .trim()
@@ -1213,8 +1215,17 @@ fn proxy_http_to_peer(
     let range_header = range
         .map(|range| format!("Range: {range}\r\n"))
         .unwrap_or_default();
+    // Conditional reads are decided by the node that reads the manifest, so a
+    // forwarded read carries the caller's conditions instead of evaluating them
+    // against the follower's possibly lagging metadata.
+    let if_match_header = if_match
+        .map(|value| format!("If-Match: {value}\r\n"))
+        .unwrap_or_default();
+    let if_none_match_header = if_none_match
+        .map(|value| format!("If-None-Match: {value}\r\n"))
+        .unwrap_or_default();
     let req = format!(
-        "{method} {path_and_query} HTTP/1.1\r\nHost: {clean}\r\nx-yadb-subject: {subject}\r\n{signature_header}{key_header}{range_header}x-yadb-forwarded: 1\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "{method} {path_and_query} HTTP/1.1\r\nHost: {clean}\r\nx-yadb-subject: {subject}\r\n{signature_header}{key_header}{range_header}{if_match_header}{if_none_match_header}x-yadb-forwarded: 1\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
     stream.write_all(req.as_bytes())?;
@@ -1331,6 +1342,22 @@ fn parse_proxy_response(raw: &[u8]) -> Result<ProxyResponse, std::io::Error> {
     }
 
     let payload_slice = &raw[hdr_end + 4..];
+    // A 304 carries no content and a peer may omit `Content-Length` for it. It
+    // is not a close-delimited body: any payload at all is malformed.
+    if status_code == StatusCode::NOT_MODIFIED.as_u16() {
+        if !payload_slice.is_empty() {
+            return Err(invalid());
+        }
+        return Ok(ProxyResponse {
+            code: status_code,
+            content_type: resp_ct,
+            etag: resp_etag,
+            write_outcome,
+            retry,
+            headers,
+            body: Vec::new(),
+        });
+    }
     if is_chunked && content_length.is_some() {
         return Err(invalid());
     }
@@ -1577,6 +1604,14 @@ async fn maybe_forward_write(
         .get(header::RANGE)
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
+    let if_match = headers
+        .get(header::IF_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let if_none_match = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
 
     let openraft = meta.is_openraft();
     let outcome = tokio::task::spawn_blocking(move || {
@@ -1608,6 +1643,8 @@ async fn maybe_forward_write(
                 &body,
                 idempotency_key.as_deref(),
                 range.as_deref(),
+                if_match.as_deref(),
+                if_none_match.as_deref(),
             )
             .map(|response| Some((target, response)))
             .map_err(|_| {
@@ -1655,6 +1692,8 @@ async fn maybe_forward_write(
                 &body,
                 idempotency_key.as_deref(),
                 range.as_deref(),
+                if_match.as_deref(),
+                if_none_match.as_deref(),
             ) {
                 Ok(ref response)
                     if response.code == 409
@@ -1755,6 +1794,72 @@ pub(crate) fn http_date(timestamp: u64) -> String {
         .unwrap_or_default()
         .format("%a, %d %b %Y %H:%M:%S GMT")
         .to_string()
+}
+
+/// Largest slice the S3 read paths serve in one response. The native listener
+/// has always refused a larger read (`400 InvalidRequest`) and the forwarding
+/// wire has the same bound, so both the local and the proxied read enforce it
+/// before any fragment is fetched.
+pub(crate) const S3_READ_CAP: u64 = 16 * 1024 * 1024;
+
+/// What a read of `size` bytes may fetch for the given `Range` header.
+pub(crate) enum RangeDecision {
+    /// Serve this slice, or the whole object when `None`.
+    Serve(Option<(u64, u64)>),
+    /// The range starts at or past the size, or is reversed: `416`.
+    Unsatisfiable,
+    /// The slice exceeds `S3_READ_CAP`: `400 InvalidRequest`.
+    TooLarge,
+}
+
+/// The range rule shared by the native listener and the gateway. It is decided
+/// against one manifest, so the slice description and the bytes always agree.
+pub(crate) fn range_decision(range: Option<&str>, size: u64) -> RangeDecision {
+    let parsed = match range {
+        Some(value) => match parse_range_header(value, size) {
+            Some(range) => Some(range),
+            None => return RangeDecision::Unsatisfiable,
+        },
+        None => None,
+    };
+    if size > S3_READ_CAP && parsed.is_none() {
+        return RangeDecision::TooLarge;
+    }
+    if let Some((start, end)) = parsed {
+        if end - start + 1 > S3_READ_CAP {
+            return RangeDecision::TooLarge;
+        }
+    }
+    RangeDecision::Serve(parsed)
+}
+
+/// Outcome of `If-Match`/`If-None-Match` for a read that produced `etag`.
+pub(crate) enum Conditional {
+    Passed,
+    /// `If-Match` did not name the object version: `412`.
+    Failed,
+    /// `If-None-Match` named the object version: `304`.
+    NotModified,
+}
+
+/// Evaluates the conditional headers against the ETag a read actually
+/// produced. The native listener renders this as an S3 XML error and the
+/// gateway as an API error, but both must decide it from the same manifest the
+/// bytes came from.
+pub(crate) fn evaluate_conditions(headers: &HeaderMap, etag: &str) -> Conditional {
+    if headers
+        .get(header::IF_MATCH)
+        .is_some_and(|v| v.as_bytes() != etag.as_bytes())
+    {
+        return Conditional::Failed;
+    }
+    if headers
+        .get(header::IF_NONE_MATCH)
+        .is_some_and(|v| v.as_bytes() == etag.as_bytes())
+    {
+        return Conditional::NotModified;
+    }
+    Conditional::Passed
 }
 
 async fn handle_ui() -> Html<&'static str> {
@@ -4563,7 +4668,7 @@ async fn handle_s3_get(
         .map(str::to_string);
 
     if q.consistent {
-        return s3_get_consistent(st, project_id, store, bucket, key, range_hdr).await;
+        return s3_get_consistent(st, project_id, store, bucket, key, &headers, range_hdr).await;
     }
 
     if !st.meta.is_openraft() {
@@ -4607,84 +4712,16 @@ async fn handle_s3_get(
         Err(error) => return api_err(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
     };
 
-    let response = if let Some(range_hdr) = range_hdr {
-        // No early return inside the fenced region: leaving it would keep the
-        // lease until it expires and block collection for no reason.
-        match st.s3.head_object(project_id, &store, &bucket, &key) {
-            Ok(head) => match parse_range_header(&range_hdr, head.size) {
-                Some((start, end)) => {
-                    let s3 = st.s3.clone();
-                    let res = tokio::task::spawn_blocking(move || {
-                        s3.get_object_range(project_id, &store, &bucket, &key, start, end)
-                    })
-                    .await;
-                    match res {
-                        Ok(Ok((mf, bytes))) => {
-                            let content_range = format!("bytes {start}-{end}/{}", mf.size);
-                            let last_modified = http_date(mf.last_modified);
-                            (
-                                StatusCode::PARTIAL_CONTENT,
-                                [
-                                    (header::CONTENT_TYPE, mf.content_type),
-                                    (header::ETAG, mf.etag),
-                                    (header::CONTENT_RANGE, content_range),
-                                    (header::LAST_MODIFIED, last_modified),
-                                    (header::ACCEPT_RANGES, "bytes".to_string()),
-                                ],
-                                bytes,
-                            )
-                                .into_response()
-                        }
-                        Ok(Err(S3Error::InvalidRange { .. })) => {
-                            api_err(StatusCode::RANGE_NOT_SATISFIABLE, "range out of bounds")
-                        }
-                        Ok(Err(e)) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-                        Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-                    }
-                }
-                None => {
-                    // Keep the size hint a native client uses to retry, so a
-                    // forwarded 416 looks like the local one.
-                    let mut response =
-                        api_err(StatusCode::RANGE_NOT_SATISFIABLE, "invalid Range header");
-                    if let Ok(value) = format!("bytes */{}", head.size).parse() {
-                        response.headers_mut().insert(header::CONTENT_RANGE, value);
-                    }
-                    response
-                }
-            },
-            Err(S3Error::ObjectNotFound { .. }) => {
-                api_err(StatusCode::NOT_FOUND, "object not found")
-            }
-            Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-        }
-    } else {
-        let s3 = st.s3.clone();
-        let res =
-            tokio::task::spawn_blocking(move || s3.get_object(project_id, &store, &bucket, &key))
-                .await;
-        match res {
-            Ok(Ok((mf, bytes))) => {
-                let last_modified = http_date(mf.last_modified);
-                (
-                    StatusCode::OK,
-                    [
-                        (header::CONTENT_TYPE, mf.content_type),
-                        (header::ETAG, mf.etag),
-                        (header::LAST_MODIFIED, last_modified),
-                        (header::ACCEPT_RANGES, "bytes".to_string()),
-                    ],
-                    bytes,
-                )
-                    .into_response()
-            }
-            Ok(Err(S3Error::ObjectNotFound { .. })) => {
-                api_err(StatusCode::NOT_FOUND, "object not found")
-            }
-            Ok(Err(e)) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-            Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-        }
-    };
+    let response = s3_get_fenced(
+        &st,
+        project_id,
+        &store,
+        &bucket,
+        &key,
+        &headers,
+        range_hdr.as_deref(),
+    )
+    .await;
 
     let st_fence = st.clone();
     match tokio::task::spawn_blocking(move || st_fence.end_read_lease(&lease)).await {
@@ -4695,6 +4732,79 @@ async fn handle_s3_get(
         Ok(Err(error)) => api_err(StatusCode::SERVICE_UNAVAILABLE, error.to_string()),
         Err(error) => api_err(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
     }
+}
+
+/// One fenced legacy read. The manifest is read once, and that same manifest
+/// decides the conditional result, the range, the size rule and the chunk ids
+/// that are fetched: a second metadata read would let an overwrite make the
+/// slice description disagree with the bytes.
+async fn s3_get_fenced(
+    st: &AppState,
+    project_id: u32,
+    store: &str,
+    bucket: &str,
+    key: &str,
+    headers: &HeaderMap,
+    range_hdr: Option<&str>,
+) -> Response {
+    let s3 = st.s3.clone();
+    let (store, bucket, key) = (store.to_string(), bucket.to_string(), key.to_string());
+    let head =
+        tokio::task::spawn_blocking(move || s3.head_object(project_id, &store, &bucket, &key))
+            .await;
+    let mf = match head {
+        Ok(Ok(mf)) => mf,
+        Ok(Err(S3Error::ObjectNotFound { .. })) => {
+            return api_err(StatusCode::NOT_FOUND, "object not found")
+        }
+        Ok(Err(e)) => return api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        Err(e) => return api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+    match evaluate_conditions(headers, &mf.etag) {
+        Conditional::Passed => {}
+        Conditional::Failed => {
+            return api_err(StatusCode::PRECONDITION_FAILED, "ETag mismatch");
+        }
+        Conditional::NotModified => return StatusCode::NOT_MODIFIED.into_response(),
+    }
+    let range = match range_decision(range_hdr, mf.size) {
+        RangeDecision::Serve(range) => range,
+        RangeDecision::Unsatisfiable => {
+            // Keep the size hint a client uses to retry.
+            let mut response = api_err(StatusCode::RANGE_NOT_SATISFIABLE, "range not satisfiable");
+            if let Ok(value) = format!("bytes */{}", mf.size).parse() {
+                response.headers_mut().insert(header::CONTENT_RANGE, value);
+            }
+            return response;
+        }
+        RangeDecision::TooLarge => {
+            return api_err(
+                StatusCode::BAD_REQUEST,
+                if range_hdr.is_some() {
+                    "range exceeds 16 MiB"
+                } else {
+                    "use Range for objects over 16 MiB"
+                },
+            );
+        }
+    };
+    let (start, end) = range.unwrap_or((0, mf.size.saturating_sub(1)));
+    let s3 = st.s3.clone();
+    let snapshot = mf.clone();
+    let res = tokio::task::spawn_blocking(move || {
+        if snapshot.size == 0 {
+            Ok(Vec::new())
+        } else {
+            s3.read_manifest_range(&snapshot, start, end)
+        }
+    })
+    .await;
+    let bytes = match res {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(e)) => return api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        Err(e) => return api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+    object_read_response(mf, range, bytes)
 }
 
 /// Quorum-confirmed GET. The manifest comes from exactly one linearizable
@@ -4711,66 +4821,86 @@ async fn s3_get_consistent(
     store: String,
     bucket: String,
     key: String,
+    headers: &HeaderMap,
     range_hdr: Option<String>,
 ) -> Response {
-    if let Some(range_hdr) = range_hdr {
-        let s3 = st.s3.clone();
-        let head = tokio::task::spawn_blocking(move || {
-            s3.head_object_consistent(project_id, &store, &bucket, &key)
-        })
-        .await;
-        let mf = match head {
-            Ok(Ok(mf)) => mf,
-            Ok(Err(e)) => return s3_read_err(&st, e),
-            Err(e) => return api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-        };
-        let Some((start, end)) = parse_range_header(&range_hdr, mf.size) else {
-            return api_err(StatusCode::RANGE_NOT_SATISFIABLE, "invalid Range header");
-        };
-        let s3 = st.s3.clone();
-        let res = tokio::task::spawn_blocking(move || {
-            let bytes = s3.read_manifest_range(&mf, start, end)?;
-            Ok::<_, S3Error>((mf, bytes))
-        })
-        .await;
-        return match res {
-            Ok(Ok((mf, bytes))) => (
-                StatusCode::PARTIAL_CONTENT,
-                [
-                    (header::CONTENT_TYPE, mf.content_type),
-                    (header::ETAG, mf.etag),
-                    (
-                        header::CONTENT_RANGE,
-                        format!("bytes {start}-{end}/{}", mf.size),
-                    ),
-                ],
-                bytes,
-            )
-                .into_response(),
-            Ok(Err(e)) => s3_read_err(&st, e),
-            Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-        };
-    }
-
     let s3 = st.s3.clone();
+    let (s, b, k) = (store.clone(), bucket.clone(), key.clone());
+    let head =
+        tokio::task::spawn_blocking(move || s3.head_object_consistent(project_id, &s, &b, &k))
+            .await;
+    let mf = match head {
+        Ok(Ok(mf)) => mf,
+        Ok(Err(e)) => return s3_read_err(&st, e),
+        Err(e) => return api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+    match evaluate_conditions(headers, &mf.etag) {
+        Conditional::Passed => {}
+        Conditional::Failed => {
+            return api_err(StatusCode::PRECONDITION_FAILED, "ETag mismatch");
+        }
+        Conditional::NotModified => return StatusCode::NOT_MODIFIED.into_response(),
+    }
+    let range = match range_decision(range_hdr.as_deref(), mf.size) {
+        RangeDecision::Serve(range) => range,
+        RangeDecision::Unsatisfiable => {
+            let mut response = api_err(StatusCode::RANGE_NOT_SATISFIABLE, "range not satisfiable");
+            if let Ok(value) = format!("bytes */{}", mf.size).parse() {
+                response.headers_mut().insert(header::CONTENT_RANGE, value);
+            }
+            return response;
+        }
+        RangeDecision::TooLarge => {
+            return api_err(
+                StatusCode::BAD_REQUEST,
+                if range_hdr.is_some() {
+                    "range exceeds 16 MiB"
+                } else {
+                    "use Range for objects over 16 MiB"
+                },
+            );
+        }
+    };
+    let (start, end) = range.unwrap_or((0, mf.size.saturating_sub(1)));
+    let s3 = st.s3.clone();
+    let snapshot = mf.clone();
     let res = tokio::task::spawn_blocking(move || {
-        s3.get_object_consistent(project_id, &store, &bucket, &key)
+        if snapshot.size == 0 {
+            Ok(Vec::new())
+        } else {
+            s3.read_manifest_range(&snapshot, start, end)
+        }
     })
     .await;
-
     match res {
-        Ok(Ok((mf, bytes))) => (
-            StatusCode::OK,
-            [
-                (header::CONTENT_TYPE, mf.content_type),
-                (header::ETAG, mf.etag),
-            ],
-            bytes,
-        )
-            .into_response(),
+        Ok(Ok(bytes)) => object_read_response(mf, range, bytes),
         Ok(Err(e)) => s3_read_err(&st, e),
         Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
+}
+
+/// Renders one object read: the slice description, the version and the
+/// timestamps all come from the same manifest the bytes were read with.
+fn object_read_response(mf: ObjectManifest, range: Option<(u64, u64)>, bytes: Vec<u8>) -> Response {
+    let mut response = Response::builder()
+        .status(if range.is_some() {
+            StatusCode::PARTIAL_CONTENT
+        } else {
+            StatusCode::OK
+        })
+        .header(header::CONTENT_TYPE, mf.content_type)
+        .header(header::ETAG, mf.etag)
+        .header(header::LAST_MODIFIED, http_date(mf.last_modified))
+        .header(header::ACCEPT_RANGES, "bytes");
+    if let Some((start, end)) = range {
+        response = response.header(
+            header::CONTENT_RANGE,
+            format!("bytes {start}-{end}/{}", mf.size),
+        );
+    }
+    response
+        .body(axum::body::Body::from(bytes))
+        .unwrap_or_else(|e| api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
 
 async fn handle_s3_delete(
@@ -6213,6 +6343,18 @@ mod security_tests {
         assert!(freshness.is_fresh_at(now + Duration::from_millis(2000)));
         freshness.invalidate();
         assert!(!freshness.is_fresh_at(now + Duration::from_millis(2000)));
+    }
+
+    #[test]
+    fn proxy_response_accepts_a_bodyless_304_without_content_length() {
+        // A peer may omit Content-Length on a 304. It is not a close-delimited
+        // body: anything but an empty payload is malformed.
+        let response = parse_proxy_response(b"HTTP/1.1 304 Not Modified\r\nETag: \"a\"\r\n\r\n")
+            .expect("a 304 needs no content-length");
+        assert_eq!(response.code, 304);
+        assert_eq!(response.etag.as_deref(), Some("\"a\""));
+        assert!(response.body.is_empty());
+        assert!(parse_proxy_response(b"HTTP/1.1 304 Not Modified\r\n\r\nx").is_err());
     }
 
     #[test]

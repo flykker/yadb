@@ -574,10 +574,12 @@ the leader — the same path writes already take, and the reason a follower read
 reports `503 node is not Raft leader` when the leader is unreachable. This
 covers the HTTP, native S3 and block read paths (the native listener re-verifies
 SigV4 first and keeps its XML error format). A native read keeps its local
-contract across the hop: `If-Match`/`If-None-Match` still answer `412`/`304`, an
+contract across the hop because the leader decides it from the manifest it
+reads: `If-Match`/`If-None-Match` still answer `412`/`304`, an
 unsatisfiable range still answers `416 InvalidRange` with `Content-Range: bytes
 */size`, the 16 MiB rules still answer `400 InvalidRequest`, and
-`Last-Modified`/`Accept-Ranges` are preserved. A proxied read is bounded by the
+`Last-Modified`/`Accept-Ranges` are preserved. The gateway `/s3/...` GET accepts
+the same conditional headers. A proxied read is bounded by the
 forwarding wire cap (16 MiB of body); larger block or object reads must be sent
 to the leader directly.
 
