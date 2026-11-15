@@ -354,5 +354,21 @@ class BackupTest(unittest.TestCase):
         self.assertFalse((self.dest / 'COMPLETE').exists())
 
 
+class RunBackupGateTest(unittest.TestCase):
+    def test_run_refuses_while_a_backup_marker_exists(self):
+        # `run` reads the marker after it holds supervisor.lock. A `run` that
+        # checked first and locked later would start a live process after a
+        # backup had already written the marker, and the copy would race it.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'state.json').write_text(json.dumps({'phase': 'stopped'}))
+            (root / '.yadb-backup-in-progress').write_text('backup\n')
+            with self.assertRaises(RuntimeError) as raised:
+                local.run(root)
+            self.assertIn('.yadb-backup-in-progress', str(raised.exception))
+            # The refusal must not rewrite lifecycle state as if a run happened.
+            self.assertEqual(json.loads((root / 'state.json').read_text()), {'phase': 'stopped'})
+
+
 if __name__ == '__main__':
     unittest.main()

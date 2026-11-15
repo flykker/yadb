@@ -396,15 +396,20 @@ def run(root):
     os.umask(0o077)
     root = root.resolve(strict=True)
     marker = root / '.yadb-backup-in-progress'
-    try:
-        marker.lstat()
-    except FileNotFoundError:
-        pass
-    else:
-        raise RuntimeError(f'Deployment root is under an offline backup ({marker}); '
-                           'finish or explicitly discard the backup and remove the marker.')
     with (root / 'supervisor.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        # The marker must be read after the lock is held. Checking it before
+        # taking the lock leaves a window: a `run` paused between check and lock
+        # would start after a backup had written the marker, and the copy would
+        # race a live process. Backup holds no supervisor lock, so this ordering
+        # is what makes "stopped" mean stopped for the whole copy.
+        try:
+            marker.lstat()
+        except FileNotFoundError:
+            pass
+        else:
+            raise RuntimeError(f'Deployment root is under an offline backup ({marker}); '
+                               'finish or explicitly discard the backup and remove the marker.')
         statepath = root / 'state.json'
         state = load(statepath)
         if state['phase'] not in ('prepared', 'stopped'):
