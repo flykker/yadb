@@ -1193,10 +1193,10 @@ async function runPoolScrub() {
     return;
   }
   const s = r.json;
-  const stillDegraded = s.degraded_puts_still_degraded
-    ? `, <strong>${s.degraded_puts_still_degraded}</strong> readable but still under-redundant`
+  const refused = s.refused_puts
+    ? `, <strong>${s.refused_puts}</strong> write(s) refused for lack of redundancy`
     : "";
-  banner.innerHTML = `<div class="alert ok">Scrub complete · Checked <strong>${s.blobs_checked}</strong> logical blobs (${s.blobs_intact} intact, <strong>${s.blobs_repaired}</strong> blobs healed, <strong>${s.fragments_repaired}</strong> fragments reconstructed, ${s.blobs_unrecoverable} unrecoverable${stillDegraded})</div>`;
+  banner.innerHTML = `<div class="alert ok">Scrub complete · Checked <strong>${s.blobs_checked}</strong> logical blobs (${s.blobs_intact} intact, <strong>${s.blobs_repaired}</strong> blobs healed, <strong>${s.fragments_repaired}</strong> fragments reconstructed, ${s.blobs_unrecoverable} unrecoverable${refused})</div>`;
   await refreshAll();
 }
 
@@ -1232,8 +1232,8 @@ function renderPools() {
             ${esc(p.status)} · ${p.online_slots}/${p.total_slots} slots online (min read: ${p.min_read_slots}, min write: ${p.min_write_slots}, repairs: ${p.total_repairs})
           </div>
         </div>
-        ${p.degraded_puts || p.pending_repairs ? `<div style="font-size:12px;color:#8a5a00;margin:-2px 0 8px">
-          ${p.degraded_puts} write(s) acked with reduced redundancy · ${p.pending_repairs} blob(s) still queued for repair
+        ${p.refused_puts ? `<div style="font-size:12px;color:#8a5a00;margin:-2px 0 8px">
+          ${p.refused_puts} write(s) refused because the pool could not reach full redundancy
         </div>` : ""}
         <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:10px">${tiles}</div>
       </div>`;

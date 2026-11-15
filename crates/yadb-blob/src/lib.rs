@@ -7,7 +7,7 @@ pub use erasure::{ErasureCodec, ErasureScheme};
 pub use id::BlobId;
 pub use pool::{
     BarrierRequest, BarrierResponse, PoolHealthSnapshot, PoolHealthState, PoolSlot, PoolStriper,
-    RepairReport, RepairSweep, SlotHealthSnapshot,
+    RepairReport, SlotHealthSnapshot,
 };
 pub use volume::{VolumeConfig, VolumeStats, VolumeStore};
 
@@ -55,6 +55,15 @@ pub enum BlobError {
 
     #[error("insufficient fragments to reconstruct blob: have {available}, need {required}")]
     InsufficientFragments { available: usize, required: usize },
+
+    #[error(
+        "write to {id} refused: {written} of {required} fragments landed, so the write would not be redundant"
+    )]
+    RedundancyNotMet {
+        id: BlobId,
+        written: usize,
+        required: usize,
+    },
 }
 
 #[cfg(test)]
@@ -928,11 +937,12 @@ mod tests {
         }
     }
 
-    // S6: `put_blob` acked with fewer than all fragments and dropped the failures,
-    // so a pool that had lost a node kept writing with reduced or absent redundancy
-    // and nothing recorded which blobs needed healing.
+    // S6 follow-up: `put_blob` used to ack once `min_write_quorum()` fragments
+    // landed — `k` for RS 4+2 — so an ack could leave zero parity on disk and the
+    // caller believed the data would survive losing a node. A write that cannot
+    // reach full redundancy is now refused instead of acked.
     #[test]
-    fn short_write_is_reported_as_degraded_and_queued_for_repair() {
+    fn short_write_is_refused_instead_of_acked() {
         let vdisk = MockVdisk::start();
         vdisk.fail_puts.store(true, Ordering::Relaxed);
         let addr = vdisk.addr.clone();
@@ -951,43 +961,38 @@ mod tests {
 
         let id = BlobId::new(11, 1, 1, 1, 2, 0);
         let payload = b"Multi-tenant erasure-coded tablet SSTable block #0001";
-        // Five of six fragments is still above the k=4 write quorum, so the write is
-        // acked — but with less than the intended redundancy.
-        striper.put_blob(id, payload).unwrap();
-        assert_eq!(striper.pending_repair_count(), 1);
+        // Five of six fragments is above the k=4 read threshold, which is exactly
+        // the case that used to be acked with no parity at all.
+        match striper.put_blob(id, payload) {
+            Err(BlobError::RedundancyNotMet {
+                written,
+                required,
+                id: refused,
+            }) => {
+                assert_eq!(written, 5);
+                assert_eq!(required, 6);
+                assert_eq!(refused, id);
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
         let health = striper.health_snapshot(false);
-        assert_eq!(health.degraded_puts, 1);
-        assert_eq!(health.pending_repairs, 1);
+        assert_eq!(health.refused_puts, 1);
+        assert_eq!(health.min_write_slots, 6);
 
-        // The peer comes back, and the next scrub pass restores redundancy.
+        // The peer comes back; the same write is then fully redundant.
         vdisk.fail_puts.store(false, Ordering::Relaxed);
-        let sweep = striper.repair_pending(16);
-        assert_eq!(sweep.attempted, 1);
-        assert_eq!(sweep.repaired_parts, 1);
-        assert_eq!(sweep.unrecoverable, 0);
-        assert_eq!(sweep.still_degraded, 0);
-        assert_eq!(sweep.still_pending, 0);
-        assert_eq!(striper.pending_repair_count(), 0);
-        // The fragment really is on the peer now, and the blob is whole.
-        assert_eq!(vdisk.store.lock().unwrap().len(), 1);
-        let seen = vdisk.requests();
-        let put = seen
-            .iter()
-            .filter(|r| r.starts_with("PUT /internal/vdisk/pool/5/blob/"))
-            .count();
-        let get = seen
-            .iter()
-            .filter(|r| r.starts_with("GET /internal/vdisk/pool/5/blob/"))
-            .count();
-        assert_eq!(put, 2, "one failed write, one repair rewrite: {seen:?}");
-        assert_eq!(get, 1, "the repair must read the fragment first: {seen:?}");
+        striper.put_blob(id, payload).unwrap();
         assert_eq!(striper.repair_blob(id).unwrap().intact_parts, 6);
+        assert_eq!(striper.health_snapshot(false).refused_puts, 1);
         vdisk.stop();
     }
 
-    // A failed rewrite leaves a readable blob degraded and queued, not lost.
+    // A refused write is not rolled back: the fragments that did land stay on
+    // disk under an id no manifest will ever reference. That is deliberate — the
+    // refusal is reported to the caller before publication — but it means the
+    // orphan scan is what reclaims the space, not the refusal itself.
     #[test]
-    fn readable_but_unredundant_blob_stays_queued() {
+    fn refused_write_leaves_unreferenced_fragments() {
         let vdisk = MockVdisk::start();
         vdisk.fail_puts.store(true, Ordering::Relaxed);
         let addr = vdisk.addr.clone();
@@ -1006,35 +1011,17 @@ mod tests {
 
         let id = BlobId::new(11, 2, 1, 1, 2, 0);
         let payload = b"Multi-tenant erasure-coded tablet SSTable block #0001";
-        striper.put_blob(id, payload).unwrap();
-        // The peer is still refusing writes, so the rewrite cannot land.
-        let sweep = striper.repair_pending(16);
-        assert_eq!(sweep.attempted, 1);
-        assert_eq!(sweep.repaired_parts, 0);
-        assert_eq!(sweep.unrecoverable, 0);
-        assert_eq!(sweep.still_degraded, 1);
-        assert_eq!(sweep.still_pending, 1);
+        assert!(striper.put_blob(id, payload).is_err());
+        // Five of six fragments are on disk, so the payload still decodes — but
+        // the write was reported as failed and no manifest will point at it.
         assert_eq!(striper.get_blob(id).unwrap(), payload);
-        assert_eq!(striper.pending_repair_count(), 1);
-
-        let report = striper.repair_blob(id).unwrap();
-        assert_eq!(report.intact_parts, 5);
-        assert_eq!(report.repaired_parts, 0);
-
-        // Once the peer accepts writes again, the next pass closes the queue.
-        vdisk.fail_puts.store(false, Ordering::Relaxed);
-        let sweep = striper.repair_pending(16);
-        assert_eq!(sweep.repaired_parts, 1);
-        assert_eq!(sweep.still_degraded, 0);
-        assert_eq!(sweep.still_pending, 0);
-        assert_eq!(striper.pending_repair_count(), 0);
+        assert_eq!(striper.health_snapshot(false).refused_puts, 1);
         vdisk.stop();
     }
 
-    // A fully redundant write must not enter the queue, or the queue would grow
-    // with every write and the signal would be worthless.
+    // A fully redundant write must be acked and must not be counted as refused.
     #[test]
-    fn full_redundancy_write_is_not_queued() {
+    fn full_redundancy_write_is_acked() {
         let id = BlobId::new(11, 3, 1, 1, 2, 0);
         let payload = b"Multi-tenant erasure-coded tablet SSTable block #0001";
         let (_fs, striper) = seeded_striper(
@@ -1044,10 +1031,9 @@ mod tests {
             id,
             payload,
         );
-        assert_eq!(striper.pending_repair_count(), 0);
         let health = striper.health_snapshot(false);
-        assert_eq!(health.degraded_puts, 0);
-        assert_eq!(health.pending_repairs, 0);
+        assert_eq!(health.refused_puts, 0);
+        assert_eq!(health.min_write_slots, 6);
     }
 
     // S2: a fully present but bit-rotted blob must never be reported as absent.

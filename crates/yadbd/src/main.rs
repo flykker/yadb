@@ -35,9 +35,6 @@ const CONTROL_REFRESH_INTERVAL: Duration = Duration::from_millis(200);
 /// Maximum time an authorization decision may rely on the last confirmed
 /// control snapshot. After this, access fails closed until quorum is proven.
 const CONTROL_FRESHNESS_TTL: Duration = Duration::from_secs(2);
-/// Maximum blobs whose redundancy is repaired in one scrub tick. Bounds the work
-/// a single tick can do so a large backlog cannot stall the scrub loop.
-const DEGRADED_REPAIR_BATCH: usize = 256;
 const EMBEDDED_UI_HTML: &str = include_str!("ui/index.html");
 const EMBEDDED_SAMPLE_YAML: &str = include_str!("../../../examples/platform.yaml");
 
@@ -318,14 +315,11 @@ struct ScrubSummary {
     pub blobs_repaired: usize,
     pub fragments_repaired: usize,
     pub blobs_unrecoverable: usize,
-    /// Blobs queued because their write acked with fewer than all fragments.
-    pub degraded_puts_queued: usize,
-    /// Blobs still queued for redundancy repair after this pass.
-    pub degraded_puts_pending: usize,
-    /// Blobs that were reconstructed but whose redundancy is still short: the
-    /// payload reads fine, only a fragment rewrite did not land. Distinct from
-    /// `blobs_unrecoverable`, where data is actually lost.
-    pub degraded_puts_still_degraded: usize,
+    /// Writes refused because the pool could not promise the redundancy it
+    /// advertises, summed over pools since this process started. A refused write
+    /// is not acknowledged, so this is a loss of write availability, not a
+    /// backlog of repairs to finish.
+    pub refused_puts: usize,
     pub orphan_blobs_collected: usize,
     pub orphan_collection_error: Option<String>,
     pub pools: Vec<PoolHealthSnapshot>,
@@ -682,28 +676,21 @@ impl AppState {
     /// Scans all live SQL Tablet manifests, S3 Object manifests, and BlockVolume extent maps in `MetaKV`,
     /// verifies every fragment across cluster VDisks, and heals missing or bit-rotted fragments!
     fn scrub_all_pools(&self) -> ScrubSummary {
-        // Blobs whose write acked short of full redundancy are repaired first, and
-        // this part runs on every runtime including OpenRaft. It needs no metadata
-        // scan and no cross-group view: the queue holds ids this process wrote, and
-        // each repair reads and rewrites fragments in one already-mounted pool. The
-        // scan below stays disabled on OpenRaft because *that* is the unsafe part.
-        let pools_for_repair = self.pools.read().unwrap().clone();
-        let mut degraded_puts_queued = 0usize;
-        let mut degraded_puts_pending = 0usize;
-        let mut degraded_puts_still_degraded = 0usize;
-        for striper in pools_for_repair.values() {
-            let sweep = striper.repair_pending(DEGRADED_REPAIR_BATCH);
-            degraded_puts_queued += sweep.attempted;
-            degraded_puts_pending += sweep.still_pending;
-            degraded_puts_still_degraded += sweep.still_degraded;
-        }
-
+        // A short write is refused at `put_blob`, so there is no in-memory backlog
+        // to drain here: every acknowledged blob was fully redundant when it was
+        // written. This scan heals damage that happened *after* the ack (a lost or
+        // bit-rotted fragment), which is a different failure and needs the manifest
+        // scan to know which blobs should exist.
         if self.meta.is_openraft() {
             // Global orphan scans are unsafe without per-group leader fencing.
             let summary = ScrubSummary {
-                degraded_puts_queued,
-                degraded_puts_pending,
-                degraded_puts_still_degraded,
+                refused_puts: self
+                    .pools
+                    .read()
+                    .unwrap()
+                    .values()
+                    .map(|striper| striper.refused_put_count() as usize)
+                    .sum(),
                 orphan_collection_error: Some("scrub disabled for Multi-Raft".into()),
                 ..ScrubSummary::default()
             };
@@ -803,9 +790,7 @@ impl AppState {
             blobs_repaired,
             fragments_repaired,
             blobs_unrecoverable,
-            degraded_puts_queued,
-            degraded_puts_pending,
-            degraded_puts_still_degraded,
+            refused_puts: pools_health.iter().map(|p| p.refused_puts as usize).sum(),
             orphan_blobs_collected,
             orphan_collection_error,
             pools: pools_health,
@@ -3061,6 +3046,13 @@ async fn handle_db_query(
             | DbError::DuplicatePrimaryKey(_)),
         )) => api_err(StatusCode::BAD_REQUEST, e.to_string()),
         Ok(Err(DbError::Meta(me))) => meta_err_resp(&st, me),
+        // A refused pool write means the statement did not commit: report it as
+        // unavailable rather than as an internal error, so a client retries instead
+        // of treating the data as lost.
+        Ok(Err(DbError::Blob(BlobError::RedundancyNotMet { .. }))) => api_err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "storage pool cannot reach full redundancy; the write was refused",
+        ),
         Ok(Err(e)) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
         Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
@@ -3142,6 +3134,12 @@ async fn handle_block_write(
             api_err(StatusCode::RANGE_NOT_SATISFIABLE, e.to_string())
         }
         Ok(Err(BlockError::Meta(me))) => meta_err_resp(&st, me),
+        // The pool refused the write because it could not reach full redundancy.
+        // Nothing was published, so this is availability, not a failed volume.
+        Ok(Err(BlockError::Blob(BlobError::RedundancyNotMet { .. }))) => api_err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "storage pool cannot reach full redundancy; the write was refused",
+        ),
         Ok(Err(e)) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
         Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
@@ -3395,6 +3393,10 @@ async fn block_unmap_legacy(
             api_err(StatusCode::RANGE_NOT_SATISFIABLE, e.to_string())
         }
         Ok(Err(BlockError::Meta(e))) => meta_err_resp(st, e),
+        Ok(Err(BlockError::Blob(BlobError::RedundancyNotMet { .. }))) => api_err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "storage pool cannot reach full redundancy; the write was refused",
+        ),
         _ => api_err(StatusCode::SERVICE_UNAVAILABLE, "UNMAP failed"),
     }
 }
@@ -3749,6 +3751,12 @@ async fn handle_s3_put(
         )
             .into_response(),
         Ok(Err(S3Error::Meta(me))) => meta_err_resp(&st, me),
+        // The pool refused the write because it could not reach full redundancy.
+        // Nothing was published, so this is availability, not a corrupt object.
+        Ok(Err(S3Error::Blob(BlobError::RedundancyNotMet { .. }))) => api_err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "storage pool cannot reach full redundancy; the write was refused",
+        ),
         Ok(Err(e)) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
         Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }

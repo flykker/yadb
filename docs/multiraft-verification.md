@@ -757,24 +757,39 @@ the corrupt image was preserved as. Tests assert a clean reopen reports nothing
 and that an appended partial frame header is reported with the exact discarded
 length and truncated durably.
 
-**S6 — degraded acknowledged writes (default build).** `put_blob` acks at
-`min_write_quorum()`, which is `k` for RS 4+2, so an ack could leave zero parity on
-disk while the failed parts were dropped. Short writes are now queued in
-`pending_repairs`, counted in `degraded_puts`, repaired in bounded batches by
-`repair_pending` and dequeued only when every fragment is intact. The queue is
-drained before the manifest scan and on OpenRaft too, since repairing blobs this
-process wrote needs no cross-group metadata view.
+**S6 — degraded acknowledged writes (default build).** `put_blob` acked at
+`min_write_quorum()`, which was `k` for RS 4+2, so an ack could leave zero parity on
+disk while the failed parts were dropped. The first correction recorded those short
+writes in an in-memory `pending_repairs` queue, which only made the gap observable:
+the write was still acked, the caller still learned nothing at write time, and a
+restart forgot the backlog.
 
-The first version of that fix returned `Err` from `repair_blob` when the payload
-decoded but a fragment rewrite failed, which made the scrub count a *readable*
-blob as `blobs_unrecoverable` — a false alarm that conflates lost data with lost
-redundancy. Now `repair_blob` answers `Ok` whenever the payload decoded, with
-`intact_parts` counting fragments *after* the attempt; `RepairSweep` and
-`ScrubSummary` carry `still_degraded` / `degraded_puts_still_degraded` separately
-from `unrecoverable`, and the blob stays queued. Three tests; 24/24 passed. Open:
-the queue is in-memory and per process, so a restart forgets it, and the live-blob
-scrub path (as opposed to the queue) still counts a readable short blob as intact
-when no rewrite succeeds.
+The contract is now strict instead of observable. `min_write_quorum()` is every
+fragment, `put_blob` returns `BlobError::RedundancyNotMet { written, required }`
+when any fragment fails, and the refusal is counted in `refused_puts` on both
+`PoolHealthSnapshot` and `ScrubSummary`. The SQL, S3 and block paths map it to
+`503`, so a client retries rather than treating data as committed. Nothing is
+published for a refused write: no manifest is written, the caller holds no
+reference, and the fragments that did land are reclaimed by the orphan scan. The
+trade-off is explicit — a pool with a slot offline refuses new writes instead of
+accepting unprotected ones, so write availability now follows full redundancy.
+
+`repair_blob` is unchanged in what it means: it still answers `Ok` whenever the
+payload decoded, with `intact_parts` counting fragments *after* the attempt, so a
+readable-but-short blob is never reported as `blobs_unrecoverable`. Three tests
+cover the refusal, the unreferenced fragments, and a fully redundant ack; 26/26
+`yadb-blob` tests passed.
+
+This changed what the daemon suite may expect, and that is the point: the first
+run of the feature gate failed `three_daemons_forward_http_to_different_group_leaders`
+with `503 storage pool cannot reach full redundancy; the write was refused` after it
+stopped one of the three replicas. A log probe showed the PUT to the stopped node
+failing with `Connection refused`, so the write was genuinely unprotected — the old
+contract had acked it. The test now asserts the refusal, that the refused row is not
+readable, that the same statement succeeds once the replica returns (a `503` refusal
+publishes nothing, so retrying it cannot double-apply), and that the returned replica
+then serves the committed row. Open: no test exercises a real multi-node pool, and a
+partially written blob stays readable by id until the orphan scan runs.
 
 **S7 — ambiguous legacy write outcome reported as a definite failure.** The
 OpenRaft bridge answered `OpenRaftWriteUnknown` with `503` plus
@@ -810,7 +825,7 @@ clear refusal at the `yadbd` boundary is not tested.
 | S1 | `yadb-metakv` 140/140, `yadb-blob` 26/26 | In-memory byte flips, not real crash shapes; `YADBWAL1` keeps the legacy ambiguity permanently, since no rewrite path exists |
 | S2 | `yadb-blob` 21/21 | No real multi-node pool; corruption is injected by flipping a byte in `SimFs` |
 | S4 | `yadb-metakv` 128/128 | No real power loss; torn tails are hand-cut bytes or `Fault::WritePartial` |
-| S6 | `yadb-blob` 24/24 | Queue is never exercised through a real pool or across a restart |
+| S6 | `yadb-blob` 26/26 | Refusal is never exercised through a real multi-node pool |
 | S7 | `yadbd` bins 31/31 | Only the HTTP mapping; `Io` after the append stays indistinguishable from `Io` before it |
 
 ### Live deployment after S1 (2026-11-15)
@@ -824,8 +839,8 @@ tests:
   same bytes, and the same read from a `readOnly` subject;
 * `POST /block/billing/vm-root/unmap` with a 4 KiB-aligned range zeroing the range,
   and a `400` for an unaligned one;
-* `/v1/pools/scrub` returning `degraded_puts_still_degraded`, which is the field
-  added by the S6 correction — proof the deployed binary is the reviewed one;
+* `/v1/pools/scrub` returning the S6 correction's field, which is how the deployed
+  binary was shown to be the reviewed one;
 * **restart durability**: a marker written at offset 4096, a clean `SIGTERM` stop
   (`exit_codes [0, 0, 0]`, all ports released), a fresh start, and the marker read
   back byte-identical with the unmapped range still zero.

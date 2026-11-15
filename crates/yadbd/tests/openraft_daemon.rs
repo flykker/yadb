@@ -1372,14 +1372,43 @@ spec: {pool: data, sizeBytes: 8192}
         assert!(Instant::now() < deadline, "failover timed out: {status}");
         std::thread::sleep(Duration::from_millis(200));
     };
+    // `data` is a three-replica mirror and one replica is down, so no write can
+    // reach full redundancy. The strict contract refuses such a write instead of
+    // acknowledging one that a single further loss would destroy. The refusal is
+    // definitive: nothing is published, so the row must not be readable either.
     let post_failover =
         serde_json::to_vec(&json!({"sql":"INSERT INTO t VALUES (101,'after-failover')"})).unwrap();
-    ok(
+    let (status, body) = request(
         public[failover_leader as usize - 1],
         "POST",
         "/db/alpha/db/query",
         &post_failover,
         "application/json",
+    );
+    assert_eq!(
+        status,
+        503,
+        "a write with a missing replica must be refused: {}",
+        String::from_utf8_lossy(&body)
+    );
+    assert!(
+        String::from_utf8_lossy(&body).contains("full redundancy"),
+        "unexpected refusal body: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let refused_readback =
+        serde_json::to_vec(&json!({"sql":"SELECT v FROM t WHERE id = 101"})).unwrap();
+    let refused_rows = ok(
+        public[failover_leader as usize - 1],
+        "POST",
+        "/db/alpha/db/query",
+        &refused_readback,
+        "application/json",
+    );
+    assert!(
+        !String::from_utf8_lossy(&refused_rows).contains("after-failover"),
+        "a refused write must not become visible: {}",
+        String::from_utf8_lossy(&refused_rows)
     );
     for group in 1..=3 {
         let path = dir
@@ -1417,20 +1446,6 @@ spec: {pool: data, sizeBytes: 8192}
             if group["leader_id"] == failover_leader {
                 assert_eq!(group["preferred_leader"], 2);
                 assert_eq!(group["preference_met"], failover_leader == 2);
-                let readback =
-                    serde_json::to_vec(&json!({"sql":"SELECT v FROM t WHERE id = 101"})).unwrap();
-                let response = ok(
-                    public[stopped],
-                    "POST",
-                    "/db/alpha/db/query",
-                    &readback,
-                    "application/json",
-                );
-                assert!(
-                    String::from_utf8_lossy(&response).contains("after-failover"),
-                    "returned replica missed committed row: {}",
-                    String::from_utf8_lossy(&response)
-                );
                 break;
             }
         }
@@ -1439,6 +1454,57 @@ spec: {pool: data, sizeBytes: 8192}
             "returning node did not observe failover leader"
         );
         std::thread::sleep(Duration::from_millis(200));
+    }
+    // With the replica back the same statement is fully redundant again. A 503
+    // refusal is definitive — nothing was published — so retrying it cannot
+    // double-apply: the row becomes visible only once a write really lands.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let (status, _, body) = request_headers(
+            public[failover_leader as usize - 1],
+            "POST",
+            "/db/alpha/db/query",
+            &post_failover,
+            "application/json",
+        );
+        if status == 200 {
+            break;
+        }
+        assert_eq!(
+            status,
+            503,
+            "unexpected status after the replica returned: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert!(
+            Instant::now() < deadline,
+            "pool never regained full redundancy: {}",
+            String::from_utf8_lossy(&body)
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // The returned replica answers reads from its own applied state, so it can
+    // trail the commit briefly; wait for it instead of reading the leader and
+    // calling that a replica check.
+    let readback = serde_json::to_vec(&json!({"sql":"SELECT v FROM t WHERE id = 101"})).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let response = ok(
+            public[stopped],
+            "POST",
+            "/db/alpha/db/query",
+            &readback,
+            "application/json",
+        );
+        if String::from_utf8_lossy(&response).contains("after-failover") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "returned replica missed committed row: {}",
+            String::from_utf8_lossy(&response)
+        );
+        std::thread::sleep(Duration::from_millis(100));
     }
     // Revocation must reach authorization on every node. Once each local
     // control cache shows the new membership, the old subject is denied.

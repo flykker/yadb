@@ -261,22 +261,21 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   an injectable filesystem; test every outcome and poisoned-handle recovery.
 - [ ] Run separate-process crash/kill and OS/filesystem power-loss tests; document
   filesystem and hardware assumptions. In-process fault simulation is not proof.
-- [ ] Redundancy of acknowledged writes. `PoolStriper::put_blob` acks once
-  `min_write_quorum()` fragments land — `k` for Reed-Solomon 4+2, so an ack can
-  leave zero parity on disk — and previously dropped the failed parts with no
-  record, while the periodic scrub was assumed to heal them. A short write is now
-  recorded: the blob is queued in `pending_repairs`, `degraded_puts` counts it, and
-  `POST /v1/pools/scrub` / the leader's scrub tick calls `repair_pending` to rewrite
-  the missing fragments before the manifest scan (on OpenRaft too, since that part
-  needs no cross-group view). `PoolHealthSnapshot` reports both counters, and
-  `repair_blob` keeps a blob queued and reports it separately when a fragment
-  rewrite did not land: the payload is readable, only its redundancy is short, so
-  that is `still_degraded` / `degraded_puts_still_degraded` and never
-  `unrecoverable`. Open: the queue is in memory and per process, so a restart forgets
-  it and the backlog is rediscovered only by a full scrub; a write that acks
-  degraded is still acked, so the caller learns nothing at write time; the live-blob
-  scrub path still counts a readable short blob as intact when no rewrite succeeds;
-  and no test exercises the queue through a real multi-node pool.
+- [ ] Redundancy of acknowledged writes. `PoolStriper::put_blob` used to ack once
+  `min_write_quorum()` fragments landed — `k` for Reed-Solomon 4+2, so an ack could
+  leave zero parity on disk. It now requires every fragment: a short write is
+  refused with `BlobError::RedundancyNotMet`, counted in
+  `PoolHealthSnapshot::refused_puts` / `ScrubSummary::refused_puts`, and mapped to
+  `503` on the SQL, S3 and block paths. Nothing is published for a refused write, so
+  the caller holds no reference to the fragments that did land and the orphan scan
+  reclaims them. The consequence is deliberate: a pool with any slot offline refuses
+  new writes instead of accepting unprotected ones, so write availability now
+  follows full redundancy. The three-node daemon test asserts this: a write while
+  one replica is stopped is refused with `503` and stays invisible, and the same
+  statement succeeds after that replica returns. Open: no test exercises a real
+  multi-node pool; a partially written blob is still readable by id until the
+  orphan scan runs; and refusal is per pool, so one offline domain stops writes for
+  every volume on it.
 - [ ] Idempotency and read-consistency contracts. A keyed `POST /v1/apply` is
   implemented (`Idempotency-Key`, the outcome record committed in the same
   `RevisionTxn` as the mutation, `POST /v1/idempotency/resolve`, and a replicated
