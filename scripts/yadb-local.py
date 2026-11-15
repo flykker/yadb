@@ -417,6 +417,10 @@ def run(root):
             raise RuntimeError('Previous run incomplete; inspect artifacts manually. No automatic retry.')
         http_base = deployment_ports(root)
         check_ports(http_base)
+        # `logs/` is derived output, not deployment state: a backup artifact
+        # excludes it deliberately, so a restored root has none. Creating it here
+        # is what lets an artifact be started at all; it holds no information.
+        (root / 'logs').mkdir(mode=0o700, exist_ok=True)
         # Fail closed even if interrupted while switching restart configurations.
         replace(statepath, {'phase': 'starting', 'supervisor_pid': os.getpid()})
         if state['phase'] == 'stopped':

@@ -438,6 +438,25 @@ class BackupTest(unittest.TestCase):
         self.assertFalse(self.dest.exists())
 
 
+class RunLogsDirectoryTest(unittest.TestCase):
+    def test_run_creates_the_logs_directory_it_writes_into(self):
+        # A backup artifact excludes `logs/` because it is derived output, so a
+        # restored root has none. `run` must create it, otherwise the artifact it
+        # was told to trust cannot be started at all.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'state.json').write_text(json.dumps({'phase': 'stopped'}))
+            self.assertFalse((root / 'logs').exists())
+            # Fail later, at the group configs, so the test observes the ordering
+            # rather than a real startup.
+            with mock.patch.object(local, 'check_ports'), \
+                    mock.patch.object(local, 'deployment_ports', return_value=8420), \
+                    self.assertRaises((OSError, KeyError, ValueError)):
+                local.run(root)
+            self.assertTrue((root / 'logs').is_dir())
+            self.assertEqual((root / 'logs').stat().st_mode & 0o777, 0o700)
+
+
 class RunBackupGateTest(unittest.TestCase):
     def test_run_refuses_while_a_backup_marker_exists(self):
         # `run` reads the marker after it holds supervisor.lock. A `run` that
