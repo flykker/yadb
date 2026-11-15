@@ -13,6 +13,13 @@ const REC_KIND_BARRIER: u8 = 2;
 const REC_KIND_TOMBSTONE: u8 = 3;
 const RECORD_HEADER_LEN: usize = 33;
 
+/// A mostly-garbage active segment is sealed even when small, because rolling it
+/// is the only way `compact_sealed_segments` can reclaim its dead records. A
+/// mostly-live one is only sealed once it is large enough that a roll would
+/// happen soon anyway, so collection does not scatter the volume into many
+/// tiny segments.
+const MIN_SEAL_GARBAGE_BYTES: u64 = 1024 * 1024;
+
 #[derive(Debug, Clone, Copy)]
 pub struct VolumeConfig {
     /// Roll over to a new append-only segment file once active segment exceeds this size.
@@ -401,6 +408,76 @@ impl<FS: StorageFs> VolumeStore<FS> {
             idx.remove(&k);
         }
         Ok(removed)
+    }
+
+    /// Every physical blob id currently readable from this volume, in ascending
+    /// order. This is the only complete view of what the volume holds: a
+    /// collector cannot infer it from manifests, because the fragments it must
+    /// reclaim are exactly the ones no manifest names.
+    pub fn live_ids(&self) -> Vec<BlobId> {
+        self.index.read().unwrap().keys().copied().collect()
+    }
+
+    /// Rolls the active segment over so its dead records become eligible for
+    /// compaction. `compact_sealed_segments` never touches the active segment, so
+    /// without this a volume that keeps overwriting the same blob reclaims nothing.
+    ///
+    /// Sealing is bounded rather than unconditional: an active segment is only
+    /// rolled when it already carries garbage and is either mostly garbage or
+    /// large enough that a roll would happen soon anyway. Returns `true` when a
+    /// new segment was opened.
+    pub fn seal_active_segment(&self, min_garbage_bytes: u64) -> Result<bool, BlobError> {
+        let mut writer = self.writer.lock().unwrap();
+        writer.ensure_healthy()?;
+        if writer.write_pos <= VOLUME_MAGIC.len() as u64 {
+            // Nothing was appended since the last roll: a new segment would only
+            // add an empty file.
+            return Ok(false);
+        }
+        let active_id = writer.seg_id;
+        let active_len = writer.write_pos;
+        let live_in_active: u64 = self
+            .index
+            .read()
+            .unwrap()
+            .values()
+            .filter(|entry| entry.seg_id == active_id)
+            .map(|entry| (RECORD_HEADER_LEN + entry.data_len as usize) as u64)
+            .sum();
+        let garbage = active_len
+            .saturating_sub(VOLUME_MAGIC.len() as u64)
+            .saturating_sub(live_in_active)
+            .saturating_sub(
+                (self.barriers.read().unwrap().len() + self.tombstones.read().unwrap().len())
+                    as u64
+                    * RECORD_HEADER_LEN as u64,
+            );
+        if garbage == 0 {
+            return Ok(false);
+        }
+        if garbage < min_garbage_bytes && garbage.saturating_mul(4) < active_len {
+            return Ok(false);
+        }
+
+        let next_id = active_id + 1;
+        let new_file = init_new_segment(&self.fs, &self.dir, next_id)?;
+        let read_handle = self.fs.open_rw(&segment_path(&self.dir, next_id), false)?;
+        self.segments.write().unwrap().insert(next_id, read_handle);
+        *writer = ActiveSegment {
+            seg_id: next_id,
+            file: new_file,
+            write_pos: VOLUME_MAGIC.len() as u64,
+            failed: false,
+        };
+        Ok(true)
+    }
+
+    /// Rolls the active segment over when it is worth compacting, then compacts
+    /// every sealed segment. Returns bytes freed. Idempotent: a second call with
+    /// nothing to reclaim returns 0.
+    pub fn seal_and_compact(&self) -> Result<u64, BlobError> {
+        self.seal_active_segment(MIN_SEAL_GARBAGE_BYTES)?;
+        self.compact_sealed_segments()
     }
 
     /// Compacts a sealed (non-active) segment by copying only live blobs into a replacement file

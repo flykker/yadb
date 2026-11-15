@@ -1,3 +1,4 @@
+pub mod gc;
 pub mod kv;
 pub mod multiraft;
 #[cfg(any(test, feature = "openraft-storage"))]
@@ -20,6 +21,7 @@ pub mod openraft_transport;
 pub mod raft;
 pub mod wal;
 
+pub use gc::{CollectorGuard, GcLease, GcLeaseGuard, LeaseKind};
 pub use kv::{
     CasGuard, KvCommand, KvResult, KvValue, MetaSnapshot, MetaStateMachine, RevisionGuard, TxnOp,
     WatchEvent,

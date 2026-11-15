@@ -818,6 +818,18 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
             return Ok(());
         }
 
+        // WAL fragments are appended in phase 1 and only referenced by the
+        // metadata transaction in phase 2. Publish a writer lease for the whole
+        // span: a collector that runs in between would otherwise see unreferenced
+        // fragments that are about to be referenced and delete them.
+        let lease_meta = self.meta.clone();
+        let writer_lease = yadb_metakv::gc::acquire_writer(
+            &lease_meta,
+            project_id,
+            self.meta.revision(),
+            yadb_metakv::gc::WRITER_TTL_MS,
+        )?;
+
         let mut schemas: BTreeMap<String, (TableSchema, u64)> = BTreeMap::new();
         #[allow(clippy::type_complexity)]
         let mut shard_batches: BTreeMap<
@@ -979,6 +991,9 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
             guard.apply_prepared(prep, revision)?;
         }
 
+        if let Err(error) = writer_lease.release() {
+            eprintln!("writer lease release failed: {error}");
+        }
         Ok(())
     }
 

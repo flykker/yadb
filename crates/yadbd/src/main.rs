@@ -25,6 +25,7 @@ use yadb_io::OsFs;
 use yadb_metakv::{KvCommand, LocalMetaKv, MetaError, RaftRpc, RoleState, WatchEvent};
 use yadb_s3::{ObjectManifest, ObjectStoreEngine, S3Error};
 
+mod gc;
 #[cfg(feature = "openraft-storage")]
 mod openraft;
 mod protocols;
@@ -322,6 +323,22 @@ struct ScrubSummary {
     pub refused_puts: usize,
     pub orphan_blobs_collected: usize,
     pub orphan_collection_error: Option<String>,
+    /// Distinct live logical blobs the sweep's final mark found.
+    pub blobs_live: usize,
+    /// Physical fragments removed by the sweep (barrier evictions and tombstones).
+    pub fragments_deleted: usize,
+    /// Bytes returned to the filesystem by the compaction that followed.
+    pub bytes_reclaimed: u64,
+    /// Live reader/writer leases observed. Non-zero always means the sweep refused.
+    pub leases_live: usize,
+    /// Set when the sweep deleted nothing. Always an explicit reason, never a
+    /// silent no-op: a refused collection is a reported failure, not success.
+    pub gc_refusal: Option<String>,
+    /// Mounted pools the sweep declined to touch, with the reason.
+    pub gc_pools_refused: Vec<String>,
+    /// Barrier or compaction failures after the refusal point. Reported, never
+    /// swallowed: a failed compaction means space was not actually reclaimed.
+    pub gc_errors: Vec<String>,
     pub pools: Vec<PoolHealthSnapshot>,
 }
 
@@ -442,6 +459,30 @@ impl AppState {
             .lock()
             .unwrap()
             .is_fresh_at(Instant::now())
+    }
+
+    /// Publishes a reader lease before a handler reads fragments.
+    ///
+    /// A reader never refuses on a live collector lease: its applied view is at
+    /// least as new as the collector's mark, and the collector re-checks reader
+    /// leases after publishing its own, so the collector is the side that backs
+    /// off. Blocking; call from `spawn_blocking`.
+    fn begin_read_lease(&self, project_id: u32) -> Result<yadb_metakv::GcLease, MetaError> {
+        yadb_metakv::gc::acquire(
+            &self.meta,
+            yadb_metakv::gc::LeaseKind::Reader,
+            project_id,
+            self.meta.revision(),
+            yadb_metakv::gc::DEFAULT_TTL_MS,
+        )
+    }
+
+    /// Releases a reader lease. A failed release only delays the next collection
+    /// pass until the lease expires; it never makes a deletion safe that was not.
+    fn end_read_lease(&self, lease: &yadb_metakv::GcLease) {
+        if let Err(error) = yadb_metakv::gc::release(&self.meta, lease) {
+            eprintln!("reader lease release failed: {error}");
+        }
     }
 
     /// Establish a fresh lease on demand, e.g. immediately after restart
@@ -677,6 +718,20 @@ impl AppState {
             .collect()
     }
 
+    /// Runs one mark-and-sweep pass without the repair scan. Same snapshot and
+    /// fence rules as [`Self::scrub_all_pools`]; a refusal is returned to the
+    /// caller as an error response, not hidden in a 200 body.
+    fn gc_all_pools(&self) -> gc::SweepOutcome {
+        if self.meta.is_openraft() {
+            return gc::SweepOutcome::refuse(
+                "garbage collection disabled for Multi-Raft: no single atomic cross-group metadata snapshot",
+            );
+        }
+        let control = self.control.read().unwrap().clone();
+        let pools = self.pools.read().unwrap().clone();
+        gc::sweep(&self.meta, &pools, &control)
+    }
+
     /// Scans all live SQL Tablet manifests, S3 Object manifests, and BlockVolume extent maps in `MetaKV`,
     /// verifies every fragment across cluster VDisks, and heals missing or bit-rotted fragments!
     fn scrub_all_pools(&self) -> ScrubSummary {
@@ -696,6 +751,10 @@ impl AppState {
                     .map(|striper| striper.refused_put_count() as usize)
                     .sum(),
                 orphan_collection_error: Some("scrub disabled for Multi-Raft".into()),
+                gc_refusal: Some(
+                    "garbage collection disabled for Multi-Raft: no single atomic cross-group metadata snapshot"
+                        .into(),
+                ),
                 ..ScrubSummary::default()
             };
             *self.last_scrub.write().unwrap() = Some(summary.clone());
@@ -787,6 +846,14 @@ impl AppState {
         }
 
         let pools_health = self.collect_pool_health(true);
+        // Mark-and-sweep runs after the repair pass so fragments it just healed are
+        // part of the live set. It takes its own snapshots and refuses on its own
+        // terms; a refusal deletes nothing and is reported, never hidden.
+        let sweep = {
+            let control = self.control.read().unwrap().clone();
+            let pools = self.pools.read().unwrap().clone();
+            gc::sweep(&self.meta, &pools, &control)
+        };
         let summary = ScrubSummary {
             pools_checked: pools_health.len(),
             blobs_checked,
@@ -797,6 +864,13 @@ impl AppState {
             refused_puts: pools_health.iter().map(|p| p.refused_puts as usize).sum(),
             orphan_blobs_collected,
             orphan_collection_error,
+            blobs_live: sweep.blobs_live,
+            fragments_deleted: sweep.fragments_deleted,
+            bytes_reclaimed: sweep.bytes_reclaimed,
+            leases_live: sweep.leases_live,
+            gc_refusal: sweep.refusal,
+            gc_pools_refused: sweep.pools_refused,
+            gc_errors: sweep.errors,
             pools: pools_health,
         };
         *self.last_scrub.write().unwrap() = Some(summary.clone());
@@ -3122,6 +3196,20 @@ async fn handle_db_query(
         )
     };
 
+    // Fence the statement against collection: a scan reads SST/WAL fragments by
+    // the ids its tablet manifest names, and a concurrent compaction makes those
+    // fragments unreferenced while the scan is still reading them. A write takes
+    // its own writer lease as well; this reader lease covers the read half.
+    let mut reader_lease: Option<yadb_metakv::GcLease> = None;
+    if !st.meta.is_openraft() {
+        let st_fence = st.clone();
+        match tokio::task::spawn_blocking(move || st_fence.begin_read_lease(project_id)).await {
+            Ok(Ok(lease)) => reader_lease = Some(lease),
+            Ok(Err(error)) => return api_err(StatusCode::SERVICE_UNAVAILABLE, error.to_string()),
+            Err(error) => return api_err(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+        }
+    }
+
     let db_engine = st.db.clone();
     if req.require_transaction {
         let session = req.session_id.as_ref().map(|id| format!("{subject}#{id}"));
@@ -3156,6 +3244,13 @@ async fn handle_db_query(
         }
     })
     .await;
+
+    // The statement has finished reading (or failed); release the fence. A failed
+    // release only delays the next collection pass until the lease expires.
+    if let Some(lease) = reader_lease.take() {
+        let st_fence = st.clone();
+        let _ = tokio::task::spawn_blocking(move || st_fence.end_read_lease(&lease)).await;
+    }
 
     match exec {
         Ok(Ok(res)) => Json(res).into_response(),
@@ -3385,20 +3480,47 @@ async fn handle_block_read(
         }
     };
 
-    if q.consistent {
-        let meta = st.meta.clone();
+    // Publish a reader lease *before* the metadata read and keep it until the
+    // fragments have been fetched. The collector refuses while any lease is
+    // live, so a fragment this read pins cannot be swept underneath it. The
+    // lease is also the reason a read that starts during a collection pass is
+    // refused: the pass already proved the fence clear, so it would delete what
+    // this read is about to pin.
+    //
+    // A consistent read additionally takes one empty quorum transaction after
+    // the lease, so the map it reads is confirmed by a quorum and not just by
+    // this node's applied state.
+    let mut reader_lease: Option<yadb_metakv::GcLease> = None;
+    if !st.meta.is_openraft() {
+        let consistent = q.consistent;
+        let st_fence = st.clone();
         let fence = tokio::task::spawn_blocking(move || {
-            meta.execute(KvCommand::Txn {
+            let lease = st_fence.begin_read_lease(project_id)?;
+            if !consistent {
+                return Ok(lease);
+            }
+            match st_fence.meta.execute(KvCommand::Txn {
                 guards: vec![],
                 ops: vec![],
-            })
+            }) {
+                Ok(yadb_metakv::KvResult::TxnOk { .. }) => Ok(lease),
+                Ok(_) => {
+                    st_fence.end_read_lease(&lease);
+                    Err(MetaError::Routing(
+                        "read quorum unavailable or metadata changed".into(),
+                    ))
+                }
+                Err(error) => {
+                    st_fence.end_read_lease(&lease);
+                    Err(error)
+                }
+            }
         })
         .await;
-        if !matches!(fence, Ok(Ok(yadb_metakv::KvResult::TxnOk { .. }))) {
-            return api_err(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "read quorum unavailable or metadata changed",
-            );
+        match fence {
+            Ok(Ok(lease)) => reader_lease = Some(lease),
+            Ok(Err(error)) => return api_err(StatusCode::SERVICE_UNAVAILABLE, error.to_string()),
+            Err(error) => return api_err(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
         }
     }
 
@@ -3407,6 +3529,14 @@ async fn handle_block_read(
         blk.read_at(project_id, &volume, &pool_name, size_bytes, q.offset, q.len)
     })
     .await;
+
+    // The fragments named by the pinned map have been fetched (or the read
+    // failed); the fence is no longer needed. A failed release only delays the
+    // next collection pass until the lease expires.
+    if let Some(lease) = reader_lease.take() {
+        let st_fence = st.clone();
+        let _ = tokio::task::spawn_blocking(move || st_fence.end_read_lease(&lease)).await;
+    }
 
     match res {
         Ok(Ok(bytes)) => (
@@ -4239,69 +4369,93 @@ async fn handle_s3_get(
         return s3_get_consistent(st, project_id, store, bucket, key, range_hdr).await;
     }
 
-    if let Some(range_hdr) = range_hdr {
-        let head = match st.s3.head_object(project_id, &store, &bucket, &key) {
-            Ok(h) => h,
+    // Fence the chunk read against collection. The manifest read and the chunk
+    // fetch must both happen under one lease: an overwrite or delete retires the
+    // previous manifest, so the chunks this read is about to fetch can become
+    // unreferenced between the two steps.
+    let st_fence = st.clone();
+    let fence = tokio::task::spawn_blocking(move || st_fence.begin_read_lease(project_id)).await;
+    let lease = match fence {
+        Ok(Ok(lease)) => lease,
+        Ok(Err(error)) => return api_err(StatusCode::SERVICE_UNAVAILABLE, error.to_string()),
+        Err(error) => return api_err(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+    };
+
+    let response = if let Some(range_hdr) = range_hdr {
+        // No early return inside the fenced region: leaving it would keep the
+        // lease until it expires and block collection for no reason.
+        match st.s3.head_object(project_id, &store, &bucket, &key) {
+            Ok(head) => match parse_range_header(&range_hdr, head.size) {
+                Some((start, end)) => {
+                    let s3 = st.s3.clone();
+                    let res = tokio::task::spawn_blocking(move || {
+                        s3.get_object_range(project_id, &store, &bucket, &key, start, end)
+                    })
+                    .await;
+                    match res {
+                        Ok(Ok((mf, bytes))) => (
+                            StatusCode::PARTIAL_CONTENT,
+                            [
+                                (header::CONTENT_TYPE, mf.content_type),
+                                (header::ETAG, mf.etag),
+                                (
+                                    header::CONTENT_RANGE,
+                                    format!("bytes {start}-{end}/{}", mf.size),
+                                ),
+                            ],
+                            bytes,
+                        )
+                            .into_response(),
+                        Ok(Err(S3Error::InvalidRange { .. })) => {
+                            api_err(StatusCode::RANGE_NOT_SATISFIABLE, "range out of bounds")
+                        }
+                        Ok(Err(e)) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+                        Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+                    }
+                }
+                None => api_err(StatusCode::RANGE_NOT_SATISFIABLE, "invalid Range header"),
+            },
             Err(S3Error::ObjectNotFound { .. }) => {
-                return api_err(StatusCode::NOT_FOUND, "object not found")
+                api_err(StatusCode::NOT_FOUND, "object not found")
             }
-            Err(e) => return api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-        };
-        let Some((start, end)) = parse_range_header(&range_hdr, head.size) else {
-            return api_err(StatusCode::RANGE_NOT_SATISFIABLE, "invalid Range header");
-        };
+            Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        }
+    } else {
         let s3 = st.s3.clone();
-        let res = tokio::task::spawn_blocking(move || {
-            s3.get_object_range(project_id, &store, &bucket, &key, start, end)
-        })
-        .await;
-        return match res {
+        let res =
+            tokio::task::spawn_blocking(move || s3.get_object(project_id, &store, &bucket, &key))
+                .await;
+        match res {
             Ok(Ok((mf, bytes))) => (
-                StatusCode::PARTIAL_CONTENT,
+                StatusCode::OK,
                 [
                     (header::CONTENT_TYPE, mf.content_type),
                     (header::ETAG, mf.etag),
-                    (
-                        header::CONTENT_RANGE,
-                        format!("bytes {start}-{end}/{}", mf.size),
-                    ),
                 ],
                 bytes,
             )
                 .into_response(),
-            Ok(Err(S3Error::InvalidRange { .. })) => {
-                api_err(StatusCode::RANGE_NOT_SATISFIABLE, "range out of bounds")
+            Ok(Err(S3Error::ObjectNotFound { .. })) => {
+                api_err(StatusCode::NOT_FOUND, "object not found")
             }
             Ok(Err(e)) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
             Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-        };
-    }
-
-    let s3 = st.s3.clone();
-    let res =
-        tokio::task::spawn_blocking(move || s3.get_object(project_id, &store, &bucket, &key)).await;
-
-    match res {
-        Ok(Ok((mf, bytes))) => (
-            StatusCode::OK,
-            [
-                (header::CONTENT_TYPE, mf.content_type),
-                (header::ETAG, mf.etag),
-            ],
-            bytes,
-        )
-            .into_response(),
-        Ok(Err(S3Error::ObjectNotFound { .. })) => {
-            api_err(StatusCode::NOT_FOUND, "object not found")
         }
-        Ok(Err(e)) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-        Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-    }
+    };
+
+    let st_fence = st.clone();
+    let _ = tokio::task::spawn_blocking(move || st_fence.end_read_lease(&lease)).await;
+    response
 }
 
 /// Quorum-confirmed GET. The manifest comes from exactly one linearizable
 /// snapshot; the chunks are then fetched by the ids that manifest names. There
 /// is no fallback to the locally applied manifest and no retry.
+///
+/// No reader lease is taken here: this path only runs on OpenRaft metadata (the
+/// legacy runtime answers 501 above), and collection refuses on OpenRaft because
+/// no single atomic cross-group snapshot exists. The legacy reader fence would
+/// add a metadata round trip to a read that no collector can race.
 async fn s3_get_consistent(
     st: AppState,
     project_id: u32,
@@ -5079,12 +5233,80 @@ async fn handle_vdisk_barrier(
             req.channel,
             req.up_to_generation,
         )?;
-        let _ = store.compact_sealed_segments();
-        Ok::<usize, BlobError>(evicted)
+        let mut response = BarrierResponse {
+            evicted,
+            ..BarrierResponse::default()
+        };
+        if req.compact {
+            match store.seal_and_compact() {
+                Ok(bytes) => response.reclaimed_bytes = bytes,
+                Err(error) => response.compaction_error = Some(error.to_string()),
+            }
+        }
+        Ok::<BarrierResponse, BlobError>(response)
     })
     .await;
     match res {
-        Ok(Ok(evicted)) => Json(BarrierResponse { evicted }).into_response(),
+        Ok(Ok(response)) => Json(response).into_response(),
+        Ok(Err(e)) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+async fn handle_vdisk_blobs(
+    State(st): State<AppState>,
+    Path((pool, slot)): Path<(String, usize)>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    if !raft_token_matches(&headers, st.raft_token.as_deref()) {
+        return api_err(
+            StatusCode::UNAUTHORIZED,
+            "invalid or missing internal Raft token",
+        );
+    }
+    let Some(store) = st.local_vdisks.read().unwrap().get(&(pool, slot)).cloned() else {
+        return api_err(
+            StatusCode::NOT_FOUND,
+            "local VDisk slot not hosted on this node",
+        );
+    };
+    let ids = match tokio::task::spawn_blocking(move || {
+        store
+            .live_ids()
+            .into_iter()
+            .map(|id| id.to_hex())
+            .collect::<Vec<_>>()
+    })
+    .await
+    {
+        Ok(ids) => ids,
+        Err(e) => return api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+    Json(yadb_blob::BlobIdList { ids }).into_response()
+}
+
+async fn handle_vdisk_compact(
+    State(st): State<AppState>,
+    Path((pool, slot)): Path<(String, usize)>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    if !raft_token_matches(&headers, st.raft_token.as_deref()) {
+        return api_err(
+            StatusCode::UNAUTHORIZED,
+            "invalid or missing internal Raft token",
+        );
+    }
+    let Some(store) = st.local_vdisks.read().unwrap().get(&(pool, slot)).cloned() else {
+        return api_err(
+            StatusCode::NOT_FOUND,
+            "local VDisk slot not hosted on this node",
+        );
+    };
+    let res = tokio::task::spawn_blocking(move || store.seal_and_compact()).await;
+    match res {
+        Ok(Ok(reclaimed_bytes)) => {
+            Json(yadb_blob::CompactResponse { reclaimed_bytes }).into_response()
+        }
         Ok(Err(e)) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
         Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
@@ -5126,6 +5348,34 @@ async fn handle_pools_scrub(State(st): State<AppState>, headers: HeaderMap) -> R
     let res = tokio::task::spawn_blocking(move || st_clone.scrub_all_pools()).await;
     match res {
         Ok(summary) => Json(summary).into_response(),
+        Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+async fn handle_pools_gc(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    // Same mutation class as scrub: it deletes fragments and rewrites durable
+    // barrier records, so it needs the same admin gate.
+    if let Err(e) = require_admin(
+        &headers,
+        st.subject_secret.as_deref(),
+        &st.admin_subjects,
+        st.meta.is_openraft(),
+    ) {
+        return e.into_response();
+    }
+    let st_clone = st.clone();
+    let res = tokio::task::spawn_blocking(move || st_clone.gc_all_pools()).await;
+    match res {
+        Ok(outcome) => {
+            // A refusal is an error, never a 200 with zero counts: the caller
+            // must not read "nothing to collect" into "could not prove safety".
+            let status = if outcome.refusal.is_some() {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::OK
+            };
+            (status, Json(outcome)).into_response()
+        }
         Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }
@@ -5422,6 +5672,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/idempotency/resolve", post(handle_resolve))
         .route("/v1/pools/health", get(handle_pools_health))
         .route("/v1/pools/scrub", post(handle_pools_scrub))
+        .route("/v1/pools/gc", post(handle_pools_gc))
         .route(
             "/internal/vdisk/{pool}/{slot}/blob/{blob_hex}",
             put(handle_vdisk_put).get(handle_vdisk_get).delete(handle_vdisk_delete),
@@ -5433,6 +5684,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route(
             "/internal/vdisk/{pool}/{slot}/barrier",
             post(handle_vdisk_barrier),
+        )
+        .route(
+            "/internal/vdisk/{pool}/{slot}/blobs",
+            get(handle_vdisk_blobs),
+        )
+        .route(
+            "/internal/vdisk/{pool}/{slot}/compact",
+            post(handle_vdisk_compact),
         )
         .route("/db/{project}/{database}/query", post(handle_db_query))
         .route("/block/{project}/{volume}/unmap", post(handle_block_unmap))
@@ -5941,6 +6200,7 @@ mod security_tests {
                     owner_id: 9,
                     channel: 9,
                     up_to_generation: 0x00ff_ffff,
+                    compact: false,
                 }),
             )
             .await;
@@ -5993,7 +6253,8 @@ mod security_tests {
                     project_id: 9,
                     owner_id: 9,
                     channel: 9,
-                    up_to_generation: 0x00ff_ffff
+                    up_to_generation: 0x00ff_ffff,
+                    compact: false,
                 })
             )
             .await
@@ -6297,5 +6558,174 @@ mod security_tests {
             ),
         ]);
         assert!(verified_subject(&wrong_secret, Some(secret)).is_none());
+    }
+
+    /// A legacy daemon state with one mirror pool, one project and one block
+    /// volume: enough to exercise the request paths that read fragments.
+    fn legacy_fragment_state(tag: &str) -> AppState {
+        use yadb_control::{BlockVolumeSpec, MemberBinding, ProjectQuotas, ProjectSpec};
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "yadb-gc-state-{tag}-{}-{nanos}",
+            std::process::id()
+        ));
+        let fs = OsFs::new(&dir).unwrap();
+        let meta = LocalMetaKv::open_single_node(&fs, "meta", 1).unwrap();
+        let stores = (0..3)
+            .map(|i| {
+                yadb_blob::VolumeStore::open(
+                    fs.clone(),
+                    format!("pool/data-{i}"),
+                    yadb_blob::VolumeConfig::default(),
+                )
+                .unwrap()
+            })
+            .collect();
+        let pool = std::sync::Arc::new(
+            yadb_blob::PoolStriper::new(yadb_blob::ErasureScheme::Mirror { replicas: 3 }, stores)
+                .unwrap(),
+        );
+        let mut control = ControlPlaneState::new();
+        control.projects.insert(
+            "proj".into(),
+            (
+                1,
+                ProjectSpec {
+                    quotas: ProjectQuotas::default(),
+                    members: vec![MemberBinding {
+                        subject: "anonymous".into(),
+                        role: Role::ReadWrite,
+                    }],
+                },
+            ),
+        );
+        control.block_volumes.insert(
+            "proj/disk".into(),
+            BlockVolumeSpec {
+                pool: "data".into(),
+                size_bytes: 1 << 20,
+            },
+        );
+        let block = BlockVolumeEngine::new(meta.clone(), DEFAULT_BLOCK_SIZE);
+        block.register_pool("data", pool.clone());
+        AppState {
+            #[cfg(feature = "openraft-storage")]
+            openraft: None,
+            listen_addr: "127.0.0.1:0".into(),
+            fs,
+            meta: meta.clone(),
+            raft_token: None,
+            subject_secret: None,
+            admin_subjects: vec![],
+            control: Arc::new(RwLock::new(control)),
+            control_refresh: Arc::new(std::sync::Mutex::new(())),
+            control_freshness: Arc::new(std::sync::Mutex::new(ControlFreshness::default())),
+            pools: Arc::new(RwLock::new(BTreeMap::from([("data".to_string(), pool)]))),
+            local_vdisks: Arc::new(RwLock::new(BTreeMap::new())),
+            last_scrub: Arc::new(RwLock::new(None)),
+            s3: ObjectStoreEngine::new(meta.clone(), 4096),
+            db: DatabaseEngine::new(meta.clone(), 100),
+            block,
+        }
+    }
+
+    async fn body_bytes(response: Response) -> Vec<u8> {
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec()
+    }
+
+    // A consistent block read publishes a lease for the duration of the read, so
+    // a collection pass that overlaps it refuses. The read itself never backs off
+    // on a collector lease: its own applied view is at least as new as the
+    // collector's mark, and it must either return the exact bytes of the revision
+    // it pinned or fail with 503, never a short or zero-filled body.
+    #[tokio::test]
+    async fn consistent_block_read_fences_collection_and_is_never_partial() {
+        let st = legacy_fragment_state("block-read-fence");
+        st.block
+            .write_at(1, "disk", "data", 1 << 20, 0, b"hello")
+            .unwrap();
+        let read = || {
+            handle_block_read(
+                State(st.clone()),
+                HeaderMap::new(),
+                Path(("proj".to_string(), "disk".to_string())),
+                Query(BlockReadQuery {
+                    offset: 0,
+                    len: 5,
+                    consistent: true,
+                }),
+            )
+        };
+
+        let ok = read().await;
+        assert_eq!(ok.status(), StatusCode::OK);
+        assert_eq!(body_bytes(ok).await, b"hello");
+
+        // A live collector lease does not make the read refuse, and does not make
+        // it return anything but the pinned bytes.
+        let held = yadb_metakv::gc::acquire_collector(&st.meta, 0, 60_000).unwrap();
+        let served = read().await;
+        assert_eq!(served.status(), StatusCode::OK);
+        assert_eq!(body_bytes(served).await, b"hello");
+        held.release().unwrap();
+
+        // The reverse direction is the safety property: while a read holds its
+        // lease, a collection pass refuses and deletes nothing.
+        let reader = yadb_metakv::gc::acquire(
+            &st.meta,
+            yadb_metakv::gc::LeaseKind::Reader,
+            1,
+            st.meta.revision(),
+            60_000,
+        )
+        .unwrap();
+        let pools = st.pools.read().unwrap().clone();
+        let control = st.control.read().unwrap().clone();
+        let outcome = crate::gc::sweep(&st.meta, &pools, &control);
+        assert_eq!(outcome.leases_live, 1, "{outcome:?}");
+        assert_eq!(outcome.fragments_deleted, 0, "{outcome:?}");
+        assert!(outcome.refusal.unwrap().contains("live lease"));
+        yadb_metakv::gc::release(&st.meta, &reader).unwrap();
+
+        // Once the pass is gone the read is served again, from the same bytes.
+        let again = read().await;
+        assert_eq!(again.status(), StatusCode::OK);
+        assert_eq!(body_bytes(again).await, b"hello");
+        assert!(
+            yadb_metakv::gc::live_leases(&st.meta).unwrap().is_empty(),
+            "the read must not leak its lease"
+        );
+    }
+
+    // The dedicated endpoint is the explicit-error surface: a refusal is a 409
+    // with the reason in the body, never a 200 that looks like "nothing to do".
+    #[tokio::test]
+    async fn gc_endpoint_reports_a_refusal_as_conflict() {
+        let st = legacy_fragment_state("gc-endpoint");
+        st.block
+            .write_at(1, "disk", "data", 1 << 20, 0, b"payload")
+            .unwrap();
+
+        let ok = handle_pools_gc(State(st.clone()), HeaderMap::new()).await;
+        assert_eq!(ok.status(), StatusCode::OK);
+        let outcome: crate::gc::SweepOutcome =
+            serde_json::from_slice(&body_bytes(ok).await).unwrap();
+        assert!(outcome.refusal.is_none(), "{outcome:?}");
+
+        let held = yadb_metakv::gc::acquire_collector(&st.meta, 0, 60_000).unwrap();
+        let refused = handle_pools_gc(State(st.clone()), HeaderMap::new()).await;
+        assert_eq!(refused.status(), StatusCode::CONFLICT);
+        let outcome: crate::gc::SweepOutcome =
+            serde_json::from_slice(&body_bytes(refused).await).unwrap();
+        let reason = outcome.refusal.expect("a 409 must carry its reason");
+        assert!(reason.contains("collector lease"), "{reason}");
+        assert_eq!(outcome.fragments_deleted, 0);
+        held.release().unwrap();
     }
 }

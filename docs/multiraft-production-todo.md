@@ -274,15 +274,15 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   `PoolHealthSnapshot::refused_puts` / `ScrubSummary::refused_puts`, and mapped to
   `503` on the SQL, S3 and block paths. Nothing is published for a refused write, so
   the caller holds no reference to the fragments that did land; those fragments are
-  garbage, not corruption, and nothing reclaims them yet (see the
+  garbage, not corruption, and the mark-and-sweep collector reclaims them (see the
   garbage-collection item). The consequence is deliberate: a pool with any slot
   offline refuses new writes instead of accepting unprotected ones, so write
   availability now follows full redundancy. The three-node daemon test asserts this:
   a write while one replica is stopped is refused with `503` and stays invisible,
   and the same statement succeeds after that replica returns. Open: no test
-  exercises a real multi-node pool; a refused write is still readable by id until a
-  collector exists; and refusal is per pool, so one offline domain stops writes for
-  every volume on it.
+  exercises a real multi-node pool; a refused write is still readable by id until
+  the next collection pass; and refusal is per pool, so one offline domain stops
+  writes for every volume on it.
 - [ ] Idempotency and read-consistency contracts. A keyed `POST /v1/apply` is
   implemented (`Idempotency-Key`, the outcome record committed in the same
   `RevisionTxn` as the mutation, `POST /v1/idempotency/resolve`, and a replicated
@@ -300,10 +300,10 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   fences in the project group. Block writes and S3 PUTs stage immutable
   fragments before that transaction; a refused, conflicted or crashed write
   therefore leaves unreferenced fragments (and, for S3, a `Prepared` intent)
-  and nothing rolls them back. Only the S3 namespace has a collector
+  and nothing rolls them back. Only the S3 namespace has an intent collector
   (`ObjectStoreEngine::collect_orphans_all`, disabled on Multi-Raft), so block
-  fragments from a refused or replaced write currently accumulate; see the
-  garbage-collection item. SQL writes are
+  fragments from a refused or replaced write accumulate until a mark-and-sweep
+  pass reclaims them; see the garbage-collection item. SQL writes are
   still **not** keyed: `POST /db/{project}/db/query` returns 501 for a keyed
   write script, because a script can mutate any number of tables, shards and
   secondary indexes through `DatabaseEngine::commit_tx_buffer_at_boundaries`,
@@ -328,34 +328,53 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   per read path. The group-scoped counter also means projects that share a group
   share one budget, which is intended but not yet exercised with a real second
   project on the same group.
-- [ ] Garbage collection outside the S3 upload-intent path. Nothing deletes
-  superseded data. Every block overwrite writes a new immutable fragment set and
-  drops the old one from the extent map; every SQL WAL blob folded into an SST,
-  and every SST replaced by a later compaction, leaves the previous blobs
-  unreferenced; overwriting or deleting an S3 object retires its manifest but
-  keeps its chunks readable; a refused write leaves the fragments that did land.
-  What exists is not a collector: `ObjectStoreEngine::collect_orphans_all` only
-  aborts expired `Prepared` upload intents inside the S3 namespace, and
-  `scrub_all_pools` repairs live blobs and deletes nothing. Both are refused
-  outright on Multi-Raft, so a cluster on that runtime reclaims nothing at all.
-  Disk therefore grows monotonically with writes, which is the main reason this
-  cannot yet be used as a long-lived store.
-  A naive mark-and-sweep is wrong here: a consistent read pins a revision and
-  fetches blobs afterwards, so deleting anything reachable from a live pinned
-  revision turns a read that was already promised into the `503` the handler
-  documents. The design must be a reader fence, not a grace period: a consistent
-  read publishes the revision it pinned as a short-lived lease in its own group,
-  and GC takes one quorum-confirmed snapshot, computes the live set, and deletes
-  only fragments that were already unreferenced at the oldest live lease, reaping
-  expired leases in the same pass. If the fence cannot be read, GC must refuse
-  rather than guess. Deletion is also pool-scoped while manifests are
-  group-scoped, so a fragment is deletable only when no group references it: the
-  sweep needs either every group's live set or a per-group barrier it can prove.
-  Acceptance: overwrite a block repeatedly, compact a table, overwrite and delete
-  an S3 object and refuse a write, then assert disk usage returns to the live-set
-  size; a concurrent consistent read must either finish from its pinned revision
-  or fail with `503`, never return partial bytes; a crash in the middle of a sweep
-  must not leave a referenced fragment deleted.
+- [x] Garbage collection on the legacy metadata runtime. `POST /v1/pools/gc`
+  runs one bounded mark-and-sweep pass, and `POST /v1/pools/scrub` runs the same
+  pass after its repair scan; both report `blobs_live`, `fragments_deleted`,
+  `bytes_reclaimed`, `leases_live` and an explicit `gc_refusal`, and `/gc`
+  answers `409` with that reason instead of a `200` that could be read as
+  "nothing to do". The mark is every fragment named by `/db/` tablet manifests
+  (WAL and SST), `/s3/` object manifests, `/s3-intent/` in-flight uploads and
+  `/block/` extent maps, from one applied snapshot. The sweep deletes only ids a
+  mounted slot actually holds and the mark does not name: a durable generation
+  barrier where the channel's `(owner, generation)` space is monotonic and the
+  dead range is provably disjoint from every live generation (S3 channel 4,
+  block channel 5), an exact per-fragment tombstone everywhere else (SQL WAL/SST
+  channels, whose owner id is name-derived and whose generation restarts at
+  zero, so a permanent barrier would fence a recreated tablet). It refuses with
+  zero deletions when the node is not the metadata leader, when any reader or
+  writer lease is live, when another pass holds the collector lease, when a
+  lease record cannot be parsed, when a mounted pool cannot be enumerated, or
+  when a manifest is unreadable. Readers publish a 30 s lease before reading and
+  writers a 300 s lease between the fragment append and the publication that
+  names it; the collector re-checks the fence immediately before its mark, so a
+  read or write that started first is seen. `/s3-retired/` is deliberately not
+  live: a retired manifest is unreachable to reads, so its chunks are exactly
+  what an overwrite or delete made garbage (the records themselves are kept).
+  Measured in the daemon suite (bytes on disk, before → after): repeated block
+  overwrite 9,513,240 → 198,339 (live set 196,608, 2,256 fragments deleted);
+  table flush plus compaction 228,765 → 42,369 (live 20,739, 651 fragments);
+  S3 overwrite and delete 789,744 → 267 (live 21, 96 fragments); a refused write
+  24,798 → 12,534 against a 12,411-byte live-set floor. A crash between the
+  durable barrier and the compaction is simulated by dropping the volume after
+  the barrier records are written: reopening reaps the expired collector lease,
+  the rerun finishes, and the newest generation still reads back byte-identical.
+  Open: the collector is legacy-only (the Multi-Raft item below still refuses);
+  the fence costs one durable lease write and one delete per SQL statement,
+  block read and S3 GET, so a continuously busy node will usually refuse a pass
+  rather than wait for a quiet window, and there is no grace-period scheduling;
+  `/s3-retired/` records are retained indefinitely; the 300 s writer TTL is the
+  only bound on a crashed writer blocking collection; and no test runs a real
+  multi-node pool, so remote enumeration, remote barriers and remote compaction
+  are only exercised in-process.
+- [ ] Garbage collection on Multi-Raft. `POST /v1/pools/gc` and the sweep inside
+  `POST /v1/pools/scrub` both refuse with `garbage collection disabled for
+  Multi-Raft: no single atomic cross-group metadata snapshot` and delete
+  nothing. The live set is group-scoped while deletion is pool-scoped, and one
+  node cannot enumerate every group's manifests, so a Multi-Raft collector needs
+  a per-group fence, a per-group barrier it can prove, and a rule for a fragment
+  referenced by another group's manifest. None of that exists; a Multi-Raft
+  deployment still reclaims nothing.
 
 Backup and restore are **out of scope by owner decision**, not an oversight: no
 command, artifact format, fence or validator exists, and none is planned. A lost
