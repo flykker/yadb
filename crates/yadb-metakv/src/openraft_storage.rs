@@ -89,6 +89,42 @@ pub struct TailRepair {
     pub discarded: u64,
 }
 
+/// The first log index OpenRaft can ever assign.
+///
+/// `LogIdOptionExt::next_index()` of `None` is 0 in openraft 0.9, so a group's
+/// very first entry is at index 0. This constant is what makes "the log starts
+/// at the beginning" checkable; it would have to change if OpenRaft started
+/// numbering a group elsewhere.
+const FIRST_LOG_INDEX: u64 = 0;
+
+/// What the log still retains, as needed to decide whether an empty state
+/// machine can be rebuilt from it.
+///
+/// Replaying the log into an empty state machine reproduces the previous state
+/// only if the log is a complete record of every entry. Two things can break
+/// that: a purge marker drops a prefix on purpose, and a snapshot install lets
+/// a fresh log begin at the snapshot boundary with no purge marker at all
+/// (`prepare_append` documents that case). Both are reported here so the
+/// decision does not depend on the purge marker alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LogCoverage {
+    /// `last_purged_log_id`, i.e. the highest entry the log has dropped.
+    pub last_purged: Option<LogId<u32>>,
+    /// Lowest retained entry index, or `None` when the log holds no entries.
+    pub first_index: Option<u64>,
+}
+
+impl LogCoverage {
+    /// Whether the retained log holds every entry from the first index, so
+    /// replaying it into an empty state machine loses nothing.
+    ///
+    /// An empty log is not enough: the corrupt image may have covered a
+    /// snapshot that the log no longer repeats.
+    pub fn replays_from_start(&self) -> bool {
+        self.last_purged.is_none() && self.first_index == Some(FIRST_LOG_INDEX)
+    }
+}
+
 #[allow(dead_code)]
 #[derive(Clone, Copy)]
 enum Fault {
@@ -637,6 +673,19 @@ impl DurableOpenRaftLog {
         self.inner.lock().unwrap().repaired_tail
     }
 
+    /// What the recovered log retains, for deciding whether a corrupt
+    /// state-machine image can be rebuilt by replaying it.
+    ///
+    /// Reads the same recovered state as [`RaftLogStorage::get_log_state`],
+    /// plus the lowest retained index that `LogState` does not expose.
+    pub fn coverage(&self) -> LogCoverage {
+        let inner = self.inner.lock().unwrap();
+        LogCoverage {
+            last_purged: inner.state.purged,
+            first_index: inner.state.log.first_key_value().map(|(index, _)| *index),
+        }
+    }
+
     fn append_durable(&self, record: &Record) -> Result<(), StorageError<u32>> {
         let mut inner = self.inner.lock().unwrap();
         if inner.failed {
@@ -1115,6 +1164,50 @@ mod tests {
             io::ErrorKind::InvalidData
         );
         assert_eq!(fs::read(path).unwrap(), before);
+    }
+
+    // `coverage()` feeds the state-machine rebuild decision, so it must agree
+    // with the openraft-visible log state and with what replay will actually
+    // see: nothing retained means no replay, a purge moves the start, and a
+    // fresh log with entries starts at the first index.
+    #[tokio::test]
+    async fn coverage_reports_purge_and_first_retained_index() {
+        let dir = TempDir::new();
+        let mut store = DurableOpenRaftLog::create(&dir.0, &identity()).unwrap();
+        assert_eq!(
+            store.coverage(),
+            LogCoverage {
+                last_purged: None,
+                first_index: None,
+            }
+        );
+        assert!(!store.coverage().replays_from_start());
+
+        store
+            .append_durable(&Record::Append((0..=3).map(entry).collect()))
+            .unwrap();
+        assert_eq!(
+            store.coverage(),
+            LogCoverage {
+                last_purged: None,
+                first_index: Some(0),
+            }
+        );
+        assert!(store.coverage().replays_from_start());
+
+        store.purge(entry(1).log_id).await.unwrap();
+        let coverage = store.coverage();
+        assert_eq!(coverage.last_purged, Some(entry(1).log_id));
+        assert_eq!(coverage.first_index, Some(2));
+        assert_eq!(
+            coverage.last_purged,
+            store.get_log_state().await.unwrap().last_purged_log_id
+        );
+        assert!(!coverage.replays_from_start());
+
+        drop(store);
+        let reopened = DurableOpenRaftLog::open(&dir.0, &identity()).unwrap();
+        assert_eq!(reopened.coverage(), coverage);
     }
 
     // Maps to OpenRaft suite: initial_logs, get_log_state, purge_logs_upto_0,
