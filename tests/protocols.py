@@ -190,8 +190,11 @@ class Pg:
         return out
 
     def rows(self, sql):
-        out = []
-        for k, data in self.query(sql):
+        return self.data_rows(self.query(sql))
+
+    def data_rows(self, out):
+        rows = []
+        for k, data in out:
             if k != b"D":
                 continue
             n, = struct.unpack("!H", data[:2])
@@ -203,8 +206,50 @@ class Pg:
                 row.append(None if length == -1 else data[:length].decode())
                 if length != -1:
                     data = data[length:]
-            out.append(row)
-        return out
+            rows.append(row)
+        return rows
+
+    # Extended query protocol framing (text format only).
+
+    def parse(self, sql, name="", oids=()):
+        body = name.encode()+b"\0"+sql.encode()+b"\0"+struct.pack("!H", len(oids))
+        body += b"".join(struct.pack("!I", oid) for oid in oids)
+        self.send(b"P", body)
+
+    def bind(self, portal="", statement="", params=(), formats=(), results=()):
+        body = portal.encode()+b"\0"+statement.encode()+b"\0"
+        body += struct.pack("!H", len(formats))
+        body += b"".join(struct.pack("!H", f) for f in formats)
+        body += struct.pack("!H", len(params))
+        for value in params:
+            if value is None:
+                body += struct.pack("!i", -1)
+            else:
+                raw = value if isinstance(value, bytes) else value.encode()
+                body += struct.pack("!i", len(raw))+raw
+        body += struct.pack("!H", len(results))
+        body += b"".join(struct.pack("!H", f) for f in results)
+        self.send(b"B", body)
+
+    def describe(self, target=b"S", name=""):
+        self.send(b"D", target+name.encode()+b"\0")
+
+    def execute(self, portal="", max_rows=0):
+        self.send(b"E", portal.encode()+b"\0"+struct.pack("!i", max_rows))
+
+    def close_object(self, target=b"S", name=""):
+        self.send(b"C", target+name.encode()+b"\0")
+
+    def sync(self):
+        self.send(b"S", b"")
+        return self.until_ready()
+
+    def extended(self, sql, params=(), oids=(), results=()):
+        self.parse(sql, oids=oids)
+        self.bind(params=params, results=results)
+        self.describe(b"P")
+        self.execute()
+        return self.sync()
 
     def close(self):
         self.send(b"X", b"")
@@ -481,12 +526,13 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
                             | ((slot["slot_index"]+1) << 16) | (250 << 8) | 1)
                     path = f'/internal/vdisk/{pool["pool_name"]}/{slot["slot_index"]}/blob/{blob:032x}'
                     port = 19000 + slot["node_id"]
-                    assert request(port, "PUT", path, b"orphan-fragment")[0] == 200
-                    result = request(port, "DELETE", path)
+                    internal = {"x-yadb-raft-token": RAFT_TOKEN}
+                    assert request(port, "PUT", path, b"orphan-fragment", internal)[0] == 200
+                    result = request(port, "DELETE", path, headers=internal)
                     assert result[0] == 200 and result[2] == b"deleted", result
-                    assert request(port, "GET", path)[0] == 404
-                    assert request(port, "DELETE", path)[2] == b"absent"
-                    assert request(port, "PUT", path, b"late-fragment")[0] == 412
+                    assert request(port, "GET", path, headers=internal)[0] == 404
+                    assert request(port, "DELETE", path, headers=internal)[2] == b"absent"
+                    assert request(port, "PUT", path, b"late-fragment", internal)[0] == 412
                     vdisk_tombstones.append((port, path))
             scrub = json.loads(request(19002, "POST", "/v1/pools/scrub")[2])
             assert scrub["orphan_collection_error"] is None, scrub
@@ -528,6 +574,109 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
             b.query("UPDATE wire SET balance=201 WHERE id=2;")
             assert a.rows("SELECT id FROM wire WHERE balance=201;") == [["2"]]
             assert a.rows("SELECT id FROM wire WHERE balance=200;") == []
+            # Extended query protocol: text parameters are bound as SQL literals.
+            a.query("CREATE TABLE ext (id INT PRIMARY KEY, note TEXT);")
+            out = a.extended("SELECT id, balance FROM wire WHERE id = $1;", params=("1",), oids=(23,))
+            assert a.data_rows(out) == [["1", "90"]], out
+            assert (b"C", b"SELECT 1\0") in out and out[-1] == (b"Z", b"I"), out
+            out = a.extended("INSERT INTO ext VALUES ($1, $2);", params=("1", "it's; fine"), oids=(23, 25))
+            assert (b"C", b"INSERT 0 1\0") in out, out
+            assert a.rows("SELECT note FROM ext WHERE id=1;") == [["it's; fine"]]
+            # A parameter value that looks like SQL stays a harmless string literal.
+            out = a.extended("INSERT INTO ext VALUES ($1, $2);", params=("2", "'; DROP TABLE ext; --"), oids=(23, 25))
+            assert (b"C", b"INSERT 0 1\0") in out, out
+            assert a.rows("SELECT note FROM ext WHERE id=2;") == [["'; DROP TABLE ext; --"]]
+            assert a.rows("SELECT id FROM ext ORDER BY id;") == [["1"], ["2"]]
+            # Re-Parse of the unnamed statement replaces the earlier one.
+            a.parse("SELECT note FROM ext WHERE id = $1;")
+            a.parse("SELECT id FROM ext WHERE id = $1;")
+            a.bind(params=("1",))
+            a.execute()
+            out = a.sync()
+            assert [k for k, _ in out].count(b"1") == 2, out
+            assert a.data_rows(out) == [["1"]], out
+            # Describe(statement): ParameterDescription then RowDescription for a
+            # read-only statement, NoData for a mutating one (which is not executed).
+            a.parse("SELECT id FROM ext WHERE id = $1;", oids=(23,))
+            out = a.sync()
+            assert [k for k, _ in out] == [b"1", b"Z"], out
+            a.describe(b"S")
+            out = a.sync()
+            assert out[0][0] == b"t" and struct.unpack("!H", out[0][1][:2])[0] == 1, out
+            assert struct.unpack("!I", out[0][1][2:6])[0] == 23 and out[1][0] == b"T", out
+            a.parse("INSERT INTO ext VALUES ($1, $2);", oids=(23, 25))
+            a.sync()
+            a.describe(b"S")
+            out = a.sync()
+            assert out[0][0] == b"t" and out[1] == (b"n", b""), out
+            assert a.rows("SELECT id FROM ext ORDER BY id;") == [["1"], ["2"]]
+            # An error skips everything until Sync; the connection stays usable.
+            a.parse("SELECT missing FROM ext;")
+            a.bind()
+            a.execute()
+            a.parse("SELECT id FROM ext;")
+            a.bind()
+            a.execute()
+            out = a.sync()
+            # Only the first Parse/Bind completed; the rest were skipped until Sync.
+            assert [k for k, _ in out] == [b"1", b"2", b"E", b"Z"], out
+            assert out[-1] == (b"Z", b"I"), out
+            assert a.rows("SELECT id FROM ext ORDER BY id;") == [["1"], ["2"]]
+            # Missing and extra parameters are protocol errors.
+            a.parse("SELECT id FROM ext WHERE id = $2;")
+            a.bind(params=("1",))
+            out = a.sync()
+            assert any(k == b"E" and b"C42P02\0" in d for k, d in out), out
+            assert out[-1] == (b"Z", b"I"), out
+            a.parse("SELECT id FROM ext;")
+            a.bind(params=("1",))
+            out = a.sync()
+            assert any(k == b"E" and b"C08P01\0" in d for k, d in out), out
+            # Binary parameter and result formats are refused.
+            a.parse("SELECT id FROM ext WHERE id = $1;")
+            a.bind(params=(b"\x00\x00\x00\x01",), formats=(1,))
+            out = a.sync()
+            assert any(k == b"E" and b"C0A000\0" in d and b"binary parameter" in d for k, d in out), out
+            a.parse("SELECT id FROM ext;")
+            a.bind(results=(1,))
+            out = a.sync()
+            assert any(k == b"E" and b"C0A000\0" in d and b"binary result" in d for k, d in out), out
+            # Named statements and portals are independent of the unnamed ones.
+            a.parse("SELECT note FROM ext WHERE id = $1;", name="find_ext")
+            a.bind(portal="p1", statement="find_ext", params=("2",))
+            a.execute("p1")
+            out = a.sync()
+            assert a.data_rows(out) == [["'; DROP TABLE ext; --"]], out
+            a.close_object(b"P", "p1")
+            a.close_object(b"S", "find_ext")
+            out = a.sync()
+            assert [k for k, _ in out].count(b"3") == 2, out
+            # Execute drives the same transaction state as Simple Query.
+            out = a.extended("BEGIN;")
+            assert out[-1] == (b"Z", b"T"), out
+            out = a.extended("UPDATE ext SET note = $1 WHERE id = $2;", params=("changed", "1"), oids=(25, 23))
+            assert (b"C", b"UPDATE 1\0") in out, out
+            out = a.extended("ROLLBACK;")
+            assert (b"C", b"ROLLBACK\0") in out and out[-1] == (b"Z", b"I"), out
+            assert a.rows("SELECT note FROM ext WHERE id=1;") == [["it's; fine"]]
+            # COMMIT in an aborted extended transaction becomes ROLLBACK.
+            out = a.extended("BEGIN;")
+            assert out[-1] == (b"Z", b"T"), out
+            a.parse("SELECT missing FROM ext;")
+            a.bind()
+            a.execute()
+            out = a.sync()
+            assert out[-1] == (b"Z", b"E"), out
+            out = a.extended("COMMIT;")
+            assert (b"C", b"ROLLBACK\0") in out and out[-1] == (b"Z", b"I"), out
+            # Close, and an Execute against a missing portal.
+            a.close_object(b"S", "")
+            out = a.sync()
+            assert (b"3", b"") in out, out
+            a.execute("absent")
+            out = a.sync()
+            assert any(k == b"E" and b"C34000\0" in d for k, d in out), out
+            print("PASS pgwire extended query: literal binding, describe, errors, transactions")
             a.close()
             print("PASS pgwire password, result framing, multi-statements, session isolation, rollback")
             print("PASS pgwire index backfill and cross-portal indexed DML")
@@ -722,8 +871,9 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
             restored.close()
             assert signed(19203, "GET", "/invoices-2026/restart")[2] == b"durable object"
             for port, path in vdisk_tombstones:
-                assert request(port, "PUT", path, b"late-after-restart")[0] == 412
-                assert request(port, "GET", path)[0] == 404
+                internal = {"x-yadb-raft-token": RAFT_TOKEN}
+                assert request(port, "PUT", path, b"late-after-restart", internal)[0] == 412
+                assert request(port, "GET", path, headers=internal)[0] == 404
             disk = Iscsi(19303)
             assert disk.read(lba=4096) == b"R"*512
             disk.s.close()
