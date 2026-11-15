@@ -306,8 +306,9 @@ impl<FS: StorageFs> BlockVolumeEngine<FS> {
             // referenced yet cannot be swept between the append and the
             // publication that names them. A release that fails leaves the record
             // until its TTL, which blocks collection but never unblocks a
-            // deletion.
-            let writer_lease = yadb_metakv::gc::acquire_writer(
+            // deletion. On Multi-Raft there is no collector to fence and no
+            // routed lease namespace, so no lease is published.
+            let mut writer_lease = yadb_metakv::gc::acquire_writer_if_legacy(
                 &self.meta,
                 project_id,
                 self.meta.revision(),
@@ -347,10 +348,22 @@ impl<FS: StorageFs> BlockVolumeEngine<FS> {
             // Prepared with the map this attempt would publish, after all
             // fragment writes: the caller's guards/ops join this transaction and
             // nothing else, and a refusal aborts before the map op is submitted.
-            let extra = prepare(&map)?;
+            //
+            // The lease's own guard joins it too. A write that stalled past its
+            // lease can no longer publish a map naming fragments a pass has
+            // already reclaimed: the renewal fails (or the transaction loses its
+            // CAS) and the write is refused instead of committing a map that
+            // points at deleted data.
+            let mut extra = prepare(&map)?;
+            if let Some(lease) = writer_lease.as_mut() {
+                lease.renew(yadb_metakv::gc::WRITER_TTL_MS)?;
+                extra.guards.push(lease.guard());
+            }
             if self.publish_map_with(key, revision, &map, extra)? {
-                if let Err(error) = writer_lease.release() {
-                    eprintln!("block writer lease release failed: {error}");
+                if let Some(lease) = writer_lease {
+                    if let Err(error) = lease.release() {
+                        eprintln!("block writer lease release failed: {error}");
+                    }
                 }
                 return Ok(data.len());
             }
@@ -1560,6 +1573,57 @@ mod tests {
         assert_eq!(
             meta.get(&map_key).unwrap().mod_revision,
             meta.get(&record).unwrap().mod_revision
+        );
+    }
+
+    /// A write that stalls past its writer lease must not publish the map that
+    /// names the fragments it appended: a collection pass may already have
+    /// reclaimed them. The renewal before publication is what refuses.
+    #[test]
+    fn a_write_whose_lease_was_reaped_does_not_publish() {
+        let fs = SimFs::new(8826);
+        let meta = LocalMetaKv::open_single_node(&fs, "meta", 1).unwrap();
+        let engine = BlockVolumeEngine::new(meta.clone(), 4096);
+        engine.register_pool("data", pool(&fs));
+        engine
+            .write_at(1, "disk", "data", 8192, 0, b"before")
+            .unwrap();
+        let map_before = meta
+            .get(&BlockVolumeEngine::<SimFs>::meta_key(1, "disk"))
+            .unwrap();
+
+        // Simulate the collector reaping an expired writer lease between the
+        // fragment append and the publication: every writer record disappears.
+        let mut reaped = 0;
+        let result = engine.write_at_with(1, "disk", "data", 8192, 0, b"after", |_| {
+            for (key, _) in meta.scan_prefix(yadb_metakv::gc::LEASE_PREFIX) {
+                if key.contains("/writer/") {
+                    meta.execute(KvCommand::Delete { key }).unwrap();
+                    reaped += 1;
+                }
+            }
+            Ok(MapPublication {
+                guards: Vec::new(),
+                ops: Vec::new(),
+            })
+        });
+
+        assert_eq!(reaped, 1, "the write published exactly one writer lease");
+        let error = result.expect_err("a write without its lease must refuse");
+        assert!(
+            error.to_string().contains("lease"),
+            "the refusal must name the lost fence: {error}"
+        );
+        let map_after = meta
+            .get(&BlockVolumeEngine::<SimFs>::meta_key(1, "disk"))
+            .unwrap();
+        assert_eq!(
+            map_after.mod_revision, map_before.mod_revision,
+            "the map must not have been republished"
+        );
+        assert_eq!(
+            engine.read_at(1, "disk", "data", 8192, 0, 6).unwrap(),
+            b"before"
         );
     }
 }

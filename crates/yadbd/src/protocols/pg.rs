@@ -1130,6 +1130,12 @@ fn prepare_sql(
             format!("at most {MAX_PREPARED} prepared statements are supported"),
         ));
     }
+    if session.statements.contains_key(&name) {
+        return Err(PgError::new(
+            "42P05",
+            format!("prepared statement \"{name}\" already exists"),
+        ));
+    }
     session
         .statements
         .insert(name, Prepared { sql, oids, params });
@@ -1362,7 +1368,16 @@ fn parse_ext(data: &[u8], statements: &mut BTreeMap<String, Prepared>) -> Result
             format!("at most {MAX_PREPARED} prepared statements are supported"),
         ));
     }
-    // PostgreSQL replaces a statement when the same name is parsed again.
+    // PostgreSQL replaces the *unnamed* statement freely but refuses to parse a
+    // second statement under a name that is already taken (`42P05`), because the
+    // existing statement may be the target of a portal that is still open. Do the
+    // same: a silent replacement would change what an already-bound portal runs.
+    if !name.is_empty() && statements.contains_key(&name) {
+        return Err(PgError::new(
+            "42P05",
+            format!("prepared statement \"{name}\" already exists"),
+        ));
+    }
     statements.insert(name, Prepared { sql, oids, params });
     Ok(())
 }
@@ -2055,7 +2070,7 @@ fn split(sql: &str) -> Vec<&str> {
         } else if !quoted && b[i..].starts_with(b"/*") {
             block = 1;
             i += 1;
-        } else if b[i] == b'"' {
+        } else if !quoted && b[i] == b'"' {
             ident = true;
         } else if b[i] == b'\'' {
             if quoted && b.get(i + 1) == Some(&b'\'') {
@@ -2264,6 +2279,12 @@ mod tests {
             split("SELECT 'it''s; fine' FROM t"),
             vec!["SELECT 'it''s; fine' FROM t"]
         );
+        // A double quote inside a string literal is data: it must not open a
+        // quoted identifier that swallows the rest of the script.
+        assert_eq!(
+            split("SELECT 'a\"b;c' FROM t; SELECT 2"),
+            vec!["SELECT 'a\"b;c' FROM t", "SELECT 2"]
+        );
         assert!(split("  -- only a comment\n").iter().all(|s| blank(s)));
         assert!(blank("/* nested /* comment */ */"));
         assert!(!blank("SELECT 1"));
@@ -2410,6 +2431,33 @@ mod tests {
                 .code,
             "22P02"
         );
+    }
+
+    #[test]
+    fn a_named_statement_cannot_be_parsed_twice_but_the_unnamed_one_can() {
+        fn parse(name: &str, sql: &str) -> Vec<u8> {
+            let mut data = Vec::new();
+            data.extend_from_slice(name.as_bytes());
+            data.push(0);
+            data.extend_from_slice(sql.as_bytes());
+            data.push(0);
+            data.extend_from_slice(&0u16.to_be_bytes());
+            data
+        }
+        let mut statements = BTreeMap::new();
+        parse_ext(&parse("p", "SELECT $1"), &mut statements).unwrap();
+        // A second Parse under a taken name is refused, and the statement that
+        // already exists is left exactly as it was.
+        let error = parse_ext(&parse("p", "SELECT $2"), &mut statements).unwrap_err();
+        assert_eq!(error.code, "42P05", "{}", error.message);
+        assert_eq!(
+            statements.get("p").map(|p| p.sql.as_str()),
+            Some("SELECT $1")
+        );
+        // The unnamed statement is replaced freely, as in PostgreSQL.
+        parse_ext(&parse("", "SELECT 1"), &mut statements).unwrap();
+        parse_ext(&parse("", "SELECT 2"), &mut statements).unwrap();
+        assert_eq!(statements.get("").map(|p| p.sql.as_str()), Some("SELECT 2"));
     }
 
     #[test]

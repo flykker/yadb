@@ -825,9 +825,11 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
         // WAL fragments are appended in phase 1 and only referenced by the
         // metadata transaction in phase 2. Publish a writer lease for the whole
         // span: a collector that runs in between would otherwise see unreferenced
-        // fragments that are about to be referenced and delete them.
+        // fragments that are about to be referenced and delete them. The lease is
+        // renewed and its guard joins phase 2, so a commit that stalled past the
+        // lease fails instead of naming reclaimed fragments.
         let lease_meta = self.meta.clone();
-        let writer_lease = yadb_metakv::gc::acquire_writer(
+        let mut writer_lease = yadb_metakv::gc::acquire_writer_if_legacy(
             &lease_meta,
             project_id,
             self.meta.revision(),
@@ -972,6 +974,11 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
 
         ops.extend(index_ops);
 
+        if let Some(lease) = writer_lease.as_mut() {
+            lease.renew(yadb_metakv::gc::WRITER_TTL_MS)?;
+            guards.push(lease.guard());
+        }
+
         after_preparation();
 
         // Phase 2: Single atomic Raft transaction across all shard manifests & secondary indexes!
@@ -995,8 +1002,10 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
             guard.apply_prepared(prep, revision)?;
         }
 
-        if let Err(error) = writer_lease.release() {
-            eprintln!("writer lease release failed: {error}");
+        if let Some(lease) = writer_lease {
+            if let Err(error) = lease.release() {
+                eprintln!("writer lease release failed: {error}");
+            }
         }
         Ok(())
     }

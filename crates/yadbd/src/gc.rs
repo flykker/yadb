@@ -4,25 +4,36 @@
 //! refuses rather than guesses, and every deletion is ordered after the durable
 //! fence that makes it safe:
 //!
-//! 1. **Fence.** Refuse on OpenRaft (no single atomic cross-group view). Read
+//! 1. **Admission fence.** Reader and writer leases can only be published while
+//!    the collector record is *absent* (their publication transaction guards on
+//!    it), and the collector record can only be published while no other pass
+//!    holds it. Publishing the collector record therefore closes admission
+//!    atomically: a lease published before it is visible to the check in step 2,
+//!    and one attempted after it loses its CAS. That is what makes the fence hold
+//!    for the whole pass, not just at one instant.
+//! 2. **Fence.** Refuse on OpenRaft (no single atomic cross-group view). Read
 //!    every live reader/writer lease and reap expired ones; any live lease means
 //!    a read or write is in flight, so the pass refuses and deletes nothing.
-//! 2. **Collector lease.** Publish a durable collector record so a second pass
-//!    cannot interleave its mark and sweep phases with this one.
-//! 3. **Enumerate.** Ask every slot of every mounted pool which physical fragment
+//! 3. **Collector lease.** Publish a durable collector record so a second pass
+//!    cannot interleave its mark and sweep phases with this one, and so no new
+//!    reader or writer can be admitted until the pass is done. The record is
+//!    renewed before each deletion batch: a pass that stalls past its lease stops
+//!    deleting instead of continuing without a fence, and its release is
+//!    ownership-guarded so it can never delete a successor's record.
+//! 4. **Enumerate.** Ask every slot of every mounted pool which physical fragment
 //!    ids it holds. A slot that cannot answer makes that pool unprovable: refuse
 //!    that pool, sweep no part of it.
-//! 4. **Re-check the fence, then mark.** A writer that published during step 3
+//! 5. **Re-check the fence, then mark.** A writer that published during step 4
 //!    would be invisible to a mark taken earlier, so the fence is checked again
 //!    and one snapshot of `/db/`, `/s3/`, `/s3-intent/` and `/block/` is taken
 //!    *after* it. A manifest that cannot be parsed, or a block extent map whose
 //!    pool cannot be resolved, makes the live set unprovable: refuse. Nothing is
 //!    deleted that this snapshot references.
-//! 5. **Delete.** Durable generation barriers on channels whose `(owner,
+//! 6. **Delete.** Durable generation barriers on channels whose `(owner,
 //!    generation)` space is monotonic and where the dead generation range is
 //!    provably disjoint from every live generation in that `(project, owner,
 //!    channel)`; exact per-fragment tombstones everywhere else.
-//! 6. **Compact.** Seal a wasteful active segment and compact sealed ones, so the
+//! 7. **Compact.** Seal a wasteful active segment and compact sealed ones, so the
 //!    bytes the barrier/tombstone freed are actually returned to the filesystem.
 //!
 //! Crash safety comes from the order, not from atomicity: the fence and the
@@ -161,7 +172,7 @@ pub fn sweep(
         }
         None => meta.get(gc::COLLECTOR_KEY).map_or(0, |kv| kv.mod_revision),
     };
-    let collector = match gc::acquire_collector(meta, collector_revision, COLLECTOR_LEASE_MS) {
+    let mut collector = match gc::acquire_collector(meta, collector_revision, COLLECTOR_LEASE_MS) {
         Ok(guard) => guard,
         Err(error) => {
             return SweepOutcome::refuse(format!(
@@ -206,6 +217,15 @@ pub fn sweep(
     // that is still behind this revision can no longer prove its manifests are
     // complete, so it refuses; a reader that publishes after this point has
     // already applied at least this revision.
+    //
+    // Renew first: enumeration can be slow, and everything below deletes bytes.
+    // A pass that has lost its record must stop before the watermark, because
+    // from that moment readers can be admitted again.
+    if let Err(error) = collector.renew(COLLECTOR_LEASE_MS) {
+        return SweepOutcome::refuse(format!(
+            "garbage collection refused: {error}; no fragment was deleted"
+        ));
+    }
     let swept_up_to = meta.revision();
     if let Err(error) = gc::publish_watermark(meta, swept_up_to) {
         let _ = collector.release();
@@ -216,7 +236,14 @@ pub fn sweep(
 
     // The fence must still be clear, and the mark must be taken after that check.
     // A writer that published its lease after step 1 is then either still holding
-    // it (refuse) or already referenced by this snapshot (kept).
+    // it (refuse) or already referenced by this snapshot (kept). Admission is
+    // already closed by the collector record, so this is the check for leases
+    // that were live before it was acquired.
+    if let Err(error) = collector.ensure_owned() {
+        return SweepOutcome::refuse(format!(
+            "garbage collection refused: {error}; no fragment was deleted"
+        ));
+    }
     let live = match gc::live_leases(meta) {
         Ok(live) => live,
         Err(error) => {
@@ -248,6 +275,15 @@ pub fn sweep(
 
     // Step 5: delete, pool by pool, only ids that the mark does not reference and
     // that the pool actually holds.
+    //
+    // Renew once more immediately before the first deletion: the mark snapshot
+    // above is only meaningful while admission is still closed, so a pass that
+    // cannot prove it still owns the collector record deletes nothing.
+    if let Err(error) = collector.renew(COLLECTOR_LEASE_MS) {
+        return SweepOutcome::refuse(format!(
+            "garbage collection refused: {error}; no fragment was deleted"
+        ));
+    }
     let live_by_pool = group_by_pool(&second);
     for (pool_name, pool_present) in &present {
         let Some(striper) = pools.get(pool_name) else {
@@ -256,6 +292,14 @@ pub fn sweep(
             ));
             continue;
         };
+        // Every pool starts from a fresh lease, so a slow sweep of an earlier
+        // pool cannot leave this one deleting under an expired fence.
+        if let Err(error) = collector.renew(COLLECTOR_LEASE_MS) {
+            outcome
+                .errors
+                .push(format!("sweep stopped before pool `{pool_name}`: {error}"));
+            break;
+        }
         let empty = BTreeSet::new();
         let live = live_by_pool.get(pool_name).unwrap_or(&empty);
         let dead: BTreeSet<BlobId> = pool_present
@@ -269,9 +313,14 @@ pub fn sweep(
         sweep_pool(striper, pool_name, &dead, live, &mut outcome);
     }
 
-    // Step 6: compact, so the bytes the barriers and tombstones freed are actually
+    // Step 7: compact, so the bytes the barriers and tombstones freed are actually
     // returned to the filesystem. Refused pools are left alone: their state is
     // unknown, and a pass that refuses a pool must not touch it at all.
+    //
+    // Compaction only reclaims space the barriers already fenced, so it is safe
+    // even if the lease is lost here; it is renewed anyway so a long compaction
+    // does not hand the next pass a record that expires mid-way.
+    let _ = collector.renew(COLLECTOR_LEASE_MS);
     for (pool_name, striper) in pools {
         if !present.contains_key(pool_name) {
             continue;
@@ -317,6 +366,15 @@ fn group_by_pool(mark: &MarkSet) -> BTreeMap<String, BTreeSet<BlobId>> {
 /// then the barrier evicts exactly the dead set and nothing a committed revision
 /// references. Otherwise each dead fragment gets an exact tombstone, which is
 /// narrower and always safe.
+///
+/// An allocation that is still in flight cannot be fenced by a barrier here. A
+/// reservation writes no fragment, so it is never part of the dead set (and a
+/// fresh generation is the newest in its group, above every `up_to` this pass can
+/// compute); the fragments it later appends exist only while it holds a writer
+/// lease, and a live lease makes the pass refuse before this point. If that lease
+/// expires while the writer is stalled, its publication transaction carries the
+/// lease's own `RevisionGuard` and therefore fails instead of publishing a map
+/// that names fragments this pass reclaimed.
 fn sweep_pool(
     striper: &PoolStriper<OsFs>,
     pool_name: &str,

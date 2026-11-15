@@ -271,7 +271,7 @@ mod tests {
             row_count: 1,
         });
         tablet.manifest.last_seq = 1;
-        tablet.cas_save_manifest().unwrap();
+        tablet.cas_save_manifest_with(Vec::new()).unwrap();
         drop(tablet);
         let mut tablet = open(&meta, &pool, "shard");
         let snapshot = DataShardTablet::open_readonly_snapshot(
@@ -534,6 +534,23 @@ pub struct DataShardTablet<FS: StorageFs> {
     flush_threshold_rows: usize,
 }
 
+/// Renews a writer lease and returns the guard a publication must carry.
+///
+/// The renewal happens at the last moment before the transaction that names the
+/// freshly appended fragments, and the guard makes that transaction fail if the
+/// lease is not the one this writer published.
+fn lease_guards<FS: StorageFs>(
+    lease: Option<&mut yadb_metakv::gc::GcLeaseGuard<'_, FS>>,
+) -> Result<Vec<RevisionGuard>, DbError> {
+    match lease {
+        None => Ok(Vec::new()),
+        Some(lease) => {
+            lease.renew(yadb_metakv::gc::WRITER_TTL_MS)?;
+            Ok(vec![lease.guard()])
+        }
+    }
+}
+
 impl<FS: StorageFs> DataShardTablet<FS> {
     #[allow(clippy::too_many_arguments)]
     pub fn open_or_recover(
@@ -754,13 +771,23 @@ impl<FS: StorageFs> DataShardTablet<FS> {
         })
     }
 
-    fn cas_save_manifest(&mut self) -> Result<(), DbError> {
+    /// Saves the manifest together with caller guards that must hold for the
+    /// publication to be allowed.
+    ///
+    /// Flush and compaction pass their writer lease here: the new SST fragment is
+    /// already on disk, so the transaction that names it must not commit after the
+    /// lease expired, or a collection pass could have reclaimed the fragment in
+    /// between and the manifest would reference deleted data.
+    fn cas_save_manifest_with(&mut self, extra: Vec<RevisionGuard>) -> Result<(), DbError> {
         let encoded = serde_json::to_vec(&self.manifest)?;
+        let mut guards = Vec::with_capacity(1 + extra.len());
+        guards.push(RevisionGuard {
+            key: self.meta_key.clone(),
+            expected_mod_revision: self.manifest_revision,
+        });
+        guards.extend(extra);
         match self.meta.execute(KvCommand::RevisionTxn {
-            guards: vec![RevisionGuard {
-                key: self.meta_key.clone(),
-                expected_mod_revision: self.manifest_revision,
-            }],
+            guards,
             ops: vec![TxnOp::Put {
                 key: self.meta_key.clone(),
                 value: encoded,
@@ -876,9 +903,11 @@ impl<FS: StorageFs> DataShardTablet<FS> {
 
         // The SST fragment is appended before the manifest that names it is
         // committed. A writer lease keeps a collector from reclaiming it in that
-        // window; it is released only after the manifest transaction returns.
+        // window; it is released only after the manifest transaction returns, and
+        // the transaction carries the lease's own guard so a stalled flush cannot
+        // publish after the lease was lost.
         let lease_meta = self.meta.clone();
-        let writer_lease = yadb_metakv::gc::acquire_writer(
+        let mut writer_lease = yadb_metakv::gc::acquire_writer_if_legacy(
             &lease_meta,
             self.manifest.project_id,
             self.meta.revision(),
@@ -906,7 +935,7 @@ impl<FS: StorageFs> DataShardTablet<FS> {
             row_count,
         });
 
-        if let Err(e) = self.cas_save_manifest() {
+        if let Err(e) = self.cas_save_manifest_with(lease_guards(writer_lease.as_mut())?) {
             self.manifest.wal_blobs = prev_wals;
             self.manifest.sst_blobs.pop();
             return Err(e);
@@ -918,8 +947,10 @@ impl<FS: StorageFs> DataShardTablet<FS> {
             let _ = self.compact()?;
         }
 
-        if let Err(error) = writer_lease.release() {
-            eprintln!("writer lease release failed: {error}");
+        if let Some(lease) = writer_lease {
+            if let Err(error) = lease.release() {
+                eprintln!("writer lease release failed: {error}");
+            }
         }
         Ok(true)
     }
@@ -933,9 +964,10 @@ impl<FS: StorageFs> DataShardTablet<FS> {
 
         let merged_ssts = self.manifest.sst_blobs.len();
         // Same ordering as a flush: the replacement SST is appended before the
-        // manifest that references it commits.
+        // manifest that references it commits, and the publication carries the
+        // lease guard.
         let lease_meta = self.meta.clone();
-        let writer_lease = yadb_metakv::gc::acquire_writer(
+        let mut writer_lease = yadb_metakv::gc::acquire_writer_if_legacy(
             &lease_meta,
             self.manifest.project_id,
             self.meta.revision(),
@@ -991,15 +1023,17 @@ impl<FS: StorageFs> DataShardTablet<FS> {
         self.manifest.wal_blobs.clear();
         self.manifest.sst_blobs = new_ssts;
 
-        if let Err(e) = self.cas_save_manifest() {
+        if let Err(e) = self.cas_save_manifest_with(lease_guards(writer_lease.as_mut())?) {
             self.manifest = prev_manifest;
             return Err(e);
         }
 
         self.memtable.clear();
 
-        if let Err(error) = writer_lease.release() {
-            eprintln!("writer lease release failed: {error}");
+        if let Some(lease) = writer_lease {
+            if let Err(error) = lease.release() {
+                eprintln!("writer lease release failed: {error}");
+            }
         }
         Ok(CompactionReport {
             merged_ssts,

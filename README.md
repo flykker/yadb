@@ -566,6 +566,15 @@ while any node is reading, so wait about 30 s after the last query:
 curl -s -X POST http://127.0.0.1:18000/v1/pools/gc
 ```
 
+While a pass runs, reads and writes are refused with `503` instead of being
+admitted unfenced, and a read whose lease expired mid-flight is refused rather
+than answered from fragments a pass may already have reclaimed. Because only the
+metadata leader can publish that lease, a read sent to a follower is proxied to
+the leader — the same path writes already take, and the reason a follower read
+reports `503 node is not Raft leader` when the leader is unreachable. A proxied
+read is bounded by the forwarding wire cap (16 MiB of body); larger block or
+object reads must be sent to the leader directly.
+
 The metadata Raft log is bounded: once `metakv/raft.wal` passes 8 MiB (or 4096
 applied entries above its base) each node writes an atomic
 `metakv/checkpoint.json` state image and rewrites the log, keeping everything
