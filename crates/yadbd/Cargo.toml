@@ -15,7 +15,7 @@ experimental-openraft-storage = ["yadb-metakv/experimental-openraft-storage", "d
 yadb-io = { path = "../yadb-io" }
 yadb-blob = { path = "../yadb-blob" }
 yadb-control = { path = "../yadb-control" }
-yadb-metakv = { path = "../yadb-metakv" }
+yadb-metakv = { path = "../yadb-metakv", features = ["experimental-openraft-storage"] }
 yadb-s3 = { path = "../yadb-s3" }
 yadb-db = { path = "../yadb-db" }
 yadb-block = { path = "../yadb-block" }

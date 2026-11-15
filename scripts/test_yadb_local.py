@@ -1,4 +1,5 @@
 import contextlib
+import hashlib
 import importlib.util
 import io
 import json
@@ -280,6 +281,93 @@ class LaunchCommandTest(unittest.TestCase):
         command = local.node_command(Path('/deployment'), 8420, 1, '1=127.0.0.1:8420')
         self.assertNotIn('--subject-secret', command)
         self.assertFalse(any('YADB_SUBJECT_SECRET' in arg for arg in command))
+
+
+class BackupTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.addCleanup(os.umask, os.umask(0o077))
+        parent = Path(self.temp.name)
+        (parent / 'target/debug').mkdir(parents=True)
+        (parent / 'target/debug/yadbd').write_text('#!/usr/bin/env python3\nimport json\nprint(json.dumps({"group": 1, "node": 1, "first_index": None, "last_index": None, "last_purged": None, "applied": None, "snapshot": None, "entry_count": 0, "torn_tail": False, "restorable": True, "reason": None, "membership_differs_from_descriptor": None}))\n')
+        self.root = parent / 'cluster'
+        self.dest = parent / 'backup'
+        with mock.patch.object(local, 'REPO', parent), mock.patch.object(local, 'check_ports'), \
+                mock.patch.object(local.subprocess, 'run'), contextlib.redirect_stdout(io.StringIO()):
+            local.prepare(self.root)
+        (self.root / 'state.json').write_text(json.dumps({'phase': 'stopped', 'pids': []}))
+        for node in range(1, 4):
+            (self.root / 'data' / f'node-{node}').mkdir()
+            for group in range(1, 4):
+                replica = self.root / 'metadata' / f'{node}-{group}'
+                replica.mkdir()
+                (replica / 'log').write_bytes(b'replica')
+
+    def run_backup(self):
+        with mock.patch.object(local, 'port_open', return_value=False), \
+                mock.patch.object(local, 'http_health', return_value=False), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            return local.backup(self.root, self.dest)
+
+    def test_existing_destination_untouched(self):
+        self.dest.mkdir()
+        (self.dest / 'keep').write_text('unchanged')
+        self.assertEqual(self.run_backup(), 2)
+        self.assertEqual([p.name for p in self.dest.iterdir()], ['keep'])
+        self.assertEqual((self.dest / 'keep').read_text(), 'unchanged')
+
+    def test_not_stopped_refused(self):
+        (self.root / 'state.json').write_text('{"phase":"running"}')
+        self.assertEqual(self.run_backup(), 2)
+        self.assertFalse((self.root / '.yadb-backup-in-progress').exists())
+
+    def test_copy_failure_retains_markers_and_incomplete(self):
+        with mock.patch.object(local, 'backup_copy', side_effect=OSError('copy failed')):
+            self.assertEqual(self.run_backup(), 5)
+        self.assertTrue((self.root / '.yadb-backup-in-progress').exists())
+        for node in range(1, 4):
+            self.assertTrue((self.root / 'data' / f'node-{node}' / '.yadb-backup-in-progress').exists())
+        self.assertIn('copy failed', (self.dest / 'INCOMPLETE').read_text())
+        self.assertFalse((self.dest / 'COMPLETE').exists())
+
+    def test_manifest_and_completion_hashes(self):
+        self.assertEqual(self.run_backup(), 0)
+        data = (self.dest / 'manifest.json').read_bytes()
+        digest = hashlib.sha256(data).hexdigest()
+        self.assertEqual((self.dest / 'manifest.sha256').read_text().strip(), digest)
+        self.assertEqual((self.dest / 'COMPLETE').read_text().strip(), digest)
+        manifest = json.loads(data)
+        payload = self.dest / 'payload'
+        self.assertEqual({f['path'] for f in manifest['files']}, {p.relative_to(payload).as_posix() for p in payload.rglob('*') if p.is_file()})
+        for entry in manifest['files']:
+            path = payload / entry['path']
+            self.assertEqual(entry['sha256'], hashlib.sha256(path.read_bytes()).hexdigest())
+            self.assertEqual(entry['mode'], path.stat().st_mode & 0o7777)
+        self.assertEqual(len(manifest['replicas']), 9)
+        self.assertFalse((self.root / '.yadb-backup-in-progress').exists())
+
+    def test_symlink_refused(self):
+        (self.root / 'data/link').symlink_to(self.root / 'state.json')
+        self.assertEqual(self.run_backup(), 4)
+        self.assertTrue((self.dest / 'INCOMPLETE').exists())
+        self.assertFalse((self.dest / 'COMPLETE').exists())
+
+
+class RunBackupGateTest(unittest.TestCase):
+    def test_run_refuses_while_a_backup_marker_exists(self):
+        # `run` reads the marker after it holds supervisor.lock. A `run` that
+        # checked first and locked later would start a live process after a
+        # backup had already written the marker, and the copy would race it.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'state.json').write_text(json.dumps({'phase': 'stopped'}))
+            (root / '.yadb-backup-in-progress').write_text('backup\n')
+            with self.assertRaises(RuntimeError) as raised:
+                local.run(root)
+            self.assertIn('.yadb-backup-in-progress', str(raised.exception))
+            # The refusal must not rewrite lifecycle state as if a run happened.
+            self.assertEqual(json.loads((root / 'state.json').read_text()), {'phase': 'stopped'})
 
 
 if __name__ == '__main__':

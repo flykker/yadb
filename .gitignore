@@ -4,3 +4,5 @@
 .DS_Store
 /data
 .yadb-state.json
+__pycache__/
+*.pyc
