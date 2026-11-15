@@ -12,6 +12,7 @@ import secrets
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import time
@@ -481,6 +482,197 @@ def verify(root):
                 print(f'node {node} {path}:', response.read().decode())
 
 
+class BackupError(Exception):
+    def __init__(self, message, code):
+        super().__init__(message)
+        self.code = code
+
+
+def sync_dir(path):
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def durable_write(path, data):
+    with Path(path).open('xb') as output:
+        output.write(data)
+        output.flush()
+        os.fsync(output.fileno())
+
+
+def backup_copy(source, target, relative, files):
+    """Refuse ambiguous filesystem objects rather than silently omitting them."""
+    info = source.lstat()
+    if stat.S_ISDIR(info.st_mode):
+        target.mkdir(mode=stat.S_IMODE(info.st_mode))
+        for child in sorted(source.iterdir()):
+            if (child.name in ('.yadb-backup-in-progress', 'supervisor.lock', 'logs')
+                    or child.name.endswith('.tmp') or child.name.startswith('.l2s.')):
+                continue
+            backup_copy(child, target / child.name, relative / child.name, files)
+        os.chmod(target, stat.S_IMODE(info.st_mode))
+        sync_dir(target)
+    elif stat.S_ISREG(info.st_mode):
+        # Reject all multiply linked files: an external link cannot be ruled out
+        # from a single path without trusting a concurrently mutable tree.
+        if info.st_nlink != 1:
+            raise BackupError(f'hard-linked file refused: {source}', 4)
+        digest = hashlib.sha256()
+        size = 0
+        fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(fd, 'rb') as input_file, target.open('xb') as output:
+            actual = os.fstat(input_file.fileno())
+            if not stat.S_ISREG(actual.st_mode) or (actual.st_dev, actual.st_ino, actual.st_nlink) != (info.st_dev, info.st_ino, 1):
+                raise BackupError(f'file changed during copy: {source}', 4)
+            while True:
+                block = input_file.read(1024 * 1024)
+                if not block:
+                    break
+                digest.update(block)
+                size += len(block)
+                output.write(block)
+            os.fchmod(output.fileno(), stat.S_IMODE(info.st_mode))
+            output.flush()
+            os.fsync(output.fileno())
+        files.append({'path': relative.as_posix(), 'size': size, 'mode': stat.S_IMODE(info.st_mode), 'sha256': digest.hexdigest()})
+    else:
+        raise BackupError(f'symlink or special file refused: {source}', 4)
+
+
+def backup(root, dest):
+    os.umask(0o077)
+    marked = False
+    markers = []
+    complete = None
+    try:
+        try:
+            root = root.resolve(strict=True)
+            base = deployment_ports(root)
+            identity = load(root / 'config/identity.json')
+            state = load(root / 'state.json')
+            if not isinstance(state, dict) or state.get('phase') != 'stopped':
+                raise BackupError('deployment phase is not stopped', 2)
+            if not isinstance(state.get('pids', []), list) or any(type(pid) is not int or pid <= 0 for pid in state.get('pids', [])) or (state.get('supervisor_pid') is not None and (type(state['supervisor_pid']) is not int or state['supervisor_pid'] <= 0)):
+                raise BackupError('invalid recorded PIDs', 2)
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            raise BackupError(f'invalid deployment root or identity: {error}', 2) from error
+        dest = dest.parent.resolve(strict=True) / dest.name
+        if dest == root or root in dest.parents:
+            raise BackupError('destination must be outside the deployment root', 2)
+        try:
+            dest.mkdir(mode=0o700)
+        except FileExistsError as error:
+            raise BackupError(f'destination already exists: {dest}', 2) from error
+        (dest / 'payload').mkdir(mode=0o700)
+        marker = root / '.yadb-backup-in-progress'
+        if marker.exists() or marker.is_symlink():
+            raise BackupError(f'backup marker already exists: {marker}', 2)
+        # Holding this lock closes the window where run has checked the marker
+        # but has not yet acquired its own supervisor lock.
+        with (root / 'supervisor.lock').open('a') as supervisor:
+            try:
+                fcntl.flock(supervisor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as error:
+                raise BackupError('supervisor lock is held', 2) from error
+            if not status(root):
+                raise BackupError('deployment status reports problems', 2)
+            for port in ports(base):
+                if port_open(port):
+                    raise BackupError(f'listener on port {port}', 2)
+            timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            marker_data = (json.dumps({'destination': str(dest), 'timestamp_utc': timestamp}) + '\n').encode()
+            markers = [marker] + [root / 'data' / f'node-{node}' / marker.name for node in identity['node_ids']]
+            # Once marker creation starts, failures must retain all created markers.
+            marked = True
+            for path in markers:
+                durable_write(path, marker_data)
+                sync_dir(path.parent)
+            metadata = root / 'metadata'
+            replicas = sorted(metadata.iterdir())
+            if len(replicas) != 9 or any(not stat.S_ISDIR(path.lstat().st_mode) for path in replicas):
+                raise BackupError('expected nine replica directories in metadata', 4)
+            locks = []
+            try:
+                for path in replicas:
+                    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                    locks.append(fd)
+                    try:
+                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError as error:
+                        raise BackupError(f'replica lock is held: {path}', 2) from error
+            finally:
+                for fd in locks:
+                    os.close(fd)
+            verdicts = []
+            for path in replicas:
+                result = subprocess.run([str(root / 'bin/yadbd'), '--verify-replica', str(path)], capture_output=True, text=True)
+                if result.returncode != 0:
+                    raise BackupError(f'replica validation failed: {path}: {result.stderr.strip()}', 4)
+                try:
+                    verdict = json.loads(result.stdout)
+                    required = {'group', 'node', 'first_index', 'last_index', 'last_purged', 'applied',
+                                'snapshot', 'entry_count', 'torn_tail', 'restorable', 'reason',
+                                'membership_differs_from_descriptor'}
+                    if not isinstance(verdict, dict) or not required.issubset(verdict):
+                        raise ValueError('missing verdict fields')
+                    if verdict['restorable'] is not True:
+                        raise ValueError(f"not restorable: {verdict['reason']}")
+                except (ValueError, TypeError) as error:
+                    raise BackupError(f'invalid replica verdict: {path}: {error}', 4) from error
+                if verdict['membership_differs_from_descriptor'] is not None:
+                    raise BackupError(f'replica membership disagrees with descriptor: {path}', 4)
+                verdicts.append(verdict)
+            files = []
+            for name in ('config', 'metadata', 'data', 'credentials', 'bin', 'state.json'):
+                backup_copy(root / name, dest / 'payload' / name, Path(name), files)
+            sync_dir(dest / 'payload')
+            manifest = {'version': 1, 'source_root': str(root), 'deployment_id': identity['deployment_id'],
+                        'listener_sha256': identity['listener_sha256'], 'timestamp_utc': timestamp,
+                        'node_ids': identity['node_ids'], 'blob_coverage': 'full', 'replicas': verdicts, 'files': files}
+            data = (json.dumps(manifest, indent=2) + '\n').encode()
+            digest = hashlib.sha256(data).hexdigest()
+            durable_write(dest / 'manifest.json', data)
+            durable_write(dest / 'manifest.sha256', (digest + '\n').encode())
+            sync_dir(dest)
+            complete = dest / 'COMPLETE'
+            durable_write(complete, (digest + '\n').encode())
+            sync_dir(dest)
+            for path in reversed(markers):
+                path.unlink()
+                sync_dir(path.parent)
+            print(f'Backup: {dest}\nSHA-256: {digest}')
+            return 0
+    except (BackupError, OSError, ValueError, KeyError, TypeError) as error:
+        code = error.code if isinstance(error, BackupError) else 5
+        if marked:
+            if complete is not None:
+                try:
+                    complete.unlink(missing_ok=True)
+                    sync_dir(dest)
+                except OSError:
+                    pass
+            # Restore any markers removed before a cleanup failure.
+            for path in markers:
+                try:
+                    if not path.exists() and not path.is_symlink():
+                        durable_write(path, marker_data)
+                        sync_dir(path.parent)
+                except OSError:
+                    pass
+            try:
+                durable_write(dest / 'INCOMPLETE', (str(error) + '\n').encode())
+                sync_dir(dest)
+            except OSError as record_error:
+                print(f'Could not record INCOMPLETE: {record_error}', file=sys.stderr)
+            print(f'Backup retained at {dest}: {error}', file=sys.stderr)
+        else:
+            print(f'Backup refused: {error}', file=sys.stderr)
+        return code
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest='command', required=True)
@@ -490,6 +682,9 @@ def main():
                                 help='first HTTP port; Raft listeners use base+10000..base+10008')
     for cmd in ('run', 'verify', 'status'):
         sub.add_parser(cmd).add_argument('root', type=Path)
+    backup_parser = sub.add_parser('backup')
+    backup_parser.add_argument('root', type=Path)
+    backup_parser.add_argument('dest', type=Path)
     args = parser.parse_args()
     if args.command == 'prepare':
         prepare(args.root, args.port_base)
@@ -498,6 +693,8 @@ def main():
     elif args.command == 'status':
         if not status(args.root.resolve(strict=True)):
             sys.exit(1)
+    elif args.command == 'backup':
+        sys.exit(backup(args.root, args.dest))
     else:
         verify(args.root.resolve(strict=True))
 
