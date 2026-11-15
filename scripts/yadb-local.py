@@ -874,7 +874,6 @@ def restore(artifact, target, expected_sha256=None):
     """
     os.umask(0o077)
     created = False
-    finished = False
     markers = []
     digest = ''
     timestamp = ''
@@ -974,17 +973,11 @@ def restore(artifact, target, expected_sha256=None):
             sync_dir(absolute)
         durable_write(absolute / 'RESTORE_COMPLETE', record)
         sync_dir(absolute)
-        finished = True
         print(f'Restored: {absolute}\nSHA-256: {digest}')
         return 0
     except (BackupError, OSError, ValueError, KeyError, TypeError) as error:
         code = error.code if isinstance(error, BackupError) else 5
         if created:
-            if finished:
-                try:
-                    (target.parent.resolve(strict=True) / target.name / 'RESTORE_COMPLETE').unlink()
-                except OSError:
-                    pass
             # A root whose restore failed must never look complete or startable.
             for path in markers:
                 try:
