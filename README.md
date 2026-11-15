@@ -104,11 +104,31 @@ Start one daemon with the optional listeners (repeat the listener flags on every
 
 ### PostgreSQL wire protocol
 
-The initial implementation supports PostgreSQL v3 **Simple Query** mode, including
-multi-statement SQL and transaction sessions. It intentionally does not claim extended
-queries, prepared statements, COPY, or TLS termination yet. Put TLS/mTLS in front of the
-listener (or use a private network): the password exchange is cleartext inside the TCP
-connection.
+The listener implements PostgreSQL v3 **Simple Query** and the **extended query**
+protocol (`Parse`, `Bind`, `Describe`, `Execute`, `Close`, `Flush`, `Sync`), including
+multi-statement Simple Query scripts, named and unnamed prepared statements and portals,
+and transaction sessions. Only **text format** is supported: a `Bind` that requests a
+binary parameter or result format is refused with `0A000`.
+
+Parameters are not server-typed. The SQL engine has no `$n` syntax, so `Bind` decodes
+each text value using the OID sent by `Parse` and substitutes a SQL literal into the
+statement text. Strings and unknown OIDs are quoted with embedded single quotes
+doubled; integers, floats and booleans must be valid literals or the statement fails
+with `22P02`; a NULL value becomes the `NULL` keyword. When the client sends OID 0
+(unspecified), the value is inferred as integer, then float, then boolean, then text.
+Substitution is quote/comment aware, so a value cannot become SQL syntax. This literal
+binding is a real limitation: it is not PostgreSQL's server-side typing, parameter
+inference and plan reuse, and float parameters reach a parser that has no float column
+type. Prepared statements and portals are bounded (64 of each, 64 KiB of SQL); exceeding
+a bound is a clean error. `Parse` records the statement text and syntax errors surface
+at `Execute`.
+
+`Describe` obtains column names only by executing a read-only statement (`SELECT` or
+`SHOW`) through the gateway with `NULL` parameters and discarding the rows; a mutating
+statement answers `NoData` without being executed. Execute row limits
+(`PortalSuspended`) are refused. COPY, TLS termination and binary formats remain
+unsupported. Put TLS/mTLS in front of the listener (or use a private network): the
+password exchange is cleartext inside the TCP connection.
 
 The database name is `project/database`, and the PostgreSQL user is the credentials-file
 access-key:
