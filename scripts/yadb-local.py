@@ -548,6 +548,42 @@ def backup_copy(source, target, relative, files):
         raise BackupError(f'symlink or special file refused: {source}', 4)
 
 
+def cluster_identity(root, base):
+    """Return what can actually be verified about this deployment's identity.
+
+    A root prepared by an older tooling version has no `config/identity.json`, so
+    there is no recorded `deployment_id` to report and inventing one would claim
+    the artifact belongs to a deployment that never existed. The verifiable facts
+    are still there: the cluster UUID and node set in every replica descriptor,
+    and the listeners derived from the group configs. Those are reported, and
+    `identity_source` says which of the two situations this is.
+    """
+    root = Path(root)
+    cluster_ids = set()
+    nodes = set()
+    for replica in sorted((root / 'metadata').iterdir()):
+        version, group, node, _voters = json.loads((replica / 'replica.json').read_text())
+        if version != 1:
+            raise BackupError(f'unsupported replica descriptor version in {replica}', 4)
+        cluster_ids.add(tuple(group['cluster']))
+        nodes.add(node)
+    if len(cluster_ids) != 1:
+        raise BackupError('replica descriptors disagree on the cluster identity', 4)
+    identity_path = root / 'config' / 'identity.json'
+    if identity_path.exists():
+        identity = load(identity_path)
+        if identity['node_ids'] != sorted(nodes):
+            raise BackupError('recorded node ids disagree with the replica descriptors', 4)
+        if identity['listener_sha256'] != listener_hash(root, base):
+            raise BackupError('recorded listener hash disagrees with the group configs', 4)
+        return {'identity_source': 'provisioned', 'deployment_id': identity['deployment_id'],
+                'listener_sha256': identity['listener_sha256'], 'node_ids': sorted(nodes),
+                'cluster_id': list(next(iter(cluster_ids))), 'http_base': base}
+    return {'identity_source': 'legacy', 'deployment_id': None,
+            'listener_sha256': listener_hash(root, base), 'node_ids': sorted(nodes),
+            'cluster_id': list(next(iter(cluster_ids))), 'http_base': base}
+
+
 def backup(root, dest):
     os.umask(0o077)
     created = False
@@ -558,7 +594,7 @@ def backup(root, dest):
         try:
             root = root.resolve(strict=True)
             base = deployment_ports(root)
-            identity = load(root / 'config/identity.json')
+            identity = cluster_identity(root, base)
             state = load(root / 'state.json')
             if not isinstance(state, dict) or state.get('phase') != 'stopped':
                 raise BackupError('deployment phase is not stopped', 2)
@@ -655,7 +691,10 @@ def backup(root, dest):
             for name in ('config', 'metadata', 'data', 'credentials', 'bin', 'state.json'):
                 backup_copy(root / name, dest / 'payload' / name, Path(name), files)
             sync_dir(dest / 'payload')
-            manifest = {'version': 1, 'source_root': str(root), 'deployment_id': identity['deployment_id'],
+            manifest = {'version': 1, 'source_root': str(root),
+                        'identity_source': identity['identity_source'],
+                        'deployment_id': identity['deployment_id'],
+                        'cluster_id': identity['cluster_id'],
                         'listener_sha256': identity['listener_sha256'], 'timestamp_utc': timestamp,
                         'node_ids': identity['node_ids'], 'blob_coverage': 'full', 'replicas': verdicts, 'files': files}
             data = (json.dumps(manifest, indent=2) + '\n').encode()

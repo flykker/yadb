@@ -303,6 +303,8 @@ class BackupTest(unittest.TestCase):
                 replica = self.root / 'metadata' / f'{node}-{group}'
                 replica.mkdir()
                 (replica / 'log').write_bytes(b'replica')
+                descriptor = [1, {'cluster': [1] * 16, 'group': group, 'incarnation': 1}, node, [1, 2, 3]]
+                (replica / 'replica.json').write_text(json.dumps(descriptor))
 
     def run_backup(self):
         with mock.patch.object(local, 'port_open', return_value=False), \
@@ -376,6 +378,8 @@ class BackupTest(unittest.TestCase):
         self.assertEqual((self.dest / 'manifest.sha256').read_text().strip(), digest)
         self.assertEqual((self.dest / 'COMPLETE').read_text().strip(), digest)
         manifest = json.loads(data)
+        self.assertEqual(manifest['identity_source'], 'provisioned')
+        self.assertEqual(manifest['cluster_id'], [1] * 16)
         payload = self.dest / 'payload'
         self.assertEqual({f['path'] for f in manifest['files']}, {p.relative_to(payload).as_posix() for p in payload.rglob('*') if p.is_file()})
         for entry in manifest['files']:
@@ -411,6 +415,27 @@ class BackupTest(unittest.TestCase):
         self.fake_verdict(restorable=False, reason='applied log id absent from log')
         self.assertEqual(self.run_backup(), 4)
         self.assertIn('applied log id absent from log', (self.dest / 'INCOMPLETE').read_text())
+
+    def test_legacy_root_reports_no_invented_deployment_id(self):
+        # A root prepared before `config/identity.json` existed has no recorded
+        # deployment id. Reporting a fresh one would claim the artifact belongs
+        # to a deployment that never existed; the cluster UUID is the fact that
+        # does exist, and it must come from the descriptors.
+        (self.root / 'config' / 'identity.json').unlink()
+        (self.root / 'config' / 'ports.json').unlink()
+        self.assertEqual(self.run_backup(), 0)
+        manifest = json.loads((self.dest / 'manifest.json').read_bytes())
+        self.assertEqual(manifest['identity_source'], 'legacy')
+        self.assertIsNone(manifest['deployment_id'])
+        self.assertEqual(manifest['cluster_id'], [1] * 16)
+        self.assertEqual(manifest['node_ids'], [1, 2, 3])
+        self.assertTrue(manifest['listener_sha256'])
+
+    def test_descriptors_disagreeing_on_cluster_refused(self):
+        (self.root / 'metadata/1-1/replica.json').write_text(
+            json.dumps([1, {'cluster': [2] * 16, 'group': 1, 'incarnation': 1}, 1, [1, 2, 3]]))
+        self.assertEqual(self.run_backup(), 4)
+        self.assertFalse(self.dest.exists())
 
 
 class RunBackupGateTest(unittest.TestCase):
