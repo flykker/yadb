@@ -10,7 +10,9 @@ use yadb_metakv::{KvCommand, KvResult, LocalMetaKv, MetaError, RevisionGuard, Tx
 pub const DEFAULT_BLOCK_SIZE: u32 = 4096;
 // Separate from legacy block channel 3 and S3 channel 4. Owner + generation
 // encode a project-wide allocation; step is the block ordinal in that allocation.
-const BLOCK_CHANNEL: u8 = 5;
+/// Blob channel of block-volume fragments. The collector needs it to know that
+/// this channel's generation space is monotonic, so a generation barrier is safe.
+pub const BLOCK_CHANNEL: u8 = 5;
 const MAX_ALLOCATION: u64 = (1u64 << 56) - 1;
 
 #[derive(Debug, Error)]
@@ -298,6 +300,20 @@ impl<FS: StorageFs> BlockVolumeEngine<FS> {
             let owner = (allocation >> 24) as u32;
             map.generation = (allocation & BlobId::MAX_U24 as u64) as u32;
 
+            // Publish a durable writer lease after the allocation (which touches
+            // no fragment) and before the first fragment append. The collector
+            // refuses while any lease is live, so fragments that are not
+            // referenced yet cannot be swept between the append and the
+            // publication that names them. A release that fails leaves the record
+            // until its TTL, which blocks collection but never unblocks a
+            // deletion.
+            let writer_lease = yadb_metakv::gc::acquire_writer(
+                &self.meta,
+                project_id,
+                self.meta.revision(),
+                yadb_metakv::gc::WRITER_TTL_MS,
+            )?;
+
             let mut cursor = 0usize;
             let mut step = 0u32;
             while cursor < data.len() {
@@ -333,6 +349,9 @@ impl<FS: StorageFs> BlockVolumeEngine<FS> {
             // nothing else, and a refusal aborts before the map op is submitted.
             let extra = prepare(&map)?;
             if self.publish_map_with(key, revision, &map, extra)? {
+                if let Err(error) = writer_lease.release() {
+                    eprintln!("block writer lease release failed: {error}");
+                }
                 return Ok(data.len());
             }
         }

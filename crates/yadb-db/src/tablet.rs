@@ -874,6 +874,17 @@ impl<FS: StorageFs> DataShardTablet<FS> {
             return Ok(false);
         }
 
+        // The SST fragment is appended before the manifest that names it is
+        // committed. A writer lease keeps a collector from reclaiming it in that
+        // window; it is released only after the manifest transaction returns.
+        let lease_meta = self.meta.clone();
+        let writer_lease = yadb_metakv::gc::acquire_writer(
+            &lease_meta,
+            self.manifest.project_id,
+            self.meta.revision(),
+            yadb_metakv::gc::WRITER_TTL_MS,
+        )?;
+
         let entries: Vec<(Vec<u8>, RowEntry)> = self
             .memtable
             .iter()
@@ -907,6 +918,9 @@ impl<FS: StorageFs> DataShardTablet<FS> {
             let _ = self.compact()?;
         }
 
+        if let Err(error) = writer_lease.release() {
+            eprintln!("writer lease release failed: {error}");
+        }
         Ok(true)
     }
 
@@ -918,6 +932,15 @@ impl<FS: StorageFs> DataShardTablet<FS> {
         }
 
         let merged_ssts = self.manifest.sst_blobs.len();
+        // Same ordering as a flush: the replacement SST is appended before the
+        // manifest that references it commits.
+        let lease_meta = self.meta.clone();
+        let writer_lease = yadb_metakv::gc::acquire_writer(
+            &lease_meta,
+            self.manifest.project_id,
+            self.meta.revision(),
+            yadb_metakv::gc::WRITER_TTL_MS,
+        )?;
         let mut merged: BTreeMap<Vec<u8>, RowEntry> = BTreeMap::new();
         for sst_ref in &self.manifest.sst_blobs {
             let raw = self.data_striper.get_blob(sst_ref.blob_id)?;
@@ -975,6 +998,9 @@ impl<FS: StorageFs> DataShardTablet<FS> {
 
         self.memtable.clear();
 
+        if let Err(error) = writer_lease.release() {
+            eprintln!("writer lease release failed: {error}");
+        }
         Ok(CompactionReport {
             merged_ssts,
             live_rows,

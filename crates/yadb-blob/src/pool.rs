@@ -66,11 +66,37 @@ pub struct BarrierRequest {
     pub owner_id: u32,
     pub channel: u8,
     pub up_to_generation: u32,
+    /// The collector reports compaction separately from the barrier, so it asks
+    /// for the durable barrier alone. A caller that omits the field keeps the
+    /// previous barrier-then-compact behaviour.
+    #[serde(default = "compact_by_default")]
+    pub compact: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+fn compact_by_default() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BarrierResponse {
     pub evicted: usize,
+    /// Bytes freed by the compaction that followed this barrier, when requested.
+    #[serde(default)]
+    pub reclaimed_bytes: u64,
+    /// A compaction failure is reported, not swallowed: the barrier is already
+    /// durable, but the caller must not believe space was reclaimed.
+    #[serde(default)]
+    pub compaction_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BlobIdList {
+    pub ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CompactResponse {
+    pub reclaimed_bytes: u64,
 }
 
 enum SlotBackend<FS: StorageFs> {
@@ -317,16 +343,41 @@ impl<FS: StorageFs> PoolSlot<FS> {
         res
     }
 
-    pub fn collect_garbage_barrier(
+    /// Durable generation barrier on one physical slot. Evicts indexed fragments
+    /// of `(project, owner, channel)` at or below `up_to_generation` and fences
+    /// later writes of that range. Compaction is a separate step the collector
+    /// drives once per slot so its bytes and failures can be reported.
+    pub fn apply_barrier(
         &self,
         project_id: u32,
         owner_id: u32,
         channel: u8,
         up_to_generation: u32,
-    ) -> Result<usize, BlobError> {
+        compact: bool,
+    ) -> Result<BarrierResponse, BlobError> {
         match &self.backend {
             SlotBackend::Local(store) => {
-                store.collect_garbage_barrier(project_id, owner_id, channel, up_to_generation)
+                let evicted = store.collect_garbage_barrier(
+                    project_id,
+                    owner_id,
+                    channel,
+                    up_to_generation,
+                )?;
+                if !compact {
+                    return Ok(BarrierResponse {
+                        evicted,
+                        ..BarrierResponse::default()
+                    });
+                }
+                let mut response = BarrierResponse {
+                    evicted,
+                    ..BarrierResponse::default()
+                };
+                match store.seal_and_compact() {
+                    Ok(bytes) => response.reclaimed_bytes = bytes,
+                    Err(error) => response.compaction_error = Some(error.to_string()),
+                }
+                Ok(response)
             }
             SlotBackend::Remote {
                 pool_name,
@@ -340,6 +391,7 @@ impl<FS: StorageFs> PoolSlot<FS> {
                     owner_id,
                     channel,
                     up_to_generation,
+                    compact,
                 })
                 .map_err(|e| BlobError::Io(std::io::Error::other(e)))?;
                 match http_raw_request(
@@ -352,13 +404,96 @@ impl<FS: StorageFs> PoolSlot<FS> {
                 ) {
                     Ok((200, resp)) => {
                         self.metrics.online.store(true, Ordering::Relaxed);
-                        let parsed: BarrierResponse = serde_json::from_slice(&resp)
-                            .map_err(|e| BlobError::Io(std::io::Error::other(e)))?;
-                        Ok(parsed.evicted)
+                        serde_json::from_slice(&resp)
+                            .map_err(|e| BlobError::Io(std::io::Error::other(e)))
                     }
                     Ok((code, resp)) => Err(BlobError::Io(std::io::Error::other(format!(
                         "remote barrier HTTP {code}: {}",
                         String::from_utf8_lossy(&resp)
+                    )))),
+                    Err(e) => {
+                        self.metrics.online.store(false, Ordering::Relaxed);
+                        Err(BlobError::Io(e))
+                    }
+                }
+            }
+        }
+    }
+
+    /// Every physical fragment id this slot currently holds.
+    pub fn scan_live(&self) -> Result<Vec<BlobId>, BlobError> {
+        match &self.backend {
+            SlotBackend::Local(store) => Ok(store.live_ids()),
+            SlotBackend::Remote {
+                pool_name,
+                slot_index,
+                peer_addr,
+                token,
+            } => {
+                let path = format!("/internal/vdisk/{pool_name}/{slot_index}/blobs");
+                match http_raw_request(
+                    peer_addr,
+                    "GET",
+                    &path,
+                    "application/json",
+                    &[],
+                    token.as_deref(),
+                ) {
+                    Ok((200, body)) => {
+                        self.metrics.online.store(true, Ordering::Relaxed);
+                        let list: BlobIdList = serde_json::from_slice(&body)
+                            .map_err(|e| BlobError::Io(std::io::Error::other(e)))?;
+                        let mut ids = Vec::with_capacity(list.ids.len());
+                        for hex in list.ids {
+                            ids.push(BlobId::from_hex(&hex).ok_or_else(|| {
+                                BlobError::Io(std::io::Error::other(format!(
+                                    "remote slot returned a malformed BlobId {hex}"
+                                )))
+                            })?);
+                        }
+                        Ok(ids)
+                    }
+                    Ok((code, body)) => Err(BlobError::Io(std::io::Error::other(format!(
+                        "remote vdisk blobs HTTP {code}: {}",
+                        String::from_utf8_lossy(&body)
+                    )))),
+                    Err(e) => {
+                        self.metrics.online.store(false, Ordering::Relaxed);
+                        Err(BlobError::Io(e))
+                    }
+                }
+            }
+        }
+    }
+
+    /// Seals a wasteful active segment and compacts every sealed segment.
+    pub fn seal_and_compact(&self) -> Result<u64, BlobError> {
+        match &self.backend {
+            SlotBackend::Local(store) => store.seal_and_compact(),
+            SlotBackend::Remote {
+                pool_name,
+                slot_index,
+                peer_addr,
+                token,
+            } => {
+                let path = format!("/internal/vdisk/{pool_name}/{slot_index}/compact");
+                match http_raw_request(
+                    peer_addr,
+                    "POST",
+                    &path,
+                    "application/json",
+                    &[],
+                    token.as_deref(),
+                ) {
+                    Ok((200, body)) => {
+                        self.metrics.online.store(true, Ordering::Relaxed);
+                        let parsed: CompactResponse = serde_json::from_slice(&body)
+                            .map_err(|e| BlobError::Io(std::io::Error::other(e)))?;
+                        Ok(parsed.reclaimed_bytes)
+                    }
+                    Ok((code, body)) => Err(BlobError::Io(std::io::Error::other(format!(
+                        "remote vdisk compact HTTP {code}: {}",
+                        String::from_utf8_lossy(&body)
                     )))),
                     Err(e) => {
                         self.metrics.online.store(false, Ordering::Relaxed);

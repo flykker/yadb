@@ -9,7 +9,9 @@ use yadb_io::StorageFs;
 use yadb_metakv::{KvCommand, KvResult, LocalMetaKv, MetaError, RevisionGuard, TxnOp};
 
 // Keep new S3 ids separate from legacy S3/SQL (channel 2) and block (3).
-const S3_CHANNEL: u8 = 4;
+/// Blob channel of S3 object chunks. The collector needs it to know that this
+/// channel's generation space is monotonic, so a generation barrier is safe.
+pub const S3_CHANNEL: u8 = 4;
 const INTENT_GRACE_SECS: u64 = 300;
 const INTENT_GRACE_REVISIONS: u64 = 32;
 const MAX_ALLOCATION: u64 = (1u64 << 56) - 1;
@@ -122,6 +124,22 @@ struct UploadIntent {
 enum UploadState {
     Prepared,
     Aborted,
+}
+
+/// Reads the chunk references out of one raw `/s3-intent/` record.
+///
+/// A prepared upload names fragments that no manifest references yet. A
+/// collector that ignores them would delete fragments of an upload that is still
+/// in flight, so the mark phase must be able to see them. Only the fields a
+/// collector needs are interpreted, and an unreadable record is an error rather
+/// than an empty set: "I could not read this" must never mean "nothing here".
+pub fn intent_chunk_ids(value: &[u8]) -> Result<Vec<(String, BlobId)>, S3Error> {
+    let intent: UploadIntent = serde_json::from_slice(value)?;
+    Ok(intent
+        .chunks
+        .iter()
+        .map(|chunk| (intent.pool.clone(), chunk.blob_id))
+        .collect())
 }
 
 /// Multi-tenant S3 / ObjectStore engine built directly on top of YADB's `MetaKV` + `PoolStriper`.

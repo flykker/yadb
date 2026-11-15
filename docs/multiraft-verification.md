@@ -862,6 +862,89 @@ clear refusal at the `yadbd` boundary is not tested.
 | S6 | `yadb-blob` 26/26 | Refusal is never exercised through a real multi-node pool |
 | S7 | `yadbd` bins 31/31 | Only the HTTP mapping; `Io` after the append stays indistinguishable from `Io` before it |
 
+### Garbage collection: bounded mark-and-sweep (2026-11-15)
+
+Superseded block fragments, folded WAL blobs, replaced SSTs, overwritten or
+deleted S3 chunks and the fragments of a refused write are now reclaimed on the
+legacy metadata runtime. `POST /v1/pools/gc` runs one pass; `POST
+/v1/pools/scrub` runs the same pass after its repair scan and keeps every
+existing response field, adding `blobs_live`, `fragments_deleted`,
+`bytes_reclaimed`, `leases_live`, `gc_refusal`, `gc_pools_refused` and
+`gc_errors`. A refusal is `409` with the reason in the body, never a `200` with
+zero counts.
+
+**Fence protocol.** A collector may only delete a fragment that no committed
+revision can still read, and the two ways that can fail are a read that pinned a
+revision before the mark and a write that appended fragments before publishing
+them. Both are recorded as durable leases in the same metadata group as the
+manifests: a reader publishes a 30 s `/gc-lease/reader/<id>` record before it
+reads the map and releases it after it has fetched the fragments; a writer
+publishes a 300 s `/gc-lease/writer/<id>` record after its allocation and before
+its first fragment append, and releases it only after the transaction that names
+those fragments returns. The collector reads the whole lease namespace (a record
+it cannot parse counts as live), refuses the entire pass while any lease of
+either kind is live, takes an exclusive `/gc-lease/collector` record by CAS so
+two passes cannot interleave, enumerates what every mounted slot holds, then
+re-checks the fence and takes its mark snapshot *after* that check. A read that
+began before the mark is therefore either still holding its lease (the pass
+refuses) or finished, and a write that began before the mark is either still
+holding its lease or has already published the fragments it appended. A read
+that starts after the mark does not need to refuse: a manifest it can see was
+committed before the mark, or names fragments allocated after the enumeration,
+which are not candidates for deletion. There is no grace period and no
+"recent enough" rule; a fence that cannot be read is a refusal.
+
+Deletion is per pool: an id is swept only when a mounted slot of that pool holds
+it and no manifest names it. Where a channel allocates `(owner, generation)`
+from a monotonic per-project counter (S3 channel 4, block channel 5) and every
+dead generation in the group is strictly below every live one, the collector
+writes one durable generation barrier per slot; elsewhere it writes an exact
+per-fragment tombstone, because the SQL channels derive the owner id from the
+table name and restart the generation at zero, so a permanent barrier would
+fence a recreated tablet. Compaction is the last step: the active segment is
+sealed only when it carries garbage and is mostly garbage or large enough to
+roll soon, then sealed segments are compacted, so the bytes the barriers freed
+actually leave the filesystem. Ordering is durable fence → durable
+barrier/tombstone → deletion → compaction, every step is idempotent, and a rerun
+recomputes the mark from committed metadata.
+
+**Evidence.** Nine acceptance tests in `crates/yadbd/src/gc.rs` and two handler
+tests in `yadbd`'s security suite. Byte counts are real bytes on disk across the
+three slots of an in-process mirror pool, measured before and after one pass:
+
+| Scenario | Before | After | Live set | Fragments deleted |
+| --- | --- | --- | --- | --- |
+| 16 overwrites of one 16-block region | 9,513,240 | 198,339 | 196,608 | 2,256 |
+| Table flush + compaction | 228,765 | 42,369 | 20,739 | 651 |
+| S3 overwrite + delete | 789,744 | 267 | 21 | 96 |
+| Forced refused write | 24,798 | 12,534 | 12,411 | 3 |
+
+The refused-write case is the interesting one: the write fails for lack of full
+redundancy, the fragments that landed are 12,387 bytes of garbage, the pass
+reclaims exactly those, and the previously committed bytes still read back. A
+crash between the barrier and the compaction is simulated by dropping the volume
+after the barrier records are written and the collector lease is left expired;
+reopening reaps the lease, the rerun compacts, and the newest generation still
+reads back byte-identical. Refusals are covered for a live reader lease, an
+unparsable lease record and a held collector lease; each asserts zero fragments
+deleted and unchanged disk usage. The non-leader refusal is implemented but not
+covered by a test, because it needs a multi-node metadata group. `yadbd --bins` **54/54**,
+`yadb-blob` **26/26**, `yadb-s3` **24/24**, `yadb-block` **33/33**,
+`yadb-db` **26/26**, and `tests/protocols.py` **16/16** on the legacy three-node
+cluster.
+
+**Open.** The collector is legacy-only: on Multi-Raft both endpoints refuse with
+`garbage collection disabled for Multi-Raft: no single atomic cross-group
+metadata snapshot`, because one node cannot enumerate every group's manifests
+while deletion is pool-scoped. The fence is a metadata write per read: every SQL
+statement, block read and S3 GET publishes and deletes a lease record, which is
+one extra round trip each and means a continuously busy node will usually refuse
+a pass instead of waiting for a quiet window. `/s3-retired/` records are kept
+indefinitely; the 300 s writer TTL is the only bound on a crashed writer blocking
+collection; and the tests use an in-process pool, so remote slot enumeration,
+remote barriers and remote compaction run through the same code paths without a
+second host.
+
 ### Live deployment after S1 (2026-11-15)
 
 `main` at `234d49a` was built with `--features openraft-storage` and

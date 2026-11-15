@@ -6,8 +6,8 @@ pub mod volume;
 pub use erasure::{ErasureCodec, ErasureScheme};
 pub use id::BlobId;
 pub use pool::{
-    BarrierRequest, BarrierResponse, PoolHealthSnapshot, PoolHealthState, PoolSlot, PoolStriper,
-    RepairReport, SlotHealthSnapshot,
+    BarrierRequest, BarrierResponse, BlobIdList, CompactResponse, PoolHealthSnapshot,
+    PoolHealthState, PoolSlot, PoolStriper, RepairReport, SlotHealthSnapshot,
 };
 pub use volume::{VolumeConfig, VolumeStats, VolumeStore};
 
