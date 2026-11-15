@@ -863,6 +863,30 @@ impl Prepared {
             }
         }
         .map_err(|e| io::Error::other(e.to_string()))?;
+        // A torn log tail or a rebuilt state image is silent by design, so the
+        // daemon must be the one that says it happened. Without this line an
+        // operator cannot tell a clean start from a recovered one.
+        let recovery = group.recovery();
+        if !recovery.is_clean() {
+            if let Some(tail) = recovery.repaired_tail {
+                eprintln!(
+                    "group {} node {}: truncated a torn log tail at byte {}, discarded {} byte(s)",
+                    self.identity.group(),
+                    self.identity.node(),
+                    tail.valid_len,
+                    tail.discarded,
+                );
+            }
+            if let Some(image) = &recovery.rebuilt_image {
+                eprintln!(
+                    "group {} node {}: rebuilt a corrupt state image ({} byte(s), preserved as {})",
+                    self.identity.group(),
+                    self.identity.node(),
+                    image.corrupt_bytes,
+                    image.preserved_as.display(),
+                );
+            }
+        }
         #[cfg(test)]
         if let Some((ready, resume)) = self.startup_pause {
             let _ = ready.send(());

@@ -34,7 +34,8 @@ pub type YadbRaft = openraft::Raft<YadbRaftTypeConfig>;
 pub mod persistent {
     use super::{ReplicaIdentity, YadbRaft, YadbRaftTypeConfig};
     use crate::{
-        openraft_state_machine::DurableMetaStateMachine, openraft_storage::DurableOpenRaftLog,
+        openraft_state_machine::{DurableMetaStateMachine, ImageRebuild},
+        openraft_storage::{DurableOpenRaftLog, TailRepair},
     };
     use openraft::{error::Fatal, RaftNetworkFactory};
     use std::{
@@ -52,10 +53,33 @@ pub mod persistent {
         Raft(#[from] Fatal<u32>),
     }
 
+    /// Storage damage that opening a replica repaired or discarded.
+    ///
+    /// Both repairs are silent by construction: a torn log tail is truncated
+    /// and a corrupt `state.json` is replaced with an empty image plus a full
+    /// replay. The bytes are preserved, but an operator who is never told sees
+    /// a healthy cluster and cannot distinguish a clean start from a recovered
+    /// one. This report is what a caller surfaces; it is empty for a clean open.
+    #[derive(Debug, Clone, Default)]
+    pub struct RecoveryReport {
+        /// A torn final log frame that `open` truncated away.
+        pub repaired_tail: Option<TailRepair>,
+        /// A corrupt `state.json` that was renamed aside and rebuilt empty.
+        pub rebuilt_image: Option<ImageRebuild>,
+    }
+
+    impl RecoveryReport {
+        /// Whether the replica opened without repairing or discarding anything.
+        pub fn is_clean(&self) -> bool {
+            self.repaired_tail.is_none() && self.rebuilt_image.is_none()
+        }
+    }
+
     pub struct PersistentGroup {
         raft: YadbRaft,
         state_machine: DurableMetaStateMachine,
         identity: ReplicaIdentity,
+        recovered: RecoveryReport,
         _owner: OsDirectoryLock,
     }
 
@@ -115,6 +139,7 @@ pub mod persistent {
                 raft,
                 state_machine: state,
                 identity: identity.clone(),
+                recovered: RecoveryReport::default(),
                 _owner: owner,
             })
         }
@@ -136,16 +161,22 @@ pub mod persistent {
             let owner = OsDirectoryLock::try_acquire(dir)?;
             verify_descriptor(dir, identity)?;
             let log = DurableOpenRaftLog::open(dir.join("log"), identity)?;
+            let repaired_tail = log.repaired_tail();
             let state = DurableMetaStateMachine::open_or_rebuild(
                 dir.join("state"),
                 identity,
                 log.coverage(),
             )?;
+            let recovered = RecoveryReport {
+                repaired_tail,
+                rebuilt_image: state.rebuilt_image(),
+            };
             let raft = YadbRaft::new(identity.node(), config, network, log, state.clone()).await?;
             Ok(Self {
                 raft,
                 state_machine: state,
                 identity: identity.clone(),
+                recovered,
                 _owner: owner,
             })
         }
@@ -156,6 +187,14 @@ pub mod persistent {
         /// The same locally applied state machine used by this Raft instance.
         pub fn state_machine(&self) -> &DurableMetaStateMachine {
             &self.state_machine
+        }
+        /// Storage damage repaired while this replica was opened.
+        ///
+        /// Empty for a clean open. A caller must report a non-empty result:
+        /// the repairs themselves are silent and the evidence files are only
+        /// discoverable if the operator is told they exist.
+        pub fn recovery(&self) -> &RecoveryReport {
+            &self.recovered
         }
         pub fn identity(&self) -> &ReplicaIdentity {
             &self.identity

@@ -1,7 +1,7 @@
 //! Volatile in-process tests only. Never use this store or network for real data.
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Debug;
-use std::io::{self, Cursor};
+use std::io::{self, Cursor, Write};
 use std::ops::RangeBounds;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -572,6 +572,14 @@ async fn corrupt_state_image_is_rebuilt_and_replayed_by_openraft() {
         .await
         .unwrap();
     assert!(group.state_machine().rebuilt_image().is_some());
+    // The daemon surfaces this report; a rebuild must never be silent.
+    let recovery = group.recovery();
+    assert!(!recovery.is_clean());
+    assert_eq!(
+        recovery.rebuilt_image.as_ref().map(|image| image.corrupt_bytes),
+        Some(bytes.len() as u64)
+    );
+    assert!(recovery.repaired_tail.is_none());
     assert_eq!(
         std::fs::read(root.join("state").join("state.json.corrupt")).unwrap(),
         bytes
@@ -601,6 +609,94 @@ async fn corrupt_state_image_is_rebuilt_and_replayed_by_openraft() {
     assert_eq!(state.snapshot().get("before").unwrap().value, b"durable");
     assert_eq!(state.snapshot().get("after").unwrap().value, b"rebuild");
     drop(state);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// A torn final log frame is truncated by `open`, which is a repair the
+/// operator must be told about: the group otherwise starts looking healthy.
+#[tokio::test]
+async fn torn_tail_repair_is_reported_through_recovery() {
+    let root = std::env::temp_dir().join(format!(
+        "yadb-openraft-recovery-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let identity = crate::multiraft::ReplicaIdentity::new(
+        crate::multiraft::GroupIdentity {
+            cluster: [4; 16],
+            group: 9,
+            incarnation: 1,
+        },
+        1,
+        vec![1],
+    )
+    .unwrap();
+    let config = Arc::new(
+        openraft::Config {
+            snapshot_policy: openraft::SnapshotPolicy::Never,
+            ..Default::default()
+        }
+        .validate()
+        .unwrap(),
+    );
+    let group = PersistentGroup::create(&root, &identity, config.clone(), NoNetwork)
+        .await
+        .unwrap();
+    group
+        .raft()
+        .initialize(BTreeMap::from([(1, BasicNode::new("node-1"))]))
+        .await
+        .unwrap();
+    group
+        .raft()
+        .wait(Some(Duration::from_secs(5)))
+        .current_leader(1, "torn tail leader")
+        .await
+        .unwrap();
+    group
+        .raft()
+        .client_write(KvCommand::Put {
+            key: "kept".into(),
+            value: b"acknowledged".to_vec(),
+        })
+        .await
+        .unwrap();
+    assert!(group.recovery().is_clean());
+    group.shutdown().await.unwrap();
+    drop(group);
+
+    // Append a partial frame header, the shape a crash between the frame write
+    // and its sync leaves behind. Appending cannot destroy an acknowledged
+    // frame, unlike cutting the file short.
+    let log = root.join("log").join("openraft.log");
+    let intact = std::fs::metadata(&log).unwrap().len();
+    let mut file = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+    file.write_all(b"YORF\x01\x02\x03").unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+
+    let group = PersistentGroup::open(&root, &identity, config.clone(), NoNetwork)
+        .await
+        .unwrap();
+    let recovery = group.recovery();
+    assert!(!recovery.is_clean());
+    let tail = recovery
+        .repaired_tail
+        .expect("a torn tail must be reported");
+    assert_eq!(tail.valid_len, intact);
+    assert_eq!(tail.discarded, 7);
+    assert!(recovery.rebuilt_image.is_none());
+    assert_eq!(
+        group.state_machine().snapshot().get("kept").unwrap().value,
+        b"acknowledged"
+    );
+    // The repair is durable: the log ends exactly at the last whole frame.
+    assert_eq!(std::fs::metadata(&log).unwrap().len(), intact);
+    group.shutdown().await.unwrap();
+    drop(group);
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -809,6 +905,9 @@ async fn persistent_shutdown_cancellation_retains_owner_and_stale_handle() {
     let reopened = PersistentGroup::open(&root, &identity, config.clone(), NoNetwork)
         .await
         .unwrap();
+    // A clean reopen repairs nothing and must say so, so the daemon's recovery
+    // line stays meaningful instead of firing on every start.
+    assert!(reopened.recovery().is_clean());
     assert!(stale
         .client_write(KvCommand::Put {
             key: "stale".into(),
