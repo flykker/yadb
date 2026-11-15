@@ -18,8 +18,6 @@ pub mod openraft_tls;
 #[cfg(any(test, feature = "experimental-openraft-storage"))]
 pub mod openraft_transport;
 pub mod raft;
-#[cfg(any(test, feature = "experimental-openraft-storage"))]
-pub mod replica_inspection;
 pub mod wal;
 
 pub use kv::{

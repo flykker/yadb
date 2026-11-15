@@ -871,7 +871,7 @@ impl Prepared {
             if let Some(tail) = recovery.repaired_tail {
                 eprintln!(
                     "group {} node {}: truncated a torn log tail at byte {}, discarded {} byte(s)",
-                    self.identity.group(),
+                    self.identity.group().group,
                     self.identity.node(),
                     tail.valid_len,
                     tail.discarded,
@@ -880,7 +880,7 @@ impl Prepared {
             if let Some(image) = &recovery.rebuilt_image {
                 eprintln!(
                     "group {} node {}: rebuilt a corrupt state image ({} byte(s), preserved as {})",
-                    self.identity.group(),
+                    self.identity.group().group,
                     self.identity.node(),
                     image.corrupt_bytes,
                     image.preserved_as.display(),

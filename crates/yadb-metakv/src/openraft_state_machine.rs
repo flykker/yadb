@@ -323,17 +323,6 @@ fn validate_image(image: &Image, identity: &ReplicaIdentity) -> io::Result<()> {
     if image.version != VERSION || image.group != group || image.node_id != node_id {
         return Err(invalid("state-machine identity mismatch"));
     }
-    if image.current_snapshot.as_ref().is_some_and(|snapshot| {
-        snapshot.version != VERSION
-            || snapshot.group != image.group
-            || snapshot.applied.is_some_and(|id| {
-                image
-                    .applied
-                    .map_or(true, |applied| id.index > applied.index)
-            })
-    }) {
-        return Err(invalid("invalid current snapshot metadata"));
-    }
     Ok(())
 }
 
@@ -440,27 +429,6 @@ fn load_image(
         Err(error) => return Err(error),
     };
     Ok((file, image, None))
-}
-
-#[derive(Debug, Clone)]
-pub struct ImageInspection {
-    pub applied: Option<LogId<u32>>,
-    pub snapshot: Option<LogId<u32>>,
-    pub voters: Vec<u32>,
-}
-
-/// Decode the stored image without acquiring ownership or publishing repairs.
-pub fn inspect_image(
-    dir: impl AsRef<Path>,
-    identity: &ReplicaIdentity,
-) -> io::Result<ImageInspection> {
-    let image = read_image(&mut File::open(dir.as_ref().join("state.json"))?)?;
-    validate_image(&image, identity)?;
-    Ok(ImageInspection {
-        applied: image.applied,
-        snapshot: image.current_snapshot.and_then(|s| s.applied),
-        voters: image.membership.membership().voter_ids().collect(),
-    })
 }
 
 impl DurableMetaStateMachine {

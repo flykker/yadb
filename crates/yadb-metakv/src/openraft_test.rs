@@ -576,7 +576,10 @@ async fn corrupt_state_image_is_rebuilt_and_replayed_by_openraft() {
     let recovery = group.recovery();
     assert!(!recovery.is_clean());
     assert_eq!(
-        recovery.rebuilt_image.as_ref().map(|image| image.corrupt_bytes),
+        recovery
+            .rebuilt_image
+            .as_ref()
+            .map(|image| image.corrupt_bytes),
         Some(bytes.len() as u64)
     );
     assert!(recovery.repaired_tail.is_none());

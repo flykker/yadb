@@ -48,9 +48,6 @@ const EMBEDDED_SAMPLE_YAML: &str = include_str!("../../../examples/platform.yaml
     about = "YADB Unified Storage, SQL, S3 & Block Node Daemon"
 )]
 struct Args {
-    /// Inspect one stopped replica without modifying its files.
-    #[arg(long, exclusive = true)]
-    verify_replica: Option<PathBuf>,
     #[arg(long, default_value = "127.0.0.1:8420")]
     listen: String,
 
@@ -4106,44 +4103,9 @@ async fn handle_pools_scrub(State(st): State<AppState>, headers: HeaderMap) -> R
     }
 }
 
-fn refuse_if_backup_in_progress(data_dir: &std::path::Path) -> Result<(), String> {
-    let marker = data_dir.join(".yadb-backup-in-progress");
-    match std::fs::symlink_metadata(&marker) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(format!("cannot inspect backup marker {}: {e}", marker.display())),
-        Ok(_) => Err(format!(
-            "deployment root is under an offline backup ({}); finish or explicitly discard the backup and remove the marker",
-            marker.display()
-        )),
-    }
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
-    if let Some(dir) = &args.verify_replica {
-        use yadb_metakv::replica_inspection::{read_replica_identity, verify_replica};
-        match read_replica_identity(dir) {
-            Ok(identity) => {
-                let verdict = verify_replica(dir, &identity);
-                println!("{}", serde_json::to_string(&verdict)?);
-                if !verdict.restorable {
-                    eprintln!("{}", verdict.reason);
-                    std::process::exit(4);
-                }
-            }
-            Err(_) => {
-                let reason = "invalid or unreadable replica descriptor";
-                println!(
-                    "{}",
-                    serde_json::json!({"group": null, "node": null, "first_index": null, "last_index": null, "last_purged": null, "applied": null, "snapshot": null, "entry_count": 0, "torn_tail": false, "restorable": false, "reason": reason, "membership_differs_from_descriptor": null})
-                );
-                eprintln!("{reason}");
-                std::process::exit(4);
-            }
-        }
-        return Ok(());
-    }
     check_experimental_openraft_config(args.experimental_openraft_config.as_deref())
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     let client_openraft = args.metadata_runtime == "openraft";
@@ -4186,7 +4148,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let data_dir = args.data_dir.clone().unwrap_or_else(|| {
         PathBuf::from("/data/data/com.foxdebug.acodefree/cache/opencode/yadbd-data")
     });
-    refuse_if_backup_in_progress(&data_dir)?;
     if !client_openraft
         && (data_dir.join(".yadb-openraft-runtime.json").exists()
             || data_dir.join(".yadb-openraft-runtime.pending").exists())
@@ -4516,27 +4477,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod security_tests {
     use super::*;
-
-    #[test]
-    fn backup_marker_refuses_startup() {
-        let dir = std::env::temp_dir().join(format!(
-            "yadbd-backup-marker-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir(&dir).unwrap();
-        assert!(refuse_if_backup_in_progress(&dir).is_ok());
-        let marker = dir.join(".yadb-backup-in-progress");
-        std::fs::write(&marker, b"backup").unwrap();
-        assert!(refuse_if_backup_in_progress(&dir)
-            .unwrap_err()
-            .contains(marker.to_str().unwrap()));
-        std::fs::remove_file(marker).unwrap();
-        std::fs::remove_dir(dir).unwrap();
-    }
 
     #[test]
     fn idempotency_validation_and_fingerprint() {

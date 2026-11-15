@@ -498,45 +498,7 @@ struct Recovered {
     repaired_tail: Option<TailRepair>,
 }
 
-#[derive(Debug, Clone)]
-pub struct LogInspection {
-    pub first_index: Option<u64>,
-    pub last_index: Option<u64>,
-    pub last_purged: Option<LogId<u32>>,
-    pub entry_count: u64,
-    /// A frame extends past EOF; corruption can produce the same observation.
-    pub torn_tail: bool,
-    pub(crate) entries: BTreeMap<u64, LogId<u32>>,
-}
-
-/// Decode an existing log without acquiring a lock or modifying any files.
-pub fn inspect_log(dir: impl AsRef<Path>, identity: &ReplicaIdentity) -> io::Result<LogInspection> {
-    let dir = dir.as_ref();
-    let mut file = File::open(dir.join("openraft.log"))?;
-    let recovered = recover(&mut file, dir, identity, false)?;
-    checkpoint_frame(&recovered.state)?;
-    let entries: BTreeMap<_, _> = recovered
-        .state
-        .log
-        .iter()
-        .map(|(&i, e)| (i, e.log_id))
-        .collect();
-    Ok(LogInspection {
-        first_index: entries.first_key_value().map(|(&i, _)| i),
-        last_index: entries.last_key_value().map(|(&i, _)| i),
-        last_purged: recovered.state.purged,
-        entry_count: entries.len() as u64,
-        torn_tail: recovered.repaired_tail.is_some(),
-        entries,
-    })
-}
-
-fn recover(
-    file: &mut File,
-    dir: &Path,
-    identity: &ReplicaIdentity,
-    repair: bool,
-) -> io::Result<Recovered> {
+fn recover(file: &mut File, dir: &Path, identity: &ReplicaIdentity) -> io::Result<Recovered> {
     let file_len = file.metadata()?.len();
     if file_len > MAX_LOG_BYTES {
         return Err(invalid("OpenRaft log exceeds disk limit"));
@@ -585,11 +547,9 @@ fn recover(
                 // rejected, because the two are byte-identical without a
                 // redundant length. No bytes followed by further bytes are ever
                 // discarded, so the prefix up to the last frame start survives.
-                if repair {
-                    file.set_len(valid_len)?;
-                    file.sync_data()?;
-                    File::open(dir)?.sync_all()?;
-                }
+                file.set_len(valid_len)?;
+                file.sync_data()?;
+                File::open(dir)?.sync_all()?;
                 repaired_tail = Some(TailRepair {
                     valid_len,
                     discarded: file_len - valid_len,
@@ -677,7 +637,7 @@ impl DurableOpenRaftLog {
             bytes,
             frames,
             repaired_tail,
-        } = recover(&mut file, dir, identity, true)?;
+        } = recover(&mut file, dir, identity)?;
         // Validate checkpoint size too, so every recovered state can later be compacted.
         checkpoint_frame(&state)?;
         // A process-only restart may still see bytes whose previous sync failed.
@@ -969,66 +929,6 @@ mod tests {
                 value: vec![index as u8],
             }),
         }
-    }
-
-    #[tokio::test]
-    async fn replica_inspection_read_only_and_pair_checks() {
-        use crate::{
-            openraft_state_machine::DurableMetaStateMachine, replica_inspection::verify_replica,
-        };
-        use openraft::storage::RaftStateMachine;
-        let dir = TempDir::new();
-        let id = identity();
-        fs::write(
-            dir.0.join("replica.json"),
-            serde_json::to_vec(&(1u32, id.group(), id.node(), id.voters())).unwrap(),
-        )
-        .unwrap();
-        let log = DurableOpenRaftLog::create(dir.0.join("log"), &id).unwrap();
-        log.append_durable(&Record::Append(vec![entry(1)])).unwrap();
-        let mut sm = DurableMetaStateMachine::create(dir.0.join("state"), &id).unwrap();
-        sm.apply(vec![entry(1)]).await.unwrap();
-        let listing = |path: &Path| {
-            let mut names: Vec<_> = fs::read_dir(path)
-                .unwrap()
-                .map(|e| e.unwrap().file_name())
-                .collect();
-            names.sort();
-            names
-        };
-        let before = [
-            listing(&dir.0),
-            listing(&dir.0.join("log")),
-            listing(&dir.0.join("state")),
-        ];
-        let verdict = verify_replica(&dir.0, &id);
-        assert!(verdict.restorable, "{}", verdict.reason);
-        assert_eq!(
-            (verdict.first_index, verdict.last_index, verdict.entry_count),
-            (Some(1), Some(1), 1)
-        );
-        assert!(verdict.membership_differs_from_descriptor.is_some());
-        assert_eq!(
-            before,
-            [
-                listing(&dir.0),
-                listing(&dir.0.join("log")),
-                listing(&dir.0.join("state"))
-            ]
-        );
-        sm.apply(vec![entry(2)]).await.unwrap();
-        let verdict = verify_replica(&dir.0, &id);
-        assert!(!verdict.restorable);
-        assert!(verdict.reason.contains("applied log id absent"));
-        drop(sm);
-        drop(log);
-        let image = dir.0.join("state/state.json");
-        fs::write(&image, b"corrupt").unwrap();
-        let bytes = fs::read(&image).unwrap();
-        let verdict = verify_replica(&dir.0, &id);
-        assert!(!verdict.restorable);
-        assert!(verdict.reason.contains("image inspection"));
-        assert_eq!(bytes, fs::read(image).unwrap());
     }
 
     #[tokio::test]
