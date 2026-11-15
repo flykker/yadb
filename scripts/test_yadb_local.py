@@ -322,6 +322,26 @@ class BackupTest(unittest.TestCase):
         self.assertEqual(self.run_backup(), 2)
         self.assertFalse((self.root / '.yadb-backup-in-progress').exists())
 
+    def test_existing_marker_refuses_and_creates_no_destination(self):
+        # A destination that exists but carries neither COMPLETE nor INCOMPLETE
+        # is indistinguishable from a damaged artifact. A refusal must not
+        # create one.
+        (self.root / '.yadb-backup-in-progress').write_text('earlier backup\n')
+        self.assertEqual(self.run_backup(), 2)
+        self.assertFalse(self.dest.exists())
+        self.assertEqual((self.root / '.yadb-backup-in-progress').read_text(), 'earlier backup\n')
+
+    def test_diagnostics_do_not_contaminate_stdout(self):
+        out = io.StringIO()
+        with mock.patch.object(local, 'port_open', return_value=False), \
+                mock.patch.object(local, 'http_health', return_value=False), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(local.backup(self.root, self.dest), 0)
+        lines = out.getvalue().splitlines()
+        self.assertEqual(len(lines), 2)
+        self.assertTrue(lines[0].startswith('Backup: '))
+        self.assertTrue(lines[1].startswith('SHA-256: '))
+
     def test_copy_failure_retains_markers_and_incomplete(self):
         with mock.patch.object(local, 'backup_copy', side_effect=OSError('copy failed')):
             self.assertEqual(self.run_backup(), 5)

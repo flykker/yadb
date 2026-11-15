@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Provision and supervise a disposable, experimental local OpenRaft cluster."""
 import argparse
+import contextlib
 import datetime
 import fcntl
 import hashlib
@@ -549,8 +550,9 @@ def backup_copy(source, target, relative, files):
 
 def backup(root, dest):
     os.umask(0o077)
-    marked = False
+    created = False
     markers = []
+    marker_data = b''
     complete = None
     try:
         try:
@@ -567,11 +569,6 @@ def backup(root, dest):
         dest = dest.parent.resolve(strict=True) / dest.name
         if dest == root or root in dest.parents:
             raise BackupError('destination must be outside the deployment root', 2)
-        try:
-            dest.mkdir(mode=0o700)
-        except FileExistsError as error:
-            raise BackupError(f'destination already exists: {dest}', 2) from error
-        (dest / 'payload').mkdir(mode=0o700)
         marker = root / '.yadb-backup-in-progress'
         if marker.exists() or marker.is_symlink():
             raise BackupError(f'backup marker already exists: {marker}', 2)
@@ -582,16 +579,26 @@ def backup(root, dest):
                 fcntl.flock(supervisor, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError as error:
                 raise BackupError('supervisor lock is held', 2) from error
-            if not status(root):
+            # Diagnostics belong on stderr: stdout carries the artifact path and
+            # digest, and a caller must not have to parse around status output.
+            with contextlib.redirect_stdout(sys.stderr):
+                consistent = status(root)
+            if not consistent:
                 raise BackupError('deployment status reports problems', 2)
             for port in ports(base):
                 if port_open(port):
                     raise BackupError(f'listener on port {port}', 2)
+            # Created only after every precondition that needs no destination has
+            # passed, so a refusal leaves no directory that looks like a backup.
+            try:
+                dest.mkdir(mode=0o700)
+            except FileExistsError as error:
+                raise BackupError(f'destination already exists: {dest}', 2) from error
+            created = True
+            (dest / 'payload').mkdir(mode=0o700)
             timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat()
             marker_data = (json.dumps({'destination': str(dest), 'timestamp_utc': timestamp}) + '\n').encode()
             markers = [marker] + [root / 'data' / f'node-{node}' / marker.name for node in identity['node_ids']]
-            # Once marker creation starts, failures must retain all created markers.
-            marked = True
             for path in markers:
                 durable_write(path, marker_data)
                 sync_dir(path.parent)
@@ -652,14 +659,17 @@ def backup(root, dest):
             return 0
     except (BackupError, OSError, ValueError, KeyError, TypeError) as error:
         code = error.code if isinstance(error, BackupError) else 5
-        if marked:
+        if created:
             if complete is not None:
                 try:
                     complete.unlink(missing_ok=True)
                     sync_dir(dest)
                 except OSError:
                     pass
-            # Restore any markers removed before a cleanup failure.
+            # A destination that exists must be unambiguous: it either carries
+            # COMPLETE or INCOMPLETE, never neither. Markers are restored here
+            # too, because a failure after the last marker was removed must not
+            # leave a root that looks safe to start.
             for path in markers:
                 try:
                     if not path.exists() and not path.is_symlink():
