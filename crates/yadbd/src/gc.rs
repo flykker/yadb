@@ -202,9 +202,21 @@ pub fn sweep(
         }
     }
 
-    // Step 4: the fence must still be clear, and the mark must be taken after
-    // that check. A writer that published its lease after step 1 is then either
-    // still holding it (refuse) or already referenced by this snapshot (kept).
+    // Step 4: raise the durable watermark before re-checking the fence. A reader
+    // that is still behind this revision can no longer prove its manifests are
+    // complete, so it refuses; a reader that publishes after this point has
+    // already applied at least this revision.
+    let swept_up_to = meta.revision();
+    if let Err(error) = gc::publish_watermark(meta, swept_up_to) {
+        let _ = collector.release();
+        return SweepOutcome::refuse(format!(
+            "garbage collection refused: sweep watermark unavailable, so readers cannot be fenced: {error}"
+        ));
+    }
+
+    // The fence must still be clear, and the mark must be taken after that check.
+    // A writer that published its lease after step 1 is then either still holding
+    // it (refuse) or already referenced by this snapshot (kept).
     let live = match gc::live_leases(meta) {
         Ok(live) => live,
         Err(error) => {
@@ -891,6 +903,34 @@ mod tests {
         assert_eq!(outcome.fragments_deleted, 0, "{outcome:?}");
         held.release().unwrap();
         assert!(f.sweep().refusal.is_none());
+    }
+
+    #[test]
+    fn a_pass_publishes_a_watermark_that_fences_a_lagging_reader() {
+        let f = Fixture::new("watermark");
+        let engine = block_engine(&f);
+        for i in 0..3u8 {
+            engine
+                .write_at(1, "disk", POOL, 1 << 20, 0, &vec![i; BLOCK_SIZE as usize])
+                .unwrap();
+        }
+        assert_eq!(yadb_metakv::gc::watermark(&f.meta).unwrap(), 0);
+        let before_sweep = f.meta.revision();
+        let outcome = f.sweep();
+        assert!(outcome.refusal.is_none(), "{outcome:?}");
+        let mark = yadb_metakv::gc::watermark(&f.meta).unwrap();
+        assert!(
+            mark >= before_sweep,
+            "the watermark must cover the revision the mark was taken at ({mark} < {before_sweep})"
+        );
+        assert!(
+            yadb_metakv::gc::reader_is_safe(&f.meta).is_ok(),
+            "a reader at the current applied revision is safe"
+        );
+
+        // A second pass only raises it.
+        f.sweep();
+        assert!(yadb_metakv::gc::watermark(&f.meta).unwrap() >= mark);
     }
 
     #[test]

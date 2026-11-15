@@ -871,7 +871,10 @@ legacy metadata runtime. `POST /v1/pools/gc` runs one pass; `POST
 existing response field, adding `blobs_live`, `fragments_deleted`,
 `bytes_reclaimed`, `leases_live`, `gc_refusal`, `gc_pools_refused` and
 `gc_errors`. A refusal is `409` with the reason in the body, never a `200` with
-zero counts.
+zero counts. The leader's periodic repair scan runs every four seconds but only
+sweeps every five minutes: a pass holds the exclusive collector lease for its
+whole duration, so a per-scan pass would make an explicit `/gc` refuse almost
+always.
 
 **Fence protocol.** A collector may only delete a fragment that no committed
 revision can still read, and the two ways that can fail are a read that pinned a
@@ -889,10 +892,16 @@ re-checks the fence and takes its mark snapshot *after* that check. A read that
 began before the mark is therefore either still holding its lease (the pass
 refuses) or finished, and a write that began before the mark is either still
 holding its lease or has already published the fragments it appended. A read
-that starts after the mark does not need to refuse: a manifest it can see was
-committed before the mark, or names fragments allocated after the enumeration,
-which are not candidates for deletion. There is no grace period and no
-"recent enough" rule; a fence that cannot be read is a refusal.
+that starts after the mark is covered by the watermark instead: the pass raises a
+durable `/gc/watermark` to its mark revision before it re-checks the fence, and a
+reader publishes its lease first and then refuses with `503` if its applied
+revision is behind that watermark. Without it, a lagging follower could serve a
+manifest committed before the mark — one whose fragments the pass already
+deleted — because its local applied view is not the leader's. A node reuses one
+reader lease while it has more than 15 s of life left, so a `SELECT` does not
+write two Raft entries each and a node stops blocking collection one TTL after
+its last read. There is no grace period and no "recent enough" rule; a fence that
+cannot be read is a refusal.
 
 Deletion is per pool: an id is swept only when a mounted slot of that pool holds
 it and no manifest names it. Where a channel allocates `(owner, generation)`
@@ -928,7 +937,17 @@ reopening reaps the lease, the rerun compacts, and the newest generation still
 reads back byte-identical. Refusals are covered for a live reader lease, an
 unparsable lease record and a held collector lease; each asserts zero fragments
 deleted and unchanged disk usage. The non-leader refusal is implemented but not
-covered by a test, because it needs a multi-node metadata group. `yadbd --bins` **54/54**,
+covered by a test, because it needs a multi-node metadata group.
+
+On a live three-node cluster started by `scripts/yadb-dev.py`, eight overwrites
+of one 8 KB block region through iSCSI left `node-1`'s pools at 963,124 bytes
+against a 897,060-byte floor; `POST /v1/pools/gc` then reported
+`blobs_live: 419, fragments_deleted: 42, bytes_reclaimed: 173,418,
+barriers_applied: 1` and the directory fell to 905,359 bytes, with the region
+still reading back byte-identical and the 413 SQL rows intact. A pass issued
+immediately after a read refused with `1 live lease(s) (1 reader, 0 writer)` and
+freed nothing, which is the intended "each node must be read-idle for one TTL"
+behaviour. `yadbd --bins` **63/63**,
 `yadb-blob` **26/26**, `yadb-s3` **24/24**, `yadb-block` **33/33**,
 `yadb-db` **26/26**, and `tests/protocols.py` **16/16** on the legacy three-node
 cluster.
@@ -936,14 +955,17 @@ cluster.
 **Open.** The collector is legacy-only: on Multi-Raft both endpoints refuse with
 `garbage collection disabled for Multi-Raft: no single atomic cross-group
 metadata snapshot`, because one node cannot enumerate every group's manifests
-while deletion is pool-scoped. The fence is a metadata write per read: every SQL
-statement, block read and S3 GET publishes and deletes a lease record, which is
-one extra round trip each and means a continuously busy node will usually refuse
-a pass instead of waiting for a quiet window. `/s3-retired/` records are kept
-indefinitely; the 300 s writer TTL is the only bound on a crashed writer blocking
-collection; and the tests use an in-process pool, so remote slot enumeration,
-remote barriers and remote compaction run through the same code paths without a
-second host.
+while deletion is pool-scoped. A pass needs each node read-idle for one lease TTL
+(30 s), because a node keeps its reader lease for reuse instead of deleting it
+per statement; a continuously busy node refuses instead of waiting. A read that
+outlives its own lease is not refreshed mid-read, so a single query longer than
+30 s is not fenced. `/s3-retired/` records are kept indefinitely; the 300 s
+writer TTL is the only bound on a crashed writer blocking collection; and the
+tests use an in-process pool, so remote slot enumeration, remote barriers and
+remote compaction run through the same code paths without a second host. The
+metadata Raft log is a separate, larger gap: `raft.wal` is never truncated, so
+disk grows with every mutation regardless of this sweep (see the tracker item
+"Bound the metadata Raft log").
 
 ### Live deployment after S1 (2026-11-15)
 

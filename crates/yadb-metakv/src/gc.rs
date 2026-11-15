@@ -37,6 +37,10 @@ pub const LEASE_PREFIX: &str = "/gc-lease/";
 pub const READER_PREFIX: &str = "/gc-lease/reader/";
 pub const WRITER_PREFIX: &str = "/gc-lease/writer/";
 pub const COLLECTOR_KEY: &str = "/gc-lease/collector";
+/// Highest revision whose dead fragments a completed pass may already have
+/// deleted. A reader whose applied view is older than this cannot prove that the
+/// manifests it sees are still complete, so it must refuse instead of reading.
+pub const WATERMARK_KEY: &str = "/gc/watermark";
 
 /// Default lease lifetime. Long enough to cover a metadata round trip plus a
 /// fragment read or write on a slow link, short enough that a crashed holder
@@ -155,6 +159,77 @@ impl<FS: StorageFs> Drop for GcLeaseGuard<'_, FS> {
             key: std::mem::take(&mut self.key),
         });
     }
+}
+
+/// The revision at which a pass may already have deleted fragments. Absent means
+/// no pass has ever run, so every applied revision is safe.
+pub fn watermark<FS: StorageFs>(meta: &LocalMetaKv<FS>) -> Result<u64, MetaError> {
+    match meta.get(WATERMARK_KEY) {
+        None => Ok(0),
+        Some(kv) => serde_json::from_slice::<u64>(&kv.value)
+            .map_err(|e| MetaError::Routing(format!("gc watermark is unreadable: {e}"))),
+    }
+}
+
+/// Raises the watermark to `revision`, never lowers it.
+///
+/// The collector calls this *before* it re-checks the reader leases and takes its
+/// mark, so the two sides close the window between them: a reader that publishes
+/// its lease before that re-check is seen and the pass refuses; a reader that
+/// publishes after it has already applied a revision at least as new as the
+/// watermark, so [`reader_is_safe`] passes. A reader that is still behind refuses
+/// instead of reading a manifest whose fragments may be gone.
+pub fn publish_watermark<FS: StorageFs>(
+    meta: &LocalMetaKv<FS>,
+    revision: u64,
+) -> Result<u64, MetaError> {
+    let (current, mod_revision) = match meta.get(WATERMARK_KEY) {
+        None => (0, 0),
+        Some(kv) => (
+            serde_json::from_slice::<u64>(&kv.value)
+                .map_err(|e| MetaError::Routing(format!("gc watermark is unreadable: {e}")))?,
+            kv.mod_revision,
+        ),
+    };
+    let next = current.max(revision);
+    if next == current && mod_revision != 0 {
+        return Ok(next);
+    }
+    let value = serde_json::to_vec(&next)?;
+    match meta.execute(KvCommand::RevisionTxn {
+        guards: vec![RevisionGuard {
+            key: WATERMARK_KEY.into(),
+            expected_mod_revision: mod_revision,
+        }],
+        ops: vec![TxnOp::Put {
+            key: WATERMARK_KEY.into(),
+            value,
+        }],
+    })? {
+        KvResult::TxnOk { .. } => Ok(next),
+        KvResult::CasConflict { .. } => Err(MetaError::Routing(
+            "gc watermark changed during the pass; another collection ran".into(),
+        )),
+        other => Err(MetaError::Routing(format!(
+            "gc watermark publication returned an unexpected result: {other:?}"
+        ))),
+    }
+}
+
+/// Refuses when this node's applied view is older than the last sweep's mark.
+///
+/// Call it *after* publishing the reader lease: a lease published before the
+/// collector's re-check makes the pass refuse, and one published after it has
+/// necessarily applied a revision at least as new as the watermark.
+pub fn reader_is_safe<FS: StorageFs>(meta: &LocalMetaKv<FS>) -> Result<(), MetaError> {
+    let mark = watermark(meta)?;
+    let applied = meta.revision();
+    if applied < mark {
+        return Err(MetaError::Routing(format!(
+            "this node applied revision {applied} but garbage collection has swept up to {mark}; refusing to read a manifest whose fragments may have been reclaimed"
+        )));
+    }
+    Ok(())
 }
 
 fn put_lease<FS: StorageFs>(
@@ -494,5 +569,40 @@ mod tests {
         let value = meta.get(COLLECTOR_KEY).unwrap();
         let third = acquire_collector(&meta, value.mod_revision, DEFAULT_TTL_MS).unwrap();
         third.release().unwrap();
+    }
+
+    #[test]
+    fn watermark_only_rises_and_fences_lagging_readers() {
+        let meta = meta();
+        // No pass has run: every applied revision is safe.
+        assert_eq!(watermark(&meta).unwrap(), 0);
+        assert!(reader_is_safe(&meta).is_ok());
+
+        let applied = meta.revision();
+        assert_eq!(publish_watermark(&meta, applied).unwrap(), applied);
+        assert!(
+            reader_is_safe(&meta).is_ok(),
+            "a reader at the mark is safe"
+        );
+
+        // A later pass cannot lower it, even when asked to.
+        assert_eq!(publish_watermark(&meta, 0).unwrap(), applied);
+        assert_eq!(watermark(&meta).unwrap(), applied);
+
+        // A reader whose applied view is behind the mark must refuse: the
+        // manifests it can see may name fragments a pass already reclaimed.
+        // Simulate a leader that is ahead of this node by publishing a watermark
+        // past the local applied revision.
+        assert_eq!(
+            publish_watermark(&meta, applied + 100).unwrap(),
+            applied + 100,
+            "the collector may raise the watermark past a lagging node's view"
+        );
+        let error = reader_is_safe(&meta).unwrap_err().to_string();
+        assert!(
+            error.contains("garbage collection has swept up to"),
+            "{error}"
+        );
+        assert!(error.contains("refusing to read"), "{error}");
     }
 }

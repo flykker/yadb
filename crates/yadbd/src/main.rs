@@ -31,6 +31,16 @@ mod openraft;
 mod protocols;
 
 const CONTROL_STATE_KEY: &str = "/sys/control_plane_state";
+
+/// A cached reader lease is reused only while it has at least this much life
+/// left, so the read that uses it cannot outlive the record it is fenced by any
+/// sooner than a freshly published one would.
+const READ_LEASE_REUSE_MARGIN_MS: u64 = 15_000;
+
+/// How often the leader's periodic repair scan also runs a collection pass.
+/// Collection takes the exclusive collector lease for its whole duration, so a
+/// per-scan pass would keep an explicit `POST /v1/pools/gc` refused.
+const BACKGROUND_SWEEP_INTERVAL: Duration = Duration::from_secs(300);
 /// How often a node tries to confirm control-group freshness.
 const CONTROL_REFRESH_INTERVAL: Duration = Duration::from_millis(200);
 /// Maximum time an authorization decision may rely on the last confirmed
@@ -303,6 +313,10 @@ struct AppState {
     #[allow(clippy::type_complexity)]
     local_vdisks: Arc<RwLock<BTreeMap<(String, usize), Arc<VolumeStore<OsFs>>>>>,
     last_scrub: Arc<RwLock<Option<ScrubSummary>>>,
+    /// The reader lease this node currently holds for garbage-collection
+    /// fencing. Reused across statements: publishing a fresh record per read
+    /// would put two Raft entries in the log for every `SELECT`.
+    reader_lease: Arc<std::sync::Mutex<Option<yadb_metakv::GcLease>>>,
     s3: ObjectStoreEngine<OsFs>,
     db: DatabaseEngine<OsFs>,
     block: BlockVolumeEngine<OsFs>,
@@ -467,22 +481,53 @@ impl AppState {
     /// least as new as the collector's mark, and the collector re-checks reader
     /// leases after publishing its own, so the collector is the side that backs
     /// off. Blocking; call from `spawn_blocking`.
+    /// Publishes or reuses this node's reader lease before a handler reads
+    /// fragments.
+    ///
+    /// The record is kept for the next statement instead of being deleted: one
+    /// published record fences every read on this node, and a fresh record per
+    /// statement would put two Raft entries in the log for every `SELECT`. A
+    /// reused lease needs no watermark check, because the record being live is
+    /// what makes a pass refuse — no pass can have raised the watermark since it
+    /// was published.
+    ///
+    /// Blocking; call from `spawn_blocking`.
     fn begin_read_lease(&self, project_id: u32) -> Result<yadb_metakv::GcLease, MetaError> {
-        yadb_metakv::gc::acquire(
+        let mut cached = self.reader_lease.lock().unwrap();
+        if let Some(lease) = cached.take() {
+            if lease.expires_at_ms > yadb_metakv::gc::now_ms() + READ_LEASE_REUSE_MARGIN_MS {
+                return Ok(lease);
+            }
+            // Too close to expiry to cover another read: drop the record now so a
+            // pass can run sooner, then publish a fresh one.
+            if let Err(error) = yadb_metakv::gc::release(&self.meta, &lease) {
+                eprintln!("reader lease release failed: {error}");
+            }
+        }
+        let lease = yadb_metakv::gc::acquire(
             &self.meta,
             yadb_metakv::gc::LeaseKind::Reader,
             project_id,
             self.meta.revision(),
             yadb_metakv::gc::DEFAULT_TTL_MS,
-        )
+        )?;
+        // The lease makes a concurrent pass refuse, but it cannot make this
+        // node's *applied* view current: a lagging follower can still hold an old
+        // manifest whose fragments a completed pass already reclaimed. Publishing
+        // the lease first and checking the sweep watermark second closes that
+        // window — the pass writes the watermark before it re-checks leases.
+        if let Err(error) = yadb_metakv::gc::reader_is_safe(&self.meta) {
+            let _ = yadb_metakv::gc::release(&self.meta, &lease);
+            return Err(error);
+        }
+        Ok(lease)
     }
 
-    /// Releases a reader lease. A failed release only delays the next collection
-    /// pass until the lease expires; it never makes a deletion safe that was not.
+    /// Keeps the lease for the next read instead of deleting it. The record
+    /// expires on its own, so a crashed node still stops blocking collection;
+    /// an idle node stops blocking it one TTL after its last read.
     fn end_read_lease(&self, lease: &yadb_metakv::GcLease) {
-        if let Err(error) = yadb_metakv::gc::release(&self.meta, lease) {
-            eprintln!("reader lease release failed: {error}");
-        }
+        *self.reader_lease.lock().unwrap() = Some(lease.clone());
     }
 
     /// Establish a fresh lease on demand, e.g. immediately after restart
@@ -734,7 +779,12 @@ impl AppState {
 
     /// Scans all live SQL Tablet manifests, S3 Object manifests, and BlockVolume extent maps in `MetaKV`,
     /// verifies every fragment across cluster VDisks, and heals missing or bit-rotted fragments!
-    fn scrub_all_pools(&self) -> ScrubSummary {
+    ///
+    /// `sweep` controls the garbage-collection phase. The periodic repair scan
+    /// passes `false` most of the time: a pass holds the exclusive collector
+    /// lease, and running one every few seconds means an explicit
+    /// `POST /v1/pools/gc` almost always finds the lease held and refuses.
+    fn scrub_all_pools(&self, sweep: bool) -> ScrubSummary {
         // A short write is refused at `put_blob`, so there is no in-memory backlog
         // to drain here: every acknowledged blob was fully redundant when it was
         // written. This scan heals damage that happened *after* the ack (a lost or
@@ -849,10 +899,16 @@ impl AppState {
         // Mark-and-sweep runs after the repair pass so fragments it just healed are
         // part of the live set. It takes its own snapshots and refuses on its own
         // terms; a refusal deletes nothing and is reported, never hidden.
-        let sweep = {
+        let sweep = if sweep {
             let control = self.control.read().unwrap().clone();
             let pools = self.pools.read().unwrap().clone();
             gc::sweep(&self.meta, &pools, &control)
+        } else {
+            // A repair scan that skipped collection must say so, rather than
+            // report zero deletions that could be read as "nothing to collect".
+            gc::SweepOutcome::refuse(
+                "collection skipped in this repair scan: it runs every five minutes and on POST /v1/pools/gc",
+            )
         };
         let summary = ScrubSummary {
             pools_checked: pools_health.len(),
@@ -5346,7 +5402,7 @@ async fn handle_pools_scrub(State(st): State<AppState>, headers: HeaderMap) -> R
         return e.into_response();
     }
     let st_clone = st.clone();
-    let res = tokio::task::spawn_blocking(move || st_clone.scrub_all_pools()).await;
+    let res = tokio::task::spawn_blocking(move || st_clone.scrub_all_pools(true)).await;
     match res {
         Ok(summary) => Json(summary).into_response(),
         Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
@@ -5557,6 +5613,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         pools: Arc::new(RwLock::new(BTreeMap::new())),
         local_vdisks: Arc::new(RwLock::new(BTreeMap::new())),
         last_scrub: Arc::new(RwLock::new(None)),
+        reader_lease: Arc::new(std::sync::Mutex::new(None)),
         s3,
         db,
         block,
@@ -5621,12 +5678,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let scrub_state = state.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(4));
+            // The repair scan is cheap and idempotent, so it runs every few
+            // seconds. Collection holds the exclusive collector lease for the
+            // whole pass, so it runs on a much slower cadence: otherwise an
+            // explicit `POST /v1/pools/gc` finds the lease held almost always.
+            let mut last_sweep = std::time::Instant::now();
             loop {
                 interval.tick().await;
                 let (_, role, _, _, _) = scrub_state.meta.role_info();
                 if role == RoleState::Leader {
+                    let due = last_sweep.elapsed() >= BACKGROUND_SWEEP_INTERVAL;
+                    if due {
+                        last_sweep = std::time::Instant::now();
+                    }
                     let st = scrub_state.clone();
-                    let _ = tokio::task::spawn_blocking(move || st.scrub_all_pools()).await;
+                    let _ =
+                        tokio::task::spawn_blocking(move || st.scrub_all_pools(due)).await;
                 }
             }
         });
@@ -6160,6 +6227,7 @@ mod security_tests {
             pools: Arc::new(RwLock::new(BTreeMap::new())),
             local_vdisks: Arc::new(RwLock::new(BTreeMap::new())),
             last_scrub: Arc::new(RwLock::new(None)),
+            reader_lease: Arc::new(std::sync::Mutex::new(None)),
             s3: ObjectStoreEngine::new(meta.clone(), 4096),
             db: DatabaseEngine::new(meta.clone(), 100),
             block: BlockVolumeEngine::new(meta, DEFAULT_BLOCK_SIZE),
@@ -6627,6 +6695,7 @@ mod security_tests {
             pools: Arc::new(RwLock::new(BTreeMap::from([("data".to_string(), pool)]))),
             local_vdisks: Arc::new(RwLock::new(BTreeMap::new())),
             last_scrub: Arc::new(RwLock::new(None)),
+            reader_lease: Arc::new(std::sync::Mutex::new(None)),
             s3: ObjectStoreEngine::new(meta.clone(), 4096),
             db: DatabaseEngine::new(meta.clone(), 100),
             block,
@@ -6676,31 +6745,34 @@ mod security_tests {
         assert_eq!(body_bytes(served).await, b"hello");
         held.release().unwrap();
 
-        // The reverse direction is the safety property: while a read holds its
-        // lease, a collection pass refuses and deletes nothing.
-        let reader = yadb_metakv::gc::acquire(
-            &st.meta,
-            yadb_metakv::gc::LeaseKind::Reader,
-            1,
-            st.meta.revision(),
-            60_000,
-        )
-        .unwrap();
+        // The reverse direction is the safety property: while this node holds its
+        // read lease, a collection pass refuses and deletes nothing.
         let pools = st.pools.read().unwrap().clone();
         let control = st.control.read().unwrap().clone();
         let outcome = crate::gc::sweep(&st.meta, &pools, &control);
         assert_eq!(outcome.leases_live, 1, "{outcome:?}");
         assert_eq!(outcome.fragments_deleted, 0, "{outcome:?}");
         assert!(outcome.refusal.unwrap().contains("live lease"));
-        yadb_metakv::gc::release(&st.meta, &reader).unwrap();
+        // Dropping the cached record, as an idle node does when it expires, lets
+        // the pass run; the bytes stay because the extent map still references them.
+        let cached = st.reader_lease.lock().unwrap().take().unwrap();
+        yadb_metakv::gc::release(&st.meta, &cached).unwrap();
+        assert!(
+            crate::gc::sweep(&st.meta, &pools, &control)
+                .refusal
+                .is_none(),
+            "an idle node must not block collection"
+        );
 
-        // Once the pass is gone the read is served again, from the same bytes.
+        // Once the pass is gone the read is served again, from the same bytes,
+        // and the node keeps exactly one record for reuse rather than one per read.
         let again = read().await;
         assert_eq!(again.status(), StatusCode::OK);
         assert_eq!(body_bytes(again).await, b"hello");
-        assert!(
-            yadb_metakv::gc::live_leases(&st.meta).unwrap().is_empty(),
-            "the read must not leak its lease"
+        assert_eq!(
+            yadb_metakv::gc::live_leases(&st.meta).unwrap().len(),
+            1,
+            "reads must reuse a single lease, not leak one per statement"
         );
     }
 

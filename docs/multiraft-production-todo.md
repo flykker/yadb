@@ -330,8 +330,11 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   project on the same group.
 - [x] Garbage collection on the legacy metadata runtime. `POST /v1/pools/gc`
   runs one bounded mark-and-sweep pass, and `POST /v1/pools/scrub` runs the same
-  pass after its repair scan; both report `blobs_live`, `fragments_deleted`,
-  `bytes_reclaimed`, `leases_live` and an explicit `gc_refusal`, and `/gc`
+  pass after its repair scan; the leader's periodic repair scan runs the sweep
+  only every five minutes, because a pass holds the exclusive collector lease for
+  its whole duration and a per-scan pass would keep an explicit `/gc` refused.
+  Both report `blobs_live`, `fragments_deleted`, `bytes_reclaimed`, `leases_live`
+  and an explicit `gc_refusal`, and `/gc`
   answers `409` with that reason instead of a `200` that could be read as
   "nothing to do". The mark is every fragment named by `/db/` tablet manifests
   (WAL and SST), `/s3/` object manifests, `/s3-intent/` in-flight uploads and
@@ -348,25 +351,58 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   when a manifest is unreadable. Readers publish a 30 s lease before reading and
   writers a 300 s lease between the fragment append and the publication that
   names it; the collector re-checks the fence immediately before its mark, so a
-  read or write that started first is seen. `/s3-retired/` is deliberately not
+  read or write that started first is seen. A node keeps one reader lease and
+  reuses it while it has more than 15 s of life left: a fresh record per
+  statement would put two Raft entries in the log for every `SELECT`, and the
+  live record already blocks a pass. Reuse also means a node stops blocking
+  collection one TTL after its last read, so a pass needs about 30 s without
+  reads on each node rather than a microsecond gap. The pass raises a durable
+  `/gc/watermark` to the revision of its mark before it re-checks the fence; a
+  reader publishes its lease first and then refuses with `503` if its applied
+  revision is behind that watermark, which is the case a lease alone cannot
+  cover — a lagging follower can still hold a manifest whose fragments a
+  completed pass already reclaimed. `/s3-retired/` is deliberately not
   live: a retired manifest is unreachable to reads, so its chunks are exactly
   what an overwrite or delete made garbage (the records themselves are kept).
   Measured in the daemon suite (bytes on disk, before → after): repeated block
   overwrite 9,513,240 → 198,339 (live set 196,608, 2,256 fragments deleted);
   table flush plus compaction 228,765 → 42,369 (live 20,739, 651 fragments);
   S3 overwrite and delete 789,744 → 267 (live 21, 96 fragments); a refused write
-  24,798 → 12,534 against a 12,411-byte live-set floor. A crash between the
+  24,798 → 12,534 against a 12,411-byte live-set floor. On a live three-node
+  cluster, eight overwrites of one 8 KB block region left 963,124 bytes of pool
+  data against a 897,060-byte floor; one pass deleted 42 fragments and reclaimed
+  173,418 bytes (963,124 → 905,359), and the region still read back
+  byte-identical, while a pass issued straight after a read refused with
+  `1 live lease(s) (1 reader, 0 writer)` and freed nothing. A crash between the
   durable barrier and the compaction is simulated by dropping the volume after
   the barrier records are written: reopening reaps the expired collector lease,
   the rerun finishes, and the newest generation still reads back byte-identical.
   Open: the collector is legacy-only (the Multi-Raft item below still refuses);
-  the fence costs one durable lease write and one delete per SQL statement,
-  block read and S3 GET, so a continuously busy node will usually refuse a pass
-  rather than wait for a quiet window, and there is no grace-period scheduling;
-  `/s3-retired/` records are retained indefinitely; the 300 s writer TTL is the
-  only bound on a crashed writer blocking collection; and no test runs a real
-  multi-node pool, so remote enumeration, remote barriers and remote compaction
-  are only exercised in-process.
+  a pass needs each node to be read-idle for one lease TTL, so a continuously
+  busy node refuses rather than waits for a quiet window, and there is no
+  grace-period scheduling; `/s3-retired/` records are retained indefinitely; the
+  300 s writer TTL is the only bound on a crashed writer blocking collection; a
+  read that outlives its own 30 s lease is not fenced (nothing refreshes it
+  mid-read); and no test runs a real multi-node pool, so remote enumeration,
+  remote barriers and remote compaction are only exercised in-process.
+- [ ] Bound the metadata Raft log. `raft.wal` is append-only and nothing ever
+  rewrites, truncates or compacts it, so the log grows with every mutation for
+  the life of the deployment — this is now the dominant unbounded growth, not
+  fragments. Measured on a three-node legacy cluster with the current binary: one
+  `INSERT` through pgwire adds about 11 KB to each node's `raft.wal`, one
+  `SELECT` about 10.6 KB when the reader lease has to be republished (zero when
+  it is reused), one 200 KB S3 `PUT` about 3 KB, and an idle cluster adds
+  nothing. The insert cost is dominated by the shard manifest, which is rewritten
+  on every statement and carries every WAL blob id written since the last flush,
+  so it grows linearly with unflushed rows (average ~10 KB at the default
+  `--db-flush-rows 1024`). Twenty overwrites of one 200 KB object left 3.3 MB of
+  `raft.wal` against 795 KB of pool data, and the fragment sweep cannot touch it.
+  Fixing it needs a real snapshot-and-truncate protocol: persist a state image,
+  truncate a log prefix, serve a lagging follower from the image rather than from
+  entries that no longer exist, and rewrite `raft.wal` (which currently promises
+  never to rewrite itself). None of that exists, so a long-lived cluster will
+  still fill its disk from metadata alone; provision a fresh root for a new test
+  run and do not expect the log to shrink.
 - [ ] Garbage collection on Multi-Raft. `POST /v1/pools/gc` and the sweep inside
   `POST /v1/pools/scrub` both refuse with `garbage collection disabled for
   Multi-Raft: no single atomic cross-group metadata snapshot` and delete
