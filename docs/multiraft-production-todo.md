@@ -269,11 +269,14 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   `POST /v1/pools/scrub` / the leader's scrub tick calls `repair_pending` to rewrite
   the missing fragments before the manifest scan (on OpenRaft too, since that part
   needs no cross-group view). `PoolHealthSnapshot` reports both counters, and
-  `repair_blob` no longer returns `Ok` when a fragment it could not rewrite is
-  still missing. Open: the queue is in memory and per process, so a restart forgets
+  `repair_blob` keeps a blob queued and reports it separately when a fragment
+  rewrite did not land: the payload is readable, only its redundancy is short, so
+  that is `still_degraded` / `degraded_puts_still_degraded` and never
+  `unrecoverable`. Open: the queue is in memory and per process, so a restart forgets
   it and the backlog is rediscovered only by a full scrub; a write that acks
-  degraded is still acked, so the caller learns nothing at write time; and no test
-  exercises the queue through a real multi-node pool.
+  degraded is still acked, so the caller learns nothing at write time; the live-blob
+  scrub path still counts a readable short blob as intact when no rewrite succeeds;
+  and no test exercises the queue through a real multi-node pool.
 - [ ] Idempotency and read-consistency contracts. A keyed `POST /v1/apply` is
   implemented (`Idempotency-Key`, the outcome record committed in the same
   `RevisionTxn` as the mutation, `POST /v1/idempotency/resolve`, and a replicated

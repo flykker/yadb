@@ -702,11 +702,20 @@ rejected, dropping the frames after it.
 `min_write_quorum()`, which is `k` for RS 4+2, so an ack could leave zero parity on
 disk while the failed parts were dropped. Short writes are now queued in
 `pending_repairs`, counted in `degraded_puts`, repaired in bounded batches by
-`repair_pending` and dequeued only when every fragment is intact; `repair_blob`
-no longer answers `Ok` when a fragment it could not rewrite is still missing. The
-queue is drained before the manifest scan and on OpenRaft too, since repairing
-blobs this process wrote needs no cross-group metadata view. Three tests; 24/24
-passed. Open: the queue is in-memory and per process, so a restart forgets it.
+`repair_pending` and dequeued only when every fragment is intact. The queue is
+drained before the manifest scan and on OpenRaft too, since repairing blobs this
+process wrote needs no cross-group metadata view.
+
+The first version of that fix returned `Err` from `repair_blob` when the payload
+decoded but a fragment rewrite failed, which made the scrub count a *readable*
+blob as `blobs_unrecoverable` — a false alarm that conflates lost data with lost
+redundancy. Now `repair_blob` answers `Ok` whenever the payload decoded, with
+`intact_parts` counting fragments *after* the attempt; `RepairSweep` and
+`ScrubSummary` carry `still_degraded` / `degraded_puts_still_degraded` separately
+from `unrecoverable`, and the blob stays queued. Three tests; 24/24 passed. Open:
+the queue is in-memory and per process, so a restart forgets it, and the live-blob
+scrub path (as opposed to the queue) still counts a readable short blob as intact
+when no rewrite succeeds.
 
 **S7 — ambiguous legacy write outcome reported as a definite failure.** The
 OpenRaft bridge answered `OpenRaftWriteUnknown` with `503` plus

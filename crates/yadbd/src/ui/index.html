@@ -1193,7 +1193,10 @@ async function runPoolScrub() {
     return;
   }
   const s = r.json;
-  banner.innerHTML = `<div class="alert ok">Scrub complete · Checked <strong>${s.blobs_checked}</strong> logical blobs (${s.blobs_intact} intact, <strong>${s.blobs_repaired}</strong> blobs healed, <strong>${s.fragments_repaired}</strong> fragments reconstructed, ${s.blobs_unrecoverable} unrecoverable)</div>`;
+  const stillDegraded = s.degraded_puts_still_degraded
+    ? `, <strong>${s.degraded_puts_still_degraded}</strong> readable but still under-redundant`
+    : "";
+  banner.innerHTML = `<div class="alert ok">Scrub complete · Checked <strong>${s.blobs_checked}</strong> logical blobs (${s.blobs_intact} intact, <strong>${s.blobs_repaired}</strong> blobs healed, <strong>${s.fragments_repaired}</strong> fragments reconstructed, ${s.blobs_unrecoverable} unrecoverable${stillDegraded})</div>`;
   await refreshAll();
 }
 
