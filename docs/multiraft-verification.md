@@ -667,9 +667,9 @@ unproven and no timeout was increased or retry added to mask the failure.
 | Multi-process failure suite | Only the tested stop/restart/quorum/failover scenarios | Network partitions unless explicitly injected; arbitrary schedules |
 | OS/device crash test | Recorded host/filesystem/device/power-failure scenario | Other hardware configurations or unrestricted power-loss guarantees |
 
-### Durability findings S2/S4/S6/S7 (2026-11-15)
+### Durability findings S1/S2/S4/S6/S7 (2026-11-15)
 
-Four defects from the durability audit are fixed on `main`. All evidence below is
+Five defects from the durability audit are fixed on `main`. All evidence below is
 in-process; none of it is a power-loss or device qualification.
 
 **S2 — corruption reported as absence (default build).**
@@ -726,12 +726,51 @@ plain `500`. A client could not tell "may have committed" from "rejected".
 outcome header, asserted by a test so the distinction cannot silently collapse.
 Three tests in `yadbd`; 31/31 units passed.
 
+**S1 — silent loss of acknowledged entries on WAL replay.** The legacy WAL reader
+treated every frame it could not parse as a torn tail and truncated the file there,
+so mid-file damage discarded every acknowledged entry after it while the node
+started and reported success. Replay now truncates only when a frame provably runs
+past EOF; a complete frame with a bad magic, a bad header or payload CRC, or a
+payload that is not a `WalRecord` is `CorruptWal`, and no `set_len` runs on any
+corruption path. The v2 header is self-checking, which makes a damaged `len`
+distinguishable from a payload that never reached disk; the magic is bumped to
+`YADBWAL2` so a pre-fix binary cannot read a v2 log as a tail. `yadb-blob` volume
+segments had the same defect in a worse form — truncating at a corrupt record
+header dropped later `TOMBSTONE`/`BARRIER` records, which can resurrect deleted
+blobs — and now refuse to open. `yadb-metakv` 140/140, `yadb-blob` 26/26,
+`yadb-block` 20/20. Open: `SimFs::corrupt_byte` proves the reader's decision logic,
+not the shapes a real device leaves after a crash; a `YADBWAL1` file keeps the
+legacy ambiguous-`len` truncation until it is rewritten; and the operator-facing
+path from `CorruptWal` to a clear refusal at the `yadbd` boundary is not tested.
+
 | Finding | Tests | What it still does not prove |
 | --- | --- | --- |
+| S1 | `yadb-metakv` 140/140, `yadb-blob` 26/26 | In-memory byte flips, not real crash shapes; `YADBWAL1` keeps the legacy ambiguity |
 | S2 | `yadb-blob` 21/21 | No real multi-node pool; corruption is injected by flipping a byte in `SimFs` |
 | S4 | `yadb-metakv` 128/128 | No real power loss; torn tails are hand-cut bytes or `Fault::WritePartial` |
 | S6 | `yadb-blob` 24/24 | Queue is never exercised through a real pool or across a restart |
 | S7 | `yadbd` bins 31/31 | Only the HTTP mapping; `Io` after the append stays indistinguishable from `Io` before it |
+
+### Live deployment after S1 (2026-11-15)
+
+`main` at `234d49a` was built with `--features experimental-openraft-storage` and
+deployed to the three-process root. Every daemon reported three group leaders and
+the same applied index per group on all nodes. What was exercised live, not just in
+tests:
+
+* block write at offset 0, three consecutive `consistent=true` reads returning the
+  same bytes, and the same read from a `readOnly` subject;
+* `POST /block/billing/vm-root/unmap` with a 4 KiB-aligned range zeroing the range,
+  and a `400` for an unaligned one;
+* `/v1/pools/scrub` returning `degraded_puts_still_degraded`, which is the field
+  added by the S6 correction — proof the deployed binary is the reviewed one;
+* **restart durability**: a marker written at offset 4096, a clean `SIGTERM` stop
+  (`exit_codes [0, 0, 0]`, all ports released), a fresh start, and the marker read
+  back byte-identical with the unmapped range still zero.
+
+This is a local single-host run. It does not establish power-loss durability,
+multi-host behaviour, or that the OpenRaft log and state images survive a kill
+rather than a clean stop.
 
 ## Required failure record format
 
