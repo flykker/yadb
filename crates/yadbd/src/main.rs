@@ -1170,6 +1170,7 @@ struct ProxyResponse {
     etag: Option<String>,
     write_outcome: Option<String>,
     retry: Option<String>,
+    headers: Vec<(String, String)>,
     body: Vec<u8>,
 }
 
@@ -1277,6 +1278,7 @@ fn parse_proxy_response(raw: &[u8]) -> Result<ProxyResponse, std::io::Error> {
     let mut content_length = None;
     let mut write_outcome = None;
     let mut retry = None;
+    let mut headers = Vec::new();
     for line in hdr_str.split("\r\n").skip(1) {
         if let Some((k, v)) = line.split_once(':') {
             axum::http::HeaderName::from_bytes(k.as_bytes()).map_err(|_| invalid())?;
@@ -1308,6 +1310,20 @@ fn parse_proxy_response(raw: &[u8]) -> Result<ProxyResponse, std::io::Error> {
                 if retry.replace(vt.to_string()).is_some() {
                     return Err(invalid());
                 }
+            } else if matches!(
+                kl.as_str(),
+                "content-range"
+                    | "last-modified"
+                    | "accept-ranges"
+                    | "cache-control"
+                    | "content-disposition"
+            ) {
+                if headers.iter().any(|(name, _)| name == &kl) {
+                    return Err(invalid());
+                }
+                // HeaderName and HeaderValue validation above also applies to
+                // the allowlisted headers before they are retained.
+                headers.push((kl, vt.to_string()));
             }
         } else {
             return Err(invalid());
@@ -1340,6 +1356,7 @@ fn parse_proxy_response(raw: &[u8]) -> Result<ProxyResponse, std::io::Error> {
         etag: resp_etag,
         write_outcome,
         retry,
+        headers,
         body: decoded,
     })
 }
@@ -1648,7 +1665,16 @@ async fn maybe_forward_write(
                 }
                 Ok(ok_tuple) => return Ok(Some((target_id, ok_tuple))),
                 Err(_) => {
-                    // Old leader just died! Immediately run failover election and retry!
+                    // A lost response to a mutation is not evidence that it did
+                    // not commit, and an unkeyed write cannot be replayed.
+                    if method != "GET" && method != "HEAD" {
+                        return Err((
+                            "forwarded request was sent but the write outcome is unknown; do not automatically retry"
+                                .to_string(),
+                            Some("unknown"),
+                        ));
+                    }
+                    // Read-only requests can safely trigger failover and retry.
                     let _ = meta.trigger_election();
                     let (_, new_role, _, _, _) = meta.role_info();
                     if new_role == RoleState::Leader {
@@ -1682,6 +1708,9 @@ async fn maybe_forward_write(
             if let Some(value) = response.retry {
                 builder = builder.header("x-yadb-retry", value);
             }
+            for (name, value) in response.headers {
+                builder = builder.header(name, value);
+            }
             Some(
                 builder
                     .body(axum::body::Body::from(response.body))
@@ -1697,6 +1726,13 @@ async fn maybe_forward_write(
     }
 }
 
+/// Parses a single `bytes=start-end` range against a known size.
+///
+/// An end past the end of the resource is clamped: RFC 9110 defines such a
+/// range as satisfiable and denoting the remainder of the representation, and
+/// the native S3 listener has always answered it with `206` and a clamped
+/// `Content-Range`. Only a range that starts at or after the size, or is
+/// reversed, is unsatisfiable.
 fn parse_range_header(val: &str, total_size: u64) -> Option<(u64, u64)> {
     let spec = val.trim().strip_prefix("bytes=")?;
     let (start_s, end_s) = spec.split_once('-')?;
@@ -1706,7 +1742,10 @@ fn parse_range_header(val: &str, total_size: u64) -> Option<(u64, u64)> {
     } else {
         end_s.parse().ok()?
     };
-    Some((start, end))
+    if total_size == 0 || start >= total_size || start > end {
+        return None;
+    }
+    Some((start, end.min(total_size - 1)))
 }
 
 async fn handle_ui() -> Html<&'static str> {
@@ -3340,22 +3379,31 @@ async fn handle_db_query(
     })
     .await;
 
-    // The statement has finished reading (or failed); prove the fence held for
-    // the whole statement and keep it for the next one. A read that outlived its
-    // lease may have had its fragments reclaimed underneath it, so its answer is
-    // refused rather than returned: the client retries (with an Idempotency-Key
-    // for a mutation) instead of acting on a result nobody can vouch for.
-    if let Some(lease) = reader_lease.take() {
+    // A read that outlived its lease may have had fragments reclaimed, so its
+    // answer must be refused. A committed mutation is not retroactively undone
+    // by a lost read fence; reporting failure would make the client retry a
+    // mutation that already landed. Verification caches only a live lease.
+    let verified = if let Some(lease) = reader_lease.take() {
         let st_fence = st.clone();
-        let verified = tokio::task::spawn_blocking(move || st_fence.end_read_lease(&lease)).await;
-        if matches!(&exec, Ok(Ok(_))) {
-            match verified {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => {
-                    return api_err(StatusCode::SERVICE_UNAVAILABLE, error.to_string())
-                }
-                Err(error) => return api_err(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+        Some(tokio::task::spawn_blocking(move || st_fence.end_read_lease(&lease)).await)
+    } else {
+        None
+    };
+    if matches!(&exec, Ok(Ok(_))) {
+        match (has_writes, verified) {
+            (_, None) | (_, Some(Ok(Ok(())))) => {}
+            (false, Some(Ok(Err(error)))) => {
+                return api_err(StatusCode::SERVICE_UNAVAILABLE, error.to_string())
             }
+            (false, Some(Err(error))) => {
+                return api_err(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+            }
+            (true, Some(Ok(Err(error)))) => eprintln!(
+                "reader lease lost after committed SQL mutation; returning the successful result: {error}"
+            ),
+            (true, Some(Err(error))) => eprintln!(
+                "reader lease verification failed after committed SQL mutation; returning the successful result: {error}"
+            ),
         }
     }
 
@@ -6154,6 +6202,37 @@ mod security_tests {
             b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\naX\r\n0\r\n\r\n"
         )
         .is_err());
+    }
+
+    #[test]
+    fn proxy_response_preserves_allowlisted_entity_headers_and_rejects_duplicates() {
+        let raw = b"HTTP/1.1 206 Partial Content\r\nContent-Length: 5\r\nContent-Range: bytes 0-4/11\r\nLast-Modified: Wed, 21 Oct 2015 07:28:00 GMT\r\nAccept-Ranges: bytes\r\nCache-Control: public\r\nContent-Disposition: inline\r\n\r\nhello";
+        let response = parse_proxy_response(raw).unwrap();
+        assert!(response
+            .headers
+            .iter()
+            .any(|(name, value)| name == "content-range" && value == "bytes 0-4/11"));
+        assert!(parse_proxy_response(
+            b"HTTP/1.1 206 Partial Content\r\nContent-Length: 5\r\nContent-Range: bytes 0-4/11\r\ncontent-range: bytes 0-4/11\r\n\r\nhello"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn range_end_past_the_size_is_clamped_but_a_start_past_it_is_refused() {
+        // RFC 9110: an end past the representation is satisfiable and denotes
+        // the remainder, so it is clamped rather than refused. This keeps the
+        // gateway identical to the native listener a follower forwards to.
+        assert_eq!(parse_range_header("bytes=7-999", 9), Some((7, 8)));
+        assert_eq!(parse_range_header("bytes=0-", 9), Some((0, 8)));
+        assert_eq!(parse_range_header("bytes=4-4", 9), Some((4, 4)));
+        // A start at or past the size, a reversed range, an empty object and a
+        // malformed unit are all unsatisfiable.
+        assert_eq!(parse_range_header("bytes=900-999", 9), None);
+        assert_eq!(parse_range_header("bytes=9-9", 9), None);
+        assert_eq!(parse_range_header("bytes=5-3", 9), None);
+        assert_eq!(parse_range_header("bytes=0-0", 0), None);
+        assert_eq!(parse_range_header("items=0-1", 9), None);
     }
 
     #[test]

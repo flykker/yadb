@@ -41,6 +41,13 @@ fn err(status: StatusCode, code: &str, msg: &str) -> Response {
         ),
     )
 }
+
+async fn discard_read_lease(app: &AppState, lease: Option<yadb_metakv::GcLease>) {
+    if let Some(lease) = lease {
+        let app = app.clone();
+        let _ = tokio::task::spawn_blocking(move || app.end_read_lease(&lease)).await;
+    }
+}
 fn query(raw: &str) -> io::Result<Vec<(String, String)>> {
     if raw.is_empty() {
         return Ok(Vec::new());
@@ -516,21 +523,96 @@ pub async fn handle(State(st): State<S3State>, request: Request) -> Response {
             }
         }
         Method::GET | Method::HEAD => {
+            // A legacy read is fenced by a reader lease, and only the metadata
+            // leader can publish one. A follower therefore forwards the request
+            // it has already authenticated (with its `Range` header) to the
+            // leader's gateway route instead of serving its own copy unfenced or
+            // failing on the lease. On the leader this returns `None` and the
+            // read runs locally under the lease taken below. HEAD reads no
+            // fragments, so it needs no fence and stays local.
+            if method == Method::GET && !st.app.meta.is_openraft() {
+                let mut forwarded = gateway_headers.clone();
+                if let Some(secret) = st.app.subject_secret.as_deref() {
+                    match subject_signature(secret, &subject).parse() {
+                        Ok(v) => {
+                            forwarded.insert("x-yadb-subject-signature", v);
+                        }
+                        Err(_) => {
+                            return err(StatusCode::FORBIDDEN, "AccessDenied", "invalid subject")
+                        }
+                    }
+                }
+                if let Some(range) = headers.get(header::RANGE) {
+                    forwarded.insert(header::RANGE, range.clone());
+                }
+                let gateway_path = format!(
+                    "/s3/{}/{}/{}/{}",
+                    crate::protocols::url(&st.project),
+                    crate::protocols::url(&st.store),
+                    crate::protocols::url(bucket),
+                    key.split('/')
+                        .map(crate::protocols::url)
+                        .collect::<Vec<_>>()
+                        .join("/")
+                );
+                if let Some(response) = crate::maybe_forward_write(
+                    &st.app,
+                    &forwarded,
+                    Some(&st.project),
+                    "GET",
+                    gateway_path,
+                    "application/octet-stream".into(),
+                    axum::body::Bytes::new(),
+                )
+                .await
+                {
+                    // A successful read is returned as-is (body, ETag and
+                    // Content-Range). A failure is re-framed as an S3 XML error,
+                    // because the gateway answers JSON and a native S3 client
+                    // parses the wire format.
+                    if response.status().is_success() {
+                        return response;
+                    }
+                    return map_error(response).await;
+                }
+            }
             let engine = st.app.s3.clone();
             let store = st.store.clone();
             let b = bucket.to_string();
             let k = key.to_string();
+            let mut read_lease = if method == Method::GET && !st.app.meta.is_openraft() {
+                let app = st.app.clone();
+                match tokio::task::spawn_blocking(move || app.begin_read_lease(pid)).await {
+                    Ok(Ok(lease)) => Some(lease),
+                    Ok(Err(_)) | Err(_) => {
+                        return err(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "ServiceUnavailable",
+                            "reader lease unavailable",
+                        )
+                    }
+                }
+            } else {
+                None
+            };
+            // The legacy lease covers both the manifest read and chunk fetch;
+            // OpenRaft does not need this fence because its collection path is
+            // not raced by the legacy collector.
             let head =
                 match tokio::task::spawn_blocking(move || engine.head_object(pid, &store, &b, &k))
                     .await
                 {
                     Ok(Ok(v)) => v,
-                    _ => return err(StatusCode::NOT_FOUND, "NoSuchKey", "object not found"),
+                    _ => {
+                        discard_read_lease(&st.app, read_lease.take()).await;
+                        return err(StatusCode::NOT_FOUND, "NoSuchKey", "object not found");
+                    }
                 };
             if headers
                 .get(header::IF_MATCH)
                 .is_some_and(|v| v.as_bytes() != head.etag.as_bytes())
             {
+                discard_read_lease(&st.app, read_lease.take()).await;
                 return err(
                     StatusCode::PRECONDITION_FAILED,
                     "PreconditionFailed",
@@ -541,6 +623,7 @@ pub async fn handle(State(st): State<S3State>, request: Request) -> Response {
                 .get(header::IF_NONE_MATCH)
                 .is_some_and(|v| v.as_bytes() == head.etag.as_bytes())
             {
+                discard_read_lease(&st.app, read_lease.take()).await;
                 return StatusCode::NOT_MODIFIED.into_response();
             }
             let modified =
@@ -549,6 +632,7 @@ pub async fn handle(State(st): State<S3State>, request: Request) -> Response {
                     .format("%a, %d %b %Y %H:%M:%S GMT")
                     .to_string();
             if method == Method::HEAD {
+                discard_read_lease(&st.app, read_lease.take()).await;
                 return Response::builder()
                     .header(header::CONTENT_LENGTH, head.size)
                     .header(header::CONTENT_TYPE, head.content_type)
@@ -560,10 +644,9 @@ pub async fn handle(State(st): State<S3State>, request: Request) -> Response {
             }
             let mut range = None;
             if let Some(v) = headers.get(header::RANGE).and_then(|v| v.to_str().ok()) {
-                range = parse_range_header(v, head.size).and_then(|(a, b)| {
-                    (a < head.size && a <= b).then(|| (a, b.min(head.size - 1)))
-                });
+                range = parse_range_header(v, head.size);
                 if range.is_none() {
+                    discard_read_lease(&st.app, read_lease.take()).await;
                     let mut r = err(
                         StatusCode::RANGE_NOT_SATISFIABLE,
                         "InvalidRange",
@@ -577,6 +660,7 @@ pub async fn handle(State(st): State<S3State>, request: Request) -> Response {
                 }
             }
             if head.size > 16 * 1024 * 1024 && range.is_none() {
+                discard_read_lease(&st.app, read_lease.take()).await;
                 return err(
                     StatusCode::BAD_REQUEST,
                     "InvalidRequest",
@@ -585,6 +669,7 @@ pub async fn handle(State(st): State<S3State>, request: Request) -> Response {
             }
             if let Some((a, b)) = range {
                 if b - a + 1 > 16 * 1024 * 1024 {
+                    discard_read_lease(&st.app, read_lease.take()).await;
                     return err(
                         StatusCode::BAD_REQUEST,
                         "InvalidRequest",
@@ -606,13 +691,27 @@ pub async fn handle(State(st): State<S3State>, request: Request) -> Response {
             let bytes = match read {
                 Ok(Ok(bytes)) => bytes,
                 _ => {
+                    discard_read_lease(&st.app, read_lease.take()).await;
                     return err(
                         StatusCode::SERVICE_UNAVAILABLE,
                         "ServiceUnavailable",
                         "object read failed",
-                    )
+                    );
                 }
             };
+            if let Some(lease) = read_lease.take() {
+                let app = st.app.clone();
+                match tokio::task::spawn_blocking(move || app.end_read_lease(&lease)).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(_)) | Err(_) => {
+                        return err(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "ServiceUnavailable",
+                            "reader lease lost during object read",
+                        )
+                    }
+                }
+            }
             let mut response = Response::builder()
                 .status(if range.is_some() {
                     StatusCode::PARTIAL_CONTENT

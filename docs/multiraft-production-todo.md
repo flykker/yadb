@@ -379,7 +379,18 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   completed pass already reclaimed. Because only the leader can publish a lease,
   a legacy follower no longer serves a read locally: it proxies the request (with
   its `Range` header) to the leader, which is also what keeps default reads
-  working instead of failing every statement on a follower. `/s3-retired/` is
+  working instead of failing every statement on a follower. The native S3 wire
+  listener does the same for GET after it has verified SigV4, forwarding the
+  proven subject through the internal gateway and re-framing a gateway error as
+  an S3 XML error; HEAD needs no fence and stays local. A range end past the
+  object is clamped to its size (RFC 9110) on both paths, so a proxied
+  `bytes=7-999` answers `206` with the clamped slice instead of `416`. A
+  read-only statement whose lease was lost is refused with `503`, but a statement
+  that committed a write keeps its result: the mutation is already durable, and
+  reporting it as failed would make the client retry a write that landed. The
+  post-commit auto-flush is best-effort for the same reason. The legacy forwarder
+  retries only a definite `409 not Raft leader`; a transport error is retried
+  only for `GET`/`HEAD`. `/s3-retired/` is
   deliberately not live: a retired manifest is unreachable to reads, so its
   chunks are exactly what an overwrite or delete made garbage (the records
   themselves are kept).
@@ -392,7 +403,20 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   data against a 897,060-byte floor; one pass deleted 42 fragments and reclaimed
   173,418 bytes (963,124 → 905,359), and the region still read back
   byte-identical, while a pass issued straight after a read refused with
-  `1 live lease(s) (1 reader, 0 writer)` and freed nothing. A crash between the
+  `1 live lease(s) (1 reader, 0 writer)` and freed nothing. A second live
+  three-node run (ports 22000-22300) confirmed the proxied read path: SQL, S3 and
+  block reads sent to a follower answered `200`/`206` with the exact bytes; a
+  pass right after those reads refused with `2 live lease(s) (2 reader, 0
+  writer)`, the same request 40 s later reclaimed 48 fragments / 198,192 bytes, a
+  rerun reclaimed nothing, and after a clean stop/start the 602 SQL rows, the S3
+  object and the block were intact. The native S3 wire listener was then
+  exercised on the same cluster: GET and HEAD answered on all three nodes, a
+  native Range GET through a follower answered `206` with `Content-Range: bytes
+  0-4/11`, and a missing key on a follower answered `404` with the S3 XML error
+  rather than the gateway's JSON. Two block overwrites plus those reads left one
+  live reader lease; the pass refused, and the next pass reclaimed 96 fragments /
+  396,483 bytes with the block, the S3 object and the 602 rows still intact.
+  `tests/protocols.py --native-clients` passed 17/17. A crash between the
   durable barrier and the compaction is simulated by dropping the volume after
   the barrier records are written: reopening reaps the expired collector lease,
   the rerun finishes, and the newest generation still reads back byte-identical.
@@ -405,12 +429,15 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   of body, the same limit keyed writes already have), so a larger block or object
   read must go to the leader directly; and no test runs a real multi-node pool,
   so remote enumeration, remote barriers and remote compaction are only exercised
-  in-process. The admission fence, ownership-guarded renewal/release and the
-  publication guard are covered by unit tests (`admission_is_closed_while_a_pass_holds_the_collector_record`,
+  in-process. The admission fence, ownership-guarded renewal/release, the
+  publication guard and the proxied read path are covered by unit tests
+  (`admission_is_closed_while_a_pass_holds_the_collector_record`,
   `a_lost_lease_cannot_release_or_guard_its_successors_record`,
   `a_superseded_collector_cannot_renew_delete_or_release_the_record`,
   `a_renewed_lease_keeps_its_ownership_and_extends_its_ttl`,
-  `a_write_whose_lease_was_reaped_does_not_publish`).
+  `a_write_whose_lease_was_reaped_does_not_publish`,
+  `proxy_response_preserves_allowlisted_entity_headers_and_rejects_duplicates`,
+  `range_end_past_the_size_is_clamped_but_a_start_past_it_is_refused`).
 - [x] Bound the metadata Raft log. The legacy Raft log is now checkpointed and
   compacted: `metakv/checkpoint.json` holds the durable state image (atomic
   write: tmp, `sync_data`, rename, `sync_dir`), `raft.wal` is rewritten through

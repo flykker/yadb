@@ -425,7 +425,7 @@ mod tests {
         let first = tablet.prepare_batch(row(2)).unwrap();
         let rejected = tablet.prepare_batch(row(3)).unwrap();
         let revision = tablet.publish_prepared(&first).unwrap();
-        tablet.apply_prepared(first, revision).unwrap();
+        tablet.apply_prepared(first, revision);
         assert!(matches!(
             tablet.publish_prepared(&rejected),
             Err(DbError::StaleTabletGeneration { .. })
@@ -845,20 +845,22 @@ impl<FS: StorageFs> DataShardTablet<FS> {
     }
 
     /// Post-commit hook: applies the committed manifest revision and MemTable updates.
-    pub fn apply_prepared(
-        &mut self,
-        prep: PreparedShardCommit,
-        new_revision: u64,
-    ) -> Result<(), DbError> {
+    pub fn apply_prepared(&mut self, prep: PreparedShardCommit, new_revision: u64) {
         self.manifest = prep.next_manifest;
         self.manifest_revision = new_revision;
         for (pk, entry) in prep.mutations {
             self.memtable.insert(pk, entry);
         }
         if self.memtable.len() >= self.flush_threshold_rows {
-            self.flush_to_sstable()?;
+            // The metadata transaction already committed this mutation durably.
+            // Flushing is a separate, retryable step, so do not report a
+            // committed write as an error. `flush_to_sstable` already leaves the
+            // memtable intact when it fails before publishing, and clears it only
+            // once the new SST is durable, so there is nothing to roll back here.
+            if let Err(error) = self.flush_to_sstable() {
+                eprintln!("post-commit auto-flush failed; will retry later: {error}");
+            }
         }
-        Ok(())
     }
 
     /// Writes a single-shard batch to `walPool`, publishes with a revision guard,
@@ -872,7 +874,8 @@ impl<FS: StorageFs> DataShardTablet<FS> {
         }
         let prep = self.prepare_batch(ops)?;
         let revision = self.publish_prepared(&prep)?;
-        self.apply_prepared(prep, revision)
+        self.apply_prepared(prep, revision);
+        Ok(())
     }
 
     fn publish_prepared(&self, prep: &PreparedShardCommit) -> Result<u64, DbError> {
@@ -927,6 +930,12 @@ impl<FS: StorageFs> DataShardTablet<FS> {
         let sst_bytes = serde_json::to_vec(&SstImage { entries })?;
         self.data_striper.put_blob(sst_id, &sst_bytes)?;
 
+        // Renew the lease *before* the in-memory manifest is touched. A renewal
+        // that fails means the fence is gone, so the write is refused with the
+        // manifest still exactly as it was: a partially applied in-memory
+        // manifest would otherwise name fragments durable metadata does not
+        // reference (and a pass may already have reclaimed).
+        let guards = lease_guards(writer_lease.as_mut())?;
         let prev_wals = std::mem::take(&mut self.manifest.wal_blobs);
         self.manifest.sst_blobs.push(SstRef {
             blob_id: sst_id,
@@ -935,7 +944,7 @@ impl<FS: StorageFs> DataShardTablet<FS> {
             row_count,
         });
 
-        if let Err(e) = self.cas_save_manifest_with(lease_guards(writer_lease.as_mut())?) {
+        if let Err(e) = self.cas_save_manifest_with(guards) {
             self.manifest.wal_blobs = prev_wals;
             self.manifest.sst_blobs.pop();
             return Err(e);
@@ -1017,13 +1026,16 @@ impl<FS: StorageFs> DataShardTablet<FS> {
             });
         }
 
+        // Renew before replacing the in-memory manifest, for the same reason as
+        // the flush path: a lost fence must leave this tablet exactly as it was.
+        let guards = lease_guards(writer_lease.as_mut())?;
         let prev_manifest = self.manifest.clone();
         self.manifest.generation = new_gen;
         self.manifest.last_step = 0;
         self.manifest.wal_blobs.clear();
         self.manifest.sst_blobs = new_ssts;
 
-        if let Err(e) = self.cas_save_manifest_with(lease_guards(writer_lease.as_mut())?) {
+        if let Err(e) = self.cas_save_manifest_with(guards) {
             self.manifest = prev_manifest;
             return Err(e);
         }

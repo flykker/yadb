@@ -999,7 +999,7 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
         // Finalize in-memory MemTables & manifest revisions.
         for (handle, prep) in prepared_list {
             let mut guard = handle.lock().unwrap();
-            guard.apply_prepared(prep, revision)?;
+            guard.apply_prepared(prep, revision);
         }
 
         if let Some(lease) = writer_lease {

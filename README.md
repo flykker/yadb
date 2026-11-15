@@ -571,9 +571,11 @@ admitted unfenced, and a read whose lease expired mid-flight is refused rather
 than answered from fragments a pass may already have reclaimed. Because only the
 metadata leader can publish that lease, a read sent to a follower is proxied to
 the leader — the same path writes already take, and the reason a follower read
-reports `503 node is not Raft leader` when the leader is unreachable. A proxied
-read is bounded by the forwarding wire cap (16 MiB of body); larger block or
-object reads must be sent to the leader directly.
+reports `503 node is not Raft leader` when the leader is unreachable. This
+covers the HTTP, native S3 and block read paths (the native listener re-verifies
+SigV4 first and keeps its XML error format). A proxied read is bounded by the
+forwarding wire cap (16 MiB of body); larger block or object reads must be sent
+to the leader directly.
 
 The metadata Raft log is bounded: once `metakv/raft.wal` passes 8 MiB (or 4096
 applied entries above its base) each node writes an atomic

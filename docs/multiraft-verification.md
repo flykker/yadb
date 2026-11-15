@@ -926,6 +926,22 @@ after fetching and answers `503` if it did not survive, because a pass may have
 reaped the expired record and reclaimed what was just read. Since only the
 metadata leader can publish a lease, a legacy follower proxies reads to the
 leader (carrying the caller's `Range` header) instead of serving them unfenced.
+Both the gateway and the native S3 listener proxy on a follower: the native
+listener re-authenticates the SigV4 request first, forwards the proven subject
+through the internal gateway, and re-frames a gateway error as an S3 XML error,
+so the wire format does not change. A range end past the object is clamped to the
+object size (RFC 9110) by both paths, so a proxied `bytes=7-999` still answers
+`206` with `Content-Range: bytes 7-8/9` rather than a `416`. A read-only
+statement whose lease did not survive is refused with `503`; a statement that
+committed a write keeps its result even if the fence was lost, because the
+mutation is already durable and reporting it as failed would make the client
+retry a write that landed — the loss is logged and the lease is not cached. The
+post-commit auto-flush is likewise best-effort: the rows are already durable
+through the committed manifest and its WAL blobs, so a flush failure is logged
+and retried by a later statement instead of failing the committed transaction.
+The legacy forwarder retries only a definite `409 not Raft leader`; a transport
+error is retried only for `GET`/`HEAD`, because a lost response to a mutation is
+not evidence that it did not commit.
 
 Deletion is per pool: an id is swept only when a mounted slot of that pool holds
 it and no manifest names it. Where a channel allocates `(owner, generation)`
@@ -950,9 +966,11 @@ module (`admission_is_closed_while_a_pass_holds_the_collector_record`,
 `a_lost_lease_cannot_release_or_guard_its_successors_record`,
 `a_superseded_collector_cannot_renew_delete_or_release_the_record`,
 `a_renewed_lease_keeps_its_ownership_and_extends_its_ttl`,
-`a_write_whose_lease_was_reaped_does_not_publish` in `yadb-block`). Byte counts
-are real bytes on disk across the three slots of an in-process mirror pool,
-measured before and after one pass:
+`a_write_whose_lease_was_reaped_does_not_publish` in `yadb-block`). The proxied
+read path is covered by `proxy_response_preserves_allowlisted_entity_headers_and_rejects_duplicates`
+and `range_end_past_the_size_is_clamped_but_a_start_past_it_is_refused`. Byte
+counts are real bytes on disk across the three slots of an in-process mirror
+pool, measured before and after one pass:
 
 | Scenario | Before | After | Live set | Fragments deleted |
 | --- | --- | --- | --- | --- |
@@ -994,10 +1012,18 @@ barriers_applied: 1`, and an immediate rerun reported `fragments_deleted: 0,
 bytes_reclaimed: 0, barriers_applied: 0`. After a clean stop/start the 602 SQL
 rows, the S3 object and the block contents were all intact, and the first pass
 after the restart refused on the two pre-restart reader records until they
-expired — no manual cleanup was needed. Gates on this tree: `yadbd --bins`
-**64/64**, `yadb-metakv` **169/169**, `yadb-block` **25/25**, `yadb-db`
-**46/46**, `yadb-s3` **26/26**, `cargo fmt --all -- --check` clean, and
-`tests/protocols.py` **16/16** on the legacy three-node cluster.
+expired — no manual cleanup was needed. The same cluster then exercised the
+native S3 wire listener: GET and HEAD answered on all three nodes, a native
+Range GET through a follower answered `206` with `Content-Range: bytes 0-4/11`,
+and a missing key on a follower answered `404` with the S3 XML error rather than
+the gateway's JSON. Two block overwrites plus those reads left one live reader
+lease, the pass refused, and the next pass reclaimed 96 fragments / 396,483
+bytes with the block, the S3 object and the 602 rows still intact. Gates on this
+tree: `yadbd --bins` **66/66**, `yadb-metakv` **169/169**, `yadb-block`
+**25/25**, `yadb-db` **46/46**, `yadb-s3` **26/26**, `cargo fmt --all --
+--check` clean, `tests/protocols.py` **16/16** and
+`tests/protocols.py --native-clients` **17/17** on the legacy three-node
+cluster.
 
 **Open.** The collector is legacy-only: on Multi-Raft both endpoints refuse with
 `garbage collection disabled for Multi-Raft: no single atomic cross-group
@@ -1005,14 +1031,14 @@ metadata snapshot`, because one node cannot enumerate every group's manifests
 while deletion is pool-scoped. A pass needs each node read-idle for one lease TTL
 (30 s), because a node keeps its reader lease for reuse instead of deleting it
 per statement; a continuously busy node refuses instead of waiting. A read that
-outlives its own lease is not refreshed mid-read, so a single query longer than
-30 s is not fenced. `/s3-retired/` records are kept indefinitely; the 300 s
-writer TTL is the only bound on a crashed writer blocking collection; and the
-tests use an in-process pool, so remote slot enumeration, remote barriers and
-remote compaction run through the same code paths without a second host. The
-metadata Raft log is a separate, larger gap: `raft.wal` is never truncated, so
-disk grows with every mutation regardless of this sweep (see the tracker item
-"Bound the metadata Raft log").
+outlives its own lease is not refreshed mid-read, so a query longer than 30 s is
+refused with `503` after it finishes rather than returning bytes a pass may have
+reclaimed; the client must re-issue it. `/s3-retired/` records are kept
+indefinitely; the 300 s writer TTL is the only bound on a crashed writer blocking
+collection; and the tests use an in-process pool, so remote slot enumeration,
+remote barriers and remote compaction run through the same code paths without a
+second host. The metadata Raft log is bounded separately by the checkpoint plus
+compaction item in the tracker.
 
 ### Live deployment after S1 (2026-11-15)
 
