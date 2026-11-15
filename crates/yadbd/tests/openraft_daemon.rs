@@ -1731,3 +1731,125 @@ spec: {quotas: {maxStorageBytes: 100000000, maxIops: 1000}, members: [{subject: 
 
     daemon.interrupt();
 }
+
+/// `/openraft/status` names every local group, so a deployment that configured
+/// `--subject-secret` must not answer an unverified caller.
+#[test]
+fn openraft_status_requires_verified_subject() {
+    let base = std::env::var_os("YADB_TEST_TMPDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let root = base.join(format!(
+        "yadb-daemon-status-auth-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir(&root).unwrap();
+    let dir = Dir(root.canonicalize().unwrap());
+    let metadata = dir.0.join("metadata");
+    std::fs::create_dir(&metadata).unwrap();
+    let data = dir.0.join("client-data");
+    let cert_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../yadb-metakv/testdata/tls")
+        .canonicalize()
+        .unwrap();
+    let cert = std::fs::read(cert_dir.join("node-1.test.cert.der")).unwrap();
+    let reservations: Vec<_> = (0..4)
+        .map(|_| TcpListener::bind("127.0.0.1:0").unwrap())
+        .collect();
+    let addrs: Vec<_> = reservations
+        .iter()
+        .map(|l| l.local_addr().unwrap())
+        .collect();
+    let mut paths = Vec::new();
+    for group in 1..=3usize {
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
+        let pair = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+        let key = dir.0.join(format!("signing-{group}.der"));
+        std::fs::write(&key, pkcs8.as_ref()).unwrap();
+        let path = dir.0.join(format!("group-{group}.json"));
+        config(
+            &path,
+            &json!({"version":1,"root":metadata,"mode":"create","initialize":true,"cluster":vec![81;16],"group":group,"incarnation":1,"node":1,"listen":addrs[group],"signing_key_der":key,
+            "tls":{"roots_der":[cert_dir.join("ca.der")],"chain_der":[cert_dir.join("node-1.test.cert.der")],"key_der":cert_dir.join("node-1.test.key.der")},
+            "peers":[{"id":1,"address":addrs[group],"public_key":pair.public_key().as_ref(),"server_name":"node-1.test","cert_sha256":MutualTls::fingerprint(&cert)}]}),
+        );
+        paths.push(path);
+    }
+    let manifest = dir.0.join("multi.json");
+    config(
+        &manifest,
+        &json!({"version":2,"control_group":1,"project_groups":{"1":2,"2":3},"groups":paths}),
+    );
+    drop(reservations);
+    let public = addrs[0];
+    let log = dir.0.join("daemon.log");
+    let mut daemon = spawn(&data, Some(&manifest), public, &log);
+    ready(&mut daemon, public);
+
+    // No identity at all is unverified.
+    let (status, _, response) = request_with_identity(
+        public,
+        "GET",
+        "/openraft/status",
+        b"",
+        "application/json",
+        "",
+        "",
+    );
+    assert_eq!(
+        status,
+        401,
+        "unsigned status: {}",
+        String::from_utf8_lossy(&response)
+    );
+    // A forged signature must not be accepted.
+    let forged = format!(
+        "x-yadb-subject: {SUBJECT}\r\nx-yadb-subject-signature: {}\r\n",
+        "00".repeat(32)
+    );
+    let (status, _, response) = request_with_identity(
+        public,
+        "GET",
+        "/openraft/status",
+        b"",
+        "application/json",
+        &forged,
+        "",
+    );
+    assert_eq!(
+        status,
+        401,
+        "forged status signature: {}",
+        String::from_utf8_lossy(&response)
+    );
+    // The signed subject the suite uses is accepted and the body is unchanged.
+    let signed = format!(
+        "x-yadb-subject: {SUBJECT}\r\nx-yadb-subject-signature: {}\r\n",
+        subject_signature(SUBJECT)
+    );
+    let (status, _, body) = request_with_identity(
+        public,
+        "GET",
+        "/openraft/status",
+        b"",
+        "application/json",
+        &signed,
+        "",
+    );
+    assert_eq!(
+        status,
+        200,
+        "signed status: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let status: Value = serde_json::from_slice(&body).unwrap();
+    assert!(status["local_observations"]
+        .as_array()
+        .is_some_and(|groups| groups.len() == 3));
+
+    daemon.interrupt();
+}

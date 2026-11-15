@@ -15,8 +15,8 @@ The local-cluster generator opts into per-group leader preferences
 (control 1 → node 1, data 2 → node 2, data 3 → node 3) and relaxed Raft
 timings. These settings bias elections, not placement guarantees or workload
 balancing; failover remains enabled. A healthy nonpreferred leader is not
-automatically displaced when the preferred node returns. Authenticated
-`/openraft/status` reports each group's observed `leader_id`,
+automatically displaced when the preferred node returns. The
+`/openraft/status` route reports each group's observed `leader_id`,
 `preferred_leader`, and `preference_met` (null when either is unknown). The
 ordinary health leader refers only to the control group. All replicas of a
 group must use the same preference and timing values; the election maximum is
@@ -41,11 +41,13 @@ The two election ranges overlap by design because the maximum must remain
 common; a nonpreferred voter can legitimately win. Both fields are opt-in
 together, and `preferred_leader` must identify a voter.
 
-The status endpoint is the authenticated endpoint
-`GET /openraft/status`; it is not an unauthenticated admin
-interface. Configure the preference on every replica of the group. A returning
-preferred node does not automatically reclaim a healthy leader, and failover
-availability remains enabled.
+The status endpoint `GET /openraft/status` is not an unauthenticated admin
+interface: when the daemon is started with `--subject-secret` it requires a
+verified signed subject and answers `401` otherwise. Without a configured
+secret no subject can be verified, so the route stays open like the other
+legacy fallbacks. Configure the preference on every replica of the group. A
+returning preferred node does not automatically reclaim a healthy leader, and
+failover availability remains enabled.
 
 `yadb` is a modular Rust distributed storage and multi-tenant data platform inspired by **YDB's immutable `BlobStorage` + Tablets** and **Kubernetes' declarative YAML control plane**—designed to run directly on standard Linux filesystems (`ext4`/`xfs`) without raw `PDisk` block devices.
 
