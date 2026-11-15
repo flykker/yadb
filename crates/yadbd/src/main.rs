@@ -359,6 +359,10 @@ struct SqlQueryPayload {
     force_leader: bool,
     #[serde(default)]
     require_transaction: bool,
+    /// Opt-in quorum-confirmed read of a `SELECT`/`SHOW` script. Absent or
+    /// `false` keeps the default local applied-state behaviour.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    consistent: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -2961,6 +2965,25 @@ async fn handle_db_query(
     };
 
     let has_writes = script_has_writes(&stmts);
+    let consistent = req.consistent.unwrap_or(false);
+    if consistent {
+        // A consistent read is one quorum-confirmed snapshot of read-only state.
+        // Anything that could mutate, open a transaction or depend on a
+        // session buffer is refused before a snapshot is taken, so a mutating
+        // statement can never reach the consistent path.
+        if req.session_id.is_some() || req.require_transaction {
+            return api_err(
+                StatusCode::BAD_REQUEST,
+                "consistent reads cannot use session_id or require_transaction",
+            );
+        }
+        if has_writes {
+            return api_err(
+                StatusCode::BAD_REQUEST,
+                "consistent reads support only SELECT and SHOW statements",
+            );
+        }
+    }
     if headers.contains_key("idempotency-key") {
         return if has_writes {
             unsupported_idempotency()
@@ -2975,7 +2998,10 @@ async fn handle_db_query(
     };
     let subject = extract_subject(&headers, st.subject_secret.as_deref());
 
-    if has_writes || req.force_leader {
+    // A quorum-confirmed read must run on the project-group leader. A legacy
+    // node cannot serve it at all, so it is not forwarded: the engine answers
+    // with the documented routing error instead of a stale local read.
+    if has_writes || req.force_leader || (consistent && st.meta.is_openraft()) {
         if let Ok(raw_body) = serde_json::to_vec(&req) {
             if let Some(proxied) = maybe_forward_write(
                 &st,
@@ -3036,15 +3062,19 @@ async fn handle_db_query(
         .map(|id| format!("{subject}#{id}"))
         .unwrap_or(subject);
     let exec = tokio::task::spawn_blocking(move || {
-        db_engine.execute_sql_with_session(
-            project_id,
-            &database,
-            &wal_pool,
-            &data_pool,
-            shards,
-            Some(&subj_session),
-            &sql_raw,
-        )
+        if consistent {
+            db_engine.execute_read_consistent(project_id, &database, &sql_raw)
+        } else {
+            db_engine.execute_sql_with_session(
+                project_id,
+                &database,
+                &wal_pool,
+                &data_pool,
+                shards,
+                Some(&subj_session),
+                &sql_raw,
+            )
+        }
     })
     .await;
 
@@ -3776,11 +3806,80 @@ async fn handle_s3_put(
     }
 }
 
+#[derive(Deserialize)]
+struct S3GetQuery {
+    /// Opt-in quorum-confirmed read of the object manifest. Absent or `false`
+    /// keeps the default local applied-state behaviour.
+    #[serde(default)]
+    consistent: bool,
+}
+
+/// A manifest obtained from a quorum-confirmed snapshot is a point-in-time
+/// view, not a GC fence: a newer overwrite may have retired a chunk before the
+/// read fetches it. For a consistent read that is an availability failure
+/// (503), never zeros or a silent skip. The default local path keeps its
+/// existing mapping.
+fn is_stale_chunk_error(err: &S3Error) -> bool {
+    matches!(
+        err,
+        S3Error::Blob(
+            BlobError::NotFound(_)
+                | BlobError::Tombstoned(_)
+                | BlobError::InsufficientFragments { .. }
+        )
+    )
+}
+
+fn s3_read_err(st: &AppState, err: S3Error) -> Response {
+    match err {
+        S3Error::ObjectNotFound { .. } => api_err(StatusCode::NOT_FOUND, "object not found"),
+        S3Error::Meta(me) => meta_err_resp(st, me),
+        S3Error::InvalidRange { .. } => {
+            api_err(StatusCode::RANGE_NOT_SATISFIABLE, "range out of bounds")
+        }
+        err if is_stale_chunk_error(&err) => {
+            api_err(StatusCode::SERVICE_UNAVAILABLE, err.to_string())
+        }
+        err => api_err(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+    }
+}
+
 async fn handle_s3_get(
     State(st): State<AppState>,
     headers: HeaderMap,
     Path((project, store, bucket, key)): Path<(String, String, String, String)>,
+    Query(q): Query<S3GetQuery>,
 ) -> Response {
+    if q.consistent && st.meta.is_openraft() {
+        // The manifest is read through a quorum-confirmed snapshot on the
+        // project-group leader, so this request must run on that leader. A
+        // legacy node cannot serve it at all, so it is not forwarded: the
+        // engine answers with the documented routing error instead of a stale
+        // local read.
+        if let Some(resp) = maybe_forward_write(
+            &st,
+            &headers,
+            Some(&project),
+            "GET",
+            format!(
+                "/s3/{}/{}/{}/{}?consistent=true",
+                protocols::url(&project),
+                protocols::url(&store),
+                protocols::url(&bucket),
+                key.split('/')
+                    .map(protocols::url)
+                    .collect::<Vec<_>>()
+                    .join("/")
+            ),
+            "application/octet-stream".into(),
+            Bytes::new(),
+        )
+        .await
+        {
+            return resp;
+        }
+    }
+
     let subject = extract_subject(&headers, st.subject_secret.as_deref());
     let (project_id, _) = {
         let cp = match st.control_for_authorization_async().await {
@@ -3793,11 +3892,16 @@ async fn handle_s3_get(
         }
     };
 
-    if let Some(range_hdr) = headers
+    let range_hdr = headers
         .get(header::RANGE)
         .and_then(|h| h.to_str().ok())
-        .map(str::to_string)
-    {
+        .map(str::to_string);
+
+    if q.consistent {
+        return s3_get_consistent(st, project_id, store, bucket, key, range_hdr).await;
+    }
+
+    if let Some(range_hdr) = range_hdr {
         let head = match st.s3.head_object(project_id, &store, &bucket, &key) {
             Ok(h) => h,
             Err(S3Error::ObjectNotFound { .. }) => {
@@ -3853,6 +3957,77 @@ async fn handle_s3_get(
             api_err(StatusCode::NOT_FOUND, "object not found")
         }
         Ok(Err(e)) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+/// Quorum-confirmed GET. The manifest comes from exactly one linearizable
+/// snapshot; the chunks are then fetched by the ids that manifest names. There
+/// is no fallback to the locally applied manifest and no retry.
+async fn s3_get_consistent(
+    st: AppState,
+    project_id: u32,
+    store: String,
+    bucket: String,
+    key: String,
+    range_hdr: Option<String>,
+) -> Response {
+    if let Some(range_hdr) = range_hdr {
+        let s3 = st.s3.clone();
+        let head = tokio::task::spawn_blocking(move || {
+            s3.head_object_consistent(project_id, &store, &bucket, &key)
+        })
+        .await;
+        let mf = match head {
+            Ok(Ok(mf)) => mf,
+            Ok(Err(e)) => return s3_read_err(&st, e),
+            Err(e) => return api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        };
+        let Some((start, end)) = parse_range_header(&range_hdr, mf.size) else {
+            return api_err(StatusCode::RANGE_NOT_SATISFIABLE, "invalid Range header");
+        };
+        let s3 = st.s3.clone();
+        let res = tokio::task::spawn_blocking(move || {
+            let bytes = s3.read_manifest_range(&mf, start, end)?;
+            Ok::<_, S3Error>((mf, bytes))
+        })
+        .await;
+        return match res {
+            Ok(Ok((mf, bytes))) => (
+                StatusCode::PARTIAL_CONTENT,
+                [
+                    (header::CONTENT_TYPE, mf.content_type),
+                    (header::ETAG, mf.etag),
+                    (
+                        header::CONTENT_RANGE,
+                        format!("bytes {start}-{end}/{}", mf.size),
+                    ),
+                ],
+                bytes,
+            )
+                .into_response(),
+            Ok(Err(e)) => s3_read_err(&st, e),
+            Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        };
+    }
+
+    let s3 = st.s3.clone();
+    let res = tokio::task::spawn_blocking(move || {
+        s3.get_object_consistent(project_id, &store, &bucket, &key)
+    })
+    .await;
+
+    match res {
+        Ok(Ok((mf, bytes))) => (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, mf.content_type),
+                (header::ETAG, mf.etag),
+            ],
+            bytes,
+        )
+            .into_response(),
+        Ok(Err(e)) => s3_read_err(&st, e),
         Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }
@@ -4533,6 +4708,48 @@ mod security_tests {
             "/block/project%20%3F%23%E9%9B%AA/name%20%3F%23%C3%A9%2F%25/unmap"
         );
         assert_eq!(format!("{block}?offset=0&len=4&consistent=true"), "/block/project%20%3F%23%E9%9B%AA/name%20%3F%23%C3%A9%2F%25?offset=0&len=4&consistent=true");
+    }
+
+    #[test]
+    fn consistent_flags_are_opt_in_and_default_off() {
+        let plain: SqlQueryPayload = serde_json::from_str(r#"{"sql":"SELECT * FROM t"}"#).unwrap();
+        assert_eq!(plain.consistent, None);
+        let opt_in: SqlQueryPayload =
+            serde_json::from_str(r#"{"sql":"SELECT * FROM t","consistent":true}"#).unwrap();
+        assert_eq!(opt_in.consistent, Some(true));
+
+        let plain: S3GetQuery = serde_json::from_str("{}").unwrap();
+        assert!(!plain.consistent);
+        let opt_in: S3GetQuery = serde_json::from_str(r#"{"consistent":true}"#).unwrap();
+        assert!(opt_in.consistent);
+    }
+
+    // A consistent S3 read reports a chunk that the pinned manifest names but
+    // that is gone as an availability failure (503), never as zeros or a short
+    // body. The default path keeps its existing mapping.
+    #[test]
+    fn consistent_s3_read_maps_a_collected_chunk_to_availability() {
+        let id = BlobId::new(1, 1, 1, 1, 4, 0);
+        for err in [
+            S3Error::Blob(BlobError::NotFound(id)),
+            S3Error::Blob(BlobError::Tombstoned(id)),
+            S3Error::Blob(BlobError::InsufficientFragments {
+                available: 1,
+                required: 4,
+            }),
+        ] {
+            assert!(is_stale_chunk_error(&err), "{err:?} must map to 503");
+        }
+        assert!(!is_stale_chunk_error(&S3Error::ObjectNotFound {
+            bucket: "b".into(),
+            key: "k".into(),
+        }));
+        assert!(!is_stale_chunk_error(&S3Error::Blob(
+            BlobError::CorruptData {
+                id,
+                reason: "corrupt",
+            }
+        )));
     }
 
     #[test]

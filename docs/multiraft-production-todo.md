@@ -64,7 +64,13 @@ targeted checks also passed: security tests 16/16, state tests 16/16, storage
 full gates above. S3 GC is disabled. OpenRaft `consistent=true` block reads are
 implemented (linearizable extent-map read on the project-group leader, forwarded
 from followers, missing blob is a `503`), so the iSCSI read path is no longer
-refused; that map snapshot is not a GC fence. Startup and shutdown cancellation
+refused; that map snapshot is not a GC fence. SQL (`"consistent": true` in the
+`POST /db/{project}/{db}/query` body, `SELECT`/`SHOW` only) and S3
+(`?consistent=true` on object GET/range GET) now have the same explicit opt-in:
+one quorum-confirmed snapshot of the SQL database namespace or of the object
+manifest, no fallback to local applied state, `MetaError` propagated (legacy
+metadata answers the routing error), and a chunk the pinned S3 manifest names
+but that is gone is a `503`. Defaults are unchanged. Startup and shutdown cancellation
 are both covered: a dropped startup future releases the acquired replica and the
 durable lock. The POSIX compaction stale-FD claim was
 false; explicit reopen and an append regression are retained only.
@@ -287,10 +293,16 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   (`BlockVolumeEngine::unmap_at_with`). `resolve` accepts a project scope and
   fences in the project group. SQL, S3 object PUT/DELETE and block PUT still
   reject a key with 501. Reads mostly still serve the locally applied state:
-  `LocalMetaKv::try_linearizable_snapshot` is consumed only by OpenRaft block
-  reads with `consistent=true` (and the iSCSI read path), which forward to the
+  `LocalMetaKv::try_linearizable_snapshot` is consumed by the OpenRaft block
+  read with `consistent=true` (and the iSCSI read path), which forward to the
   project-group leader and fail rather than return a stale or partially collected
-  volume.
+  volume. The SQL `consistent` body flag and the S3 `?consistent=true` GET take
+  exactly one such snapshot (the whole `/db/{project}/{db}/` prefix for SQL, the
+  object manifest key for S3), never mix it with local applied state, and
+  propagate `MetaError` instead of falling back; SQL refuses anything that is not
+  `SELECT`/`SHOW` and any session/transaction flag with `400` before taking a
+  snapshot. Those paths are still opt-in, and the default read remains
+  local-applied.
   `docs/multiraft-idempotency-design.md` holds the full contract and the blockers
   that prevent the remaining scopes: SQL/S3/block PUT still cannot publish all
   visible effects and a bounded response in one guarded transaction (they stage
