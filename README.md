@@ -148,8 +148,8 @@ portal; committed rows remain available through Raft and the replicated BlobStor
 New SQL WAL/SST blobs use channels 6/7 and a durable project-wide 56-bit allocation
 in `/sql-blob-sequence/{project_id}`, reserved before fragment PUT. Physical IDs no
 longer depend on the CRC32 tablet owner, legacy generation/step, or whether a prior
-preparation was published. Do not delete/reset the sequence; restore metadata and
-fragments together. Legacy channel-1/2 references remain readable. Allocation,
+preparation was published. Do not delete/reset the sequence; metadata and fragments must come
+from the same point in time. Legacy channel-1/2 references remain readable. Allocation,
 legacy generation and row-sequence exhaustion fail instead of wrapping/saturating.
 Upgrades require all nodes stopped and coordinated; mixed old/new SQL writers and
 downgrades are unsupported. Existing legacy ID aliasing is not repaired automatically.
@@ -303,8 +303,9 @@ instead of returning local data.
 
 New uploads reserve a durable per-project sequence and persist the complete chunk list
 in `/s3-intent/` **before** writing any fragments. New S3 blobs use channel 4, separate
-from legacy S3/SQL data and block extents. The allocator must never be deleted/reset;
-restore metadata and fragment data together, not from unrelated points in time.
+from legacy S3/SQL data and block extents. The allocator must never be deleted/reset, and
+metadata and fragment data must always come from the same point in time: rebuilding
+one without the other silently reuses or loses IDs.
 
 Publishing a manifest, retiring its previous version and removing the upload intent
 is one revision-guarded Raft transaction. Revision guards prevent a deleted/recreated
@@ -376,7 +377,8 @@ these IDs from legacy channel-3 extents, SQL and S3; owner/generation encode the
 allocation and step identifies each touched block. Volume names/hashes, process
 restarts and deletion/recreation of extent maps cannot reuse the new IDs. Allocation
 exhaustion fails rather than wrapping; failed writes may consume allocations.
-Never delete/reset the sequence, and restore metadata and fragments together.
+Never delete/reset the sequence, and keep metadata and fragments from the same
+point in time.
 Legacy extent maps remain readable and are migrated block-by-block on write, not
 rewritten in place. `generation` in a new extent map is allocation metadata, not a
 volume ownership or GC fence. Stopped, coordinated upgrades are required; mixed

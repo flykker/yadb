@@ -273,14 +273,15 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   refused with `BlobError::RedundancyNotMet`, counted in
   `PoolHealthSnapshot::refused_puts` / `ScrubSummary::refused_puts`, and mapped to
   `503` on the SQL, S3 and block paths. Nothing is published for a refused write, so
-  the caller holds no reference to the fragments that did land and the orphan scan
-  reclaims them. The consequence is deliberate: a pool with any slot offline refuses
-  new writes instead of accepting unprotected ones, so write availability now
-  follows full redundancy. The three-node daemon test asserts this: a write while
-  one replica is stopped is refused with `503` and stays invisible, and the same
-  statement succeeds after that replica returns. Open: no test exercises a real
-  multi-node pool; a partially written blob is still readable by id until the
-  orphan scan runs; and refusal is per pool, so one offline domain stops writes for
+  the caller holds no reference to the fragments that did land; those fragments are
+  garbage, not corruption, and nothing reclaims them yet (see the
+  garbage-collection item). The consequence is deliberate: a pool with any slot
+  offline refuses new writes instead of accepting unprotected ones, so write
+  availability now follows full redundancy. The three-node daemon test asserts this:
+  a write while one replica is stopped is refused with `503` and stays invisible,
+  and the same statement succeeds after that replica returns. Open: no test
+  exercises a real multi-node pool; a refused write is still readable by id until a
+  collector exists; and refusal is per pool, so one offline domain stops writes for
   every volume on it.
 - [ ] Idempotency and read-consistency contracts. A keyed `POST /v1/apply` is
   implemented (`Idempotency-Key`, the outcome record committed in the same
@@ -327,6 +328,34 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   per read path. The group-scoped counter also means projects that share a group
   share one budget, which is intended but not yet exercised with a real second
   project on the same group.
+- [ ] Garbage collection outside the S3 upload-intent path. Nothing deletes
+  superseded data. Every block overwrite writes a new immutable fragment set and
+  drops the old one from the extent map; every SQL WAL blob folded into an SST,
+  and every SST replaced by a later compaction, leaves the previous blobs
+  unreferenced; overwriting or deleting an S3 object retires its manifest but
+  keeps its chunks readable; a refused write leaves the fragments that did land.
+  What exists is not a collector: `ObjectStoreEngine::collect_orphans_all` only
+  aborts expired `Prepared` upload intents inside the S3 namespace, and
+  `scrub_all_pools` repairs live blobs and deletes nothing. Both are refused
+  outright on Multi-Raft, so a cluster on that runtime reclaims nothing at all.
+  Disk therefore grows monotonically with writes, which is the main reason this
+  cannot yet be used as a long-lived store.
+  A naive mark-and-sweep is wrong here: a consistent read pins a revision and
+  fetches blobs afterwards, so deleting anything reachable from a live pinned
+  revision turns a read that was already promised into the `503` the handler
+  documents. The design must be a reader fence, not a grace period: a consistent
+  read publishes the revision it pinned as a short-lived lease in its own group,
+  and GC takes one quorum-confirmed snapshot, computes the live set, and deletes
+  only fragments that were already unreferenced at the oldest live lease, reaping
+  expired leases in the same pass. If the fence cannot be read, GC must refuse
+  rather than guess. Deletion is also pool-scoped while manifests are
+  group-scoped, so a fragment is deletable only when no group references it: the
+  sweep needs either every group's live set or a per-group barrier it can prove.
+  Acceptance: overwrite a block repeatedly, compact a table, overwrite and delete
+  an S3 object and refuse a write, then assert disk usage returns to the live-set
+  size; a concurrent consistent read must either finish from its pinned revision
+  or fail with `503`, never return partial bytes; a crash in the middle of a sweep
+  must not leave a referenced fragment deleted.
 
 Backup and restore are **out of scope by owner decision**, not an oversight: no
 command, artifact format, fence or validator exists, and none is planned. A lost
