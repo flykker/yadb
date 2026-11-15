@@ -428,6 +428,26 @@ pub async fn handle(State(st): State<S3State>, request: Request) -> Response {
     if let Some(ct) = headers.get(header::CONTENT_TYPE) {
         gateway_headers.insert(header::CONTENT_TYPE, ct.clone());
     }
+    // A keyed mutation is scoped by subject and the gateway handlers require a
+    // proven identity. SigV4 already proved it here, so forward the key and
+    // vouch for the same subject with the internal signature. This is only done
+    // for keyed PUT/DELETE: an unkeyed request keeps its previous headers
+    // byte-for-byte.
+    if (method == Method::PUT || method == Method::DELETE)
+        && headers.contains_key("idempotency-key")
+    {
+        if let Some(value) = headers.get("idempotency-key") {
+            gateway_headers.insert("idempotency-key", value.clone());
+        }
+        if let Some(secret) = st.app.subject_secret.as_deref() {
+            match subject_signature(secret, &subject).parse() {
+                Ok(v) => {
+                    gateway_headers.insert("x-yadb-subject-signature", v);
+                }
+                Err(_) => return err(StatusCode::FORBIDDEN, "AccessDenied", "invalid subject"),
+            }
+        }
+    }
     let path = (
         st.project.clone(),
         st.store.clone(),

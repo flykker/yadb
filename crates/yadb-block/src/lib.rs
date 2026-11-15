@@ -145,6 +145,9 @@ impl<FS: StorageFs> BlockVolumeEngine<FS> {
         }
     }
 
+    // Used by the tests that publish a hand-built map; production paths go
+    // through `publish_map_with` so a caller can append guards and ops.
+    #[cfg(test)]
     fn publish_map(
         &self,
         key: String,
@@ -196,6 +199,68 @@ impl<FS: StorageFs> BlockVolumeEngine<FS> {
         offset: u64,
         data: &[u8],
     ) -> Result<usize, BlockError> {
+        // An empty write has never touched metadata on this entry point and must
+        // keep that behaviour: no allocation, no publication, no new revision.
+        // The `_with` form cannot short-circuit, because a caller's record has to
+        // commit with the (empty) publication.
+        if data.is_empty() {
+            return Ok(0);
+        }
+        self.write_at_with(
+            project_id,
+            volume,
+            pool_name,
+            volume_size_bytes,
+            offset,
+            data,
+            |_| Ok(MapPublication::default()),
+        )
+    }
+
+    /// [`Self::write_at`] with caller-supplied guards and ops committed in the
+    /// same `RevisionTxn` as the new extent map.
+    ///
+    /// This is the keyed-write entry point: the map and the caller's record (an
+    /// idempotency record and its admission counter, in practice) either both
+    /// commit under one cluster revision or neither does. A caller guard that
+    /// fails aborts the whole apply, so there is no state in which the map
+    /// advanced without the record or the record exists without the map.
+    ///
+    /// Ordering and orphan fragments: the new immutable blob fragments are
+    /// written *before* the publication, exactly as in [`Self::write_at`]. A
+    /// refusal, a conflict that exhausts the retry bound, or a crash before the
+    /// publication leaves those fragments unreferenced. They are garbage, not
+    /// corruption: the fragment IDs were reserved durably before the writes, so
+    /// they are never reused for different bytes, and the orphan scan reclaims
+    /// them. Nothing here rolls fragments back — a rollback would race the
+    /// publication it is trying to undo and could delete a blob another attempt
+    /// already references. This is the same "refused/unpublished write leaves
+    /// unreferenced fragments" contract `put_blob` already has.
+    ///
+    /// `prepare` is invoked once per publication attempt with the map *as it
+    /// will be published*. The engine retries `CasConflict` (a definite
+    /// non-commit) up to 32 times, so `prepare` must be safe to call repeatedly
+    /// and must re-read any state it guards (such as the record and counter
+    /// revisions) on every call; reusing a stale revision only spins. An `Err`
+    /// from `prepare` is returned immediately without another attempt and
+    /// nothing was submitted for that attempt, so it is a definite non-commit,
+    /// unlike a storage error.
+    ///
+    /// With an empty `data` the fragments and allocation are skipped but the
+    /// map still publishes, because the caller's ops need a transaction to join.
+    pub fn write_at_with<F>(
+        &self,
+        project_id: u32,
+        volume: &str,
+        pool_name: &str,
+        volume_size_bytes: u64,
+        offset: u64,
+        data: &[u8],
+        mut prepare: F,
+    ) -> Result<usize, BlockError>
+    where
+        F: FnMut(&VolumeExtentMap) -> Result<MapPublication, BlockError>,
+    {
         if offset
             .checked_add(data.len() as u64)
             .is_none_or(|end| end > volume_size_bytes)
@@ -207,7 +272,17 @@ impl<FS: StorageFs> BlockVolumeEngine<FS> {
             });
         }
         if data.is_empty() {
-            return Ok(0);
+            // No fragments and no allocation: only the caller's publication can
+            // change anything, but it still needs one guarded transaction.
+            let key = Self::meta_key(project_id, volume);
+            for _ in 0..32 {
+                let (revision, map) = self.load_map_snapshot(project_id, volume)?;
+                let extra = prepare(&map)?;
+                if self.publish_map_with(key.clone(), revision, &map, extra)? {
+                    return Ok(0);
+                }
+            }
+            return Err(BlockError::Conflict);
         }
 
         let pool = self.get_pool(pool_name)?;
@@ -253,7 +328,11 @@ impl<FS: StorageFs> BlockVolumeEngine<FS> {
                 cursor += copy_len;
             }
 
-            if self.publish_map(key, revision, &map)? {
+            // Prepared with the map this attempt would publish, after all
+            // fragment writes: the caller's guards/ops join this transaction and
+            // nothing else, and a refusal aborts before the map op is submitted.
+            let extra = prepare(&map)?;
+            if self.publish_map_with(key, revision, &map, extra)? {
                 return Ok(data.len());
             }
         }
@@ -1296,5 +1375,172 @@ mod tests {
             "a rejected request must not build or commit a transaction"
         );
         assert!(meta.get("/block-write-sequence/1").is_none());
+    }
+
+    // The write analogue of `satisfied_caller_guard_commits_map_and_record_in_one_transaction`:
+    // map and caller record carry one cluster revision, which only a single
+    // transaction can produce, and the record is the post-write map the caller
+    // was handed.
+    #[test]
+    fn keyed_write_commits_map_and_record_in_one_transaction() {
+        let fs = SimFs::new(8822);
+        let meta = LocalMetaKv::open_single_node(&fs, "meta", 1).unwrap();
+        let engine = BlockVolumeEngine::new(meta.clone(), 4096);
+        engine.register_pool("data", pool(&fs));
+        engine
+            .write_at(1, "disk", "data", 16384, 0, &vec![7u8; 4096])
+            .unwrap();
+        let map_key = BlockVolumeEngine::<SimFs>::meta_key(1, "disk");
+        let before = engine.load_map_snapshot(1, "disk").unwrap();
+        let record = "/block-write/1/disk/op-1".to_string();
+        let mut seen = None;
+        let written = engine
+            .write_at_with(1, "disk", "data", 16384, 4096, b"keyed", |map| {
+                seen = Some(map.clone());
+                Ok(MapPublication {
+                    guards: vec![RevisionGuard {
+                        key: record.clone(),
+                        expected_mod_revision: 0,
+                    }],
+                    ops: vec![TxnOp::Put {
+                        key: record.clone(),
+                        value: b"done".to_vec(),
+                    }],
+                })
+            })
+            .unwrap();
+        assert_eq!(written, 5);
+        let after = meta.get(&map_key).unwrap();
+        let stored = meta.get(&record).unwrap();
+        assert_eq!(stored.value, b"done");
+        assert_eq!(
+            after.mod_revision, stored.mod_revision,
+            "map and record were not written by one transaction"
+        );
+        assert!(before.0 < after.mod_revision);
+        // `prepare` saw exactly the map that committed.
+        let seen = seen.expect("prepare must be invoked for a publishable request");
+        let map = engine.load_map(1, "disk").unwrap();
+        assert_eq!(seen.blocks, map.blocks);
+        assert_eq!(seen.generation, map.generation);
+        assert_eq!(
+            engine.read_at(1, "disk", "data", 16384, 4096, 5).unwrap(),
+            b"keyed"
+        );
+    }
+
+    // Atomicity: an unsatisfiable caller guard aborts the whole apply, so the
+    // map keeps its revision and contents and the record never appears.
+    #[test]
+    fn failed_caller_guard_leaves_written_map_and_record_untouched() {
+        let fs = SimFs::new(8823);
+        let meta = LocalMetaKv::open_single_node(&fs, "meta", 1).unwrap();
+        let engine = BlockVolumeEngine::new(meta.clone(), 4096);
+        engine.register_pool("data", pool(&fs));
+        engine
+            .write_at(1, "disk", "data", 16384, 0, &vec![8u8; 4096])
+            .unwrap();
+        let map_key = BlockVolumeEngine::<SimFs>::meta_key(1, "disk");
+        let before = meta.get(&map_key).unwrap();
+        let record = "/block-write/1/disk/never".to_string();
+        let result = engine.write_at_with(1, "disk", "data", 16384, 4096, b"refused", |_| {
+            Ok(MapPublication {
+                guards: vec![RevisionGuard {
+                    key: record.clone(),
+                    expected_mod_revision: 1,
+                }],
+                ops: vec![TxnOp::Put {
+                    key: record.clone(),
+                    value: b"done".to_vec(),
+                }],
+            })
+        });
+        assert!(
+            matches!(&result, Err(BlockError::Conflict)),
+            "a never-satisfiable caller guard must end in a definite non-commit, got {result:?}"
+        );
+        assert!(
+            meta.get(&record).is_none(),
+            "caller record leaked although the transaction never committed"
+        );
+        let after = meta.get(&map_key).unwrap();
+        assert_eq!(
+            after.mod_revision, before.mod_revision,
+            "map advanced although the caller's guard failed"
+        );
+        assert_eq!(after.value, before.value);
+        // The refused range still reads as thin-provisioned zeros, not "refused".
+        assert_eq!(
+            engine.read_at(1, "disk", "data", 16384, 4096, 7).unwrap(),
+            vec![0u8; 7]
+        );
+    }
+
+    // A refusal is not a conflict: it must be reported on the first attempt and
+    // commit nothing, exactly like the UNMAP entry point.
+    #[test]
+    fn write_prepare_refusal_is_reported_without_retrying_or_committing() {
+        let fs = SimFs::new(8824);
+        let meta = LocalMetaKv::open_single_node(&fs, "meta", 1).unwrap();
+        let engine = BlockVolumeEngine::new(meta.clone(), 4096);
+        engine.register_pool("data", pool(&fs));
+        let map_key = BlockVolumeEngine::<SimFs>::meta_key(1, "disk");
+        let mut attempts = 0u32;
+        let result = engine.write_at_with(1, "disk", "data", 8192, 0, b"refused", |_| {
+            attempts += 1;
+            Err(BlockError::PoolNotMounted("refused".into()))
+        });
+        assert!(
+            matches!(result, Err(BlockError::PoolNotMounted(_))),
+            "a caller refusal must be reported verbatim, got {result:?}"
+        );
+        assert_eq!(attempts, 1, "a refusal must not be retried");
+        assert!(
+            meta.get(&map_key).is_none(),
+            "map published although the caller refused"
+        );
+    }
+
+    // An empty keyed write has no fragments, but the caller's record still needs
+    // one transaction to join; the legacy entry point keeps its no-op fast path.
+    #[test]
+    fn empty_write_publishes_only_the_callers_record() {
+        let fs = SimFs::new(8825);
+        let meta = LocalMetaKv::open_single_node(&fs, "meta", 1).unwrap();
+        let engine = BlockVolumeEngine::new(meta.clone(), 4096);
+        let map_key = BlockVolumeEngine::<SimFs>::meta_key(1, "disk");
+        let record = "/block-write/1/disk/empty".to_string();
+        assert_eq!(
+            engine
+                .write_at(1, "disk", "missing-pool", 8192, 0, b"")
+                .unwrap(),
+            0
+        );
+        assert!(
+            meta.get(&map_key).is_none(),
+            "legacy empty write must not touch metadata"
+        );
+        assert_eq!(
+            engine
+                .write_at_with(1, "disk", "missing-pool", 8192, 0, b"", |_| {
+                    Ok(MapPublication {
+                        guards: vec![RevisionGuard {
+                            key: record.clone(),
+                            expected_mod_revision: 0,
+                        }],
+                        ops: vec![TxnOp::Put {
+                            key: record.clone(),
+                            value: b"done".to_vec(),
+                        }],
+                    })
+                })
+                .unwrap(),
+            0
+        );
+        assert_eq!(meta.get(&record).unwrap().value, b"done");
+        assert_eq!(
+            meta.get(&map_key).unwrap().mod_revision,
+            meta.get(&record).unwrap().mod_revision
+        );
     }
 }
