@@ -503,6 +503,107 @@ async fn persistent_group_lifecycle_initializes_shuts_down_and_reopens() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+// End to end: the unit tests prove the state-machine half in isolation, but
+// only a real OpenRaft restart proves that `applied: None` plus an unpurged
+// log actually replays the whole history into the rebuilt machine. The
+// singleton writes one key, loses its image to bit rot, and must serve both
+// that key and a new one afterwards.
+#[tokio::test]
+async fn corrupt_state_image_is_rebuilt_and_replayed_by_openraft() {
+    let root = std::env::temp_dir().join(format!(
+        "yadb-openraft-rebuild-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let identity = crate::multiraft::ReplicaIdentity::new(
+        crate::multiraft::GroupIdentity {
+            cluster: [6; 16],
+            group: 21,
+            incarnation: 1,
+        },
+        1,
+        vec![1],
+    )
+    .unwrap();
+    let config = Arc::new(
+        openraft::Config {
+            snapshot_policy: openraft::SnapshotPolicy::Never,
+            ..Default::default()
+        }
+        .validate()
+        .unwrap(),
+    );
+    let group = PersistentGroup::create(&root, &identity, config.clone(), NoNetwork)
+        .await
+        .unwrap();
+    group
+        .raft()
+        .initialize(BTreeMap::from([(1, BasicNode::new("node-1"))]))
+        .await
+        .unwrap();
+    group
+        .raft()
+        .wait(Some(Duration::from_secs(5)))
+        .current_leader(1, "leader")
+        .await
+        .unwrap();
+    group
+        .raft()
+        .client_write(KvCommand::Put {
+            key: "before".into(),
+            value: b"durable".to_vec(),
+        })
+        .await
+        .unwrap();
+    group.shutdown().await.unwrap();
+    drop(group);
+
+    let image = root.join("state").join("state.json");
+    let mut bytes = std::fs::read(&image).unwrap();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 1;
+    std::fs::write(&image, &bytes).unwrap();
+    assert!(DurableMetaStateMachine::open(root.join("state"), &identity).is_err());
+
+    let group = PersistentGroup::open(&root, &identity, config.clone(), NoNetwork)
+        .await
+        .unwrap();
+    assert!(group.state_machine().rebuilt_image().is_some());
+    assert_eq!(
+        std::fs::read(root.join("state").join("state.json.corrupt")).unwrap(),
+        bytes
+    );
+    wait_durable_value(group.state_machine(), "before", b"durable").await;
+    group
+        .raft()
+        .wait(Some(Duration::from_secs(5)))
+        .current_leader(1, "rebuilt leader")
+        .await
+        .unwrap();
+    group
+        .raft()
+        .client_write(KvCommand::Put {
+            key: "after".into(),
+            value: b"rebuild".to_vec(),
+        })
+        .await
+        .unwrap();
+    group.shutdown().await.unwrap();
+    drop(group);
+
+    // The rebuilt image is an ordinary valid image again, and a later open
+    // reports no rebuild.
+    let state = DurableMetaStateMachine::open(root.join("state"), &identity).unwrap();
+    assert_eq!(state.rebuilt_image(), None);
+    assert_eq!(state.snapshot().get("before").unwrap().value, b"durable");
+    assert_eq!(state.snapshot().get("after").unwrap().value, b"rebuild");
+    drop(state);
+    let _ = std::fs::remove_dir_all(root);
+}
+
 #[tokio::test]
 async fn registry_isolates_groups_and_enforces_capacity() {
     use super::registry::{GroupRegistry, RegistryError};

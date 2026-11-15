@@ -25,6 +25,7 @@ use yadb_io::OsDirectoryLock;
 use crate::kv::{MetaSnapshot, MetaStateMachine};
 use crate::multiraft::{GroupIdentity, ReplicaIdentity};
 use crate::openraft_runtime::YadbRaftTypeConfig as C;
+use crate::openraft_storage::LogCoverage;
 use crate::{KvResult, MetaError, WatchEvent};
 
 const MAGIC: &[u8; 8] = b"YORSM001";
@@ -64,8 +65,24 @@ struct Inner {
     membership: StoredMembership<u32, BasicNode>,
     state: MetaStateMachine,
     current_snapshot: Option<SnapshotImage>,
+    rebuilt: Option<ImageRebuild>,
     failed: bool,
     fault: Option<PersistFault>,
+}
+
+/// A corrupt `state.json` that [`DurableMetaStateMachine::open_or_rebuild`]
+/// replaced with an empty image.
+///
+/// The original bytes are renamed aside, never truncated or overwritten, so an
+/// operator can still read exactly what failed validation. The rebuild is
+/// surfaced instead of logged because this module has no logging facility of
+/// its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageRebuild {
+    /// Path the corrupt image was renamed to.
+    pub preserved_as: PathBuf,
+    /// Length of the corrupt image in bytes.
+    pub corrupt_bytes: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -309,6 +326,111 @@ fn validate_image(image: &Image, identity: &ReplicaIdentity) -> io::Result<()> {
     Ok(())
 }
 
+/// The image a fresh [`DurableMetaStateMachine::create`] writes and a rebuild
+/// starts from: nothing applied, no membership, no state and no snapshot.
+fn empty_image(identity: &ReplicaIdentity) -> Image {
+    Image {
+        version: VERSION,
+        group: identity.group().clone(),
+        node_id: identity.node(),
+        applied: None,
+        membership: StoredMembership::default(),
+        state: MetaStateMachine::new().durable_snapshot(),
+        current_snapshot: None,
+    }
+}
+
+/// Rename an unreadable `state.json` aside, keeping every byte intact.
+///
+/// The image is never truncated or rewritten in place: its bytes are the only
+/// evidence of which validation failed. `OsDirectoryLock` excludes concurrent
+/// writers, so probing for a free name cannot race with another rebuild; an
+/// earlier `state.json.corrupt` is never overwritten.
+fn preserve_corrupt_image(dir: &Path, path: &Path) -> io::Result<ImageRebuild> {
+    let corrupt_bytes = fs::metadata(path)?.len();
+    let mut preserved_as = dir.join("state.json.corrupt");
+    let mut sequence = 0u32;
+    loop {
+        match fs::symlink_metadata(&preserved_as) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => break,
+            Ok(_) => {
+                sequence = sequence.saturating_add(1);
+                if sequence > 1000 {
+                    return Err(io::Error::other("too many preserved state-machine images"));
+                }
+                preserved_as = dir.join(format!("state.json.corrupt.{sequence}"));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    fs::rename(path, &preserved_as)?;
+    File::open(dir)?.sync_all()?;
+    Ok(ImageRebuild {
+        preserved_as,
+        corrupt_bytes,
+    })
+}
+
+/// Publish `image` as `state.json` through a synced temporary file, so a crash
+/// leaves either the previous image or a complete new one under the final
+/// name. A leftover `state.json.tmp` was never renamed into place, so it is not
+/// evidence of a published image and is discarded first.
+fn publish_image(dir: &Path, image: &Image) -> io::Result<()> {
+    let bytes = image_bytes(image)?;
+    let temp = dir.join("state.json.tmp");
+    let path = dir.join("state.json");
+    match fs::remove_file(&temp) {
+        Ok(()) => File::open(dir)?.sync_all()?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp)?;
+    let result = (|| -> io::Result<()> {
+        file.write_all(&bytes)?;
+        file.sync_data()?;
+        fs::rename(&temp, &path)?;
+        File::open(dir)?.sync_all()
+    })();
+    drop(file);
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
+}
+
+/// Read `state.json`, or, when `rebuild_allowed`, replace an image that cannot
+/// be decoded with a fresh empty one.
+///
+/// Only `InvalidData` from [`read_image`] counts as corruption. A missing file,
+/// an I/O error, an identity mismatch and invalid nested snapshot metadata all
+/// keep failing: rebuilding them would either create state for a directory that
+/// never had any or adopt another replica's data. The returned file handle is
+/// the published image, so the caller can re-sync it as `open` always has.
+fn load_image(
+    dir: &Path,
+    identity: &ReplicaIdentity,
+    rebuild_allowed: bool,
+) -> io::Result<(File, Image, Option<ImageRebuild>)> {
+    let path = dir.join("state.json");
+    let mut file = OpenOptions::new().read(true).write(true).open(&path)?;
+    let image = match read_image(&mut file) {
+        Ok(image) => image,
+        Err(error) if rebuild_allowed && error.kind() == io::ErrorKind::InvalidData => {
+            drop(file);
+            let rebuilt = preserve_corrupt_image(dir, &path)?;
+            let image = empty_image(identity);
+            publish_image(dir, &image)?;
+            let file = OpenOptions::new().read(true).write(true).open(&path)?;
+            return Ok((file, image, Some(rebuilt)));
+        }
+        Err(error) => return Err(error),
+    };
+    Ok((file, image, None))
+}
+
 impl DurableMetaStateMachine {
     /// Copy selected locally applied keys and prefix ranges at one revision.
     /// This does not perform a quorum or linearizable read barrier.
@@ -366,17 +488,7 @@ impl DurableMetaStateMachine {
             .create_new(true)
             .open(&path)?;
         drop(file);
-        let membership = StoredMembership::default();
-        let state = MetaStateMachine::new();
-        let image = Image {
-            version: VERSION,
-            group: identity.group().clone(),
-            node_id: identity.node(),
-            applied: None,
-            membership: membership.clone(),
-            state: state.durable_snapshot(),
-            current_snapshot: None,
-        };
+        let image = empty_image(identity);
         let bytes = image_bytes(&image)?;
         let mut file = OpenOptions::new().write(true).truncate(true).open(&path)?;
         file.write_all(&bytes)?;
@@ -389,23 +501,63 @@ impl DurableMetaStateMachine {
                 group: identity.group().clone(),
                 node_id: identity.node(),
                 applied: None,
-                membership,
-                state,
+                membership: image.membership,
+                state: MetaStateMachine::new(),
                 current_snapshot: None,
+                rebuilt: None,
                 failed: false,
                 fault: None,
             })),
         })
     }
 
+    /// Open an existing state machine image, failing closed on any corruption.
+    ///
+    /// Only [`Self::open_or_rebuild`] may discard a corrupt image, and only when
+    /// the caller knows the log still holds every entry.
     pub fn open(dir: impl AsRef<Path>, identity: &ReplicaIdentity) -> io::Result<Self> {
-        let dir = dir.as_ref().to_path_buf();
+        Self::open_image(dir.as_ref(), identity, false)
+    }
+
+    /// Open an existing state machine, rebuilding it from an empty image when
+    /// `state.json` is corrupt and the log can still replay from its start.
+    ///
+    /// `coverage` must describe the log that will replay into this state
+    /// machine. Only when it [`LogCoverage::replays_from_start`] is the log a
+    /// complete record of every entry, making an empty state machine plus
+    /// replay equivalent to the lost image. A purge marker, a log that starts at
+    /// a snapshot boundary, or an empty log all mean an empty state machine
+    /// could never reproduce the applied state, so a corrupt image then fails
+    /// closed exactly like [`Self::open`].
+    ///
+    /// The corrupt bytes are renamed to `state.json.corrupt` (or a numbered
+    /// sibling) and reported through [`Self::rebuilt_image`]; they are never
+    /// truncated or overwritten. The rebuilt image has `applied: None`, an empty
+    /// membership and an empty state, never a partially decoded one.
+    ///
+    /// A corrupt image carries no readable identity, so the caller must already
+    /// have established that this directory belongs to `identity`;
+    /// `openraft_runtime` verifies `replica.json` before calling.
+    pub fn open_or_rebuild(
+        dir: impl AsRef<Path>,
+        identity: &ReplicaIdentity,
+        coverage: LogCoverage,
+    ) -> io::Result<Self> {
+        Self::open_image(dir.as_ref(), identity, coverage.replays_from_start())
+    }
+
+    /// Shared body of [`Self::open`] and [`Self::open_or_rebuild`]. Strict
+    /// [`Self::open`] passes `rebuild_allowed = false`, so a corrupt image is
+    /// only ever discarded by a caller that supplied log coverage proving a
+    /// replay would be complete.
+    fn open_image(
+        dir: &Path,
+        identity: &ReplicaIdentity,
+        rebuild_allowed: bool,
+    ) -> io::Result<Self> {
+        let dir = dir.to_path_buf();
         let lock = OsDirectoryLock::try_acquire(&dir)?;
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(dir.join("state.json"))?;
-        let image = read_image(&mut file)?;
+        let (file, image, rebuilt) = load_image(&dir, identity, rebuild_allowed)?;
         validate_image(&image, identity)?;
         if let Some(snapshot) = &image.current_snapshot {
             if snapshot.version != VERSION
@@ -442,10 +594,21 @@ impl DurableMetaStateMachine {
                 membership: image.membership,
                 state,
                 current_snapshot: image.current_snapshot,
+                rebuilt,
                 failed: false,
                 fault: None,
             })),
         })
+    }
+
+    /// The corrupt image discarded by the last [`Self::open_or_rebuild`], if
+    /// any.
+    ///
+    /// The original bytes are preserved verbatim under
+    /// [`ImageRebuild::preserved_as`]. A later open sees the rebuilt image and
+    /// reports `None`, so a rebuild is reported once per discard.
+    pub fn rebuilt_image(&self) -> Option<ImageRebuild> {
+        self.inner.lock().unwrap().rebuilt.clone()
     }
 
     #[cfg(test)]
@@ -1235,6 +1398,219 @@ mod tests {
         bytes[last] ^= 1;
         fs::write(&path, bytes).unwrap();
         assert!(DurableMetaStateMachine::open(&dir.0, &identity()).is_err());
+    }
+
+    /// Flip one bit in `state.json`'s payload, which the header CRC covers, so
+    /// the image fails validation the way bit rot would. Returns the corrupted
+    /// bytes as they were left on disk.
+    fn corrupt_image(dir: &Path) -> Vec<u8> {
+        let path = dir.join("state.json");
+        let mut bytes = fs::read(&path).unwrap();
+        let offset = IMAGE_HEADER_LEN + 1;
+        assert!(offset < bytes.len(), "image has no payload byte to corrupt");
+        bytes[offset] ^= 1;
+        fs::write(&path, &bytes).unwrap();
+        bytes
+    }
+
+    // The whole point of the finding: an unpurged log is a complete record, so
+    // a corrupt image costs a replay, not the replica. The corrupt bytes stay
+    // on disk because they are the only evidence of what failed validation.
+    #[tokio::test]
+    async fn corrupt_image_is_rebuilt_when_the_log_replays_from_the_start() {
+        let dir = TempDir::new();
+        let mut sm = DurableMetaStateMachine::create(&dir.0, &identity()).unwrap();
+        sm.apply(vec![put(1, "a", b"one"), put(2, "b", b"two")])
+            .await
+            .unwrap();
+        drop(sm);
+        let corrupt = corrupt_image(&dir.0);
+
+        let mut rebuilt = DurableMetaStateMachine::open_or_rebuild(
+            &dir.0,
+            &identity(),
+            LogCoverage {
+                last_purged: None,
+                first_index: Some(0),
+            },
+        )
+        .unwrap();
+        let evidence = dir.0.join("state.json.corrupt");
+        assert_eq!(
+            rebuilt.rebuilt_image(),
+            Some(ImageRebuild {
+                preserved_as: evidence.clone(),
+                corrupt_bytes: corrupt.len() as u64,
+            })
+        );
+        assert_eq!(fs::read(&evidence).unwrap(), corrupt);
+        // The rebuild is a genuinely empty state, not a partial decode.
+        let (applied, membership) = rebuilt.applied_state().await.unwrap();
+        assert_eq!(applied, None);
+        assert_eq!(membership, StoredMembership::default());
+        assert_eq!(rebuilt.snapshot().revision(), 0);
+        assert!(rebuilt.snapshot().get("a").is_none());
+        assert!(rebuilt.get_current_snapshot().await.unwrap().is_none());
+        drop(rebuilt);
+
+        // The rebuilt image is valid, so a second open reports no rebuild and
+        // still starts empty: openraft replays the log from its first index.
+        let mut reopened = DurableMetaStateMachine::open(&dir.0, &identity()).unwrap();
+        assert_eq!(reopened.rebuilt_image(), None);
+        assert_eq!(reopened.applied_state().await.unwrap().0, None);
+        reopened
+            .apply(vec![put(1, "a", b"one"), put(2, "b", b"two")])
+            .await
+            .unwrap();
+        assert_eq!(reopened.snapshot().get("a").unwrap().value, b"one");
+        assert_eq!(reopened.snapshot().get("b").unwrap().value, b"two");
+        drop(reopened);
+
+        let mut final_open = DurableMetaStateMachine::open(&dir.0, &identity()).unwrap();
+        assert_eq!(
+            final_open.applied_state().await.unwrap().0.unwrap().index,
+            2
+        );
+        assert_eq!(final_open.snapshot().get("a").unwrap().value, b"one");
+        // Nothing rewrote or truncated the evidence.
+        assert_eq!(fs::read(&evidence).unwrap(), corrupt);
+    }
+
+    // A purge marker means the log is not a complete record: an empty state
+    // machine plus replay would silently lose the purged prefix, so the
+    // original fail-closed behaviour is the only safe answer.
+    #[tokio::test]
+    async fn corrupt_image_with_a_purged_log_still_fails_closed() {
+        let dir = TempDir::new();
+        let mut sm = DurableMetaStateMachine::create(&dir.0, &identity()).unwrap();
+        sm.apply(vec![put(1, "a", b"one"), put(2, "b", b"two")])
+            .await
+            .unwrap();
+        drop(sm);
+        let corrupt = corrupt_image(&dir.0);
+        let path = dir.0.join("state.json");
+
+        let error = DurableMetaStateMachine::open_or_rebuild(
+            &dir.0,
+            &identity(),
+            LogCoverage {
+                last_purged: Some(LogId::new(CommittedLeaderId::new(1, 1), 2)),
+                first_index: Some(3),
+            },
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(fs::read(&path).unwrap(), corrupt);
+        assert!(!dir.0.join("state.json.corrupt").exists());
+        // Strict open is unchanged, and still refuses the same bytes.
+        assert!(DurableMetaStateMachine::open(&dir.0, &identity()).is_err());
+        assert_eq!(fs::read(&path).unwrap(), corrupt);
+    }
+
+    // The audit's fix keys on the purge marker alone, but this log accepts a
+    // fresh snapshot-installed replica whose entries begin at the snapshot
+    // boundary with no purge marker (`prepare_append`). Replaying such a log
+    // into an empty state machine would start mid-history and lose the prefix,
+    // so coverage must include where the retained log begins.
+    #[tokio::test]
+    async fn unpurged_log_that_starts_past_the_first_index_is_not_rebuilt() {
+        for first_index in [Some(1), Some(3), None] {
+            let dir = TempDir::new();
+            let mut sm = DurableMetaStateMachine::create(&dir.0, &identity()).unwrap();
+            sm.apply(vec![put(1, "a", b"one")]).await.unwrap();
+            drop(sm);
+            let corrupt = corrupt_image(&dir.0);
+            let path = dir.0.join("state.json");
+
+            assert!(DurableMetaStateMachine::open_or_rebuild(
+                &dir.0,
+                &identity(),
+                LogCoverage {
+                    last_purged: None,
+                    first_index,
+                },
+            )
+            .is_err());
+            assert_eq!(fs::read(&path).unwrap(), corrupt);
+            assert!(!dir.0.join("state.json.corrupt").exists());
+        }
+    }
+
+    #[test]
+    fn missing_image_is_not_rebuilt() {
+        let dir = TempDir::new();
+        let sm = DurableMetaStateMachine::create(&dir.0, &identity()).unwrap();
+        drop(sm);
+        fs::remove_file(dir.0.join("state.json")).unwrap();
+        let error = DurableMetaStateMachine::open_or_rebuild(
+            &dir.0,
+            &identity(),
+            LogCoverage {
+                last_purged: None,
+                first_index: Some(0),
+            },
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(!dir.0.join("state.json").exists());
+        assert!(!dir.0.join("state.json.corrupt").exists());
+    }
+
+    #[tokio::test]
+    async fn valid_image_is_never_rebuilt() {
+        let dir = TempDir::new();
+        let mut sm = DurableMetaStateMachine::create(&dir.0, &identity()).unwrap();
+        sm.apply(vec![put(1, "a", b"one")]).await.unwrap();
+        drop(sm);
+        let before = fs::read(dir.0.join("state.json")).unwrap();
+
+        // Even a coverage that would permit a rebuild leaves a valid image
+        // alone: the file must not be rewritten or renamed.
+        let mut reopened = DurableMetaStateMachine::open_or_rebuild(
+            &dir.0,
+            &identity(),
+            LogCoverage {
+                last_purged: None,
+                first_index: Some(0),
+            },
+        )
+        .unwrap();
+        assert_eq!(reopened.rebuilt_image(), None);
+        assert_eq!(reopened.applied_state().await.unwrap().0.unwrap().index, 1);
+        assert_eq!(reopened.snapshot().get("a").unwrap().value, b"one");
+        drop(reopened);
+        assert_eq!(fs::read(dir.0.join("state.json")).unwrap(), before);
+        assert!(!dir.0.join("state.json.corrupt").exists());
+    }
+
+    // Evidence must survive a second incident: the earlier bytes are never
+    // overwritten by a later rebuild.
+    #[tokio::test]
+    async fn a_second_rebuild_preserves_the_first_evidence() {
+        let dir = TempDir::new();
+        let mut sm = DurableMetaStateMachine::create(&dir.0, &identity()).unwrap();
+        sm.apply(vec![put(1, "a", b"one")]).await.unwrap();
+        drop(sm);
+        let first = corrupt_image(&dir.0);
+        let coverage = LogCoverage {
+            last_purged: None,
+            first_index: Some(0),
+        };
+        let rebuilt =
+            DurableMetaStateMachine::open_or_rebuild(&dir.0, &identity(), coverage).unwrap();
+        let first_evidence = rebuilt.rebuilt_image().unwrap().preserved_as;
+        assert_eq!(first_evidence, dir.0.join("state.json.corrupt"));
+        drop(rebuilt);
+
+        let second = corrupt_image(&dir.0);
+        let rebuilt =
+            DurableMetaStateMachine::open_or_rebuild(&dir.0, &identity(), coverage).unwrap();
+        let report = rebuilt.rebuilt_image().unwrap();
+        assert_eq!(report.preserved_as, dir.0.join("state.json.corrupt.1"));
+        assert_eq!(fs::read(&report.preserved_as).unwrap(), second);
+        assert_eq!(fs::read(&first_evidence).unwrap(), first);
     }
 
     #[tokio::test]

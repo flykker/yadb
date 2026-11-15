@@ -120,6 +120,12 @@ pub mod persistent {
         }
 
         /// Opens existing storage only; missing or invalid files fail closed.
+        ///
+        /// A corrupt state-machine image is rebuilt from an empty image only
+        /// when the log still holds every entry. The log is opened first so its
+        /// coverage can decide that; if anything was purged or the log starts
+        /// past the first index, the state machine cannot be reconstructed and
+        /// `open` fails as before.
         pub async fn open<N: RaftNetworkFactory<YadbRaftTypeConfig>>(
             dir: impl AsRef<Path>,
             identity: &ReplicaIdentity,
@@ -130,7 +136,11 @@ pub mod persistent {
             let owner = OsDirectoryLock::try_acquire(dir)?;
             verify_descriptor(dir, identity)?;
             let log = DurableOpenRaftLog::open(dir.join("log"), identity)?;
-            let state = DurableMetaStateMachine::open(dir.join("state"), identity)?;
+            let state = DurableMetaStateMachine::open_or_rebuild(
+                dir.join("state"),
+                identity,
+                log.coverage(),
+            )?;
             let raft = YadbRaft::new(identity.node(), config, network, log, state.clone()).await?;
             Ok(Self {
                 raft,
