@@ -555,6 +555,23 @@ The iSCSI target is `iqn.2026-11.io.yadb:billing:vm-root` on `base+300..302` wit
 CHAP user `backend`; discovery advertises all three portals. These listeners are
 cleartext on loopback: keep them local and treat the whole root as secret.
 
+Reclaiming disk: overwritten blocks, folded WAL blobs, replaced SSTs and
+overwritten S3 objects leave their old fragments behind. `POST /v1/pools/gc`
+runs one collection pass and returns `blobs_live`, `fragments_deleted`,
+`bytes_reclaimed` and either `gc_refusal: null` or an explicit reason with a
+`409`; the leader also sweeps on its own every five minutes. A pass refuses
+while any node is reading, so wait about 30 s after the last query:
+
+```bash
+curl -s -X POST http://127.0.0.1:18000/v1/pools/gc
+```
+
+Known limitation: `metakv/raft.wal` is append-only and is never truncated, so
+every mutation grows it by a few KB (one `INSERT` ≈ 11 KB, one `SELECT` ≈ 0
+when the read lease is reused). A long-lived root will fill its disk from
+metadata alone; start a fresh `--root` for a new test run instead of expecting
+the log to shrink.
+
 ## Quickstart
 
 ```bash
