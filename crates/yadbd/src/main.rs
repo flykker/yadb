@@ -1601,14 +1601,28 @@ async fn handle_raft_status(State(st): State<AppState>) -> impl IntoResponse {
     }))
 }
 
+/// Cross-group OpenRaft observations.
+///
+/// The body names every local group, so a deployment that configured
+/// `--subject-secret` requires a verified signed subject. Without the secret no
+/// subject can be verified and the legacy open route is kept.
 #[cfg(feature = "openraft-storage")]
-async fn handle_openraft_status(State(st): State<AppState>) -> impl IntoResponse {
+async fn handle_openraft_status(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    if let Some(secret) = st.subject_secret.as_deref() {
+        if verified_subject(&headers, Some(secret)).is_none() {
+            return api_err(
+                StatusCode::UNAUTHORIZED,
+                "OpenRaft status requires a verified signed subject",
+            );
+        }
+    }
     Json(match &st.openraft {
         Some(status) => status.snapshot(),
         None => {
             serde_json::json!({"enabled": false, "client_traffic": "legacy", "production_ready": false})
         }
     })
+    .into_response()
 }
 
 #[cfg(feature = "openraft-storage")]

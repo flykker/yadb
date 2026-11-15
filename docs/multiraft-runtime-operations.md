@@ -143,7 +143,11 @@ identity under `root`. `create` refuses an existing path, including partial data
 group uses `initialize: true`; restart every group with `mode: "open", initialize: false`.
 
 `GET /openraft/status` is observational, not a client write API or
-readiness/cutover authority. It reports
+readiness/cutover authority. When the daemon runs with `--subject-secret` the
+route requires a verified signed subject (`x-yadb-subject` together with a valid
+`x-yadb-subject-signature`) and returns `401` otherwise; without a configured
+secret no subject can be verified, so the route stays open like the other legacy
+fallbacks. It reports
 `production_ready: false`; client traffic is labeled legacy for observational v1
 and multiraft for v2 client mode. Group node/state/term/leader are cached local
 observations. Metrics, authenticated operator controls and daemon integration
