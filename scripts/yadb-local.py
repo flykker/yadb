@@ -894,10 +894,11 @@ def restore(artifact, target, expected_sha256=None):
                 f'{absolute}. The runtime marker binds absolute paths, so a copy at another '
                 'path is a different deployment, not a restore.', 2)
         if absolute.exists():
-            if not absolute.is_dir() or any(absolute.iterdir()):
-                raise BackupError(f'target exists and is not empty: {absolute}', 2)
-        else:
-            absolute.mkdir(mode=0o700)
+            # A repeat of a failed restore must be refused, not resumed, and an
+            # existing directory may be a mount point or hold evidence. Only a
+            # path that does not exist is a valid in-place target.
+            raise BackupError(f'target already exists: {absolute}', 2)
+        absolute.mkdir(mode=0o700)
         created = True
         timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat()
         record = (f'{digest}\n{timestamp}\n').encode()
@@ -914,7 +915,13 @@ def restore(artifact, target, expected_sha256=None):
             entry = declared[relative]
             destination = absolute / relative
             destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-            directories.add(destination.parent)
+            # Every created ancestor must be synced, not just the immediate
+            # parent: a crash after the files are durable but before an
+            # intermediate directory is synced can lose the entry that names them.
+            parent = destination.parent
+            while parent != absolute:
+                directories.add(parent)
+                parent = parent.parent
             source_fd = os.open(artifact / 'payload' / relative, os.O_RDONLY | os.O_NOFOLLOW)
             try:
                 info = os.fstat(source_fd)

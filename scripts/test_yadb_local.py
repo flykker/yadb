@@ -570,6 +570,18 @@ class RestoreTest(unittest.TestCase):
         self.assertEqual([p.name for p in self.root.iterdir() if p.name == 'keep'], ['keep'])
         self.assertEqual((self.root / 'keep').read_text(), 'mine')
 
+    def test_repeat_restore_refused_not_resumed(self):
+        # A failed restore leaves markers; running restore again must refuse
+        # rather than resume over a partial tree, because nothing can tell which
+        # files are trustworthy.
+        self.destroy_root()
+        with mock.patch.object(local.os, 'write', side_effect=OSError('disk full')):
+            self.assertEqual(self.run_restore(), 5)
+        self.assertTrue((self.root / 'RESTORE_INCOMPLETE').exists())
+        self.assertEqual(self.run_restore(), 2)
+        self.assertTrue((self.root / 'RESTORE_INCOMPLETE').exists())
+        self.assertFalse((self.root / 'RESTORE_COMPLETE').exists())
+
     def test_wrong_expected_digest_refused(self):
         self.destroy_root()
         self.assertEqual(self.run_restore(expected='0' * 64), 2)
