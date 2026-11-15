@@ -11,7 +11,10 @@ use crate::{LogEntry, MetaError};
 /// instead of replaying the legacy reader, which treats an unknown frame magic
 /// as a torn tail and would truncate the whole log.
 const WAL_MAGIC: &[u8; 8] = b"YADBWAL2";
-/// Legacy file magic. Still replayed so existing WALs keep opening.
+/// Legacy file magic. Still replayed so existing WALs keep opening, and
+/// appended to in its own format: [`RaftWal`] never rewrites or compacts
+/// `raft.wal`, so a `V1` file stays `V1` for its whole life and the ambiguity
+/// documented on [`replay_wal`] is permanent for it, not a transitional state.
 const WAL_MAGIC_V1: &[u8; 8] = b"YADBWAL1";
 
 const FRAME_MAGIC_V1: u32 = 0x5957_414C; // "YWAL"
@@ -233,7 +236,9 @@ enum FrameOutcome {
 /// * a `V1` frame whose declared length runs past EOF. A `V1` header is not
 ///   checksummed, so this case is ambiguous between a torn tail and a damaged
 ///   `len`; it keeps the legacy truncate behaviour for existing files, and
-///   `V2` removes the ambiguity for every frame written from now on.
+///   `V2` removes the ambiguity for every frame written from now on. Because a
+///   `V1` file is only ever appended to, never rewritten, that residual is
+///   permanent for it rather than a state it eventually leaves.
 fn replay_wal<F: VirtualFile>(
     file: &F,
     format: FrameFormat,

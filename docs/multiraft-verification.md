@@ -799,12 +799,15 @@ header dropped later `TOMBSTONE`/`BARRIER` records, which can resurrect deleted
 blobs — and now refuse to open. `yadb-metakv` 140/140, `yadb-blob` 26/26,
 `yadb-block` 20/20. Open: `SimFs::corrupt_byte` proves the reader's decision logic,
 not the shapes a real device leaves after a crash; a `YADBWAL1` file keeps the
-legacy ambiguous-`len` truncation until it is rewritten; and the operator-facing
-path from `CorruptWal` to a clear refusal at the `yadbd` boundary is not tested.
+legacy ambiguous-`len` truncation for its whole life, because `RaftWal` takes the
+format from the file magic and appends in that format — nothing rewrites or
+compacts `raft.wal`, so "until it is rewritten" is not a bound that ever arrives
+for an existing deployment; and the operator-facing path from `CorruptWal` to a
+clear refusal at the `yadbd` boundary is not tested.
 
 | Finding | Tests | What it still does not prove |
 | --- | --- | --- |
-| S1 | `yadb-metakv` 140/140, `yadb-blob` 26/26 | In-memory byte flips, not real crash shapes; `YADBWAL1` keeps the legacy ambiguity |
+| S1 | `yadb-metakv` 140/140, `yadb-blob` 26/26 | In-memory byte flips, not real crash shapes; `YADBWAL1` keeps the legacy ambiguity permanently, since no rewrite path exists |
 | S2 | `yadb-blob` 21/21 | No real multi-node pool; corruption is injected by flipping a byte in `SimFs` |
 | S4 | `yadb-metakv` 128/128 | No real power loss; torn tails are hand-cut bytes or `Fault::WritePartial` |
 | S6 | `yadb-blob` 24/24 | Queue is never exercised through a real pool or across a restart |
