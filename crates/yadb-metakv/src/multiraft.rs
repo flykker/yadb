@@ -1,4 +1,4 @@
-//! Experimental group identity, typed WAL and incomplete deterministic core.
+//! Group identity, a typed WAL and an incomplete deterministic core prototype.
 //!
 //! The core is memory-only and disconnected from the WAL and daemon. It lacks
 //! quorum commit, follower catch-up and durable transitions and is not a safe
@@ -114,7 +114,7 @@ pub enum DescriptorError {
     Io(#[from] std::io::Error),
 }
 
-/// OS-only experimental descriptor owner. Holds an advisory directory lock for
+/// OS-only descriptor owner. Holds an advisory directory lock for
 /// its lifetime; all users must cooperate and must not replace the directory.
 /// This does not provide WAL ownership, replay, or a runnable replica.
 pub struct LockedDescriptor {
@@ -175,7 +175,7 @@ fn group_wal_path(dir: &str) -> String {
     }
 }
 
-/// Experimental OS-only ownership of a provisioned, empty, identity-bound WAL.
+/// OS-only ownership of a provisioned, empty, identity-bound WAL.
 /// It cannot append or replay records, and cannot be used by `RaftCore`. The
 /// directory and its parents must already be durable, and all access must respect
 /// the advisory lock and refrain from renaming/replacing the directory or file.
@@ -257,7 +257,7 @@ pub enum GroupWalError {
     Io(#[from] std::io::Error),
 }
 
-/// A bounded experimental framed log, not a Raft WAL implementation. Records
+/// A bounded framed log prototype, not a Raft WAL implementation. Records
 /// are opaque: callers cannot assume Raft term, vote, index or commit validation.
 /// All cooperating users must respect the advisory lock; directory replacement,
 /// external modification and arbitrary storage corruption are outside its model.
@@ -393,7 +393,7 @@ fn replay_group_wal<F: VirtualFile>(
     Ok((pos, records))
 }
 
-/// Versioned experimental records; no snapshots, membership changes or Raft
+/// Versioned records; no snapshots, membership changes or Raft
 /// protocol are implemented. Commit is recorded explicitly before application.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

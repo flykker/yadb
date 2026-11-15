@@ -1,4 +1,4 @@
-//! Synchronous metadata facade for an experimental OpenRaft replica.
+//! Synchronous metadata facade for an OpenRaft replica.
 //! Reads reflect locally applied state, not a linearizable quorum read.
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};

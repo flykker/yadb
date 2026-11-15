@@ -25,8 +25,8 @@ use yadb_io::OsFs;
 use yadb_metakv::{KvCommand, LocalMetaKv, MetaError, RaftRpc, RoleState, WatchEvent};
 use yadb_s3::{ObjectManifest, ObjectStoreEngine, S3Error};
 
-#[cfg(feature = "experimental-openraft-storage")]
-mod experimental_openraft;
+#[cfg(feature = "openraft-storage")]
+mod openraft;
 mod protocols;
 
 const CONTROL_STATE_KEY: &str = "/sys/control_plane_state";
@@ -51,7 +51,7 @@ struct Args {
     #[arg(long, default_value = "127.0.0.1:8420")]
     listen: String,
 
-    /// Metadata backend; openraft is only for new experimental clusters.
+    /// Metadata backend; openraft is opt-in and requires a freshly created root.
     #[arg(long, default_value = "legacy", value_parser = ["legacy", "openraft"])]
     metadata_runtime: String,
 
@@ -71,9 +71,9 @@ struct Args {
     #[arg(long)]
     data_dir: Option<PathBuf>,
 
-    /// Experimental single OpenRaft group configuration; no client traffic or migration.
+    /// OpenRaft group configuration path; requires the openraft-storage feature.
     #[arg(long)]
-    experimental_openraft_config: Option<PathBuf>,
+    openraft_config: Option<PathBuf>,
 
     /// S3 chunk size in bytes (default 1 MiB)
     #[arg(long, default_value_t = 1024 * 1024)]
@@ -117,14 +117,12 @@ struct Args {
     admin_subject: Vec<String>,
 }
 
-fn check_experimental_openraft_config(path: Option<&std::path::Path>) -> Result<(), &'static str> {
+fn check_openraft_config(path: Option<&std::path::Path>) -> Result<(), &'static str> {
     if path.is_none() {
         return Ok(());
     }
-    if !cfg!(feature = "experimental-openraft-storage") {
-        return Err(
-            "--experimental-openraft-config requires the experimental-openraft-storage feature",
-        );
+    if !cfg!(feature = "openraft-storage") {
+        return Err("--openraft-config requires the openraft-storage feature");
     }
     Ok(())
 }
@@ -289,8 +287,8 @@ fn require_admin(
 
 #[derive(Clone)]
 struct AppState {
-    #[cfg(feature = "experimental-openraft-storage")]
-    experimental_openraft: Option<experimental_openraft::Status>,
+    #[cfg(feature = "openraft-storage")]
+    openraft: Option<openraft::Status>,
     listen_addr: String,
     fs: OsFs,
     meta: LocalMetaKv<OsFs>,
@@ -706,7 +704,7 @@ impl AppState {
                 degraded_puts_queued,
                 degraded_puts_pending,
                 degraded_puts_still_degraded,
-                orphan_collection_error: Some("scrub disabled for experimental Multi-Raft".into()),
+                orphan_collection_error: Some("scrub disabled for Multi-Raft".into()),
                 ..ScrubSummary::default()
             };
             *self.last_scrub.write().unwrap() = Some(summary.clone());
@@ -1591,7 +1589,7 @@ async fn handle_health(State(st): State<AppState>) -> impl IntoResponse {
     Json(serde_json::json!({
         "status": "ok",
         "metadata_runtime": if st.meta.is_openraft() { "openraft" } else { "legacy" },
-        "role_scope": if st.meta.is_openraft() { "control_group; see /experimental/openraft/status for all groups" } else { "legacy" },
+        "role_scope": if st.meta.is_openraft() { "control_group; see /openraft/status for all groups" } else { "legacy" },
         "production_ready": false,
         "node_id": node_id,
         "role": format!("{role:?}"),
@@ -1607,7 +1605,7 @@ async fn handle_raft_status(State(st): State<AppState>) -> impl IntoResponse {
     let (node_id, role, term, leader_id, commit_index) = st.meta.role_info();
     Json(serde_json::json!({
         "metadata_runtime": if st.meta.is_openraft() { "openraft" } else { "legacy" },
-        "role_scope": if st.meta.is_openraft() { "control_group; see /experimental/openraft/status for all groups" } else { "legacy" },
+        "role_scope": if st.meta.is_openraft() { "control_group; see /openraft/status for all groups" } else { "legacy" },
         "production_ready": false,
         "node_id": node_id,
         "role": format!("{role:?}"),
@@ -1618,17 +1616,17 @@ async fn handle_raft_status(State(st): State<AppState>) -> impl IntoResponse {
     }))
 }
 
-#[cfg(feature = "experimental-openraft-storage")]
-async fn handle_experimental_openraft_status(State(st): State<AppState>) -> impl IntoResponse {
-    Json(match &st.experimental_openraft {
+#[cfg(feature = "openraft-storage")]
+async fn handle_openraft_status(State(st): State<AppState>) -> impl IntoResponse {
+    Json(match &st.openraft {
         Some(status) => status.snapshot(),
         None => {
-            serde_json::json!({"experimental": true, "enabled": false, "client_traffic": "legacy", "production_ready": false})
+            serde_json::json!({"enabled": false, "client_traffic": "legacy", "production_ready": false})
         }
     })
 }
 
-#[cfg(feature = "experimental-openraft-storage")]
+#[cfg(feature = "openraft-storage")]
 #[derive(Serialize)]
 struct FreshControlResponse {
     revision: u64,
@@ -1638,7 +1636,7 @@ struct FreshControlResponse {
 
 /// Internal, token-authenticated control snapshot. Only the control-group
 /// leader can answer because the read performs a quorum-confirmed barrier.
-#[cfg(feature = "experimental-openraft-storage")]
+#[cfg(feature = "openraft-storage")]
 async fn handle_internal_control_snapshot(
     State(st): State<AppState>,
     headers: HeaderMap,
@@ -4106,16 +4104,14 @@ async fn handle_pools_scrub(State(st): State<AppState>, headers: HeaderMap) -> R
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
-    check_experimental_openraft_config(args.experimental_openraft_config.as_deref())
+    check_openraft_config(args.openraft_config.as_deref())
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     let client_openraft = args.metadata_runtime == "openraft";
-    if client_openraft && args.experimental_openraft_config.is_none() {
-        return Err("--metadata-runtime openraft requires --experimental-openraft-config".into());
+    if client_openraft && args.openraft_config.is_none() {
+        return Err("--metadata-runtime openraft requires --openraft-config".into());
     }
-    if client_openraft && !cfg!(feature = "experimental-openraft-storage") {
-        return Err(
-            "--metadata-runtime openraft requires experimental-openraft-storage feature".into(),
-        );
+    if client_openraft && !cfg!(feature = "openraft-storage") {
+        return Err("--metadata-runtime openraft requires openraft-storage feature".into());
     }
     if client_openraft && args.data_dir.is_none() {
         return Err("--metadata-runtime openraft requires an explicit new --data-dir".into());
@@ -4154,19 +4150,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         return Err("legacy metadata runtime refuses an OpenRaft-marked data directory".into());
     }
-    #[cfg(feature = "experimental-openraft-storage")]
+    #[cfg(feature = "openraft-storage")]
     let prepared = if client_openraft {
         None
     } else {
-        args.experimental_openraft_config
+        args.openraft_config
             .as_deref()
-            .map(experimental_openraft::prepare)
+            .map(openraft::prepare)
             .transpose()?
     };
-    #[cfg(feature = "experimental-openraft-storage")]
+    #[cfg(feature = "openraft-storage")]
     let prepared_multi = if client_openraft {
-        Some(experimental_openraft::prepare_multi(
-            args.experimental_openraft_config.as_deref().unwrap(),
+        Some(openraft::prepare_multi(
+            args.openraft_config.as_deref().unwrap(),
         )?)
     } else {
         None
@@ -4182,7 +4178,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         protocols::Credentials::default()
     };
-    #[cfg(feature = "experimental-openraft-storage")]
+    #[cfg(feature = "openraft-storage")]
     let public_peers = if client_openraft {
         Some(
             parse_peer_map(
@@ -4195,7 +4191,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
-    #[cfg(feature = "experimental-openraft-storage")]
+    #[cfg(feature = "openraft-storage")]
     if let Some(peers) = &public_peers {
         prepared_multi.as_ref().unwrap().validate_client_root(
             &data_dir,
@@ -4205,7 +4201,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?;
     }
     let listener = tokio::net::TcpListener::bind(&args.listen).await?;
-    #[cfg(feature = "experimental-openraft-storage")]
+    #[cfg(feature = "openraft-storage")]
     let _client_root_owner = if client_openraft {
         Some(
             prepared_multi
@@ -4216,22 +4212,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
-    #[cfg(feature = "experimental-openraft-storage")]
-    let mut experimental = if let Some(prepared) = prepared_multi {
-        Some(experimental_openraft::Owner::Multi(prepared.start().await?))
+    #[cfg(feature = "openraft-storage")]
+    let mut raft_owner = if let Some(prepared) = prepared_multi {
+        Some(openraft::Owner::Multi(prepared.start().await?))
     } else if let Some(prepared) = prepared {
-        Some(experimental_openraft::Owner::Single(
-            prepared.start().await?,
-        ))
+        Some(openraft::Owner::Single(prepared.start().await?))
     } else {
         None
     };
     let result: Result<(), Box<dyn std::error::Error>> = async {
     let fs = OsFs::new(&data_dir)?;
 
-    #[cfg(feature = "experimental-openraft-storage")]
+    #[cfg(feature = "openraft-storage")]
     let meta = if client_openraft {
-        experimental.as_ref().unwrap().metadata(public_peers.clone().unwrap())?
+        raft_owner.as_ref().unwrap().metadata(public_peers.clone().unwrap())?
     } else if let Some(peers_raw) = &args.peers {
         let peer_map = parse_peer_map(peers_raw).map_err(std::io::Error::other)?;
         let token = args.raft_token.clone().filter(|t| !t.is_empty()).ok_or(
@@ -4239,7 +4233,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?;
         LocalMetaKv::open_clustered_with_token(&fs, "metakv", args.node_id, peer_map, token)?
     } else { LocalMetaKv::open_single_node(&fs, "metakv", args.node_id)? };
-    #[cfg(not(feature = "experimental-openraft-storage"))]
+    #[cfg(not(feature = "openraft-storage"))]
     let meta = if let Some(peers_raw) = &args.peers {
         let peer_map = parse_peer_map(peers_raw)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
@@ -4269,8 +4263,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let block = BlockVolumeEngine::new(meta.clone(), DEFAULT_BLOCK_SIZE);
 
     let state = AppState {
-        #[cfg(feature = "experimental-openraft-storage")]
-        experimental_openraft: experimental.as_ref().map(|group| group.status()),
+        #[cfg(feature = "openraft-storage")]
+        openraft: raft_owner.as_ref().map(|group| group.status()),
         listen_addr: args.listen.clone(),
         fs,
         meta: meta.clone(),
@@ -4424,11 +4418,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .layer(axum::extract::DefaultBodyLimit::max(16 * 1024 * 1024))
         ;
-    #[cfg(feature = "experimental-openraft-storage")]
+    #[cfg(feature = "openraft-storage")]
     let app = app
         .route(
-            "/experimental/openraft/status",
-            get(handle_experimental_openraft_status),
+            "/openraft/status",
+            get(handle_openraft_status),
         )
         .route(
             "/internal/control/snapshot",
@@ -4440,13 +4434,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "yadbd node {} listening on http://{} (data={:?}, generation={})",
         args.node_id, args.listen, data_dir, recovered_cp.generation
     );
-    #[cfg(feature = "experimental-openraft-storage")]
+    #[cfg(feature = "openraft-storage")]
     {
-        let result = if let Some(group) = experimental.as_mut() {
+        let result = if let Some(group) = raft_owner.as_mut() {
             tokio::select! {
                 result = axum::serve(listener, app) => result,
                 result = tokio::signal::ctrl_c() => result,
-                result = group.listener_finished() => Err(std::io::Error::other(format!("experimental OpenRaft listener stopped: {result}"))),
+                result = group.listener_finished() => Err(std::io::Error::other(format!("OpenRaft listener stopped: {result}"))),
             }
         } else {
             tokio::select! {
@@ -4458,7 +4452,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = watch_thread.join();
         result?;
     }
-    #[cfg(not(feature = "experimental-openraft-storage"))]
+    #[cfg(not(feature = "openraft-storage"))]
     {
         let result = axum::serve(listener, app).await;
         let _ = watch_stop.send(());
@@ -4467,8 +4461,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     Ok(())
     }.await;
-    #[cfg(feature = "experimental-openraft-storage")]
-    if let Some(group) = experimental.as_mut() {
+    #[cfg(feature = "openraft-storage")]
+    if let Some(group) = raft_owner.as_mut() {
         group.shutdown().await?;
     }
     result
@@ -4710,18 +4704,14 @@ mod security_tests {
     }
 
     #[test]
-    fn experimental_openraft_config_fails_closed() {
-        assert!(check_experimental_openraft_config(None).is_ok());
-        if cfg!(feature = "experimental-openraft-storage") {
-            assert!(
-                check_experimental_openraft_config(Some(std::path::Path::new("config.json")))
-                    .is_ok()
-            );
+    fn openraft_config_fails_closed() {
+        assert!(check_openraft_config(None).is_ok());
+        if cfg!(feature = "openraft-storage") {
+            assert!(check_openraft_config(Some(std::path::Path::new("config.json"))).is_ok());
         } else {
             let error =
-                check_experimental_openraft_config(Some(std::path::Path::new("config.json")))
-                    .unwrap_err();
-            assert!(error.contains("requires the experimental-openraft-storage feature"));
+                check_openraft_config(Some(std::path::Path::new("config.json"))).unwrap_err();
+            assert!(error.contains("requires the openraft-storage feature"));
         }
     }
 
@@ -4825,8 +4815,8 @@ mod security_tests {
         let fs = OsFs::new(&dir).unwrap();
         let meta = LocalMetaKv::open_single_node(&fs, "meta", 1).unwrap();
         let mut st = AppState {
-            #[cfg(feature = "experimental-openraft-storage")]
-            experimental_openraft: None,
+            #[cfg(feature = "openraft-storage")]
+            openraft: None,
             listen_addr: "127.0.0.1:0".into(),
             fs,
             meta: meta.clone(),

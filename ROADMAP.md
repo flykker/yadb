@@ -125,7 +125,7 @@ YADB uses ordinary filesystems; raw PDisk and NBD are not project goals.
 
 - [x] Select OpenRaft 0.9.25 for the future Multi-Raft consensus engine; compile
   offline and exercise a volatile singleton. This does not replace legacy Raft.
-- [ ] Stop development of the experimental hand-written group core. Its uncommitted
+- [ ] Stop development of the hand-written group core. Its uncommitted
   changes are not a production candidate; preserve them pending an explicit cleanup.
 - [ ] Exercise real OpenRaft in-process with three nodes: quorum loss, recovery,
   lagging replicas and reordered/lost messages. Memory tests do not prove durability.
@@ -138,7 +138,7 @@ YADB uses ordinary filesystems; raw PDisk and NBD are not project goals.
   writes, reopen, suffix handling, OS directory lock ownership and fail-closed
   corruption handling. Simulated partial writes and sync errors poison the handle;
   these tests do not simulate power loss. The test log binds cluster/group/incarnation
-  and node identity, with separate create/open paths. The experimental state machine
+  and node identity, with separate create/open paths. The OpenRaft state machine
   persists applied position, membership and KV state, and exercises cross-node
   snapshot installation. A persistent three-node test uses an in-process network
   and clean follower restart. Simulated install failures before/after file sync,
@@ -147,7 +147,7 @@ YADB uses ordinary filesystems; raw PDisk and NBD are not project goals.
   runner passes but its public-state assertions and changed apply input do not
   establish full equivalence. Persistent-group/registry tests reject changed
   bootstrap voters; a separate-process singleton kill/reopen test preserves
-  acknowledged values. The experimental `YORLOG04` log now checkpoints with
+  acknowledged values. The `YORLOG04` log now checkpoints with
   bounded physical bytes, replay frames and retained live state; this fixed
   capacity is not scalable resource isolation. Broader crash testing and
   power-loss evidence remain open; see `docs/multiraft-production-todo.md`.
@@ -161,7 +161,7 @@ YADB uses ordinary filesystems; raw PDisk and NBD are not project goals.
 - [ ] Secure internal Raft RPC and client identity: separate listeners, authenticate
   peers (evaluate rustls/mTLS), bind node and group identity, and do not trust
   client-supplied subject headers. Existing deployment exposure must be audited.
-  Experimental OpenRaft TCP supports Ed25519 envelopes, per-connection challenges,
+  OpenRaft TCP supports Ed25519 envelopes, per-connection challenges,
   signed nonce-bound replies and opt-in pinned TLS 1.3 mTLS; positive three-node
   and negative certificate/identity tests pass in process. Legacy cluster endpoints
   now require matching `--raft-token` credentials (a fail-closed upgrade change).

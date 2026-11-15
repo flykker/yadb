@@ -11,12 +11,12 @@ Broader daemon validation remains open; no cluster was deployed.
 This work does not authorize reusing existing data or imply production readiness.
 See the [production checklist](docs/multiraft-production-todo.md).
 
-The experimental local-cluster generator opts into per-group leader preferences
+The local-cluster generator opts into per-group leader preferences
 (control 1 → node 1, data 2 → node 2, data 3 → node 3) and relaxed Raft
 timings. These settings bias elections, not placement guarantees or workload
 balancing; failover remains enabled. A healthy nonpreferred leader is not
 automatically displaced when the preferred node returns. Authenticated
-`/experimental/openraft/status` reports each group's observed `leader_id`,
+`/openraft/status` reports each group's observed `leader_id`,
 `preferred_leader`, and `preference_met` (null when either is unknown). The
 ordinary health leader refers only to the control group. All replicas of a
 group must use the same preference and timing values; the election maximum is
@@ -41,8 +41,8 @@ The two election ranges overlap by design because the maximum must remain
 common; a nonpreferred voter can legitimately win. Both fields are opt-in
 together, and `preferred_leader` must identify a voter.
 
-The status endpoint is the authenticated experimental endpoint
-`GET /experimental/openraft/status`; it is not an unauthenticated admin
+The status endpoint is the authenticated endpoint
+`GET /openraft/status`; it is not an unauthenticated admin
 interface. Configure the preference on every replica of the group. A returning
 preferred node does not automatically reclaim a healthy leader, and failover
 availability remains enabled.
@@ -266,7 +266,7 @@ Clock changes can affect cleanup timing, but are not the publication safety fenc
 In clustered mode the leader runs scrub periodically; `/v1/pools/scrub` also requests it
 explicitly. `orphan_blobs_collected` counts logical blobs, not physical fragments;
 `orphan_collection_error` exposes cleanup failures (partial progress is not a total).
-These scrub and orphan-GC operations are disabled in experimental Multi-Raft mode;
+These scrub and orphan-GC operations are disabled in Multi-Raft mode;
 do not rely on automatic repair or reclamation there.
 
 **Retention is deliberately conservative:** overwritten/deleted manifests and their

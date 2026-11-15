@@ -1,4 +1,4 @@
-//! Opt-in TLS 1.3 mutual authentication for the experimental Raft listener.
+//! Opt-in TLS 1.3 mutual authentication for the Raft listener.
 //! Trust is provisioned out of band: a CA validates certificates and an exact
 //! leaf-certificate SHA-256 pin binds each certificate to one node ID.
 

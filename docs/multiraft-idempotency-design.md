@@ -1,6 +1,6 @@
 # Proposed Multi-Raft correctness gates 3 and 4
 
-Design first; three slices are now implemented, the rest is not. Scope is the experimental OpenRaft HTTP paths, not legacy Raft or production readiness. Existing evidence and unresolved failures are in `docs/multiraft-production-todo.md` and `docs/multiraft-verification.md`.
+Design first; three slices are now implemented, the rest is not. Scope is the OpenRaft HTTP paths, not legacy Raft or production readiness. Existing evidence and unresolved failures are in `docs/multiraft-production-todo.md` and `docs/multiraft-verification.md`.
 
 Implementation status (2026-11-15):
 

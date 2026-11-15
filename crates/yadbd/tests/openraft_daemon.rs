@@ -1,4 +1,4 @@
-#![cfg(feature = "experimental-openraft-storage")]
+#![cfg(feature = "openraft-storage")]
 //! Real daemon, new nonproduction root and three local singleton groups.
 use ring::{
     rand::SystemRandom,
@@ -92,7 +92,7 @@ fn spawn(data: &Path, manifest: Option<&Path>, public: SocketAddr, log: &Path) -
         cmd.args([
             "--metadata-runtime",
             "openraft",
-            "--experimental-openraft-config",
+            "--openraft-config",
             manifest.to_str().unwrap(),
             "--peers",
             &format!("1={public}"),
@@ -139,7 +139,7 @@ fn spawn_cluster(
             data.to_str().unwrap(),
             "--metadata-runtime",
             "openraft",
-            "--experimental-openraft-config",
+            "--openraft-config",
             manifest.to_str().unwrap(),
             "--peers",
             &peers,
@@ -298,7 +298,7 @@ fn ready(child: &mut Daemon, addr: SocketAddr) {
             let result: Value = serde_json::from_slice(&ok(
                 addr,
                 "GET",
-                "/experimental/openraft/status",
+                "/openraft/status",
                 b"",
                 "application/json",
             ))
@@ -1061,7 +1061,7 @@ fn three_daemons_forward_http_to_different_group_leaders() {
             let status: Value = serde_json::from_slice(&ok(
                 address,
                 "GET",
-                "/experimental/openraft/status",
+                "/openraft/status",
                 b"",
                 "application/json",
             ))
@@ -1084,7 +1084,7 @@ fn three_daemons_forward_http_to_different_group_leaders() {
     let status: Value = serde_json::from_slice(&ok(
         public[0],
         "GET",
-        "/experimental/openraft/status",
+        "/openraft/status",
         b"",
         "application/json",
     ))
@@ -1353,7 +1353,7 @@ spec: {pool: data, sizeBytes: 8192}
         let status: Value = serde_json::from_slice(&ok(
             public[observer],
             "GET",
-            "/experimental/openraft/status",
+            "/openraft/status",
             b"",
             "application/json",
         ))
@@ -1403,7 +1403,7 @@ spec: {pool: data, sizeBytes: 8192}
             let status: Value = serde_json::from_slice(&ok(
                 public[stopped],
                 "GET",
-                "/experimental/openraft/status",
+                "/openraft/status",
                 b"",
                 "application/json",
             ))
@@ -1567,7 +1567,7 @@ fn apply_requires_a_signed_allowlisted_subject() {
             dir.0.join("openraft-data").to_str().unwrap(),
             "--metadata-runtime",
             "openraft",
-            "--experimental-openraft-config",
+            "--openraft-config",
             dir.0.join("missing-manifest.json").to_str().unwrap(),
             "--peers",
             &format!("1={public}"),

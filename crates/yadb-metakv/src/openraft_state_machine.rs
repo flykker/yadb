@@ -1,6 +1,6 @@
-//! Experimental, incomplete OpenRaft state machine and snapshot prototype.
+//! OpenRaft state machine and snapshot storage.
 //!
-//! This is experimental and opt-in. It keeps the state-machine file in
+//! It is opt-in and keeps the state-machine file in
 //! its own directory so its advisory lock does not conflict with the log
 //! store's lock.  The on-disk image contains application state, applied log
 //! position and membership; watchers are runtime-only and are recreated by the

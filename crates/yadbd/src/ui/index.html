@@ -519,7 +519,7 @@
 
       <div class="card hidden" id="ov-openraft-card">
         <div class="card-title">OpenRaft group observations</div>
-        <div class="stat-sub">Local observations only; not a linearizable guarantee. Experimental: production_ready = false. Leader distribution counts groups, not workload.</div>
+        <div class="stat-sub">Local observations only; not a linearizable guarantee. production_ready = false. Leader distribution counts groups, not workload.</div>
         <div id="ov-openraft-groups"></div>
       </div>
 
@@ -757,7 +757,7 @@ async function refreshAll() {
   document.getElementById("ov-raft-title").textContent = isOpenraft ? "Raft MetaKV · CONTROL" : "Raft MetaKV";
   document.getElementById("ov-openraft-card").classList.toggle("hidden", !isOpenraft);
   if (isOpenraft) {
-    const status = await api("/experimental/openraft/status").catch(() => null);
+    const status = await api("/openraft/status").catch(() => null);
     if (sequence !== refreshSequence) return;
     if (status?.ok && Array.isArray(status.json?.local_observations)) openraftStatus = status.json;
   }

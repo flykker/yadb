@@ -125,7 +125,7 @@ pub enum WatchEvent {
     },
 }
 
-#[cfg_attr(any(test, feature = "experimental-openraft-storage"), derive(Clone))]
+#[cfg_attr(any(test, feature = "openraft-storage"), derive(Clone))]
 struct Watcher {
     prefix: String,
     tx: Sender<WatchEvent>,
@@ -133,12 +133,12 @@ struct Watcher {
 
 /// Ordered deterministic state machine applied identically on all Raft replicas.
 #[derive(Default)]
-#[cfg_attr(any(test, feature = "experimental-openraft-storage"), derive(Clone))]
+#[cfg_attr(any(test, feature = "openraft-storage"), derive(Clone))]
 pub struct MetaStateMachine {
     revision: u64,
     kv: BTreeMap<String, KvValue>,
     watchers: Vec<Watcher>,
-    #[cfg(any(test, feature = "experimental-openraft-storage"))]
+    #[cfg(any(test, feature = "openraft-storage"))]
     deferred: Option<Vec<WatchEvent>>,
 }
 
@@ -166,7 +166,7 @@ impl MetaStateMachine {
 
     /// Export only durable key/value state. Watch channels are runtime-owned
     /// and intentionally are not part of a restart or snapshot image.
-    #[cfg(any(test, feature = "experimental-openraft-storage"))]
+    #[cfg(any(test, feature = "openraft-storage"))]
     pub(crate) fn durable_snapshot(&self) -> MetaSnapshot {
         MetaSnapshot {
             revision: self.revision,
@@ -175,7 +175,7 @@ impl MetaStateMachine {
     }
 
     /// Restore durable state and discard pre-restart watchers.
-    #[cfg(any(test, feature = "experimental-openraft-storage"))]
+    #[cfg(any(test, feature = "openraft-storage"))]
     pub(crate) fn restore_durable_snapshot(&mut self, snapshot: MetaSnapshot) {
         self.revision = snapshot.revision;
         self.kv = snapshot.values;
@@ -184,24 +184,24 @@ impl MetaStateMachine {
     }
 
     /// Replace durable data while retaining runtime-owned watch subscriptions.
-    #[cfg(any(test, feature = "experimental-openraft-storage"))]
+    #[cfg(any(test, feature = "openraft-storage"))]
     pub(crate) fn replace_durable_snapshot(&mut self, snapshot: MetaSnapshot) {
         self.revision = snapshot.revision;
         self.kv = snapshot.values;
         self.deferred = None;
     }
 
-    #[cfg(any(test, feature = "experimental-openraft-storage"))]
+    #[cfg(any(test, feature = "openraft-storage"))]
     pub(crate) fn defer_notifications(&mut self) {
         self.deferred = Some(Vec::new());
     }
 
-    #[cfg(any(test, feature = "experimental-openraft-storage"))]
+    #[cfg(any(test, feature = "openraft-storage"))]
     pub(crate) fn take_deferred_notifications(&mut self) -> Vec<WatchEvent> {
         self.deferred.take().unwrap_or_default()
     }
 
-    #[cfg(any(test, feature = "experimental-openraft-storage"))]
+    #[cfg(any(test, feature = "openraft-storage"))]
     pub(crate) fn deliver_notifications(&mut self, events: Vec<WatchEvent>) {
         for event in events {
             self.deliver(event);
@@ -372,7 +372,7 @@ impl MetaStateMachine {
     }
 
     fn notify(&mut self, ev: WatchEvent) {
-        #[cfg(any(test, feature = "experimental-openraft-storage"))]
+        #[cfg(any(test, feature = "openraft-storage"))]
         if let Some(events) = &mut self.deferred {
             events.push(ev);
             return;

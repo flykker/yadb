@@ -1,4 +1,4 @@
-# Experimental OpenRaft transport: credential and incident runbook
+# OpenRaft transport: credential and incident runbook
 
 Status: **not a production deployment guide**. The adapter implements pinned
 TLS 1.3 mTLS plus Ed25519-signed envelopes; provisioning, rotation and revocation
@@ -145,7 +145,7 @@ reload or a dual-key epoch. Therefore **no safe rolling rotation is promised**.
    ownership and exact peer maps. Record inventory digests without recording keys.
 5. Reopen existing replicas explicitly; never bootstrap after a rotation error.
    Check authenticated connectivity, leader election and applied-state progress.
-6. If any peer rejects credentials, stop the experimental runtime and investigate.
+6. If any peer rejects credentials, stop the runtime and investigate.
    Reverting trust is allowed only if the previous credentials are not compromised
    and operator policy explicitly authorizes it. Never fall back to plaintext.
 
@@ -155,7 +155,7 @@ cannot authenticate through stale listeners, resumed sessions or old handlers.
 
 ## Compromise or revocation incident
 
-1. Network-isolate the affected node and stop the experimental listeners on all
+1. Network-isolate the affected node and stop the listeners on all
    peers; preserve logs, configuration digests and a consistent data backup.
 2. Do not assume revoking a TLS leaf alone is sufficient: the attacker may possess
    the envelope signing key, an active session or write access to local files.

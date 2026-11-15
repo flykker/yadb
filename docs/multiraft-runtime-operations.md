@@ -1,4 +1,4 @@
-# Experimental runtime operations and recovery boundaries
+# OpenRaft runtime operations and recovery boundaries
 
 ## Current status (2026-11-14)
 
@@ -65,12 +65,12 @@ The deployment is **not empty**: at 21:25:24 on 2026-11-14 an unidentified apply
 committed exactly `examples/platform.yaml` (generation `1`, project `billing`);
 the orchestrator did not issue it and `yadbctl` was not executed. The state was
 preserved, not rolled back. Live freshness probes and the internal
-snapshot token gate passed with revision `2`. It is an experimental test
+snapshot token gate passed with revision `2`. It is a test
 deployment, not production
 routing or migration. The feature flag alone does not authorize migration,
 production routing, rolling upgrades or disaster recovery by editing voters. The
 final independent GPT-6.1 Sol review of the freshness delta and the
-nonblocking-refresh fix returned ACCEPT for the narrow experimental local scope
+nonblocking-refresh fix returned ACCEPT for the narrow local scope
 only, with open findings listed in `multiraft-verification.md`.
 
 ## Daemon opt-in interface
@@ -87,9 +87,13 @@ current status). The
 version-1 standalone interface below remains observational, not a client-routing
 configuration.
 
-The daemon's `experimental-openraft-storage` build feature forwards the MetaKV
-experimental feature. `--experimental-openraft-config <path>` is rejected before
-data initialization when the feature is absent. In legacy mode the version-1
+The daemon's `openraft-storage` build feature forwards the MetaKV
+`openraft-storage` feature. `--openraft-config <path>` is rejected before
+data initialization when the feature is absent. These names previously carried an
+`experimental` prefix; the old spellings (`--experimental-openraft-config`, the
+`experimental-openraft-storage` feature and `/experimental/openraft/status`) are no
+longer accepted, so an existing invocation must be updated before it can start a
+daemon. In legacy mode the version-1
 configuration starts one isolated observational group on a dedicated mandatory-mTLS
 listener while legacy MetaKV serves clients. The in-progress v2 client mode instead
 uses one dedicated listener per group and does not create a legacy MetaKV WAL or
@@ -110,7 +114,7 @@ Version-1 JSON configuration fields:
 | Field | Meaning |
 | --- | --- |
 | `version` | Exactly `1`; unknown fields are rejected |
-| `root` | Existing, durably provisioned experimental root directory |
+| `root` | Existing, durably provisioned root directory |
 | `mode` | Explicit `create` or `open`; never automatic |
 | `initialize` | Defaults false; true only with create, on one operator-selected bootstrap replica |
 | `cluster`, `group`, `incarnation`, `node` | 16-byte cluster array and nonzero group/incarnation/node identity |
@@ -138,8 +142,8 @@ identity under `root`. `create` refuses an existing path, including partial data
 `open` refuses a missing path. Only one explicitly authorized initial replica per
 group uses `initialize: true`; restart every group with `mode: "open", initialize: false`.
 
-`GET /experimental/openraft/status` is observational, not a client write API or
-readiness/cutover authority. It labels the runtime experimental and
+`GET /openraft/status` is observational, not a client write API or
+readiness/cutover authority. It reports
 `production_ready: false`; client traffic is labeled legacy for observational v1
 and multiraft for v2 client mode. Group node/state/term/leader are cached local
 observations. Metrics, authenticated operator controls and daemon integration
@@ -212,14 +216,14 @@ before retrying.
 | Directory lock busy | Identify the current owner; do not bypass locks or replace the directory |
 | Partial bootstrap | Preserve artifacts and diagnose; do not auto-create missing files or initialize again |
 | Replica identity/voters mismatch | Stop and verify the intended configuration and provenance; never rewrite the descriptor to fit |
-| Unsupported experimental log version | Preserve the original bytes; use a separately reviewed migration or explicit disposable-test reprovisioning, not silent replay |
+| Unsupported log version | Preserve the original bytes; use a separately reviewed migration or explicit disposable-test reprovisioning, not silent replay |
 | Corrupt/truncated log tail or state image | Preserve raw evidence, stop serving, and recover from validated replicas/backups through an approved procedure; automatic truncation is not implemented |
 | Write/sync/rename/directory-sync error | Treat the operation outcome as unknown; the handle is poisoned, and further participation requires reopen/recovery |
 | Quorum unavailable | Restore legitimate peers/connectivity; never reduce voters, accept singleton writes or treat timeout as abort |
 | Certificate/pin/signing-key rejection | Keep listener fail-closed; follow the credential incident runbook, never disable TLS verification |
 | Snapshot exceeds transport capacity | Stop growth/recover under an approved plan; do not discard retained logs or raise isolated limits without end-to-end capacity tests |
 
-The checkpoint-capable experimental log format is `YORLOG05`. Its fixed limits
+The checkpoint-capable log format is `YORLOG05`. Its fixed limits
 are 32 MiB for the active file, 1024 frames, 4096 live entries and 8 MiB for the
 serialized retained checkpoint. Replacement temporarily uses extra disk space;
 file/directory sync errors poison the store until validated reopen. These limits

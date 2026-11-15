@@ -1,4 +1,4 @@
-//! One isolated experimental group per daemon, with a dedicated mTLS listener.
+//! One isolated OpenRaft group per daemon, with a dedicated mTLS listener.
 //! Optional nonproduction client operations use this group; no migration exists.
 //!
 //! Configuration version 1 is JSON: {version, root, mode: "create"|"open",
@@ -486,7 +486,7 @@ impl MultiRunning {
 
 pub fn prepare(path: &Path) -> io::Result<Prepared> {
     let config: Config = serde_json::from_slice(&read_bounded(path, MAX_CONFIG)?)
-        .map_err(|e| invalid(format!("invalid experimental OpenRaft config: {e}")))?;
+        .map_err(|e| invalid(format!("invalid OpenRaft config: {e}")))?;
     if config.version != 1
         || config.peers.is_empty()
         || config.peers.len() > MAX_PEERS
@@ -503,7 +503,7 @@ pub fn prepare(path: &Path) -> io::Result<Prepared> {
         return Err(invalid("initialize is only permitted with create"));
     }
     if !config.root.is_dir() {
-        return Err(invalid("experimental root must already exist"));
+        return Err(invalid("openraft root must already exist"));
     }
     if config.listen.port() == 0
         || config.peers.iter().any(|p| {
@@ -705,7 +705,7 @@ pub struct Status {
 impl Status {
     pub fn snapshot(&self) -> serde_json::Value {
         let groups = self.groups.iter().map(|(id, (raft, preferred))| { let m = raft.metrics().borrow().clone(); serde_json::json!({"group": id, "node_id": m.id, "state": format!("{:?}", m.state), "term": m.current_term, "leader_id": m.current_leader, "preferred_leader": preferred, "preference_met": preferred.zip(m.current_leader).map(|(want, actual)| want == actual), "last_applied": format!("{:?}", m.last_applied), "running_state": format!("{:?}", m.running_state)}) }).collect::<Vec<_>>();
-        serde_json::json!({"experimental": true, "enabled": true, "client_traffic": if self.client_mode { "multiraft" } else { "legacy" }, "production_ready": false, "limitation": "dedicated listener per group; reads are local-applied", "local_observations": groups})
+        serde_json::json!({"enabled": true, "client_traffic": if self.client_mode { "multiraft" } else { "legacy" }, "production_ready": false, "limitation": "dedicated listener per group; reads are local-applied", "local_observations": groups})
     }
 }
 
@@ -771,7 +771,7 @@ impl Prepared {
             || self.path.parent() == Some(canonical_root.as_path())
         {
             return Err(invalid(
-                "experimental replica root must be separate from client data root",
+                "replica root must be separate from client data root",
             ));
         }
         match self.mode {
@@ -894,7 +894,7 @@ impl Prepared {
         }
         if self.initialize {
             if let Err(e) = group.raft().initialize(self.members).await {
-                let error = io::Error::other(format!("experimental bootstrap failed: {e}"));
+                let error = io::Error::other(format!("bootstrap failed: {e}"));
                 group.raft().shutdown().await.map_err(io::Error::other)?;
                 return Err(error);
             }

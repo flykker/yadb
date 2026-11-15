@@ -1,6 +1,6 @@
 # Proposed local Multi-Raft backup and restore
 
-Design only: **none of this procedure or command surface is implemented**. Scope is the experimental three-node local OpenRaft deployment, not legacy migration or production readiness. The storage and release gates remain open (`docs/multiraft-production-todo.md`, sections 1 and 4); evidence must follow `docs/multiraft-verification.md`, “Required failure record format”.
+Design only: **none of this procedure or command surface is implemented**. Scope is the three-node local OpenRaft deployment, not legacy migration or production readiness. The storage and release gates remain open (`docs/multiraft-production-todo.md`, sections 1 and 4); evidence must follow `docs/multiraft-verification.md`, “Required failure record format”.
 
 ## Proposed recovery boundary and payload
 

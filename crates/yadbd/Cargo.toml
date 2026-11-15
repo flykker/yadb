@@ -9,7 +9,7 @@ name = "yadbd"
 path = "src/main.rs"
 
 [features]
-experimental-openraft-storage = ["yadb-metakv/experimental-openraft-storage", "dep:openraft", "dep:tokio-rustls"]
+openraft-storage = ["yadb-metakv/openraft-storage", "dep:openraft", "dep:tokio-rustls"]
 
 [dependencies]
 yadb-io = { path = "../yadb-io" }

@@ -153,7 +153,7 @@ continue to use the existing storage engines and pools; OpenRaft is the metadata
 consensus engine, not a replacement for fragment storage.
 
 The explicit selection being implemented is `--metadata-runtime openraft` with the
-`experimental-openraft-storage` build feature and a mandatory-mTLS group config.
+`openraft-storage` build feature and a mandatory-mTLS group config.
 Legacy remains the default. A child-daemon integration test passed with three
 singleton groups, before final control-cache hardening and full-suite validation.
 A targeted three-process test also covered multi-node HTTP leader routing for
@@ -198,7 +198,7 @@ listeners. Corresponding voter inventories and addresses must agree across nodes
    group's `initialize: true` only there; set it false on its other replicas.
    The chosen node may differ between groups. Do not initialize a group twice.
 3. For a separately authorized test, the intended per-node selection is
-   `--metadata-runtime openraft --experimental-openraft-config /absolute/path/to/manifest.json`,
+   `--metadata-runtime openraft --openraft-config /absolute/path/to/manifest.json`,
    plus the node's explicit `--data-dir`, `--node-id`, `--listen` and `--peers`
    public HTTP map. Use a feature-enabled build. The manifest and group configs
    are node-specific; the routing map must agree throughout the test cluster.
@@ -267,7 +267,7 @@ merely by agreeing to this work or running local integration tests.
 * A timed-out write or lost forwarded response has an unknown outcome. Do not
   automatically resubmit a mutation after an ambiguous response; inspect state
   or use application-level idempotency.
-* Pool scrub and its orphan-collection/GC work are disabled in experimental
+* Pool scrub and its orphan-collection/GC work are disabled in
   Multi-Raft mode; do not assume automatic repair or reclamation. This does not
   make direct low-level deletion or barrier endpoints safe to use.
 * Protocol write behavior on a follower must be tested separately from HTTP

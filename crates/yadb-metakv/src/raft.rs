@@ -556,7 +556,7 @@ impl<FS: StorageFs> RaftCore<FS> {
 #[derive(Clone)]
 pub struct LocalMetaKv<FS: StorageFs> {
     inner: Option<Arc<Mutex<RaftCore<FS>>>>,
-    #[cfg(any(test, feature = "experimental-openraft-storage"))]
+    #[cfg(any(test, feature = "openraft-storage"))]
     openraft: Option<crate::openraft_client::GroupRouter>,
     peer_addrs: Arc<BTreeMap<u32, String>>,
     last_leader_contact: Arc<Mutex<Instant>>,
@@ -573,11 +573,11 @@ impl<FS: StorageFs> LocalMetaKv<FS> {
 
     /// Whether this handle routes metadata writes through OpenRaft.
     pub fn is_openraft(&self) -> bool {
-        #[cfg(any(test, feature = "experimental-openraft-storage"))]
+        #[cfg(any(test, feature = "openraft-storage"))]
         {
             return self.openraft.is_some();
         }
-        #[cfg(not(any(test, feature = "experimental-openraft-storage")))]
+        #[cfg(not(any(test, feature = "openraft-storage")))]
         {
             false
         }
@@ -588,7 +588,7 @@ impl<FS: StorageFs> LocalMetaKv<FS> {
     /// Reads are local-applied and may be stale, not linearizable. Writes on
     /// current-thread Tokio runtimes (including their blocking threads) are
     /// rejected before submission. Multi-thread runtimes use block_in_place.
-    #[cfg(any(test, feature = "experimental-openraft-storage"))]
+    #[cfg(any(test, feature = "openraft-storage"))]
     pub fn from_openraft(
         raft: crate::openraft_runtime::YadbRaft,
         state: crate::openraft_state_machine::DurableMetaStateMachine,
@@ -612,7 +612,7 @@ impl<FS: StorageFs> LocalMetaKv<FS> {
     /// read methods panic on invalid scope or unavailable state; use
     /// `try_snapshot` where errors must be handled. Namespace-wide scans merge
     /// local views without an atomic cross-group revision.
-    #[cfg(any(test, feature = "experimental-openraft-storage"))]
+    #[cfg(any(test, feature = "openraft-storage"))]
     pub fn from_openraft_groups(
         control: u64,
         groups: BTreeMap<
@@ -637,7 +637,7 @@ impl<FS: StorageFs> LocalMetaKv<FS> {
     }
 
     pub fn revision_for_key(&self, key: &str) -> Result<u64, MetaError> {
-        #[cfg(any(test, feature = "experimental-openraft-storage"))]
+        #[cfg(any(test, feature = "openraft-storage"))]
         if let Some(router) = &self.openraft {
             return router.revision_for_key(key);
         }
@@ -651,7 +651,7 @@ impl<FS: StorageFs> LocalMetaKv<FS> {
         &self,
         key: &str,
     ) -> Result<(u32, RoleState, u64, Option<u32>, u64), MetaError> {
-        #[cfg(any(test, feature = "experimental-openraft-storage"))]
+        #[cfg(any(test, feature = "openraft-storage"))]
         if let Some(router) = &self.openraft {
             return router.role_for_key(key);
         }
@@ -662,7 +662,7 @@ impl<FS: StorageFs> LocalMetaKv<FS> {
         let core = RaftCore::open(fs, dir, node_id, vec![node_id], true)?;
         Ok(Self {
             inner: Some(Arc::new(Mutex::new(core))),
-            #[cfg(any(test, feature = "experimental-openraft-storage"))]
+            #[cfg(any(test, feature = "openraft-storage"))]
             openraft: None,
             peer_addrs: Arc::new(BTreeMap::new()),
             last_leader_contact: Arc::new(Mutex::new(Instant::now())),
@@ -689,7 +689,7 @@ impl<FS: StorageFs> LocalMetaKv<FS> {
         let core = RaftCore::open(fs, dir, node_id, peer_ids, true)?;
         Ok(Self {
             inner: Some(Arc::new(Mutex::new(core))),
-            #[cfg(any(test, feature = "experimental-openraft-storage"))]
+            #[cfg(any(test, feature = "openraft-storage"))]
             openraft: None,
             peer_addrs: Arc::new(peer_addrs),
             last_leader_contact: Arc::new(Mutex::new(Instant::now())),
@@ -717,7 +717,7 @@ impl<FS: StorageFs> LocalMetaKv<FS> {
         let core = RaftCore::open(fs, dir, node_id, peer_ids, true)?;
         Ok(Self {
             inner: Some(Arc::new(Mutex::new(core))),
-            #[cfg(any(test, feature = "experimental-openraft-storage"))]
+            #[cfg(any(test, feature = "openraft-storage"))]
             openraft: None,
             peer_addrs: Arc::new(peer_addrs),
             last_leader_contact: Arc::new(Mutex::new(Instant::now())),
@@ -733,7 +733,7 @@ impl<FS: StorageFs> LocalMetaKv<FS> {
     /// The last value is the commit index for legacy Raft and the locally
     /// applied log index for OpenRaft; it is not a quorum-read guarantee.
     pub fn role_info(&self) -> (u32, RoleState, u64, Option<u32>, u64) {
-        #[cfg(any(test, feature = "experimental-openraft-storage"))]
+        #[cfg(any(test, feature = "openraft-storage"))]
         if let Some(client) = &self.openraft {
             return client.role_info();
         }
@@ -748,7 +748,7 @@ impl<FS: StorageFs> LocalMetaKv<FS> {
     }
 
     pub fn node_id(&self) -> u32 {
-        #[cfg(any(test, feature = "experimental-openraft-storage"))]
+        #[cfg(any(test, feature = "openraft-storage"))]
         if let Some(client) = &self.openraft {
             return client.role_info().0;
         }
@@ -889,7 +889,7 @@ impl<FS: StorageFs> LocalMetaKv<FS> {
     /// Returns the result only for this proposal's (index, term). An error after
     /// proposing is not a rollback guarantee: replication may still commit it.
     pub fn execute(&self, cmd: KvCommand) -> Result<KvResult, MetaError> {
-        #[cfg(any(test, feature = "experimental-openraft-storage"))]
+        #[cfg(any(test, feature = "openraft-storage"))]
         if let Some(client) = &self.openraft {
             return client.execute(cmd);
         }
@@ -925,7 +925,7 @@ impl<FS: StorageFs> LocalMetaKv<FS> {
     }
 
     pub fn get(&self, key: &str) -> Option<KvValue> {
-        #[cfg(any(test, feature = "experimental-openraft-storage"))]
+        #[cfg(any(test, feature = "openraft-storage"))]
         if let Some(client) = &self.openraft {
             return client
                 .try_snapshot(&[key.to_owned()], &[])
@@ -948,7 +948,7 @@ impl<FS: StorageFs> LocalMetaKv<FS> {
         keys: &[String],
         prefixes: &[String],
     ) -> Result<MetaSnapshot, MetaError> {
-        #[cfg(any(test, feature = "experimental-openraft-storage"))]
+        #[cfg(any(test, feature = "openraft-storage"))]
         if let Some(client) = &self.openraft {
             return client.try_snapshot(keys, prefixes);
         }
@@ -976,7 +976,7 @@ impl<FS: StorageFs> LocalMetaKv<FS> {
         keys: &[String],
         prefixes: &[String],
     ) -> Result<MetaSnapshot, MetaError> {
-        #[cfg(any(test, feature = "experimental-openraft-storage"))]
+        #[cfg(any(test, feature = "openraft-storage"))]
         if let Some(client) = &self.openraft {
             return client.linearizable_snapshot(keys, prefixes);
         }
@@ -992,7 +992,7 @@ impl<FS: StorageFs> LocalMetaKv<FS> {
         &self,
         keys: &[String],
     ) -> Result<MetaSnapshot, MetaError> {
-        #[cfg(any(test, feature = "experimental-openraft-storage"))]
+        #[cfg(any(test, feature = "openraft-storage"))]
         if let Some(client) = &self.openraft {
             return client.linearizable_control_snapshot(keys);
         }
@@ -1016,7 +1016,7 @@ impl<FS: StorageFs> LocalMetaKv<FS> {
     /// or non-canonical value. A fallback to control would put the record in a
     /// group that never resolves it back to the project.
     pub fn project_idempotency_scope(&self, project: &str) -> Result<(String, String), MetaError> {
-        #[cfg(any(test, feature = "experimental-openraft-storage"))]
+        #[cfg(any(test, feature = "openraft-storage"))]
         if let Some(client) = &self.openraft {
             let records = client.idempotency_namespace(Some(project))?;
             let group = client.group_id_for_project(Some(project))?;
@@ -1029,7 +1029,7 @@ impl<FS: StorageFs> LocalMetaKv<FS> {
     }
 
     pub fn scan_prefix(&self, prefix: &str) -> Vec<(String, KvValue)> {
-        #[cfg(any(test, feature = "experimental-openraft-storage"))]
+        #[cfg(any(test, feature = "openraft-storage"))]
         if let Some(client) = &self.openraft {
             return client.scan(prefix);
         }
@@ -1037,7 +1037,7 @@ impl<FS: StorageFs> LocalMetaKv<FS> {
     }
 
     pub fn revision(&self) -> u64 {
-        #[cfg(any(test, feature = "experimental-openraft-storage"))]
+        #[cfg(any(test, feature = "openraft-storage"))]
         if let Some(client) = &self.openraft {
             return client.revision();
         }
@@ -1045,7 +1045,7 @@ impl<FS: StorageFs> LocalMetaKv<FS> {
     }
 
     pub fn watch_prefix(&self, prefix: impl Into<String>) -> Receiver<WatchEvent> {
-        #[cfg(any(test, feature = "experimental-openraft-storage"))]
+        #[cfg(any(test, feature = "openraft-storage"))]
         if let Some(client) = &self.openraft {
             return client.watch_prefix(prefix.into());
         }

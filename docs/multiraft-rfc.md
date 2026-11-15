@@ -7,11 +7,11 @@ an initial direction; open choices below require implementation-level designs an
 tests. Existing single-group behavior remains in force, except for explicitly
 documented fail-closed legacy authentication requirements in the checklist.
 
-The isolated experimental module contains group identities, a typed WAL and an
+The isolated `multiraft` prototype module contains group identities, a typed WAL and an
 incomplete deterministic memory-only core. The core is not connected to the WAL,
 daemon or client traffic; it must not be used as a production consensus engine.
 The selected production consensus dependency is OpenRaft 0.9.x. Its integration
-boundary includes experimental file-backed adapters, persistent group ownership,
+boundary includes opt-in file-backed adapters, persistent group ownership,
 an in-process registry and signed TCP RPCs with opt-in pinned TLS 1.3 mTLS.
 The opt-in daemon module runs one isolated group with a dedicated mandatory-mTLS
 listener; legacy Raft still serves all client traffic. These are not a production
@@ -24,9 +24,9 @@ an already deployed change, general resharding or a distributed transaction
 protocol; single-group adapter tests do not establish this Multi-Raft path.
 The OpenRaft storage contracts require
 persist-before-return for votes and persist-before-callback for log appends; YADB must satisfy those contracts rather
-than route OpenRaft through the experimental WAL/core. Field checks alone do not
+than route OpenRaft through the prototype WAL/core. Field checks alone do not
 authenticate peers: trusted per-node signing keys, TLS certificates and exact
-leaf pins establish the current experimental transport identity boundary.
+leaf pins establish the current transport identity boundary.
 The remaining runtime and verification gates below are not complete.
 An OpenRaft singleton smoke test runs with a test-only volatile store and applies
 a YADB command. It does not test durable recovery, replication, quorum loss or
@@ -40,19 +40,19 @@ the new majority, and catches the old leader up after healing. A timed-out write
 This simulated partition is not a durability, snapshot, authenticated transport,
 message reordering, or exhaustive consensus-safety test.
 
-An experimental opt-in file-backed OpenRaft log/vote prototype uses framed records with
+An opt-in file-backed OpenRaft log/vote implementation uses framed records with
 CRC, serialized writes, `sync_data()` before `LogFlushed`, reopen replay, matching
 overlap preservation with explicit truncation for conflicts, cooperative OS
 directory locking, and fail-closed malformed-tail handling. Corrected replay rules
 and checkpoint capability use `YORLOG05`, whose frame header is self-checking
-over `magic||len||payload_crc`, and reject the prior experimental
+over `magic||len||payload_crc`, and reject the prior
 `YORLOG02`/`YORLOG03`/`YORLOG04` formats unchanged;
 no automatic migration is implemented.
 It is not production storage: the opt-in daemon integration does not close the
-storage-contract gate, and the separate experimental state-machine and snapshot
+storage-contract gate, and the separate state-machine and snapshot
 adapter has not demonstrated complete upstream storage-suite equivalence.
 Simulated partial-write and sync errors poison the handle until reopen;
-these tests do not establish power-loss safety. The experimental log header binds
+these tests do not establish power-loss safety. The log header binds
 cluster, group, incarnation and node, not the mutable OpenRaft membership; creation
 and reopening are separate and identity mismatch is rejected without modifying data.
 
@@ -188,19 +188,19 @@ or voters, accepts unknown Raft senders, and lacks exclusive WAL ownership and
 complete structural RPC validation. In particular, reopening a multi-voter WAL
 as a singleton can apply its uncommitted tail. These are blockers for using it
 as a multi-group runtime, not guarantees supplied by a group envelope. The
-experimental `multiraft` module validates configuration and message identity and
+`multiraft` prototype module validates configuration and message identity and
 provides a separately provisioned identity descriptor. This descriptor is not
 bound to a WAL and requires externally provided exclusive ownership and durable
 directory provisioning; it does not open a WAL, authenticate peers, or dispatch RPCs.
-An experimental OS directory lock and locked descriptor wrapper exist, but are
+An OS directory lock and locked descriptor wrapper exist, but are
 not wired to a group runtime. The lock is advisory and assumes cooperating
 processes and a directory that is not renamed or replaced during use. It provides
 no exclusion against legacy code that does not acquire it.
-An experimental, separately provisioned group WAL header includes the full replica
+A separately provisioned group WAL header includes the full replica
 identity and fixed voters and is verified while holding that OS lock. A separate
 bounded framed-log API can append and recover opaque records and fails closed on
 malformed frames without truncation. It does not validate Raft state transitions or
-connect to the legacy core. An experimental typed wrapper additionally checks
+connect to the legacy core. A typed wrapper additionally checks
 term/vote monotonicity, log indices and committed-prefix replacement before append
 and on replay. Overlapping entries with the same term and index must have identical
 commands; this local check does not prove Raft's log-matching property across

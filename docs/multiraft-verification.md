@@ -92,7 +92,7 @@ CLI dispatch checks; `scripts/test_yadb_local_smoke.py` passes **3/3** and prove
 smoke requests follow the recorded port base instead of the 8420 default.
 
 The completed final independent GPT-6.1 Sol review of this delta returned
-**ACCEPT for the narrow experimental local scope only**, with `production_ready`
+**ACCEPT for the narrow local scope only**, with `production_ready`
 still false. It confirmed the lease ordering, revision-regression rejection,
 leader-only quorum-confirmed internal endpoint, and absence of a guard held across
 `.await` in the reviewed HTTP path. Its non-blocking findings were addressed where
@@ -381,7 +381,7 @@ that narrow historical empty-loopback smoke and clean reopen; the final combined
 review rejected production readiness. The deleted root's evidence is no longer available.
 
 The checklist is authoritative for incomplete gates. A successful command below
-does not make this experimental runtime production-ready. Record the exact source
+does not make this runtime production-ready. Record the exact source
 revision/diff, Rust/toolchain version, host OS, filesystem/mount options and device
 write-cache policy for release evidence; do not reuse results after relevant edits.
 
@@ -437,7 +437,7 @@ or final independent review. No OS/device power-loss qualification has run here.
 A subsequent full `--offline --locked -j 2 --workspace --all-features` test run
 passed: 109 MetaKV tests, 11 daemon tests and all other workspace tests. It includes
 the first bounded-log checkpoint tests, explicit listener drain/byte-budget tests,
-snapshot catch-up in the three-process test, and experimental daemon create/status/
+snapshot catch-up in the three-process test, and daemon create/status/
 shutdown/reopen. Later `YORLOG05` format/serialization changes, local-certificate
 preflight validation and the TCP-proxy partition scenario then required rerunning
 the integrated gates; see the subsequent results and current status above.
@@ -462,7 +462,7 @@ this failure. That build also contained incomplete snapshot-streaming work and
 emitted unused-variable/dead-code warnings, so it is not a final combined gate.
 
 After that run, daemon borrowed-shutdown hardening passed
-`cargo test --offline --locked -p yadbd --features experimental-openraft-storage experimental_openraft::tests`
+`cargo test --offline --locked -p yadbd --features openraft-storage openraft::tests`
 with **three tests**, including a deterministic cancellation/retry/reopen case.
 The caller retains the owner and listener handle when the cleanup future is
 cancelled. This targeted result neither clears the process regression nor
@@ -559,8 +559,8 @@ passed **16/16** (108 filtered, 0.36 s test runtime), including the reopen test.
 The earlier intermittent lock failure was not reproduced or conclusively explained.
 
 The focused daemon cancellation regression subsequently passed **1/1**:
-`experimental_openraft::tests::cancelled_shutdown_retains_owner_and_listener_until_retry`
-under `yadbd` with `experimental-openraft-storage`, using offline/locked Cargo and
+`openraft::tests::cancelled_shutdown_retains_owner_and_listener_until_retry`
+under `yadbd` with `openraft-storage`, using offline/locked Cargo and
 the configured test temporary root. The two daemon integration binaries ran zero
 filtered tests. This confirms the existing single-group borrowed-shutdown
 behavior, not arbitrary `MultiRunning` cancellation or startup cancellation.
@@ -579,7 +579,7 @@ behavior, not arbitrary `MultiRunning` cancellation or startup cancellation.
   project-specific `NotLeader`, group 3 writes after stopping group 2's leader,
   and selected state on reopen. It is not a multi-host or multi-process test and
   does not establish replacement election after stopping that leader.
-* `cargo test --offline --locked -p yadbd --features experimental-openraft-storage --test openraft_daemon -- --nocapture`
+* `cargo test --offline --locked -p yadbd --features openraft-storage --test openraft_daemon -- --nocapture`
   passed **1/1** in 1.06 s. The child-daemon test builds the binary and uses a v2
   manifest with singleton control group 1 and data groups 2/3. It applies two
   projects over HTTP, writes SQL/S3/block data, verifies underlying state placement,
@@ -624,7 +624,7 @@ single-node: this establishes active multi-group routing, not multi-node
 replication, daemon integration or resolution of the process snapshot failure.
 
 The new feature-gated `yadbd` engine integration test passed:
-`cargo test --offline --locked -p yadbd --features experimental-openraft-storage --test openraft_clients -- --nocapture`
+`cargo test --offline --locked -p yadbd --features openraft-storage --test openraft_clients -- --nocapture`
 — **one passed**, 0.41 s test runtime. SQL table/index and multi-statement
 transaction operations, S3 put/get/list, and block write/read/unmap use the same
 real singleton OpenRaft-backed facade and retain their results after shutdown and
@@ -686,7 +686,7 @@ block and object reads `500` with a corruption reason, `404` still means never
 written or deleted. Four tests in `yadb-blob`; 21/21 passed.
 
 **S4 — a torn final OpenRaft log frame prevented the group from opening
-(experimental build).** `append_frame` writes and syncs before OpenRaft is told the
+(opt-in build).** `append_frame` writes and syncs before OpenRaft is told the
 append succeeded, so a frame cut short by a crash was never acknowledged and can
 be dropped. `recover` now distinguishes `End`, `Torn` and `Complete`: a torn tail is
 truncated to the last frame boundary, synced, and reported through `TailRepair`.
@@ -713,7 +713,7 @@ only way to observe a length past EOF. `yadb-metakv` 149 → 150;
 `InvalidData` with a message naming the header checksum and a byte-identical file,
 and the format-rejection test now covers `YORLOG02`, `03` and `04`. What this does
 not prove: `SimFs`/hand-patched bytes are not real device damage, and no migration
-from `YORLOG04` exists, so an existing experimental log must be analysed, never
+from `YORLOG04` exists, so an existing log must be analysed, never
 rewritten in place.
 
 Operational consequence, checked against the live root: all nine
@@ -815,7 +815,7 @@ clear refusal at the `yadbd` boundary is not tested.
 
 ### Live deployment after S1 (2026-11-15)
 
-`main` at `234d49a` was built with `--features experimental-openraft-storage` and
+`main` at `234d49a` was built with `--features openraft-storage` and
 deployed to the three-process root. Every daemon reported three group leaders and
 the same applied index per group on all nodes. What was exercised live, not just in
 tests:
@@ -860,6 +860,17 @@ Not established: the same run did not kill the process mid-append, so the
 disk. The first read after the write returned zeros from the writing node before
 the entry had applied locally — the documented "reads are local-applied"
 limitation, not a `YORLOG05` effect.
+
+### Renamed OpenRaft surface (2026-11-15)
+
+The `experimental` prefix was removed from the OpenRaft names: the build feature is
+`openraft-storage`, the daemon module is `openraft`, the flag is `--openraft-config`
+and the status route is `/openraft/status`. A separate disposable root provisioned
+from that tree started with `--openraft-config`, `scripts/yadb-local.py verify`
+passed on all three nodes with `metadata_runtime: openraft`, the status JSON no
+longer carries an `experimental` field, and `GET /experimental/openraft/status`
+returns `404`. The cluster is still `production_ready: false`; the rename changes
+no runtime behaviour and no routing identity.
 
 ## Required failure record format
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Provision and supervise a disposable, experimental local OpenRaft cluster."""
+"""Provision and supervise a disposable local OpenRaft cluster."""
 import argparse
 import datetime
 import fcntl
@@ -275,7 +275,7 @@ def prepare(root=None, http_base=DEFAULT_HTTP_BASE):
     print('Building feature-enabled daemon offline; artifacts remain on failure.', flush=True)
     env = os.environ.copy()
     env['CARGO_INCREMENTAL'] = '0'
-    subprocess.run(['cargo', 'build', '--offline', '--locked', '-j', '2', '-p', 'yadbd', '--features', 'experimental-openraft-storage'], cwd=REPO, env=env, check=True)
+    subprocess.run(['cargo', 'build', '--offline', '--locked', '-j', '2', '-p', 'yadbd', '--features', 'openraft-storage'], cwd=REPO, env=env, check=True)
     binary = root / 'bin/yadbd'
     shutil.copyfile(REPO / 'target/debug/yadbd', binary)
     binary.chmod(0o700)
@@ -387,7 +387,7 @@ def node_command(root, http_base, node, peers):
     return [str(root / 'bin/yadbd'), '--listen', f'127.0.0.1:{http_port(http_base, node)}',
             '--node-id', str(node), '--data-dir', str(root / 'data' / f'node-{node}'),
             '--metadata-runtime', 'openraft',
-            '--experimental-openraft-config', str(root / 'config' / f'node-{node}-manifest.json'),
+            '--openraft-config', str(root / 'config' / f'node-{node}-manifest.json'),
             '--peers', peers, '--admin-subject', OPERATOR]
 
 
@@ -440,7 +440,7 @@ def run(root):
                 try:
                     observations = []
                     for node in range(1, 4):
-                        req = urllib.request.Request(f'http://127.0.0.1:{http_port(http_base, node)}/experimental/openraft/status', headers={'x-yadb-subject': OPERATOR, 'x-yadb-subject-signature': signature})
+                        req = urllib.request.Request(f'http://127.0.0.1:{http_port(http_base, node)}/openraft/status', headers={'x-yadb-subject': OPERATOR, 'x-yadb-subject-signature': signature})
                         with urllib.request.urlopen(req, timeout=1) as response:
                             observations.append(json.load(response)['local_observations'])
                     if all(len(groups) == 3 and all(g.get('leader_id') is not None for g in groups) for groups in observations):
@@ -467,7 +467,7 @@ def verify(root):
     subject = OPERATOR
     signature = hmac.new(secret.encode(), subject.encode(), hashlib.sha256).hexdigest()
     for node in range(1, 4):
-        for path in ('/healthz', '/experimental/openraft/status'):
+        for path in ('/healthz', '/openraft/status'):
             request = urllib.request.Request(f'http://127.0.0.1:{http_port(http_base, node)}{path}', headers={'x-yadb-subject': subject, 'x-yadb-subject-signature': signature})
             with urllib.request.urlopen(request, timeout=5) as response:
                 print(f'node {node} {path}:', response.read().decode())

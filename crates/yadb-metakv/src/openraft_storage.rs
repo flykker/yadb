@@ -1,4 +1,4 @@
-//! Experimental opt-in file-backed OpenRaft log and vote prototype.
+//! Opt-in file-backed OpenRaft log and vote store.
 //!
 //! Not suitable for production: group identity, recovery, failure handling and
 //! the OpenRaft storage contracts need further work and testing.
@@ -20,7 +20,7 @@ use crate::multiraft::ReplicaIdentity;
 use crate::openraft_runtime::YadbRaftTypeConfig as C;
 
 // Version 02 used suffix-replacing append; version 03 lacks checkpoints.
-// Neither format is migrated or reinterpreted by this experimental store.
+// Neither format is migrated or reinterpreted by this store.
 // Version 05 makes the frame header self-checking: 04 carried a payload CRC but
 // an unprotected length, so a length damaged upward was byte-identical to a torn
 // tail and got repaired by truncating away every acknowledged frame after it.

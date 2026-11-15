@@ -5,8 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-# Opt-in experimental adapters only; not wired to the daemon or client traffic.
-experimental-openraft-storage = ["dep:ring", "dep:tokio-rustls"]
+# Opt-in OpenRaft adapters; the legacy Raft core remains the default.
+openraft-storage = ["dep:ring", "dep:tokio-rustls"]
 
 [dependencies]
 yadb-io = { path = "../yadb-io" }

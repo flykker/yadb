@@ -5,7 +5,7 @@ No command currently exports/imports this format, enforces its writer fence or
 performs cutover. For existing deployments, keep all SQL, S3, block, iSCSI and
 legacy Raft traffic on the legacy runtime. The separately authorized fresh,
 empty test cluster is outside that restriction; it does not authorize importing
-or reusing existing legacy data. An experimental OpenRaft
+or reusing existing legacy data. An OpenRaft
 group is not a migration destination
 until the [production checklist](multiraft-production-todo.md) is complete.
 

@@ -273,7 +273,7 @@ class LaunchCommandTest(unittest.TestCase):
             self.assertEqual(command[command.index('--peers') + 1], peers)
             self.assertEqual(command[command.index('--metadata-runtime') + 1], 'openraft')
             self.assertEqual(command[command.index('--data-dir') + 1], f'/deployment/data/node-{node}')
-            self.assertEqual(command[command.index('--experimental-openraft-config') + 1],
+            self.assertEqual(command[command.index('--openraft-config') + 1],
                              f'/deployment/config/node-{node}-manifest.json')
 
     def test_node_command_never_carries_the_subject_secret(self):

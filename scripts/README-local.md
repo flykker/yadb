@@ -1,7 +1,7 @@
-# Experimental empty local cluster
+# Empty local cluster
 
 This creates a **new, empty, nonproduction** cluster only. It does not migrate or
-modify an existing cluster. The experimental runtime has unresolved replication,
+modify an existing cluster. The runtime has unresolved replication,
 authorization freshness and lifecycle failures; `production_ready` remains false.
 Starting processes or inspecting status does not prove replication or readiness.
 
@@ -47,7 +47,7 @@ fails closed. This checks local file integrity, not the identity of a listening
 server or authentication; it cannot stop a caller deliberately editing the files
 and recomputing the hash. Protect the deployment directory.
 
-`prepare` builds with `--features experimental-openraft-storage` and copies
+`prepare` builds with `--features openraft-storage` and copies
 `target/debug/yadbd` immediately, so it always installs a feature-enabled daemon.
 Do not copy that path after an unrelated default-feature build: `cargo test
 --workspace` and `cargo build` without the feature overwrite `target/debug/yadbd`

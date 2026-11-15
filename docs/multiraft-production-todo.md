@@ -49,7 +49,7 @@ starvation-proof: failed refreshes serialize, each expired-lease request can
 enqueue a blocking task, and the internal endpoint shares the blocking pool.
 
 The completed final independent GPT-6.1 Sol review of this delta returned ACCEPT
-for the narrow experimental local scope only. Its in-scope non-blocking findings
+for the narrow local scope only. Its in-scope non-blocking findings
 were fixed: empty Raft tokens are rejected instead of matching an absent header,
 S3-wire error mapping preserves `x-yadb-write-outcome`/`x-yadb-retry`, the
 `--port-base` upper bound is 55527, prepared-state status also checks Raft
@@ -58,7 +58,7 @@ listed in `docs/multiraft-verification.md`; they are not production blockers for
 the narrow scope but remain before any broader claim.
 
 The completed final independent Sol leadership review accepted only the narrow
-local experimental group-count balance, not production readiness. Earlier
+local group-count balance, not production readiness. Earlier
 targeted checks also passed: security tests 16/16, state tests 16/16, storage
 23/23, S3 19/19 and IO 7/7; `git diff --check` passed. These do not replace the
 full gates above. S3 GC is disabled. OpenRaft `consistent=true` block reads are
@@ -75,7 +75,7 @@ old data was untouched, and no migration occurred. Do not claim known
 regressions resolved.
 
 Status: **not production-ready**. Legacy Raft remains the daemon default; the
-experimental v2 client integration is still being hardened. A local
+v2 client integration is still being hardened. A local
 nonproduction loopback cluster is running at `/public/cluster_data`: three
 daemon processes host nine replicas. It is **not empty**: at 21:25:24 on
 2026-11-14 an unidentified apply committed exactly `examples/platform.yaml`
@@ -84,10 +84,10 @@ daemon processes host nine replicas. It is **not empty**: at 21:25:24 on
 token-gated internal-snapshot behavior were exercised live (unknown-project
 SQL/S3/block reads return 403, not 503; the internal endpoint returns 401 without
 a token, 200 with revision 2 on the control leader and 409 on followers).
-Independent Sol accepted only the narrow experimental delta, not production
+Independent Sol accepted only the narrow delta, not production
 readiness; see `docs/multiraft-verification.md` for the root, evidence, incident
 and election-churn caveat. The
-`experimental-openraft-storage` feature is opt-in, not an operational release.
+`openraft-storage` feature is opt-in, not an operational release.
 Do not enable production routing until the gates below are complete. The user
 has separately authorized this new nonproduction test cluster to exercise
 real client routing before those gates close; it is not a production release or
@@ -397,7 +397,7 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   a pre-append failure.
 - [ ] Implement a multi-group registry: several independent groups per node,
   per-group directories, per-group failure isolation and bounded resources.
-  An experimental in-process registry provides separate directories and a
+  An in-process registry provides separate directories and a
   group-count limit; it does not yet provide resource isolation, robust
   cancellation/shutdown handling or shared network routing. The in-progress daemon
   v2 implementation instead owns multiple groups with dedicated listeners; its
@@ -449,9 +449,9 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
 OpenRaft singleton and three-node tests use in-process transport. File-backed
 test stores cover restart, follower catch-up and snapshot transfer; selected
 faults are simulated in process. A persistent group owner and storage adapters
-are available behind an experimental feature and wired to an opt-in observational
+are available behind the `openraft-storage` feature and wired to an opt-in observational
 daemon group with mandatory mTLS. The multi-group client daemon path has a bounded
-singleton-group child test pass and a narrow local experimental deployment, but is
+singleton-group child test pass and a narrow local deployment, but is
 still under hardening; none of this establishes
 OS/filesystem/hardware power-loss safety.
 
@@ -529,7 +529,7 @@ pre-`YORLOG05` binary for exactly that reason, and adopting the new format there
 would require a replay-and-republish migration, not a reinitialisation. `YORLOG05` covers `magic||len||payload_crc`
 with its own CRC, which is what lets a length damaged upward be refused instead
 of repaired as a torn tail.
-No automatic log migration exists. Preserve old experimental directories for
+No automatic log migration exists. Preserve old log directories for
 explicit analysis; never delete/reinitialize them to bypass a version error.
 
 Compatibility warning: legacy clustered daemon deployments now require

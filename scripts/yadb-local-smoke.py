@@ -137,7 +137,7 @@ class Smoke:
 
     def statuses(self):
         for node in range(1, 4):
-            status, data = self.request(node, 'GET', '/experimental/openraft/status')
+            status, data = self.request(node, 'GET', '/openraft/status')
             if status != 200:
                 raise RuntimeError(f'node {node} group status returned {status}')
             observations = json.loads(data)['local_observations']
