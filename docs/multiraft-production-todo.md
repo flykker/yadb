@@ -299,12 +299,29 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   path. The group-scoped counter also means projects that share a group share one
   budget, which is intended but not yet exercised with a real second project on
   the same group.
-- [ ] Consistent backup and restore. Nothing is implemented.
+- [ ] Consistent backup and restore. Offline capture is partly implemented; restore
+  is not implemented at all, so no artifact has ever been restored.
   `docs/multiraft-backup-restore-design.md` designs a whole-deployment artifact
   and a restore into a new root, and records why raw `cp -a` of live data, a
-  `state.json`-only copy and a Raft snapshot alone are not backups. Its hardest
-  unsolved problem is a cluster-wide fence that drains delayed and forwarded
-  mutations so independently captured group states form one consistent cut.
+  `state.json`-only copy and a Raft snapshot alone are not backups.
+  What exists: a durable `.yadb-backup-in-progress` marker that makes `yadbd` and
+  the supervisor's `run` refuse to start, read while holding `supervisor.lock` so a
+  paused `run` cannot start after a backup began; a strictly read-only replica
+  validator (`yadbd --verify-replica`, exit `4` on refusal) that replays the log
+  without repairing it and decodes the image without publishing a rebuild, and
+  requires the applied log ID to be in the log or covered by the snapshot or
+  `last_purged`; and `scripts/yadb-local.py backup <root> <dest>`, which requires a
+  stopped deployment, a free supervisor lock and nine free replica locks, validates
+  all nine replicas, refuses a stored membership that disagrees with the descriptor,
+  copies with per-file SHA-256, and writes `COMPLETE` last. Blob GC and the scrub
+  cannot run during the copy for the trivial reason that no daemon can start at all,
+  which is why increment 1 needs no separate refusal for them — that requirement
+  belongs to the online variant.
+  Open: no restore path, so `restorable` means "passed these checks"; the artifact
+  digest is not authenticated, so a replaced manifest and hash cannot be detected;
+  the cluster-wide fence that would allow an online cut is designed but not
+  implemented, and identity duplication after restore has no solution yet
+  (nothing carries a monotonic deployment generation).
 
 ## 2. Network and security
 
