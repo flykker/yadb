@@ -71,7 +71,64 @@ pub enum MetaError {
 mod tests {
     use super::*;
     use std::collections::{BTreeMap, BTreeSet, VecDeque};
-    use yadb_io::{FaultConfig, SimFs, SyncFault};
+    use yadb_io::{FaultConfig, SimFs, StorageFs, SyncFault, VirtualFile};
+
+    #[test]
+    fn corrupt_wal_refuses_to_start_instead_of_dropping_acked_writes() {
+        // End-to-end through the production entry point: five acknowledged
+        // writes, then one bit flip inside the third data frame. Before the
+        // fix this reopened `Ok` with a two-entry log and the single-node
+        // recovery path committed that shorter prefix as truth.
+        let fs = SimFs::new(9021);
+        let meta = LocalMetaKv::open_single_node(&fs, "meta", 1).unwrap();
+        for n in 0..5u64 {
+            meta.execute(KvCommand::Put {
+                key: format!("k{n}"),
+                value: n.to_le_bytes().to_vec(),
+            })
+            .unwrap();
+        }
+        drop(meta);
+        fs.simulate_power_cut();
+
+        let path = "meta/raft.wal";
+        let file = fs.open_rw(path, false).unwrap();
+        let mut bytes = vec![0u8; file.len().unwrap() as usize];
+        file.read_at(0, &mut bytes).unwrap();
+        drop(file);
+
+        // Walk the frame headers to find the third data frame's payload.
+        let mut pos = 8usize;
+        let mut starts = Vec::new();
+        while pos + 16 <= bytes.len() {
+            starts.push(pos);
+            let len = u32::from_le_bytes(bytes[pos + 4..pos + 8].try_into().unwrap()) as usize;
+            pos += 16 + len;
+        }
+        // Frame 0 is the bootstrap HardState, so frame 3 is data write 3.
+        assert!(
+            starts.len() >= 4,
+            "expected a bootstrap frame plus 5 writes"
+        );
+        fs.corrupt_byte(path, starts[3] + 16).unwrap();
+        let damaged = {
+            let file = fs.open_rw(path, false).unwrap();
+            let mut after = vec![0u8; file.len().unwrap() as usize];
+            file.read_at(0, &mut after).unwrap();
+            after
+        };
+
+        match LocalMetaKv::open_single_node(&fs, "meta", 1) {
+            Err(MetaError::CorruptWal(_)) => {}
+            Err(error) => panic!("expected CorruptWal, got {error:?}"),
+            Ok(_) => panic!("reopened with a truncated log after mid-file corruption"),
+        }
+
+        let file = fs.open_rw(path, false).unwrap();
+        let mut after = vec![0u8; file.len().unwrap() as usize];
+        file.read_at(0, &mut after).unwrap();
+        assert_eq!(after, damaged, "refusing to start must not rewrite the WAL");
+    }
 
     #[test]
     fn selected_snapshot_is_owned_atomic_and_does_not_write_metadata() {

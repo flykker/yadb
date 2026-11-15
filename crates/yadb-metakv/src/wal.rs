@@ -3,21 +3,67 @@ use yadb_io::{StorageFs, VirtualFile};
 
 use crate::{LogEntry, MetaError};
 
-const WAL_MAGIC: &[u8; 8] = b"YADBWAL1";
+/// File magic written by this version. New WALs are `YADBWAL2`, which promises
+/// that every frame carries a self-checking header (see [`FrameFormat::V2`]).
+///
+/// The magic is bumped rather than silently reusing `YADBWAL1` so that a binary
+/// that predates this format refuses to open the file (`invalid wal magic`)
+/// instead of replaying the legacy reader, which treats an unknown frame magic
+/// as a torn tail and would truncate the whole log.
+const WAL_MAGIC: &[u8; 8] = b"YADBWAL2";
+/// Legacy file magic. Still replayed so existing WALs keep opening.
+const WAL_MAGIC_V1: &[u8; 8] = b"YADBWAL1";
 
-/// Legacy frame: `magic | len | crc32(payload) | payload`. The checksum does not
-/// cover the framing fields, so a corrupted `len` is indistinguishable from a
-/// torn tail. Still replayed so existing files keep opening.
 const FRAME_MAGIC_V1: u32 = 0x5957_414C; // "YWAL"
 const FRAME_HDR_LEN_V1: usize = 12;
 
-/// Current frame: `magic | len | payload_crc | header_crc | payload`, where
-/// `header_crc = crc32(magic || len || payload_crc)`. A distinct magic means a
-/// reader never has to guess which checksum layout a frame uses. Because the
-/// framing fields validate themselves, a corrupted `len` is reported as
-/// corruption instead of being mistaken for an incomplete final frame.
 const FRAME_MAGIC_V2: u32 = u32::from_le_bytes(*b"YW2L");
 const FRAME_HDR_LEN_V2: usize = 16;
+
+/// On-disk frame layout, fixed by the file magic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FrameFormat {
+    /// `magic | len | crc32(payload) | payload`.
+    ///
+    /// The checksum covers only the payload, so a damaged `len` that grows past
+    /// EOF is indistinguishable from a torn final frame: the bytes after the
+    /// header are then read as a short payload. This format is replayed for
+    /// files written before the header checksum existed.
+    V1,
+    /// `magic | len | crc32(payload) | crc32(magic || len || payload_crc) | payload`.
+    ///
+    /// The header checksums itself, so a damaged `len` is reported as
+    /// corruption instead of being mistaken for a torn tail. That distinction
+    /// is the whole point: truncating at a damaged `len` silently discards
+    /// every acknowledged frame after it, including later `HardState` frames.
+    V2,
+}
+
+impl FrameFormat {
+    fn from_wal_magic(magic: &[u8; 8]) -> Option<Self> {
+        if magic == WAL_MAGIC_V1 {
+            Some(Self::V1)
+        } else if magic == WAL_MAGIC {
+            Some(Self::V2)
+        } else {
+            None
+        }
+    }
+
+    fn hdr_len(self) -> usize {
+        match self {
+            Self::V1 => FRAME_HDR_LEN_V1,
+            Self::V2 => FRAME_HDR_LEN_V2,
+        }
+    }
+
+    fn frame_magic(self) -> u32 {
+        match self {
+            Self::V1 => FRAME_MAGIC_V1,
+            Self::V2 => FRAME_MAGIC_V2,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum WalRecord {
@@ -41,6 +87,7 @@ pub struct RecoveredWal {
 /// Durable Raft Write-Ahead Log backed by `StorageFs` (`OsFs` or `SimFs`).
 pub struct RaftWal<FS: StorageFs> {
     file: FS::File,
+    format: FrameFormat,
     write_pos: u64,
     sync_writes: bool,
     failed: bool,
@@ -67,6 +114,7 @@ impl<FS: StorageFs> RaftWal<FS> {
             return Ok((
                 Self {
                     file,
+                    format: FrameFormat::V2,
                     write_pos: WAL_MAGIC.len() as u64,
                     sync_writes,
                     failed: false,
@@ -75,7 +123,8 @@ impl<FS: StorageFs> RaftWal<FS> {
             ));
         }
 
-        let (recovered, valid_end) = replay_wal(&file)?;
+        let format = read_wal_magic(&file)?;
+        let (recovered, valid_end) = replay_wal(&file, format)?;
         if sync_writes {
             // A process-only restart retains page cache, including records
             // whose previous sync failed. Reading valid bytes is not evidence
@@ -86,6 +135,7 @@ impl<FS: StorageFs> RaftWal<FS> {
         Ok((
             Self {
                 file,
+                format,
                 write_pos: valid_end,
                 sync_writes,
                 failed: false,
@@ -104,11 +154,7 @@ impl<FS: StorageFs> RaftWal<FS> {
     pub fn append(&mut self, record: &WalRecord) -> Result<(), MetaError> {
         self.ensure_healthy()?;
         let payload = serde_json::to_vec(record)?;
-        let crc = crc32fast::hash(&payload);
-        let hdr = v2_header(payload.len(), crc);
-        let mut frame = Vec::with_capacity(FRAME_HDR_LEN_V2 + payload.len());
-        frame.extend_from_slice(&hdr);
-        frame.extend_from_slice(&payload);
+        let frame = encode_frame(self.format, &payload);
 
         let pos = self.write_pos;
         if let Err(e) = self.file.write_at(pos, &frame) {
@@ -129,17 +175,32 @@ impl<FS: StorageFs> RaftWal<FS> {
     }
 }
 
-/// Encodes a v2 frame header. The header checksum covers every other header
-/// field, so `len` cannot be silently damaged into a value that merely looks
-/// like an incomplete payload at the end of the file.
-fn v2_header(payload_len: usize, payload_crc: u32) -> [u8; FRAME_HDR_LEN_V2] {
-    let mut hdr = [0u8; FRAME_HDR_LEN_V2];
-    hdr[0..4].copy_from_slice(&FRAME_MAGIC_V2.to_le_bytes());
-    hdr[4..8].copy_from_slice(&(payload_len as u32).to_le_bytes());
-    hdr[8..12].copy_from_slice(&payload_crc.to_le_bytes());
-    let header_crc = crc32fast::hash(&hdr[..12]);
-    hdr[12..16].copy_from_slice(&header_crc.to_le_bytes());
-    hdr
+fn read_wal_magic<F: VirtualFile>(file: &F) -> Result<FrameFormat, MetaError> {
+    if file.len()? < WAL_MAGIC_V1.len() as u64 {
+        return Err(MetaError::CorruptWal("wal shorter than magic header"));
+    }
+    let mut magic = [0u8; 8];
+    if file.read_at(0, &mut magic)? < magic.len() {
+        return Err(MetaError::CorruptWal("wal shorter than magic header"));
+    }
+    FrameFormat::from_wal_magic(&magic).ok_or(MetaError::CorruptWal("invalid wal magic"))
+}
+
+fn encode_frame(format: FrameFormat, payload: &[u8]) -> Vec<u8> {
+    let payload_len = payload.len() as u32;
+    let payload_crc = crc32fast::hash(payload);
+    let mut frame = Vec::with_capacity(format.hdr_len() + payload.len());
+    frame.extend_from_slice(&format.frame_magic().to_le_bytes());
+    frame.extend_from_slice(&payload_len.to_le_bytes());
+    frame.extend_from_slice(&payload_crc.to_le_bytes());
+    if format == FrameFormat::V2 {
+        // Covers magic, len and payload_crc: the framing fields validate
+        // themselves, so a damaged len can never masquerade as a torn tail.
+        let hdr_crc = crc32fast::hash(&frame[..FRAME_HDR_LEN_V1]);
+        frame.extend_from_slice(&hdr_crc.to_le_bytes());
+    }
+    frame.extend_from_slice(payload);
+    frame
 }
 
 enum FrameOutcome {
@@ -149,30 +210,40 @@ enum FrameOutcome {
     TornTail,
 }
 
-fn replay_wal<F: VirtualFile>(file: &F) -> Result<(RecoveredWal, u64), MetaError> {
+/// Replays the WAL prefix, distinguishing a torn tail from real corruption.
+///
+/// `append` writes one whole frame at the current end of the file and only
+/// advances `write_pos` after the write (and, when configured, its
+/// `sync_data`) succeeds. Appends are strictly sequential, so an incomplete
+/// frame can only be the final bytes of the file, and it was never
+/// acknowledged: discarding it loses nothing.
+///
+/// A frame that is present in full but fails validation is *not* a tail.
+/// Truncating there would silently drop acknowledged entries after it and any
+/// later `HardState`, rewinding `current_term`/`voted_for` (which permits
+/// double-voting in a term). Such damage is reported as `CorruptWal` and the
+/// caller refuses to start.
+///
+/// Truncation is therefore limited to the cases where the frame provably runs
+/// past the end of the file:
+///
+/// * fewer bytes remain than a header needs, or a short read at EOF;
+/// * a `V2` frame whose self-checking header is intact but whose payload never
+///   reached the file;
+/// * a `V1` frame whose declared length runs past EOF. A `V1` header is not
+///   checksummed, so this case is ambiguous between a torn tail and a damaged
+///   `len`; it keeps the legacy truncate behaviour for existing files, and
+///   `V2` removes the ambiguity for every frame written from now on.
+fn replay_wal<F: VirtualFile>(
+    file: &F,
+    format: FrameFormat,
+) -> Result<(RecoveredWal, u64), MetaError> {
     let total_len = file.len()?;
-    if total_len < WAL_MAGIC.len() as u64 {
-        return Err(MetaError::CorruptWal("wal shorter than magic header"));
-    }
-    let mut magic = [0u8; 8];
-    file.read_at(0, &mut magic)?;
-    if &magic != WAL_MAGIC {
-        return Err(MetaError::CorruptWal("invalid wal magic"));
-    }
-
     let mut out = RecoveredWal::default();
     let mut pos = WAL_MAGIC.len() as u64;
 
-    // `append` writes one whole frame at the current end of the file and only
-    // advances `write_pos` after the write (and, when configured, its
-    // `sync_data`) succeeds. Appends are strictly sequential, so an incomplete
-    // frame can only be the final bytes of the file, and it was never
-    // acknowledged. Anything with a complete, frame-shaped header that fails
-    // validation and is followed by more bytes is corruption: silently
-    // dropping it would discard acknowledged records and could rewind the
-    // `HardState` term/vote, which violates Raft safety.
     while pos < total_len {
-        match read_frame(file, pos, total_len)? {
+        match read_frame(file, pos, total_len, format)? {
             FrameOutcome::Record { next_pos, record } => {
                 match record {
                     WalRecord::HardState { term, voted_for } => {
@@ -194,7 +265,7 @@ fn replay_wal<F: VirtualFile>(file: &F) -> Result<(RecoveredWal, u64), MetaError
                 pos = next_pos;
             }
             FrameOutcome::TornTail => {
-                truncate_tail(file, pos)?;
+                truncate_torn_tail(file, pos)?;
                 break;
             }
         }
@@ -207,90 +278,55 @@ fn read_frame<F: VirtualFile>(
     file: &F,
     pos: u64,
     total_len: u64,
+    format: FrameFormat,
 ) -> Result<FrameOutcome, MetaError> {
-    let remaining = total_len - pos;
-    // Neither frame layout fits in the remaining bytes, and only the final
-    // frame can be short. Provable torn tail.
-    if remaining < FRAME_HDR_LEN_V1 as u64 {
+    let hdr_len = format.hdr_len();
+    // Fewer bytes remain than a header needs. Only the final frame can be
+    // short, so this is a provable torn tail.
+    if total_len - pos < hdr_len as u64 {
         return Ok(FrameOutcome::TornTail);
     }
 
     let mut hdr = [0u8; FRAME_HDR_LEN_V2];
-    let n = file.read_at(pos, &mut hdr[..FRAME_HDR_LEN_V1])?;
-    if n < FRAME_HDR_LEN_V1 {
+    if file.read_at(pos, &mut hdr[..hdr_len])? < hdr_len {
+        // Short read at EOF: same provable torn tail.
         return Ok(FrameOutcome::TornTail);
     }
+
     let fmagic = u32::from_le_bytes(hdr[0..4].try_into().expect("4-byte magic"));
+    if fmagic != format.frame_magic() {
+        // A complete header is present and a torn write can only leave a
+        // *prefix* of a frame (so a short magic, not a wrong one). Damage to a
+        // frame that may be followed by acknowledged records is corruption.
+        return Err(MetaError::CorruptWal("invalid frame magic"));
+    }
 
-    let (hdr_len, payload_len, expected_crc, next_pos) = match fmagic {
-        FRAME_MAGIC_V1 => {
-            let len = u32::from_le_bytes(hdr[4..8].try_into().expect("4-byte len")) as usize;
-            let crc = u32::from_le_bytes(hdr[8..12].try_into().expect("4-byte crc"));
-            let next = pos + FRAME_HDR_LEN_V1 as u64 + len as u64;
-            if next > total_len {
-                // A v1 header carries no checksum over `len`, so a length
-                // damaged by bit rot looks exactly like a torn final frame
-                // here. Truncating would silently discard acknowledged entries
-                // and could rewind `HardState`; losing a whole replica is the
-                // lesser harm, so fail closed. The one overrun that cannot be
-                // corruption of acknowledged data is a write that reached
-                // fresh, never-written space without its bytes: the region
-                // after the header is then all zeroes, and an acknowledged
-                // payload is JSON, never all zeroes.
-                if tail_is_zero(file, pos + FRAME_HDR_LEN_V1 as u64, total_len)? {
-                    return Ok(FrameOutcome::TornTail);
-                }
-                return Err(MetaError::CorruptWal(
-                    "v1 frame length runs past EOF and cannot be validated",
-                ));
-            }
-            (FRAME_HDR_LEN_V1, len, crc, next)
+    if format == FrameFormat::V2 {
+        let stored_hdr_crc = u32::from_le_bytes(hdr[12..16].try_into().expect("4-byte hdr crc"));
+        if crc32fast::hash(&hdr[..FRAME_HDR_LEN_V1]) != stored_hdr_crc {
+            // The framing bytes damaged themselves. A frame cut short by a torn
+            // write is caught by the length checks above, so this cannot be a
+            // tail: report it instead of discarding later acknowledged frames.
+            return Err(MetaError::CorruptWal("frame header checksum mismatch"));
         }
-        FRAME_MAGIC_V2 => {
-            if remaining < FRAME_HDR_LEN_V2 as u64 {
-                // A v2 header was cut short by a torn write. Only the final
-                // frame can be short, and it was never acknowledged.
-                return Ok(FrameOutcome::TornTail);
-            }
-            let n = file.read_at(pos, &mut hdr)?;
-            if n < FRAME_HDR_LEN_V2 {
-                return Ok(FrameOutcome::TornTail);
-            }
-            let stored_crc = u32::from_le_bytes(hdr[12..16].try_into().expect("4-byte hdr crc"));
-            if crc32fast::hash(&hdr[..12]) != stored_crc {
-                // The header damaged its own checksum, and a frame cut short by
-                // a torn write is caught above by the length check. Damage to
-                // framing bytes of a frame that is followed by acknowledged
-                // records must never be read as a tail.
-                return Err(MetaError::CorruptWal("v2 frame header checksum mismatch"));
-            }
-            let len = u32::from_le_bytes(hdr[4..8].try_into().expect("4-byte len")) as usize;
-            let crc = u32::from_le_bytes(hdr[8..12].try_into().expect("4-byte crc"));
-            let next = pos + FRAME_HDR_LEN_V2 as u64 + len as u64;
-            if next > total_len {
-                // The header checksum verified, so `len` is intact and the
-                // payload simply never reached disk. Torn, unacknowledged tail.
-                return Ok(FrameOutcome::TornTail);
-            }
-            (FRAME_HDR_LEN_V2, len, crc, next)
-        }
-        _ => {
-            // An unknown magic at a position that held at least a full legacy
-            // header. Only a zero-filled remainder is a torn write into fresh
-            // space; anything else is corruption of an acknowledged frame.
-            if tail_is_zero(file, pos, total_len)? {
-                return Ok(FrameOutcome::TornTail);
-            }
-            return Err(MetaError::CorruptWal("invalid frame magic"));
-        }
-    };
+    }
 
-    let mut payload = vec![0u8; payload_len];
-    let n = file.read_at(pos + hdr_len as u64, &mut payload)?;
-    if n < payload_len {
-        // The declared payload lies inside the file, so a short read means the
-        // file changed underneath us. Never treat that as a torn tail: a torn
-        // frame is only ever the final bytes and never has a validated header.
+    let len = u32::from_le_bytes(hdr[4..8].try_into().expect("4-byte len")) as usize;
+    let expected_crc = u32::from_le_bytes(hdr[8..12].try_into().expect("4-byte crc"));
+    let next_pos = pos + hdr_len as u64 + len as u64;
+    if next_pos > total_len {
+        // The frame runs past EOF, so only its leading bytes exist and no
+        // acknowledged record can be hiding in them. For `V2` the header
+        // checksum proved `len` is intact, so the payload simply never reached
+        // disk. For `V1` this is the legacy ambiguous case documented above.
+        return Ok(FrameOutcome::TornTail);
+    }
+
+    let mut payload = vec![0u8; len];
+    if file.read_at(pos + hdr_len as u64, &mut payload)? < len {
+        // The declared payload lies inside the file, so the bytes exist but the
+        // read returned fewer. The file changed underneath us; that is not a
+        // torn tail and must not be truncated.
         return Err(MetaError::CorruptWal("frame payload shorter than declared"));
     }
     if crc32fast::hash(&payload) != expected_crc {
@@ -301,31 +337,12 @@ fn read_frame<F: VirtualFile>(
     Ok(FrameOutcome::Record { next_pos, record })
 }
 
-fn truncate_tail<F: VirtualFile>(file: &F, pos: u64) -> Result<(), MetaError> {
+/// Removes a provably incomplete final frame. Callers must have established
+/// that `pos` is the start of the file's last, never-acknowledged bytes.
+fn truncate_torn_tail<F: VirtualFile>(file: &F, pos: u64) -> Result<(), MetaError> {
     file.set_len(pos)?;
     file.sync_data()?;
     Ok(())
-}
-
-/// True when `[from, total_len)` is entirely zero bytes. A torn write can leave
-/// the file length extended over blocks that were never filled; those bytes are
-/// zeros and are safe to discard. Damage to acknowledged data is not zero-filled
-/// in practice, so this distinguishes the two without guessing.
-fn tail_is_zero<F: VirtualFile>(file: &F, from: u64, total_len: u64) -> Result<bool, MetaError> {
-    let mut buf = [0u8; 4096];
-    let mut pos = from;
-    while pos < total_len {
-        let want = ((total_len - pos) as usize).min(buf.len());
-        let n = file.read_at(pos, &mut buf[..want])?;
-        if n == 0 {
-            break;
-        }
-        if buf[..n].iter().any(|&b| b != 0) {
-            return Ok(false);
-        }
-        pos += n as u64;
-    }
-    Ok(true)
 }
 
 #[cfg(test)]
@@ -352,36 +369,26 @@ mod tests {
         }
     }
 
-    fn append(index: u64, entries: Vec<LogEntry>) -> WalRecord {
+    fn append(from_index: u64, entries: Vec<LogEntry>) -> WalRecord {
         WalRecord::AppendEntries {
-            from_index: index,
+            from_index,
             entries,
         }
     }
 
-    fn encode_v2(record: &WalRecord) -> Vec<u8> {
-        let payload = serde_json::to_vec(record).unwrap();
-        let mut frame = v2_header(payload.len(), crc32fast::hash(&payload)).to_vec();
-        frame.extend_from_slice(&payload);
-        frame
-    }
-
-    fn encode_v1(record: &WalRecord) -> Vec<u8> {
-        let payload = serde_json::to_vec(record).unwrap();
-        let mut frame = Vec::new();
-        frame.extend_from_slice(&FRAME_MAGIC_V1.to_le_bytes());
-        frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-        frame.extend_from_slice(&crc32fast::hash(&payload).to_le_bytes());
-        frame.extend_from_slice(&payload);
-        frame
+    fn encode(record: &WalRecord) -> Vec<u8> {
+        encode_frame(
+            FrameFormat::V2,
+            &serde_json::to_vec(record).expect("record serializes"),
+        )
     }
 
     /// Writes a WAL file directly, bypassing `RaftWal::append`, so tests control
     /// frame layout and damage precisely.
-    fn write_frames(fs: &SimFs, frames: &[Vec<u8>]) -> u64 {
+    fn write_wal(fs: &SimFs, magic: &[u8; 8], frames: &[Vec<u8>]) -> u64 {
         fs.create_dir_all(DIR).unwrap();
         let file = fs.open_rw(PATH, true).unwrap();
-        let mut bytes = WAL_MAGIC.to_vec();
+        let mut bytes = magic.to_vec();
         for frame in frames {
             bytes.extend_from_slice(frame);
         }
@@ -390,8 +397,19 @@ mod tests {
         bytes.len() as u64
     }
 
+    fn write_frames(fs: &SimFs, frames: &[Vec<u8>]) -> u64 {
+        write_wal(fs, WAL_MAGIC, frames)
+    }
+
     fn file_len(fs: &SimFs) -> u64 {
         fs.open_rw(PATH, false).unwrap().len().unwrap()
+    }
+
+    fn file_bytes(fs: &SimFs) -> Vec<u8> {
+        let file = fs.open_rw(PATH, false).unwrap();
+        let mut buf = vec![0u8; file.len().unwrap() as usize];
+        file.read_at(0, &mut buf).unwrap();
+        buf
     }
 
     fn assert_corrupt(result: Result<(RaftWal<SimFs>, RecoveredWal), MetaError>) {
@@ -403,26 +421,27 @@ mod tests {
     }
 
     #[test]
-    fn v2_round_trip_recovers_records_in_order() {
-        let fs = SimFs::new(3100);
+    fn acked_appends_round_trip_in_order() {
+        let fs = SimFs::new(3200);
         let (mut wal, recovered) = RaftWal::open(&fs, DIR, true).unwrap();
         assert_eq!(recovered.term, 0);
         assert!(recovered.log.is_empty());
 
-        for record in [
-            hard_state(1, Some(1)),
-            append(1, vec![entry(1), entry(2)]),
-            hard_state(2, Some(3)),
-            append(3, vec![entry(3)]),
-        ] {
-            wal.append(&record).unwrap();
+        wal.append(&hard_state(1, Some(1))).unwrap();
+        for index in 1..=3 {
+            wal.append(&append(index, vec![entry(index)])).unwrap();
         }
+        wal.append(&hard_state(2, Some(3))).unwrap();
         drop(wal);
 
         let (wal, recovered) = RaftWal::open(&fs, DIR, true).unwrap();
         assert_eq!(recovered.term, 2);
         assert_eq!(recovered.voted_for, Some(3));
-        assert_eq!(recovered.log, vec![entry(1), entry(2), entry(3)]);
+        assert_eq!(
+            recovered.log,
+            vec![entry(1), entry(2), entry(3)],
+            "a clean WAL must recover every acknowledged append"
+        );
         drop(wal);
 
         // A second reopen must observe the same durable state.
@@ -431,84 +450,89 @@ mod tests {
         assert_eq!(recovered.log, vec![entry(1), entry(2), entry(3)]);
     }
 
+    /// S1 loss test: five acknowledged appends, one payload bit flip in frame 3.
+    /// The old reader truncated at the bad frame and returned `Ok` with two
+    /// entries; the only safe answer is to refuse to start.
     #[test]
-    fn mid_file_payload_corruption_is_reported_and_not_truncated() {
-        let fs = SimFs::new(3101);
-        let frames: Vec<Vec<u8>> = [
-            hard_state(1, Some(1)),
-            append(1, vec![entry(1)]),
-            append(2, vec![entry(2)]),
-            hard_state(4, Some(2)),
-        ]
-        .iter()
-        .map(encode_v2)
-        .collect();
-        let len = write_frames(&fs, &frames);
+    fn mid_file_payload_corruption_refuses_to_start() {
+        let fs = SimFs::new(3201);
+        let (mut wal, _) = RaftWal::open(&fs, DIR, true).unwrap();
+        let mut starts = Vec::new();
+        for index in 1..=5 {
+            starts.push(file_len(&fs));
+            wal.append(&append(index, vec![entry(index)])).unwrap();
+        }
+        drop(wal);
+        let len = file_len(&fs);
 
-        // Flip one payload byte inside frame 2 of 4. The frame is followed by
-        // more bytes, so this cannot be a torn tail.
-        let second_payload =
-            WAL_MAGIC.len() as u64 + frames[0].len() as u64 + FRAME_HDR_LEN_V2 as u64;
-        fs.corrupt_byte(PATH, second_payload as usize).unwrap();
+        // Flip one byte of frame 3's payload. Frames 4 and 5 follow it, so this
+        // cannot be a torn tail.
+        fs.corrupt_byte(PATH, (starts[2] + FRAME_HDR_LEN_V2 as u64) as usize)
+            .unwrap();
+        let damaged = file_bytes(&fs);
 
         assert_corrupt(RaftWal::open(&fs, DIR, true));
         assert_eq!(
-            file_len(&fs),
-            len,
-            "corruption must never truncate the file; that would drop acknowledged records"
+            file_bytes(&fs),
+            damaged,
+            "corruption must never be repaired by truncating acknowledged records"
         );
+        assert_eq!(file_len(&fs), len);
     }
 
+    /// S1 term/vote regression: the `HardState` after the damaged frame is
+    /// acknowledged. A reader that truncates at frame 3 recovers the older
+    /// term/vote and can vote twice in term 5.
     #[test]
-    fn corrupted_v2_length_is_corruption_not_a_torn_tail() {
-        let fs = SimFs::new(3102);
-        let frames: Vec<Vec<u8>> = [
+    fn corrupt_frame_before_hard_state_does_not_rewind_term() {
+        let fs = SimFs::new(3202);
+        let (mut wal, _) = RaftWal::open(&fs, DIR, true).unwrap();
+        let mut starts = Vec::new();
+        for record in [
             hard_state(1, Some(1)),
             append(1, vec![entry(1)]),
             append(2, vec![entry(2)]),
-            append(3, vec![entry(3)]),
-        ]
-        .iter()
-        .map(encode_v2)
-        .collect();
-        let len = write_frames(&fs, &frames);
-
-        // Flip the top byte of frame 2's `len`. Without the header checksum the
-        // decoded length would run past EOF, which is exactly the shape of a
-        // torn tail -- and the old reader would have truncated the log there.
-        let second_frame = WAL_MAGIC.len() as u64 + frames[0].len() as u64;
-        fs.corrupt_byte(PATH, (second_frame + 7) as usize).unwrap();
-
-        let mut hdr = [0u8; FRAME_HDR_LEN_V2];
-        fs.open_rw(PATH, false)
-            .unwrap()
-            .read_at(second_frame, &mut hdr)
+            hard_state(5, Some(2)),
+        ] {
+            starts.push(file_len(&fs));
+            wal.append(&record).unwrap();
+        }
+        drop(wal);
+        fs.corrupt_byte(PATH, (starts[2] + FRAME_HDR_LEN_V2 as u64) as usize)
             .unwrap();
-        let decoded_len = u32::from_le_bytes(hdr[4..8].try_into().unwrap()) as u64;
-        assert!(
-            second_frame + FRAME_HDR_LEN_V2 as u64 + decoded_len > len,
-            "the corrupted length must look like a frame running past EOF; \
-             only the v2 header checksum distinguishes it from a torn tail"
-        );
+        let damaged = file_bytes(&fs);
 
-        assert_corrupt(RaftWal::open(&fs, DIR, true));
-        assert_eq!(file_len(&fs), len, "a corrupted length is not a torn tail");
+        match RaftWal::open(&fs, DIR, true) {
+            Ok((_, recovered)) => panic!(
+                "reopened with term {} vote {:?} after mid-file damage; the durable \
+                 state was term 5 vote Some(2)",
+                recovered.term, recovered.voted_for
+            ),
+            Err(MetaError::CorruptWal(_)) => {}
+            Err(other) => panic!("expected CorruptWal, got {other:?}"),
+        }
+        assert_eq!(
+            file_bytes(&fs),
+            damaged,
+            "a rewound term must not be produced by truncating the WAL"
+        );
     }
 
+    /// A genuine torn tail is still truncated: fewer bytes than a header, a
+    /// complete header with no payload, and a header with a short payload.
     #[test]
     fn torn_tail_is_truncated_and_the_wal_stays_appendable() {
-        for keep_payload_bytes in [0usize, 5] {
-            let fs = SimFs::new(3103);
+        for cut in [5usize, FRAME_HDR_LEN_V2, FRAME_HDR_LEN_V2 + 4] {
+            let fs = SimFs::new(3203);
             let (mut wal, _) = RaftWal::open(&fs, DIR, true).unwrap();
             wal.append(&hard_state(3, Some(1))).unwrap();
             wal.append(&append(1, vec![entry(1), entry(2)])).unwrap();
             drop(wal);
             let valid_len = file_len(&fs);
 
-            // Simulate a torn final write: a complete header plus at most part
-            // of its payload, never acknowledged.
-            let torn = encode_v2(&hard_state(9, None));
-            let cut = FRAME_HDR_LEN_V2 + keep_payload_bytes;
+            // Simulate a torn final write: only `cut` bytes of the frame ever
+            // reached the file, and the frame was never acknowledged.
+            let torn = encode(&hard_state(9, None));
             let file = fs.open_rw(PATH, false).unwrap();
             file.write_at(valid_len, &torn[..cut]).unwrap();
             file.sync_data().unwrap();
@@ -535,128 +559,211 @@ mod tests {
         }
     }
 
+    /// Bad magic in the middle is corruption, not a tail: the frame is followed
+    /// by acknowledged records, and the file must be left byte-identical.
     #[test]
-    fn hard_state_after_mid_file_corruption_is_not_silently_rewound() {
-        let fs = SimFs::new(3104);
-        let frames: Vec<Vec<u8>> = [
-            hard_state(5, Some(1)),
+    fn mid_file_bad_magic_is_not_repaired() {
+        let fs = SimFs::new(3204);
+        let frames = [
+            hard_state(1, Some(1)),
             append(1, vec![entry(1)]),
-            hard_state(9, Some(2)),
+            hard_state(2, Some(2)),
         ]
-        .iter()
-        .map(encode_v2)
-        .collect();
-        let len = write_frames(&fs, &frames);
+        .map(|record| encode(&record));
+        write_frames(&fs, &frames);
 
-        // Damage the final HardState payload: term 9/vote 2 is acknowledged and
-        // must never be replaced by the earlier term 5/vote 1.
-        let last_payload = WAL_MAGIC.len() as u64
-            + frames[0].len() as u64
-            + frames[1].len() as u64
-            + FRAME_HDR_LEN_V2 as u64;
-        fs.corrupt_byte(PATH, last_payload as usize).unwrap();
+        let second_frame = WAL_MAGIC.len() as u64 + frames[0].len() as u64;
+        fs.corrupt_byte(PATH, second_frame as usize).unwrap();
+        let damaged = file_bytes(&fs);
+
+        assert_corrupt(RaftWal::open(&fs, DIR, true));
+        assert_eq!(
+            file_bytes(&fs),
+            damaged,
+            "no set_len may run for mid-file damage"
+        );
+    }
+
+    /// A CRC flip in the middle is corruption, not a tail.
+    #[test]
+    fn mid_file_crc_flip_is_not_repaired() {
+        let fs = SimFs::new(3205);
+        let frames = [
+            hard_state(1, Some(1)),
+            append(1, vec![entry(1)]),
+            append(2, vec![entry(2)]),
+            hard_state(3, Some(3)),
+        ]
+        .map(|record| encode(&record));
+        write_frames(&fs, &frames);
+
+        let third_frame = WAL_MAGIC.len() as u64 + frames[0].len() as u64 + frames[1].len() as u64;
+        fs.corrupt_byte(PATH, (third_frame + FRAME_HDR_LEN_V2 as u64) as usize)
+            .unwrap();
+        let damaged = file_bytes(&fs);
+
+        assert_corrupt(RaftWal::open(&fs, DIR, true));
+        assert_eq!(file_bytes(&fs), damaged);
+    }
+
+    /// A complete, checksum-valid frame whose payload is not a `WalRecord` (an
+    /// older or newer variant) is corruption, not a torn tail.
+    #[test]
+    fn mid_file_undecodable_record_is_corruption() {
+        let fs = SimFs::new(3206);
+        let frames = vec![
+            encode(&hard_state(1, Some(1))),
+            encode_frame(FrameFormat::V2, br#"{"LegacyVariant":{"term":7}}"#),
+            encode(&hard_state(2, Some(2))),
+        ];
+        write_frames(&fs, &frames);
+        let len = file_len(&fs);
 
         assert_corrupt(RaftWal::open(&fs, DIR, true));
         assert_eq!(file_len(&fs), len);
     }
 
+    /// A complete, checksum-valid but undecodable frame at the tail is still a
+    /// complete frame: it was written and acknowledged as a whole.
     #[test]
-    fn v1_frames_still_replay_and_accept_v2_appends() {
-        let fs = SimFs::new(3105);
-        write_frames(
-            &fs,
-            &[
-                encode_v1(&hard_state(3, Some(1))),
-                encode_v1(&append(1, vec![entry(1)])),
-                encode_v1(&hard_state(4, Some(2))),
-            ],
+    fn undecodable_record_at_tail_is_corruption() {
+        let fs = SimFs::new(3207);
+        let frames = vec![
+            encode(&hard_state(1, Some(1))),
+            encode_frame(FrameFormat::V2, br#"{"LegacyVariant":{"term":7}}"#),
+        ];
+        write_frames(&fs, &frames);
+        let len = file_len(&fs);
+
+        assert_corrupt(RaftWal::open(&fs, DIR, true));
+        assert_eq!(file_len(&fs), len);
+    }
+
+    /// The v2 header checksum exists for this case: a damaged `len` that grows
+    /// past EOF has the exact shape of a torn tail. Without the header checksum
+    /// the reader would truncate and drop every acknowledged frame after it.
+    #[test]
+    fn corrupted_length_is_corruption_not_a_torn_tail() {
+        let fs = SimFs::new(3208);
+        let (mut wal, _) = RaftWal::open(&fs, DIR, true).unwrap();
+        let mut starts = Vec::new();
+        for record in [
+            hard_state(1, Some(1)),
+            append(1, vec![entry(1)]),
+            append(2, vec![entry(2)]),
+            hard_state(4, Some(2)),
+        ] {
+            starts.push(file_len(&fs));
+            wal.append(&record).unwrap();
+        }
+        drop(wal);
+        let len = file_len(&fs);
+
+        // Flip the top byte of frame 2's `len` so the frame appears to run far
+        // past EOF.
+        fs.corrupt_byte(PATH, (starts[1] + 7) as usize).unwrap();
+        let mut hdr = [0u8; FRAME_HDR_LEN_V2];
+        fs.open_rw(PATH, false)
+            .unwrap()
+            .read_at(starts[1], &mut hdr)
+            .unwrap();
+        let declared = u32::from_le_bytes(hdr[4..8].try_into().unwrap()) as u64;
+        assert!(
+            starts[1] + FRAME_HDR_LEN_V2 as u64 + declared > len,
+            "the damaged length must look like a frame running past EOF; only the \
+             v2 header checksum distinguishes it from a torn tail"
         );
+        let damaged = file_bytes(&fs);
 
-        let (mut wal, recovered) = RaftWal::open(&fs, DIR, true).unwrap();
-        assert_eq!(recovered.term, 4);
-        assert_eq!(recovered.voted_for, Some(2));
-        assert_eq!(recovered.log, vec![entry(1)]);
+        assert_corrupt(RaftWal::open(&fs, DIR, true));
+        assert_eq!(
+            file_bytes(&fs),
+            damaged,
+            "a damaged length is not a torn tail"
+        );
+    }
 
-        // Upgrade in place: new records are v2, appended after the v1 prefix.
-        wal.append(&append(2, vec![entry(2)])).unwrap();
-        wal.append(&hard_state(5, Some(3))).unwrap();
+    /// New WALs use the self-checking format, and the file magic says so, which
+    /// is what makes an older binary fail loudly instead of truncating.
+    #[test]
+    fn new_wal_uses_the_self_checking_format() {
+        let fs = SimFs::new(3209);
+        let (mut wal, _) = RaftWal::open(&fs, DIR, true).unwrap();
+        wal.append(&hard_state(1, Some(1))).unwrap();
         drop(wal);
 
-        let (_, recovered) = RaftWal::open(&fs, DIR, true).unwrap();
-        assert_eq!(recovered.term, 5);
-        assert_eq!(recovered.voted_for, Some(3));
-        assert_eq!(recovered.log, vec![entry(1), entry(2)]);
-    }
-
-    #[test]
-    fn v1_length_overrun_is_corruption_and_the_ambiguity_is_documented() {
-        // A v1 header checksums only the payload, so an overrun is genuinely
-        // ambiguous: a damaged `len` looks exactly like a torn final frame.
-        // Truncation could drop acknowledged entries and rewind HardState, so
-        // the reader fails closed unless the bytes after the header are all
-        // zero (see below).
-        let fs = SimFs::new(3106);
-        let first = encode_v1(&hard_state(7, Some(1)));
-        let second = encode_v1(&hard_state(8, Some(2)));
-        let len = write_frames(&fs, &[first, second]);
-        // Top byte of the first frame's `len`: the declared payload now runs
-        // far past EOF, the shape a torn tail would have.
-        fs.corrupt_byte(PATH, (WAL_MAGIC.len() + 7) as usize)
-            .unwrap();
-
-        assert_corrupt(RaftWal::open(&fs, DIR, true));
-        assert_eq!(file_len(&fs), len, "a v1 overrun is not provably torn");
-
-        // Header plus a *nonzero* partial payload is the truly ambiguous v1
-        // shape: it may be a torn write, or a corrupted `len` over a payload
-        // that is really complete. v1 cannot tell, so it reports corruption
-        // rather than risk dropping acknowledged bytes.
-        let fs = SimFs::new(3107);
-        let valid = encode_v1(&hard_state(7, Some(1)));
-        let torn = encode_v1(&hard_state(8, Some(2)));
-        let cut = FRAME_HDR_LEN_V1 + 4;
-        let len = write_frames(&fs, &[valid, torn[..cut].to_vec()]);
-        assert_corrupt(RaftWal::open(&fs, DIR, true));
-        assert_eq!(file_len(&fs), len);
-
-        // A header with nothing at all after it is still provable: the declared
-        // payload bytes are absent, so no acknowledged record can be hiding
-        // there. Discarding the header loses nothing.
-        let fs = SimFs::new(3110);
-        let valid = encode_v1(&hard_state(7, Some(1)));
-        let torn = encode_v1(&hard_state(8, Some(2)));
-        let len = write_frames(&fs, &[valid, torn[..FRAME_HDR_LEN_V1].to_vec()]);
-        let (_, recovered) = RaftWal::open(&fs, DIR, true).unwrap();
-        assert_eq!(recovered.term, 7);
+        let bytes = file_bytes(&fs);
+        assert_eq!(&bytes[..8], WAL_MAGIC);
         assert_eq!(
-            file_len(&fs),
-            len - FRAME_HDR_LEN_V1 as u64,
-            "the payload-less v1 header is discarded"
+            u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
+            FRAME_MAGIC_V2
         );
 
-        // A zero-filled remainder is the other overrun v1 can rule out as data
-        // loss: a torn write that extended the file over never-written space.
-        let fs = SimFs::new(3108);
-        let len = write_frames(&fs, &[encode_v1(&hard_state(7, Some(1)))]);
-        let file = fs.open_rw(PATH, false).unwrap();
-        file.write_at(len, &[0u8; 64]).unwrap();
-        file.sync_data().unwrap();
-        let (_, recovered) = RaftWal::open(&fs, DIR, true).unwrap();
-        assert_eq!(recovered.term, 7);
-        assert_eq!(file_len(&fs), len, "the zero-filled tail is discarded");
+        let mut unknown = *WAL_MAGIC;
+        unknown[7] = b'9';
+        write_wal(&fs, &unknown, &[]);
+        assert_corrupt(RaftWal::open(&fs, DIR, true));
     }
 
+    /// Legacy files keep their legacy behaviour: payload corruption still fails
+    /// closed, a torn tail is still truncated, and appends stay in the file's
+    /// original format.
     #[test]
-    fn zeroed_tail_after_a_v2_frame_is_treated_as_a_torn_write() {
-        let fs = SimFs::new(3109);
-        let frames = vec![encode_v2(&hard_state(2, Some(1)))];
-        let len = write_frames(&fs, &frames);
-        let file = fs.open_rw(PATH, false).unwrap();
-        file.write_at(len, &[0u8; 32]).unwrap();
-        file.sync_data().unwrap();
+    fn legacy_v1_wal_replays_with_the_same_tail_rule() {
+        let v1 = |record: &WalRecord| {
+            encode_frame(
+                FrameFormat::V1,
+                &serde_json::to_vec(record).expect("record serializes"),
+            )
+        };
 
+        // Clean replay and in-format append.
+        let fs = SimFs::new(3210);
+        write_wal(
+            &fs,
+            WAL_MAGIC_V1,
+            &[v1(&hard_state(3, Some(1))), v1(&append(1, vec![entry(1)]))],
+        );
+        let (mut wal, recovered) = RaftWal::open(&fs, DIR, true).unwrap();
+        assert_eq!(recovered.term, 3);
+        assert_eq!(recovered.log, vec![entry(1)]);
+        wal.append(&append(2, vec![entry(2)])).unwrap();
+        drop(wal);
+        let bytes = file_bytes(&fs);
+        assert_eq!(&bytes[..8], WAL_MAGIC_V1, "the file format must not change");
+        assert_eq!(
+            u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
+            FRAME_MAGIC_V1
+        );
         let (_, recovered) = RaftWal::open(&fs, DIR, true).unwrap();
-        assert_eq!(recovered.term, 2);
-        assert_eq!(file_len(&fs), len);
+        assert_eq!(recovered.log, vec![entry(1), entry(2)]);
+
+        // A torn v1 tail (complete header, short payload) is still a tail.
+        let fs = SimFs::new(3211);
+        let torn = v1(&hard_state(9, None));
+        let valid_len = write_wal(&fs, WAL_MAGIC_V1, &[v1(&hard_state(3, Some(1)))]);
+        let file = fs.open_rw(PATH, false).unwrap();
+        file.write_at(valid_len, &torn[..FRAME_HDR_LEN_V1 + 4])
+            .unwrap();
+        file.sync_data().unwrap();
+        drop(file);
+        let (_, recovered) = RaftWal::open(&fs, DIR, true).unwrap();
+        assert_eq!(recovered.term, 3);
+        assert_eq!(file_len(&fs), valid_len);
+
+        // Mid-file payload corruption in a v1 file is corruption.
+        let fs = SimFs::new(3212);
+        let frames = [
+            v1(&hard_state(1, Some(1))),
+            v1(&append(1, vec![entry(1)])),
+            v1(&hard_state(2, Some(2))),
+        ];
+        write_wal(&fs, WAL_MAGIC_V1, &frames);
+        let second = WAL_MAGIC_V1.len() as u64 + frames[0].len() as u64;
+        fs.corrupt_byte(PATH, (second + FRAME_HDR_LEN_V1 as u64) as usize)
+            .unwrap();
+        let damaged = file_bytes(&fs);
+        assert_corrupt(RaftWal::open(&fs, DIR, true));
+        assert_eq!(file_bytes(&fs), damaged);
     }
 }

@@ -60,7 +60,7 @@ pub enum BlobError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use yadb_io::{FaultConfig, SimFs, StorageFs, SyncFault};
+    use yadb_io::{FaultConfig, SimFs, StorageFs, SyncFault, VirtualFile};
 
     #[test]
     fn process_only_reopen_must_sync_recovered_records_before_idempotent_ack() {
@@ -589,6 +589,84 @@ mod tests {
         ));
         recovered.put(corrupt, b"repair-me").unwrap();
         assert_eq!(recovered.get(corrupt).unwrap(), b"repair-me");
+    }
+
+    #[test]
+    fn mid_file_corrupt_record_header_refuses_to_start() {
+        let fs = SimFs::new(1260);
+        let cfg = VolumeConfig::default();
+        let store = VolumeStore::open(fs.clone(), "hdr_bitrot", cfg).unwrap();
+        let dead = BlobId::new(1, 1, 1, 1, 4, 0);
+        let live = BlobId::new(1, 1, 1, 2, 4, 0);
+        let other = BlobId::new(1, 1, 1, 3, 4, 0);
+        store.put(dead, b"deleted").unwrap();
+        store.put(live, b"durable").unwrap();
+        store.delete(dead).unwrap();
+        store.put(other, b"other").unwrap();
+        drop(store);
+
+        // Damage the header of the second record. It is followed by the
+        // tombstone for `dead`; truncating at the bad header would drop that
+        // tombstone and resurrect the deleted blob.
+        let path = "hdr_bitrot/vol_00000001.dat";
+        fs.corrupt_byte(path, 8 + 40 + 4).unwrap();
+        let damaged = {
+            let file = fs.open_rw(path, false).unwrap();
+            let mut bytes = vec![0u8; file.len().unwrap() as usize];
+            file.read_at(0, &mut bytes).unwrap();
+            bytes
+        };
+
+        match VolumeStore::open(fs.clone(), "hdr_bitrot", cfg) {
+            Err(BlobError::InvalidSegment(_)) => {}
+            Err(error) => panic!("expected InvalidSegment, got {error:?}"),
+            Ok(_) => panic!("a mid-file corrupt header must not be truncated away"),
+        }
+
+        let file = fs.open_rw(path, false).unwrap();
+        let mut after = vec![0u8; file.len().unwrap() as usize];
+        file.read_at(0, &mut after).unwrap();
+        assert_eq!(after, damaged, "recovery must not rewrite mid-file damage");
+    }
+
+    #[test]
+    fn torn_tail_record_header_still_truncates_and_volume_stays_appendable() {
+        // A partial header and a complete header with a short payload are both
+        // provably the final, never-acknowledged bytes and are still removed.
+        for torn_len in [10usize, 33 + 2] {
+            let fs = SimFs::new(1261);
+            let cfg = VolumeConfig::default();
+            let store = VolumeStore::open(fs.clone(), "torn_hdr", cfg).unwrap();
+            let a = BlobId::new(1, 1, 1, 1, 4, 0);
+            let b = BlobId::new(1, 1, 1, 2, 4, 0);
+            store.put(a, b"alpha").unwrap();
+            store.put(b, b"bravo").unwrap();
+            drop(store);
+
+            let path = "torn_hdr/vol_00000001.dat";
+            let file = fs.open_rw(path, false).unwrap();
+            let mut bytes = vec![0u8; file.len().unwrap() as usize];
+            file.read_at(0, &mut bytes).unwrap();
+            let valid_len = bytes.len() as u64;
+            // Replay the first record's header (plus part of its payload) at
+            // EOF, as a torn append would leave it.
+            file.write_at(valid_len, &bytes[8..8 + torn_len]).unwrap();
+            file.sync_data().unwrap();
+            assert_eq!(file.len().unwrap(), valid_len + torn_len as u64);
+            drop(file);
+
+            let reopened = VolumeStore::open(fs.clone(), "torn_hdr", cfg).unwrap();
+            assert_eq!(reopened.get(a).unwrap(), b"alpha");
+            assert_eq!(reopened.get(b).unwrap(), b"bravo");
+            let c = BlobId::new(1, 1, 1, 3, 4, 0);
+            reopened.put(c, b"charlie").unwrap();
+            drop(reopened);
+
+            let again = VolumeStore::open(fs, "torn_hdr", cfg).unwrap();
+            assert_eq!(again.get(a).unwrap(), b"alpha");
+            assert_eq!(again.get(b).unwrap(), b"bravo");
+            assert_eq!(again.get(c).unwrap(), b"charlie");
+        }
     }
 
     #[test]
