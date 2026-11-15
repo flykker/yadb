@@ -310,6 +310,24 @@ class BackupTest(unittest.TestCase):
                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             return local.backup(self.root, self.dest)
 
+    def fake_verdict(self, **overrides):
+        """Replace the stand-in daemon with one that prints a chosen verdict."""
+        verdict = {'group': 1, 'node': 1, 'first_index': None, 'last_index': None,
+                   'last_purged': None, 'applied': None, 'snapshot': None, 'entry_count': 0,
+                   'torn_tail': False, 'restorable': True, 'reason': '',
+                   'membership_differs_from_descriptor': None}
+        verdict.update(overrides)
+        script = ('#!/usr/bin/env python3\n'
+                  'import json, sys\n'
+                  f'verdict = json.loads({json.dumps(json.dumps(verdict))})\n'
+                  'print(json.dumps(verdict))\n'
+                  "if not verdict['restorable']:\n"
+                  "    sys.stderr.write(verdict['reason'] + '\\n')\n"
+                  '    sys.exit(4)\n')
+        for path in (Path(self.temp.name) / 'target/debug/yadbd', self.root / 'bin/yadbd'):
+            path.write_text(script)
+            path.chmod(0o700)
+
     def test_existing_destination_untouched(self):
         self.dest.mkdir()
         (self.dest / 'keep').write_text('unchanged')
@@ -372,6 +390,27 @@ class BackupTest(unittest.TestCase):
         self.assertEqual(self.run_backup(), 4)
         self.assertTrue((self.dest / 'INCOMPLETE').exists())
         self.assertFalse((self.dest / 'COMPLETE').exists())
+
+    def test_torn_log_tail_refused(self):
+        # The copy would preserve the torn frame, and the next open truncates it,
+        # so a published artifact would lose the final frame without saying so.
+        self.fake_verdict(torn_tail=True)
+        self.assertEqual(self.run_backup(), 4)
+        self.assertTrue((self.dest / 'INCOMPLETE').exists())
+        self.assertFalse((self.dest / 'COMPLETE').exists())
+        self.assertIn('torn log tail', (self.dest / 'INCOMPLETE').read_text())
+
+    def test_membership_difference_refused(self):
+        self.fake_verdict(membership_differs_from_descriptor={
+            'descriptor_voters': [1, 2, 3], 'stored_voters': [1, 2]})
+        self.assertEqual(self.run_backup(), 4)
+        self.assertTrue((self.dest / 'INCOMPLETE').exists())
+        self.assertFalse((self.dest / 'COMPLETE').exists())
+
+    def test_not_restorable_refused(self):
+        self.fake_verdict(restorable=False, reason='applied log id absent from log')
+        self.assertEqual(self.run_backup(), 4)
+        self.assertIn('applied log id absent from log', (self.dest / 'INCOMPLETE').read_text())
 
 
 class RunBackupGateTest(unittest.TestCase):

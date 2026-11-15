@@ -636,6 +636,20 @@ def backup(root, dest):
                     raise BackupError(f'invalid replica verdict: {path}: {error}', 4) from error
                 if verdict['membership_differs_from_descriptor'] is not None:
                     raise BackupError(f'replica membership disagrees with descriptor: {path}', 4)
+                if verdict['torn_tail'] is not True and verdict['torn_tail'] is not False:
+                    raise BackupError(f'invalid replica verdict: {path}: torn_tail is not a boolean', 4)
+                if verdict['torn_tail']:
+                    # A torn tail is copied byte for byte, and the next open
+                    # truncates it. So publishing this artifact would silently
+                    # drop the final frame, and the frame's bytes cannot say
+                    # whether it was an interrupted append or a length field
+                    # corrupted upward (docs/multiraft-verification.md). A clean
+                    # shutdown never leaves one, so the honest answer is to
+                    # refuse: the operator starts the deployment once (the opener
+                    # repairs the tail deterministically) and stops it again.
+                    raise BackupError(
+                        f'replica has a torn log tail: {path}; start and cleanly stop the '
+                        'deployment so the opener resolves it before taking a backup', 4)
                 verdicts.append(verdict)
             files = []
             for name in ('config', 'metadata', 'data', 'credentials', 'bin', 'state.json'):
