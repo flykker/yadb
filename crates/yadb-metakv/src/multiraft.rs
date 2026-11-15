@@ -769,6 +769,7 @@ impl DeterministicGroupCore {
                         prev_log_term: prev_term,
                         entries,
                         leader_commit: self.state.commit_index,
+                        compaction_floor: 0,
                     },
                 )
             })
@@ -886,6 +887,7 @@ impl DeterministicGroupCore {
                 prev_log_term,
                 entries,
                 leader_commit,
+                ..
             } => {
                 // Validate structural fields before updating term, vote or role.
                 if *term == 0
@@ -1487,6 +1489,7 @@ mod tests {
                     prev_log_term: 0,
                     entries: vec![],
                     leader_commit,
+                    compaction_floor: 0,
                 },
             },
             _ => unreachable!(),
@@ -1510,6 +1513,7 @@ mod tests {
                 prev_log_term: 0,
                 entries: vec![],
                 leader_commit: 0,
+                compaction_floor: 0,
             },
         };
         follower.receive(&stale, 1).unwrap();
@@ -1544,6 +1548,7 @@ mod tests {
                     },
                 }],
                 leader_commit: 0,
+                compaction_floor: 0,
             },
         };
         assert!(matches!(
@@ -1583,6 +1588,7 @@ mod tests {
                 prev_log_term,
                 entries,
                 leader_commit,
+                compaction_floor: 0,
             },
         };
         let mut follower = DeterministicGroupCore::new(replica_for(1, 2));
@@ -1795,6 +1801,7 @@ mod tests {
                 prev_log_term: 0,
                 entries: vec![],
                 leader_commit: 0,
+                compaction_floor: 0,
             },
             RaftRpc::AppendEntriesReply {
                 term: 1,

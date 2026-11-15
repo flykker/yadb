@@ -1055,6 +1055,9 @@ fn meta_err_response(err: MetaError, peer_addr: impl FnOnce(u32) -> Option<Strin
         return forward_error_response(err.to_string(), Some("unknown"));
     }
     match err {
+        // The node has stopped accepting metadata work until it is restarted;
+        // another replica may still be able to serve the request.
+        MetaError::CompactionFailed(_) => api_err(StatusCode::SERVICE_UNAVAILABLE, err.to_string()),
         MetaError::NotLeader { leader } => {
             let leader_addr = leader.and_then(peer_addr);
             (
@@ -1722,6 +1725,7 @@ async fn handle_health(State(st): State<AppState>) -> impl IntoResponse {
 
 async fn handle_raft_status(State(st): State<AppState>) -> impl IntoResponse {
     let (node_id, role, term, leader_id, commit_index) = st.meta.role_info();
+    let (base_index, compaction_floor, wal_bytes) = st.meta.compaction_info().unwrap_or((0, 0, 0));
     Json(serde_json::json!({
         "metadata_runtime": if st.meta.is_openraft() { "openraft" } else { "legacy" },
         "role_scope": if st.meta.is_openraft() { "control_group; see /openraft/status for all groups" } else { "legacy" },
@@ -1732,6 +1736,10 @@ async fn handle_raft_status(State(st): State<AppState>) -> impl IntoResponse {
         "leader_id": leader_id,
         "commit_index": commit_index,
         "revision": if st.meta.is_openraft() { None } else { Some(st.meta.revision()) },
+        "base_index": base_index,
+        "compaction_floor": compaction_floor,
+        "wal_bytes": wal_bytes,
+        "compaction_error": st.meta.compaction_error(),
     }))
 }
 

@@ -74,6 +74,10 @@ pub enum WalRecord {
         term: u64,
         voted_for: Option<u32>,
     },
+    Base {
+        index: u64,
+        term: u64,
+    },
     AppendEntries {
         from_index: u64,
         entries: Vec<LogEntry>,
@@ -85,10 +89,14 @@ pub struct RecoveredWal {
     pub term: u64,
     pub voted_for: Option<u32>,
     pub log: Vec<LogEntry>,
+    pub base_index: u64,
+    pub base_term: u64,
 }
 
 /// Durable Raft Write-Ahead Log backed by `StorageFs` (`OsFs` or `SimFs`).
 pub struct RaftWal<FS: StorageFs> {
+    fs: FS,
+    dir: String,
     file: FS::File,
     format: FrameFormat,
     write_pos: u64,
@@ -99,11 +107,7 @@ pub struct RaftWal<FS: StorageFs> {
 impl<FS: StorageFs> RaftWal<FS> {
     pub fn open(fs: &FS, dir: &str, sync_writes: bool) -> Result<(Self, RecoveredWal), MetaError> {
         fs.create_dir_all(dir)?;
-        let path = if dir.is_empty() {
-            "raft.wal".to_string()
-        } else {
-            format!("{}/raft.wal", dir.trim_end_matches('/'))
-        };
+        let path = wal_path(dir);
 
         let exists = fs.exists(&path);
         let file = fs.open_rw(&path, true)?;
@@ -116,6 +120,8 @@ impl<FS: StorageFs> RaftWal<FS> {
             }
             return Ok((
                 Self {
+                    fs: fs.clone(),
+                    dir: dir.to_string(),
                     file,
                     format: FrameFormat::V2,
                     write_pos: WAL_MAGIC.len() as u64,
@@ -137,6 +143,8 @@ impl<FS: StorageFs> RaftWal<FS> {
         }
         Ok((
             Self {
+                fs: fs.clone(),
+                dir: dir.to_string(),
                 file,
                 format,
                 write_pos: valid_end,
@@ -175,6 +183,51 @@ impl<FS: StorageFs> RaftWal<FS> {
         }
         self.write_pos = pos + frame.len() as u64;
         Ok(())
+    }
+
+    pub fn rewrite(&mut self, records: &[WalRecord]) -> Result<(), MetaError> {
+        self.ensure_healthy()?;
+        let path = wal_path(&self.dir);
+        let tmp = format!("{path}.tmp");
+        let result = (|| -> Result<_, MetaError> {
+            let file = self.fs.open_rw(&tmp, true)?;
+            file.set_len(0)?;
+            file.write_at(0, WAL_MAGIC)?;
+            let mut pos = WAL_MAGIC.len() as u64;
+            for record in records {
+                let frame = encode_frame(FrameFormat::V2, &serde_json::to_vec(record)?);
+                file.write_at(pos, &frame)?;
+                pos += frame.len() as u64;
+            }
+            file.sync_data()?;
+            self.fs.rename_atomic(&tmp, &path)?;
+            self.fs.sync_dir(&self.dir)?;
+            Ok((self.fs.open_rw(&path, false)?, pos))
+        })();
+        match result {
+            Ok((file, pos)) => {
+                self.file = file;
+                self.format = FrameFormat::V2;
+                self.write_pos = pos;
+                Ok(())
+            }
+            Err(e) => {
+                self.failed = true;
+                Err(e)
+            }
+        }
+    }
+
+    pub fn byte_len(&self) -> Result<u64, MetaError> {
+        Ok(self.file.len()?)
+    }
+}
+
+fn wal_path(dir: &str) -> String {
+    if dir.is_empty() {
+        "raft.wal".to_string()
+    } else {
+        format!("{}/raft.wal", dir.trim_end_matches('/'))
     }
 }
 
@@ -255,15 +308,31 @@ fn replay_wal<F: VirtualFile>(
                         out.term = term;
                         out.voted_for = voted_for;
                     }
+                    WalRecord::Base { index, term } => {
+                        out.base_index = index;
+                        out.base_term = term;
+                        out.log.clear();
+                    }
                     WalRecord::AppendEntries {
                         from_index,
                         entries,
                     } => {
-                        // `from_index` is 1-based Raft log index
-                        let keep = (from_index.saturating_sub(1)) as usize;
-                        if keep < out.log.len() {
-                            out.log.truncate(keep);
+                        // `from_index` is a 1-based Raft log index. Frames must
+                        // tile the log contiguously above the base; anything
+                        // else would leave a hole that `entry_at` reads as a
+                        // missing committed entry much later.
+                        if from_index <= out.base_index {
+                            return Err(MetaError::CorruptWal(
+                                "WAL entry at or below the compacted base",
+                            ));
                         }
+                        let keep = (from_index - out.base_index - 1) as usize;
+                        if keep > out.log.len() {
+                            return Err(MetaError::CorruptWal(
+                                "WAL entries leave a gap above the compacted base",
+                            ));
+                        }
+                        out.log.truncate(keep);
                         out.log.extend(entries);
                     }
                 }
@@ -770,5 +839,78 @@ mod tests {
         let damaged = file_bytes(&fs);
         assert_corrupt(RaftWal::open(&fs, DIR, true));
         assert_eq!(file_bytes(&fs), damaged);
+    }
+
+    #[test]
+    fn base_marker_replays_and_rewrite_preserves_hard_state() {
+        let fs = SimFs::new(3213);
+        let (mut wal, _) = RaftWal::open(&fs, DIR, true).unwrap();
+        wal.append(&hard_state(9, Some(7))).unwrap();
+        wal.append(&append(1, vec![entry(1), entry(2), entry(3)]))
+            .unwrap();
+        wal.rewrite(&[
+            hard_state(9, Some(7)),
+            WalRecord::Base { index: 2, term: 1 },
+            append(3, vec![entry(3)]),
+        ])
+        .unwrap();
+        let (_, recovered) = RaftWal::open(&fs, DIR, true).unwrap();
+        assert_eq!(recovered.term, 9);
+        assert_eq!(recovered.voted_for, Some(7));
+        assert_eq!(recovered.base_index, 2);
+        assert_eq!(recovered.base_term, 1);
+        assert_eq!(recovered.log, vec![entry(3)]);
+    }
+
+    #[test]
+    fn rewrite_replaces_the_whole_file_and_shrinks_it() {
+        let fs = SimFs::new(3214);
+        let (mut wal, _) = RaftWal::open(&fs, DIR, true).unwrap();
+        for index in 1..=6 {
+            wal.append(&append(index, vec![entry(index)])).unwrap();
+        }
+        let before = wal.byte_len().unwrap();
+        wal.rewrite(&[
+            hard_state(4, Some(2)),
+            WalRecord::Base { index: 5, term: 1 },
+            append(6, vec![entry(6)]),
+        ])
+        .unwrap();
+        let after = wal.byte_len().unwrap();
+        assert!(after < before, "{after} !< {before}");
+        drop(wal);
+
+        let (_, recovered) = RaftWal::open(&fs, DIR, true).unwrap();
+        assert_eq!(recovered.term, 4);
+        assert_eq!(recovered.base_index, 5);
+        assert_eq!(recovered.log, vec![entry(6)]);
+    }
+
+    /// A hole above the base would make `entry_at` report a committed entry as
+    /// missing long after startup, so it must be refused while opening.
+    #[test]
+    fn a_gap_above_the_base_is_corruption() {
+        let fs = SimFs::new(3215);
+        let frames = vec![
+            encode(&hard_state(1, Some(1))),
+            encode(&WalRecord::Base { index: 5, term: 1 }),
+            encode(&append(8, vec![entry(8)])),
+        ];
+        write_frames(&fs, &frames);
+        assert_corrupt(RaftWal::open(&fs, DIR, true));
+    }
+
+    /// An append that reaches back into the compacted range cannot be replayed:
+    /// those entries are not in the file any more.
+    #[test]
+    fn an_append_below_the_base_is_corruption() {
+        let fs = SimFs::new(3216);
+        let frames = vec![
+            encode(&hard_state(1, Some(1))),
+            encode(&WalRecord::Base { index: 5, term: 1 }),
+            encode(&append(3, vec![entry(3)])),
+        ];
+        write_frames(&fs, &frames);
+        assert_corrupt(RaftWal::open(&fs, DIR, true));
     }
 }

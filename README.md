@@ -566,11 +566,15 @@ while any node is reading, so wait about 30 s after the last query:
 curl -s -X POST http://127.0.0.1:18000/v1/pools/gc
 ```
 
-Known limitation: `metakv/raft.wal` is append-only and is never truncated, so
-every mutation grows it by a few KB (one `INSERT` ≈ 11 KB, one `SELECT` ≈ 0
-when the read lease is reused). A long-lived root will fill its disk from
-metadata alone; start a fresh `--root` for a new test run instead of expecting
-the log to shrink.
+The metadata Raft log is bounded: once `metakv/raft.wal` passes 8 MiB (or 4096
+applied entries above its base) each node writes an atomic
+`metakv/checkpoint.json` state image and rewrites the log, keeping everything
+above a replicated compaction floor. `GET /raft/status` reports `base_index`,
+`compaction_floor`, `wal_bytes` and `compaction_error`. Two limitations remain:
+a node that falls behind the compacted base cannot be re-seeded (there is no
+install-snapshot path, so it is refused explicitly and needs a fresh root), and
+the checkpoint is a full image, so its size tracks live metadata rather than
+history.
 
 ## Quickstart
 

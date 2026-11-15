@@ -6,11 +6,66 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use yadb_io::StorageFs;
+use yadb_io::{StorageFs, VirtualFile};
 
 use crate::kv::{KvCommand, KvResult, MetaStateMachine, WatchEvent};
 use crate::wal::{RaftWal, WalRecord};
 use crate::{KvValue, MetaError, MetaSnapshot};
+
+const WAL_COMPACTION_BYTES: u64 = 8 * 1024 * 1024;
+const WAL_COMPACTION_ENTRIES: u64 = 4096;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DurableCheckpoint {
+    format_version: u32,
+    applied_index: u64,
+    applied_term: u64,
+    commit_index: u64,
+    hard_state: DurableHardState,
+    compaction_floor: u64,
+    snapshot: MetaSnapshot,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DurableHardState {
+    term: u64,
+    voted_for: Option<u32>,
+}
+
+fn checkpoint_path(dir: &str) -> String {
+    if dir.is_empty() {
+        "checkpoint.json".to_string()
+    } else {
+        format!("{}/checkpoint.json", dir.trim_end_matches('/'))
+    }
+}
+
+fn load_checkpoint<FS: StorageFs>(
+    fs: &FS,
+    dir: &str,
+) -> Result<Option<DurableCheckpoint>, MetaError> {
+    let path = checkpoint_path(dir);
+    if !fs.exists(&path) {
+        return Ok(None);
+    }
+    let file = fs.open_rw(&path, false)?;
+    let mut bytes = vec![0; file.len()? as usize];
+    file.read_at(0, &mut bytes)?;
+    let checkpoint: DurableCheckpoint =
+        serde_json::from_slice(&bytes).map_err(|e| MetaError::Checkpoint(format!("{e}")))?;
+    if checkpoint.format_version != 1 {
+        return Err(MetaError::Checkpoint(format!(
+            "unsupported format version {}",
+            checkpoint.format_version
+        )));
+    }
+    if checkpoint.applied_index > checkpoint.commit_index {
+        return Err(MetaError::Checkpoint(
+            "applied index exceeds checkpoint commit index".into(),
+        ));
+    }
+    Ok(Some(checkpoint))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RoleState {
@@ -46,6 +101,8 @@ pub enum RaftRpc {
         prev_log_term: u64,
         entries: Vec<LogEntry>,
         leader_commit: u64,
+        #[serde(default)]
+        compaction_floor: u64,
     },
     AppendEntriesReply {
         from: u32,
@@ -64,6 +121,8 @@ pub struct OutboundMsg {
 /// Core Raft + Ordered KV state machine node (works identically in single-node mode,
 /// deterministic in-memory multi-node simulation, or networked HTTP/TCP transport).
 pub struct RaftCore<FS: StorageFs> {
+    fs: FS,
+    dir: String,
     node_id: u32,
     peers: Vec<u32>,
     role: RoleState,
@@ -71,6 +130,10 @@ pub struct RaftCore<FS: StorageFs> {
     voted_for: Option<u32>,
     leader_id: Option<u32>,
     log: Vec<LogEntry>,
+    base_index: u64,
+    base_term: u64,
+    compaction_floor: u64,
+    checkpoint_snapshot: MetaSnapshot,
     commit_index: u64,
     last_applied: u64,
     votes_received: BTreeSet<u32>,
@@ -79,6 +142,14 @@ pub struct RaftCore<FS: StorageFs> {
     applied_results: BTreeMap<u64, KvResult>,
     wal: RaftWal<FS>,
     sm: MetaStateMachine,
+    compaction_bytes: u64,
+    compaction_entries: u64,
+    /// Set when a checkpoint or WAL rewrite failed. The applied state and the
+    /// WAL are still consistent at that point, but the log can no longer be
+    /// bounded, so the node refuses further work instead of reporting success
+    /// for a mutation whose durable maintenance is broken. Only a restart (and
+    /// an operator) clears it.
+    compaction_error: Option<String>,
 }
 
 impl<FS: StorageFs> RaftCore<FS> {
@@ -95,23 +166,114 @@ impl<FS: StorageFs> RaftCore<FS> {
         peers.sort_unstable();
         peers.dedup();
 
-        let (wal, recovered) = RaftWal::open(fs, dir, sync_writes)?;
+        let (mut wal, mut recovered) = RaftWal::open(fs, dir, sync_writes)?;
+        let checkpoint = load_checkpoint(fs, dir)?;
+        let (
+            sm,
+            applied_index,
+            checkpoint_floor,
+            checkpoint_snapshot,
+            checkpoint_term,
+            checkpoint_vote,
+        ) = if let Some(cp) = checkpoint {
+            if cp.applied_index < recovered.base_index {
+                return Err(MetaError::Checkpoint(
+                    "checkpoint applied index is below the WAL base".into(),
+                ));
+            }
+            if cp.applied_index == recovered.base_index && cp.applied_term != recovered.base_term {
+                return Err(MetaError::Checkpoint(
+                    "checkpoint applied term disagrees with the WAL base term".into(),
+                ));
+            }
+            let snapshot = cp.snapshot.clone();
+            let retained: Vec<_> = recovered
+                .log
+                .iter()
+                .filter(|entry| entry.index > cp.applied_index)
+                .cloned()
+                .collect();
+            let needs_rewrite = recovered.base_index != cp.applied_index;
+            recovered.base_index = cp.applied_index;
+            recovered.base_term = cp.applied_term;
+            recovered.log = retained;
+            if needs_rewrite {
+                let mut records = vec![
+                    WalRecord::HardState {
+                        term: cp.hard_state.term,
+                        voted_for: cp.hard_state.voted_for,
+                    },
+                    WalRecord::Base {
+                        index: cp.applied_index,
+                        term: cp.applied_term,
+                    },
+                ];
+                if !recovered.log.is_empty() {
+                    records.push(WalRecord::AppendEntries {
+                        from_index: recovered.log[0].index,
+                        entries: recovered.log.clone(),
+                    });
+                }
+                wal.rewrite(&records)?;
+            }
+            let mut sm = MetaStateMachine::new();
+            sm.restore_durable_snapshot(snapshot.clone());
+            (
+                sm,
+                cp.applied_index,
+                cp.compaction_floor,
+                snapshot,
+                cp.hard_state.term,
+                cp.hard_state.voted_for,
+            )
+        } else {
+            if recovered.base_index != 0 {
+                return Err(MetaError::Checkpoint(
+                    "WAL has a compacted base but checkpoint is missing".into(),
+                ));
+            }
+            let snapshot = MetaSnapshot {
+                revision: 0,
+                values: BTreeMap::new(),
+            };
+            (
+                MetaStateMachine::new(),
+                0,
+                0,
+                snapshot,
+                recovered.term,
+                recovered.voted_for,
+            )
+        };
         let mut core = Self {
+            fs: fs.clone(),
+            dir: dir.to_string(),
             node_id,
             peers,
             role: RoleState::Follower,
-            current_term: recovered.term,
-            voted_for: recovered.voted_for,
+            current_term: checkpoint_term.max(recovered.term),
+            voted_for: if recovered.term >= checkpoint_term {
+                recovered.voted_for
+            } else {
+                checkpoint_vote
+            },
             leader_id: None,
             log: recovered.log,
-            commit_index: 0,
-            last_applied: 0,
+            base_index: recovered.base_index,
+            base_term: recovered.base_term,
+            compaction_floor: checkpoint_floor,
+            checkpoint_snapshot,
+            commit_index: applied_index,
+            last_applied: applied_index,
             votes_received: BTreeSet::new(),
             next_index: BTreeMap::new(),
             match_index: BTreeMap::new(),
             applied_results: BTreeMap::new(),
             wal,
-            sm: MetaStateMachine::new(),
+            sm,
+            compaction_bytes: WAL_COMPACTION_BYTES,
+            compaction_entries: WAL_COMPACTION_ENTRIES,
+            compaction_error: None,
         };
 
         // Single-node cluster automatically becomes leader and replays its own durable WAL!
@@ -127,8 +289,11 @@ impl<FS: StorageFs> RaftCore<FS> {
             core.role = RoleState::Leader;
             core.leader_id = Some(node_id);
             let last_idx = core.last_log_index();
-            core.commit_index = last_idx;
-            core.apply_committed();
+            core.commit_index = core.commit_index.max(last_idx);
+            // A single node is its own quorum, so everything it holds is
+            // committed and nothing else can need it: the floor may follow.
+            core.compaction_floor = core.compaction_floor.max(core.commit_index);
+            core.apply_committed()?;
         }
 
         Ok(core)
@@ -159,23 +324,73 @@ impl<FS: StorageFs> RaftCore<FS> {
     }
 
     pub fn last_log_index(&self) -> u64 {
-        self.log.len() as u64
+        self.base_index + self.log.len() as u64
+    }
+
+    pub fn base_index(&self) -> u64 {
+        self.base_index
+    }
+
+    pub fn compaction_floor(&self) -> u64 {
+        self.compaction_floor
+    }
+
+    pub fn wal_bytes(&self) -> Result<u64, MetaError> {
+        self.wal.byte_len()
+    }
+
+    /// The explicit reason this node stopped accepting work after a failed
+    /// checkpoint or WAL rewrite, if any. Nothing clears it except a restart.
+    pub fn compaction_error(&self) -> Option<String> {
+        self.compaction_error.clone()
+    }
+
+    fn ensure_operable(&self) -> Result<(), MetaError> {
+        if let Some(err) = &self.compaction_error {
+            return Err(MetaError::CompactionFailed(err.clone()));
+        }
+        self.wal.ensure_healthy()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_compaction_thresholds(&mut self, bytes: u64, entries: u64) {
+        self.compaction_bytes = bytes;
+        self.compaction_entries = entries;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn voted_for(&self) -> Option<u32> {
+        self.voted_for
     }
 
     pub fn last_log_term(&self) -> u64 {
-        self.log.last().map_or(0, |e| e.term)
+        self.log.last().map_or(self.base_term, |e| e.term)
     }
 
     fn term_at(&self, index: u64) -> Option<u64> {
-        if index == 0 {
-            return Some(0);
+        if index == self.base_index {
+            // `base_index == 0` is genesis, whose term is 0.
+            return Some(self.base_term);
         }
-        self.log.get((index - 1) as usize).map(|e| e.term)
+        if index < self.base_index {
+            return None;
+        }
+        self.log
+            .get((index - self.base_index - 1) as usize)
+            .map(|e| e.term)
+    }
+
+    fn entry_at(&self, index: u64) -> Option<&LogEntry> {
+        if index <= self.base_index {
+            None
+        } else {
+            self.log.get((index - self.base_index - 1) as usize)
+        }
     }
 
     /// Triggers an election timeout on this node: transitions to `Candidate` (or directly `Leader` if N=1).
     pub fn start_election(&mut self) -> Result<Vec<OutboundMsg>, MetaError> {
-        self.wal.ensure_healthy()?;
+        self.ensure_operable()?;
         self.current_term += 1;
         self.role = RoleState::Candidate;
         self.voted_for = Some(self.node_id);
@@ -241,7 +456,7 @@ impl<FS: StorageFs> RaftCore<FS> {
     /// Proposes a KV mutation on the Leader, appends to local WAL, and returns replication RPCs
     /// (for N=1 single-node mode, commits and applies immediately).
     pub fn propose(&mut self, cmd: KvCommand) -> Result<(u64, Vec<OutboundMsg>), MetaError> {
-        self.wal.ensure_healthy()?;
+        self.ensure_operable()?;
         if self.role != RoleState::Leader {
             return Err(MetaError::NotLeader {
                 leader: self.leader_id,
@@ -262,16 +477,21 @@ impl<FS: StorageFs> RaftCore<FS> {
 
         if self.quorum_size() == 1 {
             self.commit_index = idx;
-            self.apply_committed();
+            self.compaction_floor = self.compaction_floor.max(idx);
+            self.apply_committed()?;
             return Ok((idx, Vec::new()));
         }
 
-        Ok((idx, self.broadcast_append_entries()))
+        Ok((idx, self.broadcast_append_entries_checked()?))
     }
 
     pub fn broadcast_append_entries(&self) -> Vec<OutboundMsg> {
-        if self.wal.ensure_healthy().is_err() || self.role != RoleState::Leader {
-            return Vec::new();
+        self.broadcast_append_entries_checked().unwrap_or_default()
+    }
+
+    fn broadcast_append_entries_checked(&self) -> Result<Vec<OutboundMsg>, MetaError> {
+        if self.ensure_operable().is_err() || self.role != RoleState::Leader {
+            return Ok(Vec::new());
         }
         let mut out = Vec::new();
         for &peer in &self.peers {
@@ -286,7 +506,10 @@ impl<FS: StorageFs> RaftCore<FS> {
                 .max(1);
             let prev_log_index = next_idx - 1;
             let prev_log_term = self.term_at(prev_log_index).unwrap_or(0);
-            let entries = self.log[(next_idx as usize - 1)..].to_vec();
+            if next_idx <= self.base_index {
+                return Err(MetaError::PeerBehindCompactedBase(peer));
+            }
+            let entries = self.log[(next_idx - self.base_index - 1) as usize..].to_vec();
             out.push(OutboundMsg {
                 to: peer,
                 rpc: RaftRpc::AppendEntries {
@@ -296,14 +519,15 @@ impl<FS: StorageFs> RaftCore<FS> {
                     prev_log_term,
                     entries,
                     leader_commit: self.commit_index,
+                    compaction_floor: self.compaction_floor,
                 },
             });
         }
-        out
+        Ok(out)
     }
 
     pub fn step(&mut self, rpc: RaftRpc) -> Result<Vec<OutboundMsg>, MetaError> {
-        self.wal.ensure_healthy()?;
+        self.ensure_operable()?;
         match rpc {
             RaftRpc::RequestVote {
                 term,
@@ -363,6 +587,7 @@ impl<FS: StorageFs> RaftCore<FS> {
                 prev_log_term,
                 entries,
                 leader_commit,
+                compaction_floor,
             } => {
                 if term < self.current_term {
                     return Ok(vec![OutboundMsg {
@@ -414,7 +639,10 @@ impl<FS: StorageFs> RaftCore<FS> {
                 let mut write_start: Option<u64> = None;
                 let mut to_persist: Vec<LogEntry> = Vec::new();
                 for entry in entries {
-                    let pos = (entry.index - 1) as usize;
+                    if entry.index <= self.base_index {
+                        return Err(MetaError::PeerBehindCompactedBase(leader_id));
+                    }
+                    let pos = (entry.index - self.base_index - 1) as usize;
                     if pos < self.log.len() {
                         if self.log[pos].term != entry.term {
                             self.log.truncate(pos);
@@ -442,8 +670,10 @@ impl<FS: StorageFs> RaftCore<FS> {
 
                 if leader_commit > self.commit_index {
                     self.commit_index = self.commit_index.max(leader_commit.min(matched_index));
-                    self.apply_committed();
+                    self.apply_committed()?;
                 }
+                self.compaction_floor = self.compaction_floor.max(compaction_floor);
+                self.try_compact();
 
                 Ok(vec![OutboundMsg {
                     to: leader_id,
@@ -475,6 +705,10 @@ impl<FS: StorageFs> RaftCore<FS> {
                     let updated_match = cur_match.max(match_index);
                     self.match_index.insert(from, updated_match);
                     self.next_index.insert(from, updated_match + 1);
+                    let candidate = self
+                        .commit_index
+                        .min(self.match_index.values().copied().min().unwrap_or(0));
+                    self.compaction_floor = self.compaction_floor.max(candidate);
 
                     // Raft §5.4.2: advance `commit_index` only for entries from `current_term`
                     let old_commit = self.commit_index;
@@ -487,20 +721,23 @@ impl<FS: StorageFs> RaftCore<FS> {
                                 .count();
                             if replicated >= self.quorum_size() {
                                 self.commit_index = n;
-                                self.apply_committed();
+                                self.apply_committed()?;
                                 break;
                             }
                         }
                     }
                     // Broadcast updated `leader_commit` so followers apply immediately
                     if self.commit_index > old_commit {
-                        return Ok(self.broadcast_append_entries());
+                        return self.broadcast_append_entries_checked();
                     }
                 } else {
                     let cur_next = self.next_index.get(&from).copied().unwrap_or(2);
                     let backed_off = cur_next.saturating_sub(1).max(1);
+                    if backed_off <= self.base_index {
+                        return Err(MetaError::PeerBehindCompactedBase(from));
+                    }
                     self.next_index.insert(from, backed_off);
-                    return Ok(self.broadcast_append_entries());
+                    return self.broadcast_append_entries_checked();
                 }
                 Ok(Vec::new())
             }
@@ -519,13 +756,122 @@ impl<FS: StorageFs> RaftCore<FS> {
         })
     }
 
-    fn apply_committed(&mut self) {
+    fn apply_committed(&mut self) -> Result<(), MetaError> {
         while self.last_applied < self.commit_index {
-            self.last_applied += 1;
-            let entry = self.log[(self.last_applied - 1) as usize].clone();
+            let next = self.last_applied + 1;
+            // A committed index the log cannot serve is a gap, not something to
+            // skip: skipping it would apply later entries over a state the
+            // earlier ones never produced.
+            let entry = self.entry_at(next).cloned().ok_or(MetaError::CorruptWal(
+                "a committed entry is missing from the log",
+            ))?;
+            self.last_applied = next;
             let res = self.sm.apply(entry.cmd);
-            self.applied_results.insert(self.last_applied, res);
+            self.applied_results.insert(next, res);
         }
+        self.try_compact();
+        Ok(())
+    }
+
+    /// Runs compaction and records, rather than propagates, its failure.
+    ///
+    /// The entries applied so far are already durable in the WAL, so failing the
+    /// operation that happened to trigger compaction would report a committed
+    /// mutation as failed. The node instead refuses every later operation with
+    /// [`MetaError::CompactionFailed`] until it is restarted.
+    fn try_compact(&mut self) {
+        if self.compaction_error.is_some() {
+            return;
+        }
+        if let Err(err) = self.maybe_compact() {
+            self.compaction_error = Some(err.to_string());
+        }
+    }
+
+    fn snapshot_at(&self, index: u64) -> MetaSnapshot {
+        let mut sm = MetaStateMachine::new();
+        sm.restore_durable_snapshot(self.checkpoint_snapshot.clone());
+        for entry in self
+            .log
+            .iter()
+            .filter(|e| e.index > self.base_index && e.index <= index)
+        {
+            sm.apply(entry.cmd.clone());
+        }
+        sm.durable_snapshot()
+    }
+
+    fn maybe_compact(&mut self) -> Result<(), MetaError> {
+        let target = self.last_applied.min(self.compaction_floor);
+        if target <= self.base_index {
+            return Ok(());
+        }
+        let over_threshold = self.wal.byte_len()? >= self.compaction_bytes
+            || self.last_applied.saturating_sub(self.base_index) >= self.compaction_entries;
+        if !over_threshold {
+            return Ok(());
+        }
+        let applied_term = self
+            .term_at(target)
+            .ok_or(MetaError::Checkpoint("missing compaction term".into()))?;
+        // Everything above `target` is kept, so the suffix must start exactly at
+        // `target + 1`. A gap here would be written into the WAL as a silent
+        // hole, so refuse before touching either file.
+        let suffix: Vec<_> = self
+            .log
+            .iter()
+            .filter(|e| e.index > target)
+            .cloned()
+            .collect();
+        if suffix.first().is_some_and(|e| e.index != target + 1) {
+            return Err(MetaError::Checkpoint(
+                "compaction would leave a gap above the new base".into(),
+            ));
+        }
+        let snapshot = self.snapshot_at(target);
+        let checkpoint = DurableCheckpoint {
+            format_version: 1,
+            applied_index: target,
+            applied_term,
+            commit_index: self.commit_index,
+            hard_state: DurableHardState {
+                term: self.current_term,
+                voted_for: self.voted_for,
+            },
+            compaction_floor: self.compaction_floor,
+            snapshot: snapshot.clone(),
+        };
+        let path = checkpoint_path(&self.dir);
+        let tmp = format!("{path}.tmp");
+        let file = self.fs.open_rw(&tmp, true)?;
+        let bytes = serde_json::to_vec(&checkpoint)?;
+        file.set_len(0)?;
+        file.write_at(0, &bytes)?;
+        file.sync_data()?;
+        self.fs.rename_atomic(&tmp, &path)?;
+        self.fs.sync_dir(&self.dir)?;
+        let mut records = vec![
+            WalRecord::HardState {
+                term: self.current_term,
+                voted_for: self.voted_for,
+            },
+            WalRecord::Base {
+                index: target,
+                term: applied_term,
+            },
+        ];
+        if !suffix.is_empty() {
+            records.push(WalRecord::AppendEntries {
+                from_index: suffix[0].index,
+                entries: suffix.clone(),
+            });
+        }
+        self.wal.rewrite(&records)?;
+        self.log = suffix;
+        self.base_index = target;
+        self.base_term = applied_term;
+        self.checkpoint_snapshot = snapshot;
+        Ok(())
     }
 
     pub fn take_applied_result(&mut self, index: u64) -> Option<KvResult> {
@@ -747,6 +1093,25 @@ impl<FS: StorageFs> LocalMetaKv<FS> {
         )
     }
 
+    pub fn compaction_info(&self) -> Result<(u64, u64, u64), MetaError> {
+        #[cfg(any(test, feature = "openraft-storage"))]
+        if self.openraft.is_some() {
+            return Ok((0, 0, 0));
+        }
+        let g = self.legacy().lock().unwrap();
+        Ok((g.base_index(), g.compaction_floor(), g.wal_bytes()?))
+    }
+
+    /// The reason this node stopped accepting metadata work after a failed
+    /// checkpoint or WAL rewrite. `None` on a healthy node and on OpenRaft.
+    pub fn compaction_error(&self) -> Option<String> {
+        #[cfg(any(test, feature = "openraft-storage"))]
+        if self.openraft.is_some() {
+            return None;
+        }
+        self.legacy().lock().unwrap().compaction_error()
+    }
+
     pub fn node_id(&self) -> u32 {
         #[cfg(any(test, feature = "openraft-storage"))]
         if let Some(client) = &self.openraft {
@@ -843,7 +1208,7 @@ impl<FS: StorageFs> LocalMetaKv<FS> {
             if guard.role() == RoleState::Leader {
                 *self.last_leader_contact.lock().unwrap() = Instant::now();
             }
-            guard.broadcast_append_entries()
+            guard.broadcast_append_entries_checked()?
         };
         self.drive_outbound(msgs)
     }
@@ -1322,5 +1687,449 @@ mod transport_tests {
         for node in nodes.values() {
             assert_eq!(node.get("committed").unwrap().value, b"original");
         }
+    }
+}
+
+#[cfg(test)]
+mod compaction_tests {
+    use super::*;
+    use yadb_io::SimFs;
+
+    const DIR: &str = "meta";
+
+    fn key(i: u32) -> String {
+        format!("/k/{i:03}")
+    }
+
+    fn value(i: u32) -> Vec<u8> {
+        vec![i as u8]
+    }
+
+    fn put_cmd(i: u32) -> KvCommand {
+        KvCommand::Put {
+            key: key(i),
+            value: value(i),
+        }
+    }
+
+    fn try_single(fs: &SimFs) -> Result<RaftCore<SimFs>, MetaError> {
+        RaftCore::open(fs, DIR, 1, vec![1], true)
+    }
+
+    fn single(fs: &SimFs) -> RaftCore<SimFs> {
+        try_single(fs).unwrap()
+    }
+
+    fn put(core: &mut RaftCore<SimFs>, i: u32) {
+        core.propose(put_cmd(i)).unwrap();
+    }
+
+    /// The checkpoint `maybe_compact` would write for `index`.
+    fn checkpoint_at(core: &RaftCore<SimFs>, index: u64) -> DurableCheckpoint {
+        DurableCheckpoint {
+            format_version: 1,
+            applied_index: index,
+            applied_term: core.term_at(index).expect("index must be in the log"),
+            commit_index: core.commit_index(),
+            hard_state: DurableHardState {
+                term: core.current_term(),
+                voted_for: core.voted_for(),
+            },
+            compaction_floor: core.compaction_floor(),
+            snapshot: core.snapshot_at(index),
+        }
+    }
+
+    fn write_checkpoint(fs: &SimFs, checkpoint: &DurableCheckpoint) {
+        fs.create_dir_all(DIR).unwrap();
+        let file = fs.open_rw(&checkpoint_path(DIR), true).unwrap();
+        let bytes = serde_json::to_vec(checkpoint).unwrap();
+        file.set_len(0).unwrap();
+        file.write_at(0, &bytes).unwrap();
+        file.sync_data().unwrap();
+    }
+
+    fn cluster_fs(ids: &[u32]) -> BTreeMap<u32, SimFs> {
+        ids.iter()
+            .map(|&id| (id, SimFs::new(5000 + id as u64)))
+            .collect()
+    }
+
+    fn open_cluster(fss: &BTreeMap<u32, SimFs>) -> BTreeMap<u32, LocalMetaKv<SimFs>> {
+        let peers: BTreeMap<u32, String> = fss.keys().map(|&id| (id, id.to_string())).collect();
+        fss.iter()
+            .map(|(&id, fs)| {
+                let meta = LocalMetaKv::open_clustered_with_token(
+                    fs,
+                    DIR,
+                    id,
+                    peers.clone(),
+                    "test-token".to_string(),
+                )
+                .unwrap();
+                (id, meta)
+            })
+            .collect()
+    }
+
+    fn deliver(
+        nodes: &BTreeMap<u32, LocalMetaKv<SimFs>>,
+        addr: &str,
+        rpc: &RaftRpc,
+    ) -> Result<Option<RaftRpc>, std::io::Error> {
+        Ok(nodes[&addr.parse::<u32>().unwrap()]
+            .step_rpc(rpc.clone())
+            .unwrap())
+    }
+
+    fn deliver_but(
+        nodes: &BTreeMap<u32, LocalMetaKv<SimFs>>,
+        isolated: &BTreeSet<u32>,
+        addr: &str,
+        rpc: &RaftRpc,
+    ) -> Result<Option<RaftRpc>, std::io::Error> {
+        if isolated.contains(&addr.parse::<u32>().unwrap()) {
+            return Ok(None);
+        }
+        deliver(nodes, addr, rpc)
+    }
+
+    fn elect(nodes: &BTreeMap<u32, LocalMetaKv<SimFs>>, id: u32) {
+        let msgs = nodes[&id]
+            .legacy()
+            .lock()
+            .unwrap()
+            .start_election()
+            .unwrap();
+        nodes[&id]
+            .drive_outbound_with(msgs, &mut |addr, rpc| deliver(nodes, addr, rpc))
+            .unwrap();
+        assert_eq!(nodes[&id].role_info().1, RoleState::Leader);
+    }
+
+    fn propose_on(
+        nodes: &BTreeMap<u32, LocalMetaKv<SimFs>>,
+        leader: u32,
+        i: u32,
+        isolated: &BTreeSet<u32>,
+    ) -> u64 {
+        let (idx, msgs) = nodes[&leader]
+            .legacy()
+            .lock()
+            .unwrap()
+            .propose(put_cmd(i))
+            .unwrap();
+        nodes[&leader]
+            .drive_outbound_with(msgs, &mut |addr, rpc| {
+                deliver_but(nodes, isolated, addr, rpc)
+            })
+            .unwrap();
+        idx
+    }
+
+    #[test]
+    fn compaction_bounds_the_wal_and_preserves_state_across_reopen() {
+        let fs = SimFs::new(4101);
+        let mut core = single(&fs);
+        for i in 0..50u32 {
+            put(&mut core, i);
+        }
+        let wal_before = core.wal_bytes().unwrap();
+        let revision_before = core.revision();
+        assert_eq!(core.base_index(), 0);
+
+        core.set_compaction_thresholds(1, 1);
+        put(&mut core, 50);
+
+        let base = core.base_index();
+        let floor = core.compaction_floor();
+        let wal_after = core.wal_bytes().unwrap();
+        assert!(base > 0, "compaction must advance the base");
+        assert_eq!(floor, base);
+        assert!(wal_after < wal_before, "{wal_after} !< {wal_before}");
+        assert_eq!(core.revision(), revision_before + 1);
+        assert_eq!(core.compaction_error(), None);
+        drop(core);
+
+        let core = single(&fs);
+        assert_eq!(core.base_index(), base);
+        assert_eq!(core.compaction_floor(), floor);
+        assert_eq!(core.revision(), revision_before + 1);
+        for i in 0..=50u32 {
+            assert_eq!(
+                core.get(&key(i)).unwrap().value,
+                value(i),
+                "key {i} must survive compaction"
+            );
+        }
+        assert_eq!(
+            core.wal_bytes().unwrap(),
+            wal_after,
+            "reopening a compacted WAL must not append to it"
+        );
+    }
+
+    #[test]
+    fn checkpoint_renamed_before_the_wal_rewrite_is_reconciled_on_open() {
+        let fs = SimFs::new(4102);
+        let mut core = single(&fs);
+        for i in 0..20u32 {
+            put(&mut core, i);
+        }
+        core.set_compaction_thresholds(1, 1);
+        put(&mut core, 20);
+        let base_after_compaction = core.base_index();
+        assert!(base_after_compaction > 0);
+
+        // Entries above the base stay in the WAL, so the on-disk checkpoint
+        // still covers only `base_after_compaction`.
+        core.set_compaction_thresholds(u64::MAX, u64::MAX);
+        for i in 21..30u32 {
+            put(&mut core, i);
+        }
+        let applied = core.last_applied;
+        assert!(applied > base_after_compaction);
+
+        // The crash window: the checkpoint for `applied` reached the disk, the
+        // WAL rewrite did not. Write that checkpoint by hand and reopen.
+        let checkpoint = checkpoint_at(&core, applied);
+        let revision = core.revision();
+        let wal_before = core.wal_bytes().unwrap();
+        write_checkpoint(&fs, &checkpoint);
+        drop(core);
+
+        let core = single(&fs);
+        assert_eq!(
+            core.base_index(),
+            applied,
+            "opening must rewrite the stale WAL to the checkpoint"
+        );
+        assert_eq!(core.revision(), revision);
+        assert!(core.wal_bytes().unwrap() < wal_before);
+        for i in 0..30u32 {
+            assert_eq!(core.get(&key(i)).unwrap().value, value(i));
+        }
+    }
+
+    #[test]
+    fn a_compacted_base_without_a_checkpoint_refuses_to_start() {
+        let fs = SimFs::new(4103);
+        {
+            let (mut wal, _) = RaftWal::open(&fs, DIR, true).unwrap();
+            wal.append(&WalRecord::HardState {
+                term: 4,
+                voted_for: Some(2),
+            })
+            .unwrap();
+            wal.append(&WalRecord::Base { index: 10, term: 2 }).unwrap();
+        }
+        match try_single(&fs) {
+            Err(MetaError::Checkpoint(_)) => {}
+            Err(other) => panic!("expected an explicit checkpoint error, got {other:?}"),
+            Ok(_) => panic!("a compacted WAL without its state image must not open"),
+        }
+    }
+
+    #[test]
+    fn an_unparsable_checkpoint_refuses_to_start() {
+        let fs = SimFs::new(4104);
+        fs.create_dir_all(DIR).unwrap();
+        let file = fs.open_rw(&checkpoint_path(DIR), true).unwrap();
+        file.write_at(0, b"{not json").unwrap();
+        match try_single(&fs) {
+            Err(MetaError::Checkpoint(_)) => {}
+            Err(other) => panic!("expected an explicit checkpoint error, got {other:?}"),
+            Ok(_) => panic!("a damaged checkpoint must not silently re-initialise"),
+        }
+    }
+
+    #[test]
+    fn term_and_vote_survive_compaction() {
+        let fs = SimFs::new(4105);
+        let mut core = single(&fs);
+        let term = core.current_term();
+        let vote = core.voted_for();
+        assert_eq!(vote, Some(1));
+        for i in 0..5u32 {
+            put(&mut core, i);
+        }
+        core.set_compaction_thresholds(1, 1);
+        put(&mut core, 5);
+        let base = core.base_index();
+        assert!(base > 0);
+        drop(core);
+
+        // The rewritten WAL must carry the hard state itself, not only the
+        // checkpoint: replaying it is what prevents double voting in a term.
+        let (_, recovered) = RaftWal::open(&fs, DIR, true).unwrap();
+        assert_eq!(recovered.term, term);
+        assert_eq!(recovered.voted_for, vote);
+        assert_eq!(recovered.base_index, base);
+
+        let core = single(&fs);
+        assert_eq!(core.current_term(), term);
+        assert_eq!(core.voted_for(), vote);
+    }
+
+    #[test]
+    fn compaction_never_drops_an_entry_above_a_stopped_peer_match() {
+        let fss = cluster_fs(&[1, 2, 3]);
+        let nodes = open_cluster(&fss);
+        elect(&nodes, 1);
+        let none = BTreeSet::new();
+        for i in 0..10u32 {
+            propose_on(&nodes, 1, i, &none);
+        }
+        let common = nodes[&1].legacy().lock().unwrap().commit_index();
+        for i in 0..10u32 {
+            assert!(nodes[&3].get(&key(i)).is_some());
+        }
+
+        let isolated: BTreeSet<u32> = [3].into_iter().collect();
+        for i in 10..40u32 {
+            propose_on(&nodes, 1, i, &isolated);
+        }
+        assert!(nodes[&3].get(&key(39)).is_none());
+
+        nodes[&1]
+            .legacy()
+            .lock()
+            .unwrap()
+            .set_compaction_thresholds(1, 1);
+        propose_on(&nodes, 1, 99, &isolated);
+
+        let (base, floor) = {
+            let g = nodes[&1].legacy().lock().unwrap();
+            (g.base_index(), g.compaction_floor())
+        };
+        assert_eq!(
+            base, common,
+            "the leader must not compact past the stopped peer's match"
+        );
+        assert_eq!(floor, common);
+
+        // Healing the link must let the stopped peer catch up from the base,
+        // which only works because nothing above the floor was dropped.
+        let msgs = nodes[&1]
+            .legacy()
+            .lock()
+            .unwrap()
+            .broadcast_append_entries_checked()
+            .unwrap();
+        nodes[&1]
+            .drive_outbound_with(msgs, &mut |addr, rpc| deliver(&nodes, addr, rpc))
+            .unwrap();
+        for i in 0..40u32 {
+            assert_eq!(nodes[&3].get(&key(i)).unwrap().value, value(i));
+        }
+        assert!(nodes[&3].get(&key(99)).is_some());
+    }
+
+    #[test]
+    fn a_peer_below_the_compacted_base_is_refused_explicitly() {
+        let fss = cluster_fs(&[1, 2, 3]);
+        let nodes = open_cluster(&fss);
+        elect(&nodes, 1);
+        let none = BTreeSet::new();
+        for i in 0..5u32 {
+            propose_on(&nodes, 1, i, &none);
+        }
+        nodes[&1]
+            .legacy()
+            .lock()
+            .unwrap()
+            .set_compaction_thresholds(1, 1);
+        propose_on(&nodes, 1, 5, &none);
+
+        let (base, term) = {
+            let g = nodes[&1].legacy().lock().unwrap();
+            (g.base_index(), g.current_term())
+        };
+        assert!(base > 0);
+
+        // A peer that lost its log needs entries from below the base.
+        nodes[&1]
+            .legacy()
+            .lock()
+            .unwrap()
+            .next_index
+            .insert(3, base);
+        let refused = nodes[&1]
+            .legacy()
+            .lock()
+            .unwrap()
+            .broadcast_append_entries_checked();
+        assert!(
+            matches!(refused, Err(MetaError::PeerBehindCompactedBase(3))),
+            "{refused:?}"
+        );
+
+        // Backing off to the base is refused too, never turned into a silent skip.
+        nodes[&1]
+            .legacy()
+            .lock()
+            .unwrap()
+            .next_index
+            .insert(3, base + 1);
+        let refused = nodes[&1]
+            .legacy()
+            .lock()
+            .unwrap()
+            .step(RaftRpc::AppendEntriesReply {
+                from: 3,
+                term,
+                success: false,
+                match_index: 0,
+            });
+        assert!(
+            matches!(refused, Err(MetaError::PeerBehindCompactedBase(3))),
+            "{refused:?}"
+        );
+
+        // The follower side of the same boundary: with its own base at `base`,
+        // an append whose prefix lies below it cannot be verified, so it is
+        // rejected instead of being treated as a match.
+        nodes[&3]
+            .legacy()
+            .lock()
+            .unwrap()
+            .set_compaction_thresholds(1, 1);
+        let msgs = nodes[&1]
+            .legacy()
+            .lock()
+            .unwrap()
+            .broadcast_append_entries_checked()
+            .unwrap();
+        nodes[&1]
+            .drive_outbound_with(msgs, &mut |addr, rpc| deliver(&nodes, addr, rpc))
+            .unwrap();
+        let floor = nodes[&1].legacy().lock().unwrap().compaction_floor();
+        let follower_base = nodes[&3].legacy().lock().unwrap().base_index();
+        assert_eq!(
+            follower_base, floor,
+            "the follower must compact to the floor the leader published"
+        );
+
+        let replies = nodes[&3]
+            .legacy()
+            .lock()
+            .unwrap()
+            .step(RaftRpc::AppendEntries {
+                term,
+                leader_id: 1,
+                prev_log_index: follower_base - 1,
+                prev_log_term: 0,
+                entries: vec![],
+                leader_commit: follower_base,
+                compaction_floor: floor,
+            })
+            .unwrap();
+        assert!(
+            matches!(
+                replies[0].rpc,
+                RaftRpc::AppendEntriesReply { success: false, .. }
+            ),
+            "{replies:?}"
+        );
     }
 }

@@ -1056,3 +1056,55 @@ atomic multi-key results and classify unknown outcomes without inventing aborts.
 Failing artifacts must be preserved, not repaired/truncated by the test harness.
 Publish filesystem/hardware assumptions and unsupported recovery states with the
 release. Do not claim these tests ran without actual supported-host evidence.
+
+## Metadata WAL compaction (2026-11-15)
+
+The legacy Raft log is checkpointed and compacted. `metakv/checkpoint.json`
+carries the durable state image plus `applied_index`, `applied_term`,
+`commit_index`, `hard_state`, `compaction_floor` and a format version; it is
+written tmp/`sync_data`/rename/`sync_dir`. `raft.wal` is rewritten the same way,
+always beginning with a `HardState` frame and then `WalRecord::Base{index, term}`.
+`RaftCore` addresses the log through `base_index`/`base_term`, and compaction is
+bounded by a monotone `compaction_floor` replicated in `AppendEntries` with
+`#[serde(default)]`.
+
+Ordering: checkpoint, then WAL rewrite, then the in-memory base. On open the
+checkpoint is authoritative; a WAL whose base is older is rewritten to match, so
+a crash between the two renames is harmless and idempotent. A `Base > 0` with a
+missing or unparsable checkpoint, a checkpoint below the WAL base, and a
+checkpoint term disagreeing with the base term all refuse to start.
+
+Tests (`cargo test -p yadb-metakv`, 165 tests):
+- `compaction_bounds_the_wal_and_preserves_state_across_reopen`: 51 puts, forced
+  threshold, base advances, WAL shrinks, every key reads back, reopen reproduces
+  base/floor/revision and does not append.
+- `checkpoint_renamed_before_the_wal_rewrite_is_reconciled_on_open`: the crash
+  window; the stale WAL is rewritten on open, state and revision are identical,
+  and the file shrinks.
+- `a_compacted_base_without_a_checkpoint_refuses_to_start` and
+  `an_unparsable_checkpoint_refuses_to_start`: explicit `Checkpoint` errors.
+- `term_and_vote_survive_compaction`: the rewritten WAL itself carries the hard
+  state, so replay cannot rewind the term.
+- `compaction_never_drops_an_entry_above_a_stopped_peer_match`: 3-node cluster,
+  one peer stopped, leader's base and floor stop at that peer's match, and the
+  peer catches up after healing.
+- `a_peer_below_the_compacted_base_is_refused_explicitly`: both the leader
+  (broadcast and back-off) and the follower (prefix below its own base) refuse.
+- WAL layer: `base_marker_replays_and_rewrite_preserves_hard_state`,
+  `rewrite_replaces_the_whole_file_and_shrinks_it`, `a_gap_above_the_base_is_corruption`,
+  `an_append_below_the_base_is_corruption`.
+
+Live measurement on a three-node legacy cluster (ports 21000-21300, fresh root):
+4801 rows written through pgwire in three runs, 19491 Raft entries. `base_index`
+advanced to 18506 and `compaction_floor` to 19491; each node's `raft.wal` stayed
+in a 3.7-8.4 MB band (about 3.8 KB per entry) instead of growing with the entry
+count, and `checkpoint.json` settled at 56 KB. A `stop`/`start` cycle recovered
+all 4801 rows with no WAL growth; a node killed with `SIGKILL` while the other
+two kept writing was refused for writes (full redundancy is required) and caught
+up from the leader's retained suffix when restarted. `tests/protocols.py` passed
+16/16, `cargo test -p yadbd --bins` 63 tests, `cargo fmt --all -- --check` clean.
+
+Open: no install-snapshot path, so a peer behind the compacted base is refused
+rather than re-seeded; the checkpoint is a full image rather than incremental
+history; compaction runs under the Raft mutex, so a pass briefly stalls
+proposals; and a single-node cluster bounds itself by its own applied index.

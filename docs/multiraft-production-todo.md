@@ -385,24 +385,45 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   read that outlives its own 30 s lease is not fenced (nothing refreshes it
   mid-read); and no test runs a real multi-node pool, so remote enumeration,
   remote barriers and remote compaction are only exercised in-process.
-- [ ] Bound the metadata Raft log. `raft.wal` is append-only and nothing ever
-  rewrites, truncates or compacts it, so the log grows with every mutation for
-  the life of the deployment — this is now the dominant unbounded growth, not
-  fragments. Measured on a three-node legacy cluster with the current binary: one
-  `INSERT` through pgwire adds about 11 KB to each node's `raft.wal`, one
-  `SELECT` about 10.6 KB when the reader lease has to be republished (zero when
-  it is reused), one 200 KB S3 `PUT` about 3 KB, and an idle cluster adds
-  nothing. The insert cost is dominated by the shard manifest, which is rewritten
-  on every statement and carries every WAL blob id written since the last flush,
-  so it grows linearly with unflushed rows (average ~10 KB at the default
-  `--db-flush-rows 1024`). Twenty overwrites of one 200 KB object left 3.3 MB of
-  `raft.wal` against 795 KB of pool data, and the fragment sweep cannot touch it.
-  Fixing it needs a real snapshot-and-truncate protocol: persist a state image,
-  truncate a log prefix, serve a lagging follower from the image rather than from
-  entries that no longer exist, and rewrite `raft.wal` (which currently promises
-  never to rewrite itself). None of that exists, so a long-lived cluster will
-  still fill its disk from metadata alone; provision a fresh root for a new test
-  run and do not expect the log to shrink.
+- [x] Bound the metadata Raft log. The legacy Raft log is now checkpointed and
+  compacted: `metakv/checkpoint.json` holds the durable state image (atomic
+  write: tmp, `sync_data`, rename, `sync_dir`), `raft.wal` is rewritten through
+  a tmp file plus rename, and every rewritten WAL begins with a `HardState`
+  frame followed by `WalRecord::Base{index, term}` so compaction can never lose
+  the term or vote. `RaftCore` carries `base_index`/`base_term` and every log
+  access is an offset above the base.
+  Entries are dropped only when two facts hold: they are applied and durable in
+  a checkpoint, and no peer can still need them. The bound is a monotone
+  `compaction_floor = max(floor, min(commit_index, min peer match_index))` that
+  is replicated in every `AppendEntries` (`#[serde(default)]`, so an older peer
+  keeps working and a missing field means 0). Each node compacts to
+  `min(last_applied, floor)`; a node that never heard a floor does not compact.
+  Ordering is checkpoint, then WAL rewrite, then the in-memory base, so a crash
+  between the two files is reconciled on open: the checkpoint is authoritative,
+  entries at or below its applied index are dropped, and the WAL is rewritten to
+  match. `Base > 0` without a readable checkpoint, a checkpoint below the WAL
+  base, and a disagreement between the checkpoint term and the base term are all
+  explicit startup errors, never a silent re-initialisation. A failed checkpoint
+  or rewrite does not fail the mutation that triggered it (its entries are
+  already durable); it records `compaction_error`, refuses every later operation
+  with `CompactionFailed` (503), and surfaces the reason on `/raft/status`.
+  Compaction triggers at 8 MiB of WAL or 4096 applied entries above the base
+  (`WAL_COMPACTION_BYTES`/`WAL_COMPACTION_ENTRIES`); `/raft/status` reports
+  `base_index`, `compaction_floor`, `wal_bytes` and `compaction_error`.
+  Measured on a three-node legacy cluster (ports 21000-21300, 4801 rows through
+  pgwire, 19491 Raft entries): `base_index` advanced to 18506, each node's
+  `raft.wal` stayed inside a 3.7-8.4 MB band instead of growing with history
+  (about 3.8 KB per entry, so the append-only file would have been tens of
+  megabytes), and the checkpoint settled at 56 KB. A `stop`/`start` cycle
+  recovered every row with no WAL growth, and a node killed with `SIGKILL`
+  caught up from the leader's retained suffix.
+  Open: there is no install-snapshot path, so a peer that falls below the
+  compacted base is refused with `PeerBehindCompactedBase` and adding or
+  re-seeding a node needs that protocol first; the checkpoint is a full image,
+  not an incremental history, so its size follows live metadata (small here:
+  SQL rows live in pool fragments, not in the metadata image); compaction runs
+  under the Raft mutex, so one pass briefly stalls proposals; and a single-node
+  cluster compacts on its own applied index without a peer bound.
 - [ ] Garbage collection on Multi-Raft. `POST /v1/pools/gc` and the sweep inside
   `POST /v1/pools/scrub` both refuse with `garbage collection disabled for
   Multi-Raft: no single atomic cross-group metadata snapshot` and delete
