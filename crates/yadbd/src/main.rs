@@ -669,7 +669,16 @@ impl AppState {
         slot: usize,
     ) -> Result<Arc<VolumeStore<OsFs>>, String> {
         let key = (pool_name.to_string(), slot);
-        if let Some(existing) = self.local_vdisks.read().unwrap().get(&key) {
+        // The check, the open and the insert happen under one write lock. Two
+        // requests that both miss the map would otherwise open the same
+        // directory twice, and each instance keeps its own `write_pos`,
+        // tombstones and barriers. Both then append to the same segment from the
+        // same offset, so the second writer overwrites records the first one
+        // acknowledged — including tombstones and GC barriers, which is how a
+        // deleted blob could be resurrected after a restart. Serialising here is
+        // what makes "one store per slot directory" true.
+        let mut map = self.local_vdisks.write().unwrap();
+        if let Some(existing) = map.get(&key) {
             return Ok(existing.clone());
         }
         let dir = format!("pools/{pool_name}/slot_{slot:02}");
@@ -677,10 +686,7 @@ impl AppState {
             VolumeStore::open(self.fs.clone(), dir, VolumeConfig::default())
                 .map_err(|e| e.to_string())?,
         );
-        self.local_vdisks
-            .write()
-            .unwrap()
-            .insert(key, store.clone());
+        map.insert(key, store.clone());
         Ok(store)
     }
 
@@ -5371,17 +5377,19 @@ async fn handle_s3_list_parts(
 fn parse_complete_multipart(body: &[u8]) -> Result<Vec<(u32, String)>, S3Error> {
     let text = std::str::from_utf8(body)
         .map_err(|_| S3Error::MalformedMultipart("body is not UTF-8".into()))?;
+    // A leading byte-order mark is an encoding signature, not content: XML
+    // parsers consume it, and it may precede even the declaration.
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let mut input = text;
-    // Only whitespace, an XML declaration and comments may precede the root.
-    // The declaration is accepted only at the very start of the document: XML
-    // puts it before everything else, so one found later is a malformed
-    // document, not a token to skip.
-    let mut at_start = true;
+    // Only XML whitespace, comments, processing instructions and one XML
+    // declaration may precede the root. The declaration is legal only as the
+    // very first token of the document: a comment or any whitespace before it
+    // is a malformed document, and one inside the root is not a token to skip.
+    let mut first = true;
     loop {
         match xml_token(&mut input)? {
-            XmlToken::Declaration if at_start => {
-                // Only one declaration, and only before any content.
-                at_start = false;
+            XmlToken::Declaration if first => {
+                first = false;
                 continue;
             }
             XmlToken::Declaration => {
@@ -5389,8 +5397,12 @@ fn parse_complete_multipart(body: &[u8]) -> Result<Vec<(u32, String)>, S3Error> 
                     "an XML declaration is only allowed at the start of the document".into(),
                 ))
             }
-            XmlToken::Text(text) if text.trim().is_empty() => {
-                at_start = false;
+            XmlToken::Comment | XmlToken::ProcessingInstruction => {
+                first = false;
+                continue;
+            }
+            XmlToken::Text(text) if xml_is_ws(text) => {
+                first = false;
                 continue;
             }
             XmlToken::Open {
@@ -5407,7 +5419,8 @@ fn parse_complete_multipart(body: &[u8]) -> Result<Vec<(u32, String)>, S3Error> 
     let mut parts = Vec::new();
     loop {
         match xml_token(&mut input)? {
-            XmlToken::Text(text) if text.trim().is_empty() => continue,
+            XmlToken::Comment | XmlToken::ProcessingInstruction => continue,
+            XmlToken::Text(text) if xml_is_ws(text) => continue,
             XmlToken::Open {
                 name: "Part",
                 self_closing: false,
@@ -5424,7 +5437,8 @@ fn parse_complete_multipart(body: &[u8]) -> Result<Vec<(u32, String)>, S3Error> 
     }
     loop {
         match xml_token(&mut input)? {
-            XmlToken::Text(text) if text.trim().is_empty() => continue,
+            XmlToken::Comment | XmlToken::ProcessingInstruction => continue,
+            XmlToken::Text(text) if xml_is_ws(text) => continue,
             XmlToken::Eof => break,
             _ => {
                 return Err(S3Error::MalformedMultipart(
@@ -5448,7 +5462,8 @@ fn read_complete_part(input: &mut &str) -> Result<(u32, String), S3Error> {
     let mut etag = None;
     loop {
         match xml_token(input)? {
-            XmlToken::Text(text) if text.trim().is_empty() => continue,
+            XmlToken::Comment | XmlToken::ProcessingInstruction => continue,
+            XmlToken::Text(text) if xml_is_ws(text) => continue,
             XmlToken::Open {
                 name: "PartNumber",
                 self_closing: false,
@@ -5481,35 +5496,43 @@ fn read_complete_part(input: &mut &str) -> Result<(u32, String), S3Error> {
     }
     let number =
         number.ok_or_else(|| S3Error::MalformedMultipart("a <Part> has no <PartNumber>".into()))?;
-    let number = number.trim().parse::<u32>().map_err(|_| {
-        S3Error::MalformedMultipart(format!("invalid part number `{}`", number.trim()))
-    })?;
+    let number = xml_trim_end(xml_trim_start(&number));
+    let number = number
+        .parse::<u32>()
+        .map_err(|_| S3Error::MalformedMultipart(format!("invalid part number `{number}`")))?;
     let etag = etag.ok_or_else(|| S3Error::MalformedMultipart("a <Part> has no <ETag>".into()))?;
-    Ok((number, xml_unescape(etag.trim())))
+    Ok((number, xml_trim_end(xml_trim_start(&etag)).to_string()))
 }
 
-/// Reads the text content of one element and its closing tag. Nested elements
-/// are refused: the expected values are plain text.
+/// Reads the character content of one element and its closing tag.
+///
+/// Comments and processing instructions inside the element are not content in
+/// XML, so they are skipped rather than treated as the value; their text is not
+/// concatenated. Nested elements are refused: the expected values are plain
+/// text, and `<PartNumber><a>1</a></PartNumber>` is not a number.
 fn read_element_text(input: &mut &str, name: &str) -> Result<String, S3Error> {
-    let text = match xml_token(input)? {
-        XmlToken::Text(text) => text.to_string(),
-        _ => {
-            return Err(S3Error::MalformedMultipart(format!(
-                "<{name}> does not contain plain text"
-            )))
+    let mut text = String::new();
+    loop {
+        match xml_token(input)? {
+            XmlToken::Comment | XmlToken::ProcessingInstruction => continue,
+            XmlToken::Text(chunk) => text.push_str(&xml_decode(chunk, false)?),
+            XmlToken::Close { name: closing } if closing == name => return Ok(text),
+            _ => {
+                return Err(S3Error::MalformedMultipart(format!(
+                    "<{name}> does not contain plain text"
+                )))
+            }
         }
-    };
-    match xml_token(input)? {
-        XmlToken::Close { name: closing } if closing == name => Ok(text),
-        _ => Err(S3Error::MalformedMultipart(format!(
-            "<{name}> is not closed by </{name}>"
-        ))),
     }
 }
 
-/// One XML token. Comments and the XML declaration are skipped inside the
-/// tokenizer; `<!` constructs it does not understand are refused rather than
-/// treated as text.
+/// One XML token.
+///
+/// Comments and processing instructions are reported to the caller instead of
+/// being skipped here: whether one is legal depends on where it sits, and
+/// silently dropping framing is what let a malformed document complete an
+/// upload. `<!` constructs the tokenizer does not implement (CDATA, a DOCTYPE)
+/// are refused rather than treated as text.
 enum XmlToken<'a> {
     Open {
         name: &'a str,
@@ -5518,105 +5541,188 @@ enum XmlToken<'a> {
     Close {
         name: &'a str,
     },
-    /// `<?xml ...?>`. Legal only before the root element.
+    /// `<?xml ...?>` with an already-validated body. Legal only as the very
+    /// first token of the document.
     Declaration,
+    Comment,
+    ProcessingInstruction,
     Text(&'a str),
     Eof,
 }
 
+/// XML 1.0 `S`: space, tab, CR or LF.
+///
+/// Rust's `trim` also eats NBSP, U+2028 and the rest of Unicode whitespace,
+/// which XML does not permit inside markup. Using it would accept
+/// `<Part a="1"\u{a0}b="2">` as two attributes.
+fn is_xml_ws(ch: char) -> bool {
+    matches!(ch, ' ' | '\t' | '\r' | '\n')
+}
+
+/// XML 1.0 `Char`: the characters a document may contain at all. Control
+/// characters other than tab/CR/LF, and the surrogate range, are excluded.
+fn is_xml_char(ch: char) -> bool {
+    matches!(ch, '\u{9}' | '\u{A}' | '\u{D}')
+        || ('\u{20}'..='\u{D7FF}').contains(&ch)
+        || ('\u{E000}'..='\u{FFFD}').contains(&ch)
+        || ch >= '\u{10000}'
+}
+
+fn xml_trim_start(value: &str) -> &str {
+    value.trim_start_matches(is_xml_ws)
+}
+
+fn xml_trim_end(value: &str) -> &str {
+    value.trim_end_matches(is_xml_ws)
+}
+
+fn xml_is_ws(value: &str) -> bool {
+    value.chars().all(is_xml_ws)
+}
+
+fn is_xml_name_start(ch: char) -> bool {
+    ch.is_ascii_alphabetic() || ch == '_' || ch == ':'
+}
+
+fn is_xml_name_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | ':')
+}
+
+/// Byte length of the `Name` at the start of `value`, or `None` when it does
+/// not start with one. The completion document only uses ASCII names, so the
+/// ASCII subset of the XML production is both sufficient and strict.
+fn xml_name_len(value: &str) -> Option<usize> {
+    let mut chars = value.char_indices();
+    let (_, first) = chars.next()?;
+    if !is_xml_name_start(first) {
+        return None;
+    }
+    let mut end = first.len_utf8();
+    for (index, ch) in chars {
+        if !is_xml_name_char(ch) {
+            break;
+        }
+        end = index + ch.len_utf8();
+    }
+    Some(end)
+}
+
 fn xml_token<'a>(input: &mut &'a str) -> Result<XmlToken<'a>, S3Error> {
-    loop {
-        if input.is_empty() {
-            return Ok(XmlToken::Eof);
-        }
-        if let Some(rest) = input.strip_prefix("<?") {
-            let end = rest.find("?>").ok_or_else(|| {
-                S3Error::MalformedMultipart("unterminated processing instruction".into())
-            })?;
-            let body = &rest[..end];
-            let target_end = body
-                .find(|c: char| c.is_ascii_whitespace())
-                .unwrap_or(body.len());
-            let target = &body[..target_end];
-            if target.is_empty() {
-                return Err(S3Error::MalformedMultipart(
-                    "processing instruction without a target".into(),
-                ));
-            }
-            *input = &rest[end + 2..];
-            // `xml` is reserved for the declaration. It is reported as its own
-            // token so the caller can enforce that it appears only at the very
-            // start of the document: a declaration inside the root is not a
-            // processing instruction that may be skipped.
-            if target == "xml" {
-                return Ok(XmlToken::Declaration);
-            }
-            if target.eq_ignore_ascii_case("xml") {
-                return Err(S3Error::MalformedMultipart(
-                    "reserved processing-instruction target".into(),
-                ));
-            }
-            continue;
-        }
-        if let Some(rest) = input.strip_prefix("<!--") {
-            let end = rest
-                .find("-->")
-                .ok_or_else(|| S3Error::MalformedMultipart("unterminated XML comment".into()))?;
-            let body = &rest[..end];
-            // XML forbids `--` inside a comment and a comment ending in `-`.
-            // Skipping an invalid comment would let a document that a strict
-            // parser rejects still complete an upload.
-            if body.contains("--") || body.ends_with('-') {
-                return Err(S3Error::MalformedMultipart("malformed XML comment".into()));
-            }
-            *input = &rest[end + 3..];
-            continue;
-        }
-        if input.starts_with("<!") {
+    if input.is_empty() {
+        return Ok(XmlToken::Eof);
+    }
+    if let Some(rest) = input.strip_prefix("<?") {
+        let end = rest.find("?>").ok_or_else(|| {
+            S3Error::MalformedMultipart("unterminated processing instruction".into())
+        })?;
+        let body = &rest[..end];
+        *input = &rest[end + 2..];
+        let name_len = xml_name_len(body).ok_or_else(|| {
+            S3Error::MalformedMultipart("processing instruction without a valid target".into())
+        })?;
+        let target = &body[..name_len];
+        let data = &body[name_len..];
+        // The target is a Name, followed by whitespace or by the end of the
+        // instruction. `<?1?>` and `<?xml?>`-style targets are not Names.
+        if !data.is_empty() && !data.starts_with(is_xml_ws) {
             return Err(S3Error::MalformedMultipart(
-                "unsupported XML declaration or CDATA section".into(),
+                "processing instruction target must be followed by whitespace".into(),
             ));
         }
-        if let Some(rest) = input.strip_prefix("</") {
-            let end = rest
-                .find('>')
-                .ok_or_else(|| S3Error::MalformedMultipart("unterminated closing tag".into()))?;
-            // Only trailing whitespace before `>` is allowed: `</ Part>` names no
-            // element in XML and must not be read as `</Part>`.
-            let name = rest[..end].trim_end();
-            if name.is_empty() || name.contains(|c: char| c.is_ascii_whitespace()) {
-                return Err(S3Error::MalformedMultipart("invalid closing tag".into()));
-            }
-            *input = &rest[end + 1..];
-            return Ok(XmlToken::Close { name });
+        if !data.chars().all(is_xml_char) {
+            return Err(S3Error::MalformedMultipart(
+                "invalid character in processing instruction".into(),
+            ));
         }
-        if let Some(rest) = input.strip_prefix('<') {
-            let end = xml_tag_end(rest)?;
-            let mut inner = rest[..end].trim_end();
-            let self_closing = inner.ends_with('/');
-            if self_closing {
-                inner = inner[..inner.len() - 1].trim_end();
-            }
-            let name_end = inner
-                .find(|c: char| c.is_ascii_whitespace())
-                .unwrap_or(inner.len());
-            let name = &inner[..name_end];
-            if name.is_empty() || !name.starts_with(|c: char| c.is_ascii_alphabetic()) {
-                return Err(S3Error::MalformedMultipart("invalid opening tag".into()));
-            }
-            // Everything after the element name is an attribute list. It is
-            // validated instead of discarded: an unvalidated attribute can hide
-            // the real tag end, so `<Part ignored="><PartNumber>1<...` used to be
-            // read as a normal `<Part>` and could publish an object.
-            xml_validate_attributes(&inner[name_end..])?;
-            *input = &rest[end + 1..];
-            return Ok(XmlToken::Open { name, self_closing });
+        if target == "xml" {
+            // `xml` is reserved for the declaration; its body is a real grammar,
+            // not free text, so it is validated here.
+            xml_validate_declaration(data)?;
+            return Ok(XmlToken::Declaration);
         }
-        let end = input.find('<').unwrap_or(input.len());
-        let text = &input[..end];
-        *input = &input[end..];
-        return Ok(XmlToken::Text(text));
+        if target.eq_ignore_ascii_case("xml") {
+            return Err(S3Error::MalformedMultipart(
+                "reserved processing-instruction target".into(),
+            ));
+        }
+        return Ok(XmlToken::ProcessingInstruction);
     }
+    if let Some(rest) = input.strip_prefix("<!--") {
+        let end = rest
+            .find("-->")
+            .ok_or_else(|| S3Error::MalformedMultipart("unterminated XML comment".into()))?;
+        let body = &rest[..end];
+        // XML forbids `--` inside a comment and a comment ending in `-`.
+        if body.contains("--") || body.ends_with('-') {
+            return Err(S3Error::MalformedMultipart("malformed XML comment".into()));
+        }
+        if !body.chars().all(is_xml_char) {
+            return Err(S3Error::MalformedMultipart(
+                "invalid character in XML comment".into(),
+            ));
+        }
+        *input = &rest[end + 3..];
+        return Ok(XmlToken::Comment);
+    }
+    if input.starts_with("<!") {
+        return Err(S3Error::MalformedMultipart(
+            "unsupported XML declaration or CDATA section".into(),
+        ));
+    }
+    if let Some(rest) = input.strip_prefix("</") {
+        let end = rest
+            .find('>')
+            .ok_or_else(|| S3Error::MalformedMultipart("unterminated closing tag".into()))?;
+        let inner = &rest[..end];
+        // `</Name S? >`. No whitespace may follow `</`: `</ Part>` names no
+        // element in XML and must not be read as `</Part>`.
+        let name_len = xml_name_len(inner)
+            .ok_or_else(|| S3Error::MalformedMultipart("invalid closing tag".into()))?;
+        let name = &inner[..name_len];
+        if !xml_is_ws(&inner[name_len..]) {
+            return Err(S3Error::MalformedMultipart("invalid closing tag".into()));
+        }
+        *input = &rest[end + 1..];
+        return Ok(XmlToken::Close { name });
+    }
+    if let Some(rest) = input.strip_prefix('<') {
+        let end = xml_tag_end(rest)?;
+        let inner = &rest[..end];
+        let name_len = xml_name_len(inner)
+            .ok_or_else(|| S3Error::MalformedMultipart("invalid opening tag".into()))?;
+        let name = &inner[..name_len];
+        // `EmptyElemTag` ends with `/>`: the slash must be adjacent to `>`, so
+        // `<Part a="1" / >` is malformed rather than a self-closing tag with a
+        // stray slash. The raw tail is used, before trimming.
+        let after_name = &inner[name_len..];
+        let (tail, self_closing) = match after_name.strip_suffix('/') {
+            Some(before) => (xml_trim_end(before), true),
+            None => (xml_trim_end(after_name), false),
+        };
+        // Everything after the element name is an attribute list. It is
+        // validated instead of discarded: an unvalidated attribute can hide the
+        // real tag end, so `<Part ignored="><PartNumber>1<...` used to be read as
+        // a normal `<Part>` and could publish an object.
+        xml_validate_attributes(tail)?;
+        *input = &rest[end + 1..];
+        return Ok(XmlToken::Open { name, self_closing });
+    }
+    let end = input.find('<').unwrap_or(input.len());
+    let text = &input[..end];
+    *input = &input[end..];
+    // `]]>` may not appear in character data, and no literal character may be
+    // outside XML's `Char` production.
+    if text.contains("]]>") {
+        return Err(S3Error::MalformedMultipart(
+            "`]]>` is not allowed in character data".into(),
+        ));
+    }
+    if !text.chars().all(is_xml_char) {
+        return Err(S3Error::MalformedMultipart(
+            "invalid character in character data".into(),
+        ));
+    }
+    Ok(XmlToken::Text(text))
 }
 
 /// Index of the `>` that closes an opening tag, ignoring a `>` inside an
@@ -5646,109 +5752,193 @@ fn xml_tag_end(rest: &str) -> Result<usize, S3Error> {
     }))
 }
 
-/// Validates the attribute list of an opening tag: `name="value"` or
-/// `name='value'`, whitespace separated, nothing else. The completion document
-/// needs no attribute semantics, but its syntax must still be well-formed —
-/// an unquoted or unterminated value is a malformed document, not something to
-/// ignore.
+/// Validates the attribute list of an opening tag: `Name S? = S? "value"`,
+/// separated by XML whitespace, nothing else. The completion document needs no
+/// attribute semantics, but its syntax must still be well-formed — an unquoted
+/// or unterminated value is a malformed document, not something to ignore.
 fn xml_validate_attributes(mut rest: &str) -> Result<(), S3Error> {
     let malformed = || S3Error::MalformedMultipart("malformed attribute list".into());
     let mut names: BTreeSet<&str> = BTreeSet::new();
-    loop {
-        if rest.is_empty() {
-            return Ok(());
-        }
-        // The element name ends at the first whitespace, so every attribute must
-        // be separated from what precedes it by whitespace. `<Part a="1"b="2">`
-        // is malformed XML and must not be read as two attributes.
-        let after_space = rest.trim_start();
-        if after_space.len() == rest.len() {
+    while !rest.is_empty() {
+        // Every attribute must be preceded by XML whitespace, so `<Part a="1"b="2">`
+        // and `<Part\u{a0}a="1">` are not two attributes.
+        if !rest.starts_with(is_xml_ws) {
             return Err(malformed());
         }
-        rest = after_space;
+        rest = xml_trim_start(rest);
         if rest.is_empty() {
-            return Ok(());
+            break;
         }
-        let name_end = rest
-            .find(|c: char| c.is_ascii_whitespace() || c == '=')
-            .ok_or_else(malformed)?;
-        let name = &rest[..name_end];
-        if name.is_empty()
-            || !name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
-            || !name
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
-        {
-            return Err(malformed());
-        }
+        let name_len = xml_name_len(rest).ok_or_else(malformed)?;
+        let name = &rest[..name_len];
         // XML forbids repeating an attribute name on one element.
         if !names.insert(name) {
             return Err(malformed());
         }
-        let after_name = rest[name_end..].trim_start();
-        let after_eq = after_name
-            .strip_prefix('=')
-            .ok_or_else(malformed)?
-            .trim_start();
-        let quote = match after_eq.chars().next() {
+        rest = xml_trim_start(&rest[name_len..]);
+        rest = rest.strip_prefix('=').ok_or_else(malformed)?;
+        rest = xml_trim_start(rest);
+        let quote = match rest.chars().next() {
             Some(q @ ('"' | '\'')) => q,
             _ => return Err(malformed()),
         };
-        let value = &after_eq[quote.len_utf8()..];
+        let value = &rest[quote.len_utf8()..];
         let end = value
             .find(quote)
             .ok_or_else(|| S3Error::MalformedMultipart("unterminated attribute value".into()))?;
-        xml_validate_attribute_value(&value[..end])?;
+        // Decodes nothing here, but validates the value: no raw `<`, only
+        // permitted characters, and only declared entities or character
+        // references.
+        xml_decode(&value[..end], true)?;
         rest = &value[end + quote.len_utf8()..];
     }
+    Ok(())
 }
 
-/// Validates one attribute value: no raw `<`, and every `&` starts a declared
-/// entity or a character reference. An undeclared reference is a malformed
-/// document that a strict parser rejects.
-fn xml_validate_attribute_value(value: &str) -> Result<(), S3Error> {
-    if value.contains('<') {
-        return Err(S3Error::MalformedMultipart(
-            "malformed attribute value".into(),
-        ));
+/// One `Name S? = S? "value"` pseudo-attribute of the XML declaration, or
+/// `None` when the text does not start with XML whitespace (nothing left).
+fn xml_pseudo_attribute<'a>(rest: &mut &'a str) -> Result<Option<(&'a str, String)>, S3Error> {
+    let malformed = || S3Error::MalformedMultipart("malformed XML declaration".into());
+    let base: &'a str = *rest;
+    if !base.starts_with(is_xml_ws) {
+        return Ok(None);
     }
+    let mut cursor: &'a str = xml_trim_start(base);
+    if cursor.is_empty() {
+        *rest = cursor;
+        return Ok(None);
+    }
+    let name_len = xml_name_len(cursor).ok_or_else(malformed)?;
+    let name = &cursor[..name_len];
+    cursor = xml_trim_start(&cursor[name_len..]);
+    cursor = cursor.strip_prefix('=').ok_or_else(malformed)?;
+    cursor = xml_trim_start(cursor);
+    let quote = match cursor.chars().next() {
+        Some(q @ ('"' | '\'')) => q,
+        _ => return Err(malformed()),
+    };
+    let value = &cursor[quote.len_utf8()..];
+    let end = value.find(quote).ok_or_else(malformed)?;
+    let decoded = xml_decode(&value[..end], true)?;
+    *rest = &value[end + quote.len_utf8()..];
+    Ok(Some((name, decoded)))
+}
+
+/// Validates an XML declaration's body (the text between `<?xml` and `?>`): a
+/// mandatory `version`, then optional `encoding` and `standalone`, in that
+/// order, and nothing else. XML 1.0 only.
+fn xml_validate_declaration(data: &str) -> Result<(), S3Error> {
+    let malformed = || S3Error::MalformedMultipart("malformed XML declaration".into());
+    let mut rest = data;
+    let (name, version) = xml_pseudo_attribute(&mut rest)?.ok_or_else(malformed)?;
+    if name != "version" || !is_version_num(&version) {
+        return Err(malformed());
+    }
+    let mut encoding_seen = false;
+    let mut standalone_seen = false;
+    while let Some((name, value)) = xml_pseudo_attribute(&mut rest)? {
+        match name {
+            "encoding" if !encoding_seen && !standalone_seen => {
+                if !is_enc_name(&value) {
+                    return Err(malformed());
+                }
+                encoding_seen = true;
+            }
+            "standalone" if !standalone_seen => {
+                if value != "yes" && value != "no" {
+                    return Err(malformed());
+                }
+                standalone_seen = true;
+            }
+            _ => return Err(malformed()),
+        }
+    }
+    if !xml_is_ws(rest) {
+        return Err(malformed());
+    }
+    Ok(())
+}
+
+fn is_version_num(value: &str) -> bool {
+    value
+        .strip_prefix("1.")
+        .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+}
+
+fn is_enc_name(value: &str) -> bool {
+    let mut chars = value.chars();
+    matches!(chars.next(), Some(ch) if ch.is_ascii_alphabetic())
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
+}
+
+/// Validates XML character data and decodes its references.
+///
+/// `reject_lt` is set for attribute values, where a raw `<` is forbidden; a
+/// text token can never contain one because the tokenizer splits on `<`.
+/// Every `&` must start a declared entity or a character reference, and every
+/// literal character must be a permitted XML character.
+fn xml_decode(value: &str, reject_lt: bool) -> Result<String, S3Error> {
+    let mut out = String::with_capacity(value.len());
     let mut rest = value;
-    while let Some(amp) = rest.find('&') {
+    loop {
+        let Some(amp) = rest.find('&') else {
+            push_literal(&mut out, rest, reject_lt)?;
+            return Ok(out);
+        };
+        push_literal(&mut out, &rest[..amp], reject_lt)?;
         let after = &rest[amp + 1..];
         let end = after
             .find(';')
             .ok_or_else(|| S3Error::MalformedMultipart("unterminated entity reference".into()))?;
         let entity = &after[..end];
-        let valid = matches!(entity, "amp" | "lt" | "gt" | "quot" | "apos")
-            || entity.strip_prefix('#').is_some_and(valid_char_reference);
-        if !valid {
-            return Err(S3Error::MalformedMultipart(format!(
-                "unknown entity reference `&{entity};`"
-            )));
+        match entity {
+            "amp" => out.push('&'),
+            "lt" => out.push('<'),
+            "gt" => out.push('>'),
+            "quot" => out.push('"'),
+            "apos" => out.push('\''),
+            _ => out.push(xml_char_reference(entity).ok_or_else(|| {
+                S3Error::MalformedMultipart(format!("unknown entity reference `&{entity};`"))
+            })?),
         }
         rest = &after[end + 1..];
     }
+}
+
+fn push_literal(out: &mut String, literal: &str, reject_lt: bool) -> Result<(), S3Error> {
+    if reject_lt && literal.contains('<') {
+        return Err(S3Error::MalformedMultipart(
+            "malformed attribute value".into(),
+        ));
+    }
+    if !literal.chars().all(is_xml_char) {
+        return Err(S3Error::MalformedMultipart(
+            "invalid character in character data".into(),
+        ));
+    }
+    out.push_str(literal);
     Ok(())
 }
 
-/// `&#123;` or `&#x1F;`: a non-empty decimal or hexadecimal character
-/// reference, and nothing else.
-fn valid_char_reference(reference: &str) -> bool {
-    match reference.strip_prefix(['x', 'X']) {
-        Some(hex) => !hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit()),
-        None => !reference.is_empty() && reference.bytes().all(|b| b.is_ascii_digit()),
+/// `#123` or `#x1F`: a character reference naming a permitted XML character.
+/// The `x` must be lowercase, the digits must not overflow, and the code point
+/// must be a legal XML character (`&#0;` and `&#xD800;` are not).
+fn xml_char_reference(entity: &str) -> Option<char> {
+    let digits = entity.strip_prefix('#')?;
+    let (radix, digits) = match digits.strip_prefix('x') {
+        Some(hex) => (16, hex),
+        None => (10, digits),
+    };
+    if digits.is_empty()
+        || !digits.bytes().all(|b| match radix {
+            16 => b.is_ascii_hexdigit(),
+            _ => b.is_ascii_digit(),
+        })
+    {
+        return None;
     }
-}
-
-/// XML entity decoding for the handful of entities an ETag can carry. `&amp;`
-/// is expanded last so a literal `&amp;quot;` is not decoded twice.
-fn xml_unescape(value: &str) -> String {
-    value
-        .replace("&quot;", "\"")
-        .replace("&apos;", "'")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&amp;", "&")
+    let value = u32::from_str_radix(digits, radix).ok()?;
+    char::from_u32(value).filter(|ch| is_xml_char(*ch))
 }
 
 /// `POST /s3/{project}/{store}/{bucket}/{key}`: create or complete a multipart
@@ -8638,6 +8828,42 @@ mod security_tests {
         legacy_fragment_state_with_dir(tag).0
     }
 
+    /// Opening one slot directory concurrently must hand out one store.
+    ///
+    /// Two instances over one directory each keep their own `write_pos`,
+    /// tombstones and barriers and append to the same segment from the same
+    /// offset. The later writer then overwrites records the first one
+    /// acknowledged: a tombstone or GC barrier disappears from disk, and after
+    /// a restart the deleted blob is writable again. This is the shape of a
+    /// live flake where an internal `DELETE` tombstone vanished while the
+    /// engine kept writing to the slot.
+    #[test]
+    fn concurrent_local_vdisk_opens_return_one_store() {
+        let (state, dir) = legacy_fragment_state_with_dir("vdisk-open-race");
+        let _dir = TempDirGuard(dir);
+        let state = std::sync::Arc::new(state);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let state = state.clone();
+            let barrier = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                state.open_or_get_local_vdisk("pool", 0).unwrap()
+            }));
+        }
+        let stores: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+        for store in &stores[1..] {
+            assert!(
+                std::sync::Arc::ptr_eq(&stores[0], store),
+                "two VolumeStore instances were opened for one slot directory"
+            );
+        }
+    }
+
     /// Removes a fixture directory when the test ends, including when an
     /// assertion panics mid-test.
     struct TempDirGuard(std::path::PathBuf);
@@ -9220,6 +9446,37 @@ mod security_tests {
     }
 
     #[test]
+    fn element_text_skips_markup_that_is_not_content() {
+        // A comment or processing instruction is not character data in XML, so
+        // it neither splits nor contributes to the value: `1<!--x-->2` is `12`.
+        let parsed = parse_complete_multipart(
+            b"<CompleteMultipartUpload><Part><PartNumber>1<!--x-->2</PartNumber><ETag>\"ab<?pi?>cd\"</ETag></Part></CompleteMultipartUpload>",
+        )
+        .unwrap();
+        assert_eq!(parsed, vec![(12, "\"abcd\"".to_string())]);
+        // A byte-order mark is an encoding signature, not content.
+        let with_bom = parse_complete_multipart(
+            "\u{feff}<?xml version=\"1.0\"?><CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>\"a\"</ETag></Part></CompleteMultipartUpload>".as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(with_bom, vec![(1, "\"a\"".to_string())]);
+        // A nested element is not text, and an empty number is not a number.
+        for body in [
+            &b"<CompleteMultipartUpload><Part><PartNumber><a>1</a></PartNumber><ETag>\"a\"</ETag></Part></CompleteMultipartUpload>"[..],
+            b"<CompleteMultipartUpload><Part><PartNumber></PartNumber><ETag>\"a\"</ETag></Part></CompleteMultipartUpload>",
+        ] {
+            assert!(
+                matches!(
+                    parse_complete_multipart(body),
+                    Err(S3Error::MalformedMultipart(_))
+                ),
+                "{}",
+                String::from_utf8_lossy(body)
+            );
+        }
+    }
+
+    #[test]
     fn completion_parser_consumes_the_whole_document() {
         // Valid XML with whitespace before `>` is the same element; the old
         // substring scan silently skipped it and completed a shorter object.
@@ -9274,6 +9531,42 @@ mod security_tests {
             // Only one declaration, and only before the root.
             b"<?xml version=\"1.0\"?><?xml version=\"1.0\"?><CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>\"a\"</ETag></Part></CompleteMultipartUpload>",
             b"<?xml version=\"1.0\"?><CompleteMultipartUpload><?xml version=\"1.0\"?><Part><PartNumber>1</PartNumber><ETag>\"a\"</ETag></Part></CompleteMultipartUpload>",
+            // The declaration must be the very first thing in the document: a
+            // comment or whitespace before it is malformed, not something to
+            // skip past.
+            b"<!--c--><?xml version=\"1.0\"?><CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>\"a\"</ETag></Part></CompleteMultipartUpload>",
+            b" <?xml version=\"1.0\"?><CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>\"a\"</ETag></Part></CompleteMultipartUpload>",
+            // A declaration has a grammar: a version is required and XML 1.0 is
+            // the only version this server speaks.
+            b"<?xml?><CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>\"a\"</ETag></Part></CompleteMultipartUpload>",
+            b"<?xml version=\"2.0\"?><CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>\"a\"</ETag></Part></CompleteMultipartUpload>",
+            b"<?xml encoding=\"UTF-8\"?><CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>\"a\"</ETag></Part></CompleteMultipartUpload>",
+            b"<?xml version=\"1.0\" standalone=\"maybe\"?><CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>\"a\"</ETag></Part></CompleteMultipartUpload>",
+            b"<?xml version=\"1.0\" junk?><CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>\"a\"</ETag></Part></CompleteMultipartUpload>",
+            // A processing-instruction target is a Name: `<?1?>` has none.
+            b"<?1?><CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>\"a\"</ETag></Part></CompleteMultipartUpload>",
+            // Character references name a permitted XML character. `&#0;` is not
+            // one, a surrogate and an out-of-range code point are not characters,
+            // and the hexadecimal marker is lowercase `x` only.
+            b"<CompleteMultipartUpload><Part a=\"&#0;\"><PartNumber>1</PartNumber><ETag>\"a\"</ETag></Part></CompleteMultipartUpload>",
+            b"<CompleteMultipartUpload><Part a=\"&#xD800;\"><PartNumber>1</PartNumber><ETag>\"a\"</ETag></Part></CompleteMultipartUpload>",
+            b"<CompleteMultipartUpload><Part a=\"&#x110000;\"><PartNumber>1</PartNumber><ETag>\"a\"</ETag></Part></CompleteMultipartUpload>",
+            b"<CompleteMultipartUpload><Part a=\"&#X41;\"><PartNumber>1</PartNumber><ETag>\"a\"</ETag></Part></CompleteMultipartUpload>",
+            b"<CompleteMultipartUpload><Part a=\"&#99999999999999999999;\"><PartNumber>1</PartNumber><ETag>\"a\"</ETag></Part></CompleteMultipartUpload>",
+            // A raw control character is not an XML `Char` anywhere.
+            b"<CompleteMultipartUpload><Part a=\"\x01\"><PartNumber>1</PartNumber><ETag>\"a\"</ETag></Part></CompleteMultipartUpload>",
+            // `]]>` may not appear in character data.
+            b"<CompleteMultipartUpload>]]><Part><PartNumber>1</PartNumber><ETag>\"a\"</ETag></Part></CompleteMultipartUpload>",
+            // XML whitespace is space/tab/CR/LF: a no-break space is not a
+            // separator, neither between attributes nor around `=`.
+            "<CompleteMultipartUpload><Part a=\"1\"\u{a0}b=\"2\"><PartNumber>1</PartNumber><ETag>\"a\"</ETag></Part></CompleteMultipartUpload>".as_bytes(),
+            "<CompleteMultipartUpload><Part a=\u{a0}\"1\"><PartNumber>1</PartNumber><ETag>\"a\"</ETag></Part></CompleteMultipartUpload>".as_bytes(),
+            "<CompleteMultipartUpload><Part\u{a0}a=\"1\"><PartNumber>1</PartNumber><ETag>\"a\"</ETag></Part></CompleteMultipartUpload>".as_bytes(),
+            // The empty-element slash is adjacent to `>`; a space between them
+            // is malformed, not a self-closing tag with a stray slash.
+            b"<CompleteMultipartUpload><Part a=\"1\" / ><PartNumber>1</PartNumber><ETag>\"a\"</ETag></Part></CompleteMultipartUpload>",
+            b"<CompleteMultipartUpload><Part a=\"1\"/ ><PartNumber>1</PartNumber><ETag>\"a\"</ETag></Part></CompleteMultipartUpload>",
+            b"<CompleteMultipartUpload><Part/ ><PartNumber>1</PartNumber><ETag>\"a\"</ETag></Part></CompleteMultipartUpload>",
         ] {
             assert!(
                 matches!(
@@ -9292,6 +9585,9 @@ mod security_tests {
         for body in [
             &b"<CompleteMultipartUpload xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\" note='ok'><Part><PartNumber>1</PartNumber><ETag>\"a\"</ETag></Part></CompleteMultipartUpload>"[..],
             b"<?xml version=\"1.0\" encoding=\"UTF-8\"?><CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>\"a\"</ETag></Part></CompleteMultipartUpload>",
+            b"<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\" ?><CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>\"a\"</ETag></Part></CompleteMultipartUpload>",
+            // A non-reserved processing instruction is legal before the root.
+            b"<?xml-stylesheet type=\"text/xsl\"?><CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>\"a\"</ETag></Part></CompleteMultipartUpload>",
             b"<CompleteMultipartUpload><!-- a comment --><Part><PartNumber>1</PartNumber><ETag>\"a\"</ETag></Part></CompleteMultipartUpload>",
             b"<CompleteMultipartUpload><Part a=\"&amp;&#65;&#x41;\"><PartNumber>1</PartNumber><ETag>\"a\"</ETag></Part></CompleteMultipartUpload>",
             b"<CompleteMultipartUpload><Part\n a=\"1\"\t b='2' ><PartNumber>1</PartNumber><ETag>\"a\"</ETag></Part ></CompleteMultipartUpload>",

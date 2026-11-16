@@ -1812,3 +1812,65 @@ attributes are still accepted.
 `cargo test -p yadb-s3 --lib` 39/39; `python3 -m unittest
 scripts/test_yadb_openraft_dev.py` 3/3; `tests/protocols.py` 18/18 on three
 consecutive runs; `tests/protocols.py --native-clients` 20/20.
+## Fourth review round: a real XML grammar, and the flake behind it (2026-11-16)
+
+The re-review of `980e7ea` returned BLOCK with three majors, all of the same
+kind: the hand-written tokenizer was still laxer than XML in ways that let a
+malformed document complete an upload. No XML crate is vendored and `--locked`
+forbids adding one, so the tokenizer was replaced rather than patched again.
+
+| Issue | Fix |
+| --- | --- |
+| Declaration placement and syntax were unchecked: a declaration after a comment or after whitespace was accepted, and `<?xml?>` / `<?xml version="2.0"?>` / `<?xml junk?>` were all skipped as valid. `<?1?>` was skipped too. | `XmlToken::Declaration` is emitted only for the very first token of the document; a comment, whitespace or any other token before it makes the declaration illegal. `xml_validate_declaration` parses the real grammar: mandatory `version` with `1.x`, optional `encoding` (`is_enc_name`) then optional `standalone` (`yes`/`no`), nothing else. A processing-instruction target must be an XML `Name` (`<?1?>` is refused), and any case-variant of `xml` is a reserved target. |
+| Character references accepted `&#0;`, `&#xD800;`, `&#x110000;`, `&#X41;` and overflowing digits. | `xml_char_reference` requires lowercase `x`, digits only, no overflow (`u32::from_str_radix`), and the resulting code point must satisfy XML's `Char` production. Literal characters are checked with `is_xml_char` as well, so a raw `\x01` is refused in text, comments, PIs and attribute values. |
+| Non-XML whitespace was accepted as an attribute separator and around `=`, because the code used Rust's `trim`, which eats U+00A0. | One predicate, `is_xml_ws` (space, tab, CR, LF), is used for every structural position: attribute separation, `=` spacing, closing-tag tail, inter-element text, declaration pseudo-attributes. `xml_is_ws` decides whether a text token is ignorable, so NBSP is content, not whitespace. |
+| `<Part a="1" / >` was accepted as a self-closing tag. | The `/` must be adjacent to `>`; the raw tail is checked before trimming. |
+| Element text was decoded with `xml_unescape`, which expanded named entities only and left numeric references alone, so `&#49;` was not `1`. | `read_element_text` decodes through `xml_decode`, which handles the five predefined entities and character references, and refuses undeclared ones. It also treats comments and processing instructions as non-content, so `1<!--x-->2` is `12` and `"ab<?pi?>cd"` is `"abcd"`, while a nested element is still refused. |
+
+`]]>` in character data is refused, comments still reject `--` and a trailing
+`-`, and `<!DOCTYPE`/CDATA remain unsupported and explicit. A leading byte-order
+mark is accepted as an encoding signature, not content. Every regression
+carries a real `<PartNumber>`/`<ETag>` pair inside the normal root, so accepting
+one would publish an object. Positive controls keep passing: a legal
+declaration with `encoding`/`standalone`, an `xml-stylesheet` PI, a namespace,
+comments, entity and character references, and newline/tab-separated
+attributes.
+
+### The native-client flake was a lost tombstone, not a timeout
+
+`tests/protocols.py --native-clients` failed about one run in three at the
+post-restart VDisk check: a `PUT` of a tombstoned blob answered `200` instead of
+`412`. Instrumenting the test showed the tombstone was already gone **before**
+the SIGKILL, and the segment file had been rebuilt with live records only.
+
+Cause: `open_or_get_local_vdisk` checked the map under a read lock, released it,
+opened the store, then inserted under a write lock. Two concurrent callers (the
+`/v1/apply` materialisation and the first internal request, or two internal
+requests) both missed the map and opened the same slot directory twice. Each
+instance keeps its own `write_pos`, `tombstones` and `barriers`; when the
+directory was still empty, the second `init_new_segment` truncated the segment
+the first instance had just created. The instance holding the older view then
+appended from offset 8 and overwrote the tombstone the other instance had
+acknowledged, so a restart recovered a file where the deleted blob was live.
+
+Two changes, both minimal:
+
+* `open_or_get_local_vdisk` now does the check, the open and the insert under
+  one write lock. One slot directory has one store per process.
+* `init_new_segment` refuses to reinitialise a segment that already has bytes
+  (`InvalidSegment: refusing to reinitialize a non-empty segment`) instead of
+  truncating it. A lost race is now an explicit error rather than silent loss of
+  tombstones and GC barriers.
+
+Regression: `concurrent_local_vdisk_opens_return_one_store` starts eight threads
+on a barrier and asserts every returned `Arc` is the same store. With the racy
+version restored it fails on all three runs; with the fix it passes.
+
+### Gates
+
+`cargo fmt --all -- --check` clean; `cargo test -p yadbd --bins` 95/95;
+`cargo test -p yadbd --bins --features openraft-storage` 104/104;
+`cargo test -p yadb-blob --lib` 26/26; `cargo test -p yadb-s3 --lib` 39/39;
+`python3 -m unittest scripts/test_yadb_openraft_dev.py` 3/3;
+`tests/protocols.py` 18/18; `tests/protocols.py --native-clients` 20/20 on six
+consecutive runs after the fix.

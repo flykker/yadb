@@ -645,6 +645,17 @@ fn parse_segment_name(name: &str) -> Option<u32> {
 fn init_new_segment<FS: StorageFs>(fs: &FS, dir: &str, seg_id: u32) -> Result<FS::File, BlobError> {
     let path = segment_path(dir, seg_id);
     let file = fs.open_rw(&path, true)?;
+    // Creating a segment must never discard one that already exists. `open`
+    // only calls this for an id its directory scan did not see, so a non-empty
+    // file here means two `VolumeStore` instances are serving one directory (a
+    // lost race) or the scan missed a file. Truncating would drop every record
+    // in it — including tombstones and barriers, which resurrect deleted blobs —
+    // so this refuses instead of reinitialising.
+    if file.len()? > 0 {
+        return Err(BlobError::InvalidSegment(
+            "refusing to reinitialize a non-empty segment",
+        ));
+    }
     file.set_len(0)?;
     file.write_at(0, VOLUME_MAGIC)?;
     file.sync_data()?;
