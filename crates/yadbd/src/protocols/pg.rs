@@ -2356,6 +2356,37 @@ fn copy_flush(
     }
 }
 
+/// Ends the implicit COPY transaction after a failure.
+///
+/// A rollback that cannot be confirmed leaves a transaction open that the
+/// client cannot see, so the connection is closed instead of being reported as
+/// clean and idle. The original COPY error is returned only when cleanup is
+/// known to have happened.
+fn copy_rollback(
+    c: &mut Stream,
+    cx: &Conn,
+    work: &mut TxState,
+    session: &mut Session,
+) -> io::Result<()> {
+    match run_text(c, cx, work, session, "ROLLBACK") {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(e)) => Err(io::Error::other(format!(
+            "COPY cleanup failed: {}: {}",
+            e.code, e.message
+        ))),
+        Err(e) => Err(e),
+    }
+}
+
+/// Removes one text-format line terminator from a drained line. A CRLF pair is
+/// one terminator; a lone LF keeps its old meaning. The CR is not row data.
+fn copy_strip_eol(line: &mut Vec<u8>) {
+    line.pop();
+    if line.last() == Some(&b'\r') {
+        line.pop();
+    }
+}
+
 fn copy_in(
     c: &mut Stream,
     cx: &Conn,
@@ -2437,7 +2468,7 @@ fn copy_in(
         if let Err(e) = c.read_exact(&mut kind) {
             // A client that disappears mid-COPY must not leave its rows behind.
             if implicit_tx {
-                let _ = run_text(c, cx, work, session, "ROLLBACK");
+                copy_rollback(c, cx, work, session)?;
             }
             return Err(e);
         }
@@ -2445,15 +2476,15 @@ fn copy_in(
         match kind[0] {
             b'd' if !end_of_data => {
                 pending.extend_from_slice(&data);
-                if pending.len() > MAX_COPY_LINE {
-                    failed = Some(PgError::new("54000", "COPY line is too long"));
-                    pending.clear();
-                    end_of_data = true;
-                    continue;
-                }
                 while let Some(position) = pending.iter().position(|b| *b == b'\n') {
                     let mut line: Vec<u8> = pending.drain(..=position).collect();
-                    line.pop();
+                    copy_strip_eol(&mut line);
+                    if line.len() > MAX_COPY_LINE {
+                        failed = Some(PgError::new("54000", "COPY line is too long"));
+                        pending.clear();
+                        end_of_data = true;
+                        break;
+                    }
                     if line == b"\\." {
                         // The text format's explicit end-of-data marker.
                         end_of_data = true;
@@ -2484,13 +2515,23 @@ fn copy_in(
                         }
                     }
                 }
+                // The limit is per line, not per frame: a frame carrying many
+                // short rows is legal however large it is. Only the unterminated
+                // remainder is bounded here.
+                if !end_of_data && pending.len() > MAX_COPY_LINE {
+                    if failed.is_none() {
+                        failed = Some(PgError::new("54000", "COPY line is too long"));
+                    }
+                    pending.clear();
+                    end_of_data = true;
+                }
             }
             b'd' => {}
             b'c' => break,
             b'f' => {
                 let message = cstr(&data).unwrap_or("client aborted");
                 if implicit_tx {
-                    let _ = run_text(c, cx, work, session, "ROLLBACK");
+                    copy_rollback(c, cx, work, session)?;
                 }
                 return Ok(Err(PgError::new(
                     "57014",
@@ -2500,13 +2541,13 @@ fn copy_in(
             b'H' => {}
             b'X' => {
                 if implicit_tx {
-                    let _ = run_text(c, cx, work, session, "ROLLBACK");
+                    copy_rollback(c, cx, work, session)?;
                 }
                 return Err(io::Error::other("client terminated during COPY"));
             }
             _ => {
                 if implicit_tx {
-                    let _ = run_text(c, cx, work, session, "ROLLBACK");
+                    copy_rollback(c, cx, work, session)?;
                 }
                 return Ok(Err(PgError::new("08P01", "unexpected message during COPY")));
             }
@@ -2514,12 +2555,20 @@ fn copy_in(
     }
     // A trailing line without its newline is still a row.
     if failed.is_none() && !end_of_data && !pending.is_empty() {
-        match copy_row(&pending, &columns) {
-            Ok(values) => {
-                batch.push(values);
-                rows += 1;
+        let mut line = std::mem::take(&mut pending);
+        if line.last() == Some(&b'\r') {
+            line.pop();
+        }
+        if line.len() > MAX_COPY_LINE {
+            failed = Some(PgError::new("54000", "COPY line is too long"));
+        } else {
+            match copy_row(&line, &columns) {
+                Ok(values) => {
+                    batch.push(values);
+                    rows += 1;
+                }
+                Err(e) => failed = Some(e),
             }
-            Err(e) => failed = Some(e),
         }
     }
     if failed.is_none() && !batch.is_empty() {
@@ -2531,7 +2580,7 @@ fn copy_in(
     match failed {
         Some(e) => {
             if implicit_tx {
-                let _ = run_text(c, cx, work, session, "ROLLBACK");
+                copy_rollback(c, cx, work, session)?;
             }
             Ok(Err(e))
         }
@@ -2539,7 +2588,13 @@ fn copy_in(
             if implicit_tx {
                 match run_text(c, cx, work, session, "COMMIT")? {
                     Ok(_) => {}
-                    Err(e) => return Ok(Err(e)),
+                    Err(e) => {
+                        // A COMMIT that returned an error leaves the implicit
+                        // transaction's fate uncertain. Roll it back and close
+                        // the connection if even that cannot be confirmed.
+                        copy_rollback(c, cx, work, session)?;
+                        return Ok(Err(e));
+                    }
                 }
             }
             Ok(Ok(Completed {
@@ -3573,6 +3628,20 @@ mod tests {
         assert_eq!(copy_unescape(b"bad\\x").unwrap_err().code, "22P04");
         // An octal escape above one byte is refused rather than truncated.
         assert_eq!(copy_unescape(b"\\777").unwrap_err().code, "22P04");
+    }
+
+    #[test]
+    fn copy_line_terminators_are_stripped_without_eating_data() {
+        let mut lf = b"1\talpha\n".to_vec();
+        copy_strip_eol(&mut lf);
+        assert_eq!(lf, b"1\talpha");
+        let mut crlf = b"1\talpha\r\n".to_vec();
+        copy_strip_eol(&mut crlf);
+        assert_eq!(crlf, b"1\talpha");
+        // A lone CR before the LF is the terminator, not a second data byte.
+        let mut empty = b"\r\n".to_vec();
+        copy_strip_eol(&mut empty);
+        assert!(empty.is_empty());
     }
 
     #[test]

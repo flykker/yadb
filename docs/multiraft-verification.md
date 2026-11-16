@@ -1675,3 +1675,75 @@ every start instead of only in the `stopped` branch.
   outcome; the server does not resume an upload on its own.
 * A full `?consistent=true` read of an object above 16 MiB is refused; use
   `Range`.
+
+## Independent review round: multipart, forwarding and COPY (2026-11-16)
+
+An independent review of `ff335e1..cf614e9` returned **BLOCK** with six blockers
+and four major findings. Every finding was fixed with a test rather than a
+relaxed assertion, and the tree was re-verified from scratch.
+
+### Blockers and majors
+
+| Finding | Fix |
+| --- | --- |
+| Part registration did not guard the part's own intent, so a collector that aborted a stalled part could still be acknowledged, and the upload lease was refreshed without the part lease. | Registration is one `RevisionTxn` guarded on both the upload record and the part's `Prepared` intent, refreshing both leases. A lost part guard ends the call; the collector re-reads the record instead of trusting a stale `pinned_parts` snapshot. |
+| An initiate could accept options a single PUT refuses, dropping them silently. | `unsupported_object_options` refuses `x-amz-meta-*`, encryption and ACL at initiate, before the durable upload record. The live run below showed the native listener needed its own check as well. |
+| The completion parser accepted a truncated or extended document. | A full tokenizer (`xml_token`, `read_complete_part`, `read_element_text`) consumes the whole document, accepts only the expected elements, refuses duplicates and rejects content after the root as `MalformedMultipart`. |
+| `ListParts` ignored `part-number-marker`/`max-parts`. | Both are honoured: `max-parts` 1..=1000 (out of range → `InvalidArgument`), `NextPartNumberMarker` emitted, and the gateway answer is read through a typed, fallible, bounded JSON parse. |
+| A failed `ROLLBACK` after a broken `COPY` was ignored, leaving an invisible open transaction. | `copy_rollback` surfaces the failure as an `io::Error` and the connection is closed; both `COMMIT` errors are checked. |
+| The multipart error mapper dropped `x-yadb-write-outcome`. | `multipart_error` preserves it and maps a local `ConcurrentModification` to `unknown`. |
+| A forwarded `HEAD` was parsed with the GET framing rule, so a bodyless `HEAD` with `Content-Length` was rejected as truncated. | `ProxyResponse` carries `content_length`; `parse_proxy_response_for(raw, head)` accepts a bodyless `HEAD` with its declared length, rejects a `HEAD` that carries a body, and `maybe_forward_write` restores `Content-Length` on the forwarded answer. |
+| `Location` in a Complete answer leaked the `uploadId`. | `Location` names the object only. |
+| The launcher skipped `sync_replica_modes` in `start-node`/`restart-node`, and a stop timeout wrote a compacted PID list. | `sync_replica_modes` runs on the common start path; PIDs stay node-indexed. |
+
+### Defect found by the live run on the merged tree
+
+The live smoke refused to pass an initiate carrying `x-amz-meta-owner`: the
+native listener builds a small gateway header set and forwards only
+`content-type` and the identity headers, so `handle_s3_create_multipart` never
+saw the client's metadata and answered `200` with the metadata silently
+dropped. The gateway path refused it, the native path did not. The listener now
+applies `unsupported_object_options` to the raw client headers before the
+upload record exists, and `tests/protocols.py` asserts `501 NotImplemented` plus
+no object for both a metadata and an encryption option.
+
+### Live evidence on the merged tree
+
+Root `yadb-or-merge` at port base 23500, three processes, control and data
+groups 1–3, node 1 leader of all three.
+
+| Check | Observed |
+| --- | --- |
+| Multipart initiate on node 1, three 1 MiB parts on node 2, ListParts on node 3, Complete on node 1 | Same multipart ETag `"…-3"`; a follower's `ListParts` converged on all three parts within the 15 s bound. |
+| `ListParts` pagination on node 3 | `max-parts=2` → parts 1–2, `IsTruncated=true`, `NextPartNumberMarker=2`; the marker page → part 3, `IsTruncated=false`; `max-parts=1001` → `400 InvalidArgument`. |
+| Complete `Location` | `http://127.0.0.1:23800/invoices-2026/smoke/multi-listener`, no `uploadId`. |
+| `HEAD ?consistent=true` of a 20 MiB object (two 10 MiB parts) on node 2, a follower | `200`, `Content-Length: 20971520`, empty body — the forwarded HEAD keeps the leader's declared length. |
+| Plain `HEAD` of the same object on nodes 2 and 3 | `200` with `Content-Length: 20971520` and no body. |
+| `If-None-Match` on a plain GET (node 2) and on a consistent GET (node 3) | `304` both times, with no representation and no error envelope. |
+| Initiate with `x-amz-meta-owner`, and with `x-amz-server-side-encryption` | `501 NotImplemented` on the native listener, no object created. |
+
+pgwire on the same run: `SHOW COLUMNS` reported the declared schema, a `COPY`
+from a follower node committed, a `COPY` whose second row failed to parse left
+the table at exactly the three committed rows, and a CRLF-terminated line stored
+its value without the `\r`.
+
+### Gates
+
+`cargo fmt --all -- --check` clean; `cargo test -p yadbd --bins` 94/94;
+`cargo test -p yadbd --bins --features openraft-storage` 103/103;
+`cargo test -p yadb-s3 --lib` 38/38; `cargo test -p yadb-metakv --lib` 170/170;
+`cargo test -p yadb-db --lib` 46/46; `tests/protocols.py` 17/17 on four
+consecutive runs; `tests/protocols.py --native-clients` 19/19 on four
+consecutive runs, including the AWS CLI multipart upload and psql 17.
+
+A focused repro of the post-restart VDisk tombstone assertion (`SIGKILL` every
+node, restart, re-probe each tombstone) passed 30/30 rounds, so the earlier
+single failure was not reproduced; the assertion now reports the status and body
+if it ever fails again.
+
+### Still open
+
+* `ListParts` and a plain GET on a follower answer from that node's applied
+  state, so a part or object acknowledged a moment earlier through another node
+  can be missing until it applies; `?consistent=true` is the opt-in read.
+* Per-group GC on Multi-Raft, and `InstallSnapshot`, remain unimplemented.

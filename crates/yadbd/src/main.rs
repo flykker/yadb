@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
-use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
+use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
@@ -1204,6 +1204,10 @@ struct ProxyResponse {
     write_outcome: Option<String>,
     retry: Option<String>,
     headers: Vec<(String, String)>,
+    /// Declared body length. A `HEAD` answer reports the size of the
+    /// representation while carrying no bytes, so the length must survive the
+    /// hop even though `body` is empty.
+    content_length: Option<usize>,
     body: Vec<u8>,
 }
 
@@ -1430,11 +1434,18 @@ fn proxy_http_to_peer(
         return Err(ForwardFailure::unknown("leader response too large"));
     }
 
-    parse_proxy_response(&raw)
+    parse_proxy_response_for(&raw, method == "HEAD")
         .map_err(|e| ForwardFailure::unknown(format!("malformed response from leader: {e}")))
 }
 
 fn parse_proxy_response(raw: &[u8]) -> Result<ProxyResponse, std::io::Error> {
+    parse_proxy_response_for(raw, false)
+}
+
+/// Parses a leader response. `head` marks a response to a `HEAD` request: it
+/// reports the representation's length but never carries it, so an empty
+/// payload is complete rather than a truncated body.
+fn parse_proxy_response_for(raw: &[u8], head: bool) -> Result<ProxyResponse, std::io::Error> {
     let invalid = || {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -1541,6 +1552,25 @@ fn parse_proxy_response(raw: &[u8]) -> Result<ProxyResponse, std::io::Error> {
             write_outcome,
             retry,
             headers,
+            content_length: None,
+            body: Vec::new(),
+        });
+    }
+    if head {
+        // A HEAD answer must not carry bytes. Its `Content-Length` is the
+        // length of the representation the GET would return, so it is kept and
+        // checked against nothing.
+        if !payload_slice.is_empty() || is_chunked {
+            return Err(invalid());
+        }
+        return Ok(ProxyResponse {
+            code: status_code,
+            content_type: resp_ct,
+            etag: resp_etag,
+            write_outcome,
+            retry,
+            headers,
+            content_length,
             body: Vec::new(),
         });
     }
@@ -1570,6 +1600,7 @@ fn parse_proxy_response(raw: &[u8]) -> Result<ProxyResponse, std::io::Error> {
         write_outcome,
         retry,
         headers,
+        content_length,
         body: decoded,
     })
 }
@@ -1967,6 +1998,13 @@ async fn maybe_forward_write(
             }
             if let Some(value) = response.retry {
                 builder = builder.header("x-yadb-retry", value);
+            }
+            // A HEAD answer keeps the leader's declared representation length;
+            // axum would otherwise report the empty body's length (zero).
+            if method == "HEAD" {
+                if let Some(length) = response.content_length {
+                    builder = builder.header(header::CONTENT_LENGTH, length);
+                }
             }
             for (name, value) in response.headers {
                 builder = builder.header(name, value);
@@ -4873,6 +4911,7 @@ struct S3WriteQuery {
 /// attempt, so the caller must not replay it. It is reported as an ambiguous
 /// failure with the explicit no-retry marker the forwarding path uses.
 fn s3_multipart_err(st: &AppState, err: S3Error) -> Response {
+    let ambiguous = matches!(err, S3Error::ConcurrentModification);
     let (status, code, message) = match err {
         S3Error::MultipartUploadNotFound(id) => (
             StatusCode::NOT_FOUND,
@@ -4923,6 +4962,13 @@ fn s3_multipart_err(st: &AppState, err: S3Error) -> Response {
         response
             .headers_mut()
             .insert("x-yadb-retry", HeaderValue::from_static("do-not-retry"));
+    }
+    if ambiguous {
+        // The guard was lost: the completion may or may not have published. Say
+        // so explicitly instead of leaving the client to infer it from prose.
+        response
+            .headers_mut()
+            .insert("x-yadb-write-outcome", HeaderValue::from_static("unknown"));
     }
     response
 }
@@ -5002,6 +5048,33 @@ async fn handle_s3_upload_part(
     }
 }
 
+/// Rejects object-creation options this build cannot honour.
+///
+/// A single `PUT` refuses the same options on the native listener, but a
+/// multipart upload takes a different dispatch path and used to skip them
+/// entirely: a client could ask for encryption or an ACL, receive a successful
+/// initiation, and complete an object without the requested semantics. The
+/// check runs before any durable upload state exists.
+fn unsupported_object_options(headers: &HeaderMap) -> Option<&'static str> {
+    if headers
+        .keys()
+        .any(|k| k.as_str().starts_with("x-amz-meta-"))
+    {
+        return Some("custom metadata is not supported");
+    }
+    for name in [
+        "x-amz-server-side-encryption",
+        "x-amz-server-side-encryption-customer-algorithm",
+        "x-amz-server-side-encryption-aws-kms-key-id",
+        "x-amz-acl",
+    ] {
+        if headers.contains_key(name) {
+            return Some("requested encryption or ACL is unsupported");
+        }
+    }
+    None
+}
+
 /// Starts a multipart upload. The record is durable before this returns, so the
 /// id it hands out always names a collectable upload.
 async fn handle_s3_create_multipart(
@@ -5012,6 +5085,17 @@ async fn handle_s3_create_multipart(
     bucket: String,
     key: String,
 ) -> Response {
+    if let Some(reason) = unsupported_object_options(&headers) {
+        return api_err(StatusCode::NOT_IMPLEMENTED, reason);
+    }
+    // The forwarded initiation must carry the client's own content type, not a
+    // placeholder, or a follower would store a different type than the leader
+    // was asked for.
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream")
+        .to_string();
     if let Some(proxied) = maybe_forward_write(
         &st,
         &headers,
@@ -5027,18 +5111,13 @@ async fn handle_s3_create_multipart(
                 .collect::<Vec<_>>()
                 .join("/"),
         ),
-        "application/octet-stream".into(),
+        content_type.clone(),
         Bytes::new(),
     )
     .await
     {
         return proxied;
     }
-    let content_type = headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("application/octet-stream")
-        .to_string();
     let subject = extract_subject(&headers, st.subject_secret.as_deref());
     let (project_id, pool_name) = {
         let cp = match st.control_for_authorization_async().await {
@@ -5217,6 +5296,8 @@ async fn handle_s3_list_parts(
     bucket: String,
     key: String,
     upload_id: String,
+    part_number_marker: u32,
+    max_parts: u32,
 ) -> Response {
     let subject = extract_subject(&headers, st.subject_secret.as_deref());
     let (project_id, _) = {
@@ -5236,18 +5317,43 @@ async fn handle_s3_list_parts(
     })
     .await;
     match res {
-        Ok(Ok((parts, bucket, key, upload_id))) => Json(serde_json::json!({
-            "bucket": bucket,
-            "key": key,
-            "uploadId": upload_id,
-            "parts": parts.iter().map(|part| serde_json::json!({
-                "partNumber": part.part_number,
-                "etag": part.etag,
-                "size": part.size,
-                "lastModified": part.last_modified,
-            })).collect::<Vec<_>>(),
-        }))
-        .into_response(),
+        Ok(Ok((parts, bucket, key, upload_id))) => {
+            // Paginate before serializing so one response stays bounded even for
+            // an upload with many parts. `parts` is ascending by part number.
+            let after = parts
+                .into_iter()
+                .filter(|part| part.part_number > part_number_marker)
+                .collect::<Vec<_>>();
+            let is_truncated = after.len() > max_parts as usize;
+            let shown = after
+                .into_iter()
+                .take(max_parts as usize)
+                .collect::<Vec<_>>();
+            let next_part_number_marker = if is_truncated {
+                shown
+                    .last()
+                    .map(|part| part.part_number)
+                    .unwrap_or(part_number_marker)
+            } else {
+                0
+            };
+            Json(serde_json::json!({
+                "bucket": bucket,
+                "key": key,
+                "uploadId": upload_id,
+                "partNumberMarker": part_number_marker,
+                "maxParts": max_parts,
+                "isTruncated": is_truncated,
+                "nextPartNumberMarker": next_part_number_marker,
+                "parts": shown.iter().map(|part| serde_json::json!({
+                    "partNumber": part.part_number,
+                    "etag": part.etag,
+                    "size": part.size,
+                    "lastModified": part.last_modified,
+                })).collect::<Vec<_>>(),
+            }))
+            .into_response()
+        }
         Ok(Err(e)) => s3_multipart_err(&st, e),
         Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
@@ -5256,42 +5362,59 @@ async fn handle_s3_list_parts(
 /// Reads the `<Part><PartNumber>`/`<ETag>` list out of a completion document.
 ///
 /// The parser is deliberately narrow: it accepts the document S3 clients send
-/// and rejects anything it cannot read as a whole, rather than guessing. An
-/// empty list is refused here as well as in the engine.
+/// and rejects anything it cannot read as a whole, rather than guessing. The
+/// client's list is the authority on what the object must contain, so a
+/// partial extraction would publish a different object than the one asked for:
+/// every token is consumed, only the expected elements are accepted, and any
+/// leftover content after the root is refused. An empty list is refused here as
+/// well as in the engine.
 fn parse_complete_multipart(body: &[u8]) -> Result<Vec<(u32, String)>, S3Error> {
     let text = std::str::from_utf8(body)
         .map_err(|_| S3Error::MalformedMultipart("body is not UTF-8".into()))?;
-    if !text.contains("<CompleteMultipartUpload") {
-        return Err(S3Error::MalformedMultipart(
-            "expected a CompleteMultipartUpload document".into(),
-        ));
-    }
-    // A truncated document is refused rather than read as a shorter list: the
-    // client's list is the authority on what the object must contain.
-    if !text.contains("</CompleteMultipartUpload>") {
-        return Err(S3Error::MalformedMultipart(
-            "unterminated CompleteMultipartUpload document".into(),
-        ));
+    let mut input = text;
+    // Only whitespace, an XML declaration and comments may precede the root.
+    loop {
+        match xml_token(&mut input)? {
+            XmlToken::Text(text) if text.trim().is_empty() => continue,
+            XmlToken::Open {
+                name: "CompleteMultipartUpload",
+                self_closing: false,
+            } => break,
+            _ => {
+                return Err(S3Error::MalformedMultipart(
+                    "expected a CompleteMultipartUpload document".into(),
+                ))
+            }
+        }
     }
     let mut parts = Vec::new();
-    let mut rest = text;
-    while let Some(start) = rest.find("<Part>") {
-        let after = &rest[start + "<Part>".len()..];
-        let Some(end) = after.find("</Part>") else {
-            return Err(S3Error::MalformedMultipart(
-                "unterminated <Part> element".into(),
-            ));
-        };
-        let block = &after[..end];
-        let number = tag_value(block, "PartNumber")
-            .ok_or_else(|| S3Error::MalformedMultipart("a <Part> has no <PartNumber>".into()))?;
-        let number = number.trim().parse::<u32>().map_err(|_| {
-            S3Error::MalformedMultipart(format!("invalid part number `{}`", number.trim()))
-        })?;
-        let etag = tag_value(block, "ETag")
-            .ok_or_else(|| S3Error::MalformedMultipart("a <Part> has no <ETag>".into()))?;
-        parts.push((number, xml_unescape(etag.trim())));
-        rest = &after[end + "</Part>".len()..];
+    loop {
+        match xml_token(&mut input)? {
+            XmlToken::Text(text) if text.trim().is_empty() => continue,
+            XmlToken::Open {
+                name: "Part",
+                self_closing: false,
+            } => parts.push(read_complete_part(&mut input)?),
+            XmlToken::Close {
+                name: "CompleteMultipartUpload",
+            } => break,
+            _ => {
+                return Err(S3Error::MalformedMultipart(
+                    "unexpected content in CompleteMultipartUpload".into(),
+                ))
+            }
+        }
+    }
+    loop {
+        match xml_token(&mut input)? {
+            XmlToken::Text(text) if text.trim().is_empty() => continue,
+            XmlToken::Eof => break,
+            _ => {
+                return Err(S3Error::MalformedMultipart(
+                    "unexpected content after CompleteMultipartUpload".into(),
+                ))
+            }
+        }
     }
     if parts.is_empty() {
         return Err(S3Error::MalformedMultipart(
@@ -5301,12 +5424,141 @@ fn parse_complete_multipart(body: &[u8]) -> Result<Vec<(u32, String)>, S3Error> 
     Ok(parts)
 }
 
-fn tag_value<'a>(input: &'a str, tag: &str) -> Option<&'a str> {
-    let open = format!("<{tag}>");
-    let close = format!("</{tag}>");
-    let start = input.find(&open)? + open.len();
-    let end = start + input[start..].find(&close)?;
-    Some(&input[start..end])
+/// One `<Part>` element: exactly one `<PartNumber>` and one `<ETag>`, nothing
+/// else. Duplicates are refused instead of letting the last one win.
+fn read_complete_part(input: &mut &str) -> Result<(u32, String), S3Error> {
+    let mut number = None;
+    let mut etag = None;
+    loop {
+        match xml_token(input)? {
+            XmlToken::Text(text) if text.trim().is_empty() => continue,
+            XmlToken::Open {
+                name: "PartNumber",
+                self_closing: false,
+            } => {
+                let value = read_element_text(input, "PartNumber")?;
+                if number.replace(value).is_some() {
+                    return Err(S3Error::MalformedMultipart(
+                        "a <Part> has more than one <PartNumber>".into(),
+                    ));
+                }
+            }
+            XmlToken::Open {
+                name: "ETag",
+                self_closing: false,
+            } => {
+                let value = read_element_text(input, "ETag")?;
+                if etag.replace(value).is_some() {
+                    return Err(S3Error::MalformedMultipart(
+                        "a <Part> has more than one <ETag>".into(),
+                    ));
+                }
+            }
+            XmlToken::Close { name: "Part" } => break,
+            _ => {
+                return Err(S3Error::MalformedMultipart(
+                    "unexpected content in <Part>".into(),
+                ))
+            }
+        }
+    }
+    let number =
+        number.ok_or_else(|| S3Error::MalformedMultipart("a <Part> has no <PartNumber>".into()))?;
+    let number = number.trim().parse::<u32>().map_err(|_| {
+        S3Error::MalformedMultipart(format!("invalid part number `{}`", number.trim()))
+    })?;
+    let etag = etag.ok_or_else(|| S3Error::MalformedMultipart("a <Part> has no <ETag>".into()))?;
+    Ok((number, xml_unescape(etag.trim())))
+}
+
+/// Reads the text content of one element and its closing tag. Nested elements
+/// are refused: the expected values are plain text.
+fn read_element_text(input: &mut &str, name: &str) -> Result<String, S3Error> {
+    let text = match xml_token(input)? {
+        XmlToken::Text(text) => text.to_string(),
+        _ => {
+            return Err(S3Error::MalformedMultipart(format!(
+                "<{name}> does not contain plain text"
+            )))
+        }
+    };
+    match xml_token(input)? {
+        XmlToken::Close { name: closing } if closing == name => Ok(text),
+        _ => Err(S3Error::MalformedMultipart(format!(
+            "<{name}> is not closed by </{name}>"
+        ))),
+    }
+}
+
+/// One XML token. Comments and the XML declaration are skipped inside the
+/// tokenizer; `<!` constructs it does not understand are refused rather than
+/// treated as text.
+enum XmlToken<'a> {
+    Open { name: &'a str, self_closing: bool },
+    Close { name: &'a str },
+    Text(&'a str),
+    Eof,
+}
+
+fn xml_token<'a>(input: &mut &'a str) -> Result<XmlToken<'a>, S3Error> {
+    loop {
+        if input.is_empty() {
+            return Ok(XmlToken::Eof);
+        }
+        if let Some(rest) = input.strip_prefix("<?") {
+            let end = rest.find("?>").ok_or_else(|| {
+                S3Error::MalformedMultipart("unterminated processing instruction".into())
+            })?;
+            *input = &rest[end + 2..];
+            continue;
+        }
+        if let Some(rest) = input.strip_prefix("<!--") {
+            let end = rest
+                .find("-->")
+                .ok_or_else(|| S3Error::MalformedMultipart("unterminated XML comment".into()))?;
+            *input = &rest[end + 3..];
+            continue;
+        }
+        if input.starts_with("<!") {
+            return Err(S3Error::MalformedMultipart(
+                "unsupported XML declaration or CDATA section".into(),
+            ));
+        }
+        if let Some(rest) = input.strip_prefix("</") {
+            let end = rest
+                .find('>')
+                .ok_or_else(|| S3Error::MalformedMultipart("unterminated closing tag".into()))?;
+            let name = rest[..end].trim();
+            if name.is_empty() || name.contains(|c: char| c.is_ascii_whitespace()) {
+                return Err(S3Error::MalformedMultipart("invalid closing tag".into()));
+            }
+            *input = &rest[end + 1..];
+            return Ok(XmlToken::Close { name });
+        }
+        if let Some(rest) = input.strip_prefix('<') {
+            let end = rest
+                .find('>')
+                .ok_or_else(|| S3Error::MalformedMultipart("unterminated opening tag".into()))?;
+            let mut inner = rest[..end].trim_end();
+            let self_closing = inner.ends_with('/');
+            if self_closing {
+                inner = inner[..inner.len() - 1].trim_end();
+            }
+            let name_end = inner
+                .find(|c: char| c.is_ascii_whitespace())
+                .unwrap_or(inner.len());
+            let name = &inner[..name_end];
+            if name.is_empty() || !name.starts_with(|c: char| c.is_ascii_alphabetic()) {
+                return Err(S3Error::MalformedMultipart("invalid opening tag".into()));
+            }
+            *input = &rest[end + 1..];
+            return Ok(XmlToken::Open { name, self_closing });
+        }
+        let end = input.find('<').unwrap_or(input.len());
+        let text = &input[..end];
+        *input = &input[end..];
+        return Ok(XmlToken::Text(text));
+    }
 }
 
 /// XML entity decoding for the handful of entities an ETag can carry. `&amp;`
@@ -5503,11 +5755,13 @@ fn s3_read_err(st: &AppState, err: S3Error) -> Response {
 }
 
 async fn handle_s3_get(
+    method: Method,
     State(st): State<AppState>,
     headers: HeaderMap,
     Path((project, store, bucket, key)): Path<(String, String, String, String)>,
     Query(q): Query<S3GetQuery>,
 ) -> Response {
+    let head = method == Method::HEAD;
     if q.consistent && st.meta.is_openraft() {
         // The manifest is read through a quorum-confirmed snapshot on the
         // project-group leader, so this request must run on that leader. A
@@ -5518,7 +5772,7 @@ async fn handle_s3_get(
             &st,
             &headers,
             Some(&project),
-            "GET",
+            if head { "HEAD" } else { "GET" },
             format!(
                 "/s3/{}/{}/{}/{}?consistent=true",
                 protocols::url(&project),
@@ -5565,7 +5819,10 @@ async fn handle_s3_get(
         .map(str::to_string);
 
     if q.consistent {
-        return s3_get_consistent(st, project_id, store, bucket, key, &headers, range_hdr).await;
+        return s3_get_consistent(
+            st, project_id, store, bucket, key, &headers, range_hdr, head,
+        )
+        .await;
     }
 
     if !st.meta.is_openraft() {
@@ -5733,13 +5990,14 @@ async fn s3_get_consistent(
     key: String,
     headers: &HeaderMap,
     range_hdr: Option<String>,
+    head_request: bool,
 ) -> Response {
     let s3 = st.s3.clone();
     let (s, b, k) = (store.clone(), bucket.clone(), key.clone());
-    let head =
+    let lookup =
         tokio::task::spawn_blocking(move || s3.head_object_consistent(project_id, &s, &b, &k))
             .await;
-    let mf = match head {
+    let mf = match lookup {
         Ok(Ok(mf)) => mf,
         Ok(Err(e)) => return s3_read_err(&st, e),
         Err(e) => return api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
@@ -5750,6 +6008,11 @@ async fn s3_get_consistent(
             return api_err(StatusCode::PRECONDITION_FAILED, "ETag mismatch");
         }
         Conditional::NotModified => return StatusCode::NOT_MODIFIED.into_response(),
+    }
+    // A HEAD is answered from the manifest alone: it needs no fragments and no
+    // range, so the GET body cap must not turn a metadata read into an error.
+    if head_request {
+        return object_head_response(mf);
     }
     let range = match range_decision(range_hdr.as_deref(), mf.size) {
         RangeDecision::Serve(range) => range,
@@ -5787,6 +6050,20 @@ async fn s3_get_consistent(
         Ok(Err(e)) => s3_read_err(&st, e),
         Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
+}
+
+/// A HEAD answer built from the manifest: the same metadata a GET reports, no
+/// body and no fragment read.
+fn object_head_response(mf: ObjectManifest) -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, mf.content_type)
+        .header(header::ETAG, mf.etag)
+        .header(header::LAST_MODIFIED, http_date(mf.last_modified))
+        .header(header::CONTENT_LENGTH, mf.size)
+        .header(header::ACCEPT_RANGES, "bytes")
+        .body(axum::body::Body::empty())
+        .unwrap_or_else(|e| api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
 
 /// Renders one object read: the slice description, the version and the
@@ -7524,6 +7801,22 @@ mod security_tests {
     }
 
     #[test]
+    fn proxy_response_accepts_a_bodyless_head_with_its_declared_length() {
+        // A forwarded HEAD reports the object's size but carries no bytes. The
+        // GET framing rule (payload must equal Content-Length) would reject it.
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 4096\r\nAccept-Ranges: bytes\r\n\r\n";
+        let response = parse_proxy_response_for(raw, true).unwrap();
+        assert_eq!(response.code, 200);
+        assert_eq!(response.content_length, Some(4096));
+        assert!(response.body.is_empty());
+        // A HEAD answer with bytes is malformed, not a body to forward.
+        let with_body = b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nbody";
+        assert!(parse_proxy_response_for(with_body, true).is_err());
+        // The GET rule still requires the declared length to be present.
+        assert!(parse_proxy_response(raw).is_err());
+    }
+
+    #[test]
     fn proxy_response_requires_complete_framing_and_preserves_outcome() {
         let raw = b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 2\r\nx-yadb-write-outcome: unknown\r\nx-yadb-retry: do-not-retry\r\n\r\nno";
         let response = parse_proxy_response(raw).unwrap();
@@ -8374,6 +8667,7 @@ mod security_tests {
             let st = st.clone();
             async move {
                 handle_s3_get(
+                    Method::GET,
                     State(st),
                     headers,
                     Path((
@@ -8547,6 +8841,7 @@ mod security_tests {
         assert_eq!(head.size, expected.len() as u64);
         assert_eq!(head.etag, etag);
         let response = handle_s3_get(
+            Method::GET,
             State(st.clone()),
             HeaderMap::new(),
             Path(("proj".into(), "store".into(), "bucket".into(), key.into())),
@@ -8558,6 +8853,7 @@ mod security_tests {
         let mut headers = HeaderMap::new();
         headers.insert(header::RANGE, "bytes=4096-4999".parse().unwrap());
         let response = handle_s3_get(
+            Method::GET,
             State(st.clone()),
             headers,
             Path(("proj".into(), "store".into(), "bucket".into(), key.into())),
@@ -8744,6 +9040,61 @@ mod security_tests {
         ));
     }
 
+    #[test]
+    fn completion_parser_consumes_the_whole_document() {
+        // Valid XML with whitespace before `>` is the same element; the old
+        // substring scan silently skipped it and completed a shorter object.
+        let parsed = parse_complete_multipart(
+            b"<CompleteMultipartUpload><Part ><PartNumber>1</PartNumber><ETag>\"a\"</ETag></Part></CompleteMultipartUpload>",
+        )
+        .unwrap();
+        assert_eq!(parsed, vec![(1, "\"a\"".to_string())]);
+
+        // A comment is one token, not text to scan for `<Part>`.
+        let parsed = parse_complete_multipart(
+            b"<CompleteMultipartUpload><!-- <Part><PartNumber>9</PartNumber><ETag>\"x\"</ETag></Part> --><Part><PartNumber>1</PartNumber><ETag>\"a\"</ETag></Part></CompleteMultipartUpload>",
+        )
+        .unwrap();
+        assert_eq!(parsed, vec![(1, "\"a\"".to_string())]);
+
+        for body in [
+            // Trailing content after the root must not be ignored.
+            &b"<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>\"a\"</ETag></Part></CompleteMultipartUpload><Part/>"[..],
+            b"<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>\"a\"</ETag></Part></CompleteMultipartUpload><CompleteMultipartUpload/>",
+            // An unknown element inside the root is not silently dropped.
+            b"<CompleteMultipartUpload><Extra/><Part><PartNumber>1</PartNumber><ETag>\"a\"</ETag></Part></CompleteMultipartUpload>",
+            // A duplicate element would otherwise let the last one win.
+            b"<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><PartNumber>2</PartNumber><ETag>\"a\"</ETag></Part></CompleteMultipartUpload>",
+        ] {
+            assert!(
+                matches!(
+                    parse_complete_multipart(body),
+                    Err(S3Error::MalformedMultipart(_))
+                ),
+                "{}",
+                String::from_utf8_lossy(body)
+            );
+        }
+    }
+
+    #[test]
+    fn multipart_initiation_refuses_options_a_single_put_refuses() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(unsupported_object_options(&headers), None);
+        for (name, value) in [
+            ("x-amz-server-side-encryption", "AES256"),
+            ("x-amz-acl", "public-read"),
+            ("x-amz-meta-owner", "billing"),
+        ] {
+            let mut probe = HeaderMap::new();
+            probe.insert(name, value.parse().unwrap());
+            assert!(
+                unsupported_object_options(&probe).is_some(),
+                "{name} must not be silently accepted at initiation"
+            );
+        }
+    }
+
     // A restarted node accepts connections before the control watcher has
     // installed the persisted image. Authorization must classify that window as
     // "not ready" (retryable) rather than "unknown project" (403, which S3
@@ -8764,6 +9115,7 @@ mod security_tests {
         );
         let get = |st: AppState, subject: &'static str| async move {
             handle_s3_get(
+                Method::GET,
                 State(st),
                 headers_with(&[("x-yadb-subject", subject)]),
                 Path((

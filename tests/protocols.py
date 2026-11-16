@@ -834,6 +834,17 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
             assert b"consistent reads require OpenRaft metadata" in consistent[2], consistent
             # Multipart upload: the parts are real durable allocations, and the
             # completed object must be indistinguishable from a single PUT.
+            # An option the object store cannot honour is refused at initiate,
+            # before any durable upload record exists, on the native wire too:
+            # the listener only forwards a few headers, so the gateway cannot
+            # see the client's metadata and would silently drop it.
+            for options in ({"x-amz-meta-owner": "ops"},
+                            {"x-amz-server-side-encryption": "AES256"}):
+                status, _, body = signed(
+                    19202, "POST", "/invoices-2026/multipart/refused?uploads",
+                    b"", options)
+                assert status == 501 and b"<Code>NotImplemented</Code>" in body, (status, body)
+                assert signed(19202, "GET", "/invoices-2026/multipart/refused")[0] == 404
             mp_key = "/invoices-2026/multipart/object.bin"
             status, _, body = signed(19202, "POST", mp_key + "?uploads")
             assert status == 200, (status, body)
@@ -852,6 +863,26 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
             status, _, body = signed(19202, "GET", f"{mp_key}?uploadId={upload_id}")
             assert status == 200, (status, body)
             assert len(ET.fromstring(body).findall("{*}Part")) == 3, body
+            # ListParts is paginated and says so; the marker resumes after the
+            # last part shown. An out-of-range page size is refused, not clamped.
+            status, _, body = signed(
+                19202, "GET", f"{mp_key}?uploadId={upload_id}&max-parts=2")
+            assert status == 200, (status, body)
+            page = ET.fromstring(body)
+            assert [p.find("{*}PartNumber").text for p in page.findall("{*}Part")] == ["1", "2"], body
+            assert page.find("{*}IsTruncated").text == "true", body
+            marker = page.find("{*}NextPartNumberMarker").text
+            assert marker == "2", body
+            status, _, body = signed(
+                19202, "GET",
+                f"{mp_key}?uploadId={upload_id}&max-parts=2&part-number-marker={marker}")
+            assert status == 200, (status, body)
+            page = ET.fromstring(body)
+            assert [p.find("{*}PartNumber").text for p in page.findall("{*}Part")] == ["3"], body
+            assert page.find("{*}IsTruncated").text == "false", body
+            status, _, body = signed(
+                19202, "GET", f"{mp_key}?uploadId={upload_id}&max-parts=0")
+            assert status == 400 and b"<Code>InvalidArgument</Code>" in body, (status, body)
             # A wrong ETag and an out-of-order list are refused with the S3 codes,
             # and neither consumes the upload.
             wrong = [(mp_etags[0][0], "0" * 32)] + mp_etags[1:]
@@ -1059,7 +1090,8 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
             assert signed(19203, "GET", "/invoices-2026/restart")[2] == b"durable object"
             for port, path in vdisk_tombstones:
                 internal = {"x-yadb-raft-token": RAFT_TOKEN}
-                assert request(port, "PUT", path, b"late-after-restart", internal)[0] == 412
+                status, _, body = request(port, "PUT", path, b"late-after-restart", internal)
+                assert status == 412, (status, body)
                 assert request(port, "GET", path, headers=internal)[0] == 404
             disk = Iscsi(19303)
             assert disk.read(lba=4096) == b"R"*512

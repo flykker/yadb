@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use yadb_blob::{BlobError, BlobId, PoolStriper};
 use yadb_io::StorageFs;
-use yadb_metakv::{KvCommand, KvResult, LocalMetaKv, MetaError, RevisionGuard, TxnOp};
+use yadb_metakv::{KvCommand, KvResult, KvValue, LocalMetaKv, MetaError, RevisionGuard, TxnOp};
 
 // Keep new S3 ids separate from legacy S3/SQL (channel 2) and block (3).
 /// Blob channel of S3 object chunks. The collector needs it to know that this
@@ -694,41 +694,103 @@ impl<FS: StorageFs> ObjectStoreEngine<FS> {
         let etag = md5_hex(payload);
         let part = MultipartPartRef {
             part_number,
-            intent_key: part_intent_key,
+            intent_key: part_intent_key.clone(),
             etag: etag.clone(),
             size: payload.len() as u64,
             last_modified: unix_seconds(),
         };
-        // Registration is a small, bounded CAS retry: a parallel part changes
-        // the same record. The part intent is already durable, so exhausting
-        // the retries leaves collectable state, never an unreferenced fragment.
+        // The part intent must still be the `Prepared` record this call wrote.
+        // Its own lease may lapse while this call is stalled, and collection is
+        // then entitled to abort it. Registering without guarding it would
+        // acknowledge a part whose fragments are already scheduled for
+        // deletion, so the guard is part of the registration transaction and a
+        // lost part guard ends the call instead of being retried.
+        let part_kv = self
+            .meta
+            .get(&part_intent_key)
+            .filter(|kv| {
+                serde_json::from_slice::<UploadIntent>(&kv.value)
+                    .is_ok_and(|intent| intent.state == UploadState::Prepared)
+            })
+            .ok_or_else(|| S3Error::MultipartUploadNotFound(upload_id.to_string()))?;
+        self.register_multipart_part(&upload_key, upload_id, &part, &part_kv)?;
+        Ok(etag)
+    }
+
+    /// Registers one uploaded part against its parent upload.
+    ///
+    /// Registration is a small, bounded CAS retry: a parallel part changes the
+    /// same record. The transaction guards both the upload record and the part's
+    /// own `Prepared` intent, and refreshes both leases. A collector that
+    /// aborted the part while the upload call was stalled therefore makes
+    /// registration fail instead of acknowledging bytes that are already being
+    /// reclaimed; a part whose own lease lapsed is refreshed here so the
+    /// acknowledgement is durable.
+    fn register_multipart_part(
+        &self,
+        upload_key: &str,
+        upload_id: &str,
+        part: &MultipartPartRef,
+        part_kv: &KvValue,
+    ) -> Result<(), S3Error> {
+        let part_intent_key = part.intent_key.as_str();
         for _ in 0..64 {
             let current = self
                 .meta
-                .get(&upload_key)
+                .get(upload_key)
                 .ok_or_else(|| S3Error::MultipartUploadNotFound(upload_id.to_string()))?;
             let mut record: UploadIntent = serde_json::from_slice(&current.value)?;
             if !record.multipart || record.state != UploadState::Prepared {
                 return Err(S3Error::MultipartUploadNotFound(upload_id.to_string()));
             }
-            record.parts.retain(|p| p.part_number != part_number);
+            // A concurrent collector may have aborted the part between the
+            // caller's read and this attempt; re-check before building the
+            // guard.
+            let live_part = self.meta.get(part_intent_key).filter(|kv| {
+                kv.mod_revision == part_kv.mod_revision
+                    && serde_json::from_slice::<UploadIntent>(&kv.value)
+                        .is_ok_and(|intent| intent.state == UploadState::Prepared)
+            });
+            let Some(live_part) = live_part else {
+                return Err(S3Error::MultipartUploadNotFound(upload_id.to_string()));
+            };
+            record.parts.retain(|p| p.part_number != part.part_number);
             record.parts.push(part.clone());
             record.parts.sort_by_key(|p| p.part_number);
-            let revision = self.meta.revision_for_key(&upload_key)?;
+            let revision = self.meta.revision_for_key(upload_key)?;
             record.lease_until_revision = revision.saturating_add(INTENT_GRACE_REVISIONS);
             record.lease_until_unix_secs = unix_seconds().saturating_add(INTENT_GRACE_SECS);
+            // The part intent is refreshed in the same transaction. Its own
+            // lease may have lapsed while this call was stalled; extending it
+            // here is what makes the acknowledged part survive the collector
+            // that is allowed to abort an expired, unregistered part.
+            let mut live_intent: UploadIntent = serde_json::from_slice(&live_part.value)?;
+            live_intent.lease_until_revision = revision.saturating_add(INTENT_GRACE_REVISIONS);
+            live_intent.lease_until_unix_secs = unix_seconds().saturating_add(INTENT_GRACE_SECS);
             let result = self.meta.execute(KvCommand::RevisionTxn {
-                guards: vec![RevisionGuard {
-                    key: upload_key.clone(),
-                    expected_mod_revision: current.mod_revision,
-                }],
-                ops: vec![TxnOp::Put {
-                    key: upload_key.clone(),
-                    value: serde_json::to_vec(&record)?,
-                }],
+                guards: vec![
+                    RevisionGuard {
+                        key: upload_key.to_string(),
+                        expected_mod_revision: current.mod_revision,
+                    },
+                    RevisionGuard {
+                        key: part_intent_key.to_string(),
+                        expected_mod_revision: part_kv.mod_revision,
+                    },
+                ],
+                ops: vec![
+                    TxnOp::Put {
+                        key: upload_key.to_string(),
+                        value: serde_json::to_vec(&record)?,
+                    },
+                    TxnOp::Put {
+                        key: part_intent_key.to_string(),
+                        value: serde_json::to_vec(&live_intent)?,
+                    },
+                ],
             })?;
             if matches!(result, KvResult::TxnOk { .. }) {
-                return Ok(etag);
+                return Ok(());
             }
         }
         Err(S3Error::ConcurrentModification)
@@ -1263,13 +1325,27 @@ impl<FS: StorageFs> ObjectStoreEngine<FS> {
                 pinned_parts.extend(record.parts.iter().map(|part| part.intent_key.clone()));
                 continue;
             }
-            self.meta.execute(KvCommand::RevisionTxn {
+            let deleted = self.meta.execute(KvCommand::RevisionTxn {
                 guards: vec![RevisionGuard {
                     key: key.clone(),
                     expected_mod_revision: value.mod_revision,
                 }],
                 ops: vec![TxnOp::Delete { key: key.clone() }],
             })?;
+            if !matches!(deleted, KvResult::TxnOk { .. }) {
+                // The record changed under this pass: a concurrent part
+                // registration refreshed it, or a completion won. Never collect
+                // from the stale scan. Re-read the record and retain the parts
+                // it names now, so an older part that a registration just
+                // re-confirmed is not aborted on the strength of the old pin
+                // set. If the record is gone, its parts were deleted or
+                // aborted by the transaction that won.
+                if let Some(fresh) = self.meta.get(key) {
+                    if let Ok(fresh) = serde_json::from_slice::<UploadIntent>(&fresh.value) {
+                        pinned_parts.extend(fresh.parts.iter().map(|part| part.intent_key.clone()));
+                    }
+                }
+            }
         }
 
         for (key, value) in intents {
@@ -3068,5 +3144,72 @@ mod tests {
             s3.get_object(1, "store", "bucket", "key").unwrap().1,
             b"pinned"
         );
+    }
+
+    #[test]
+    fn multipart_registration_guards_the_part_intent_and_refreshes_its_lease() {
+        let s3 = multipart_engine(7200);
+        let upload_id = s3
+            .create_multipart_upload(1, "store", "pool", "bucket", "key", "text/plain")
+            .unwrap();
+        s3.upload_part(1, "store", "bucket", "key", &upload_id, 1, b"part")
+            .unwrap();
+        let upload_key = ObjectStoreEngine::<SimFs>::intent_key(1, &upload_id);
+        let record: UploadIntent =
+            serde_json::from_slice(&s3.meta.get(&upload_key).unwrap().value).unwrap();
+        let part = record.parts[0].clone();
+        let part_key = part.intent_key.clone();
+
+        // Expire the part intent's own lease, then register the same part
+        // again. Registration must refresh that lease in the same transaction:
+        // an acknowledged part must not stay collectable because the upload
+        // call outlived the lease it was created with.
+        let kv = s3.meta.get(&part_key).unwrap();
+        let mut intent: UploadIntent = serde_json::from_slice(&kv.value).unwrap();
+        intent.lease_until_unix_secs = 0;
+        intent.lease_until_revision = 0;
+        s3.meta
+            .execute(KvCommand::RevisionTxn {
+                guards: vec![RevisionGuard {
+                    key: part_key.clone(),
+                    expected_mod_revision: kv.mod_revision,
+                }],
+                ops: vec![TxnOp::Put {
+                    key: part_key.clone(),
+                    value: serde_json::to_vec(&intent).unwrap(),
+                }],
+            })
+            .unwrap();
+        let stale = s3.meta.get(&part_key).unwrap();
+        s3.register_multipart_part(&upload_key, &upload_id, &part, &stale)
+            .unwrap();
+        let refreshed: UploadIntent =
+            serde_json::from_slice(&s3.meta.get(&part_key).unwrap().value).unwrap();
+        assert!(refreshed.lease_until_unix_secs > unix_seconds());
+        assert!(refreshed.lease_until_revision > 0);
+
+        // A collector aborting the part must make registration refuse rather
+        // than return an ETag for bytes it is reclaiming. Passing the stale
+        // `Prepared` value is exactly the interleaving: the guard sees that the
+        // part changed.
+        let kv = s3.meta.get(&part_key).unwrap();
+        let mut aborted: UploadIntent = serde_json::from_slice(&kv.value).unwrap();
+        aborted.state = UploadState::Aborted;
+        s3.meta
+            .execute(KvCommand::RevisionTxn {
+                guards: vec![RevisionGuard {
+                    key: part_key.clone(),
+                    expected_mod_revision: kv.mod_revision,
+                }],
+                ops: vec![TxnOp::Put {
+                    key: part_key.clone(),
+                    value: serde_json::to_vec(&aborted).unwrap(),
+                }],
+            })
+            .unwrap();
+        assert!(matches!(
+            s3.register_multipart_part(&upload_key, &upload_id, &part, &stale),
+            Err(S3Error::MultipartUploadNotFound(_))
+        ));
     }
 }

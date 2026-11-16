@@ -1329,9 +1329,11 @@ impl<FS: StorageFs> LocalMetaKv<FS> {
                 }
                 // A peer may already hold the entry, so a heartbeat round
                 // collects its acknowledgement instead of waiting for the next
-                // timer tick.
-                guard.broadcast_append_entries()
-            };
+                // timer tick. A replication failure is surfaced, not flattened
+                // into "no messages": that would turn a concrete error such as
+                // a compacted base into an ambiguous timeout.
+                guard.broadcast_append_entries_checked()
+            }?;
             if Instant::now() >= deadline {
                 return Err(MetaError::UncommittedIndex(idx));
             }

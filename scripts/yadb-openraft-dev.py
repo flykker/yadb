@@ -816,7 +816,14 @@ def cmd_stop(args):
                 print(f'node {node} PID {pid}: exited')
 
         if still:
-            state.update(phase='stopping', pids=[pid for _, pid in still],
+            # Keep the node-indexed PID slots: a compacted list of only the
+            # still-running PIDs loses which node each one belongs to and makes
+            # later lifecycle operations fail with a generic "expected 3 PIDs".
+            remaining = list(pids)
+            for node, pid in live:
+                if (node, pid) not in still:
+                    remaining[node - 1] = None
+            state.update(phase='stopping', pids=remaining,
                          error=f'PID(s) did not exit after SIGTERM: {still}')
             write_json(root / 'state.json', state)
             raise RuntimeError(
@@ -936,6 +943,11 @@ def cmd_start_node(args):
     root = resolve_root(args.root, create=False)
     with cluster_lock(root):
         state = _running_state(root)
+        # The first start leaves every config in create mode because no replica
+        # existed yet. Reconcile from the directories that are on disk now, or a
+        # node restarted after that first start is refused with "replica path
+        # conflicts with explicit create/open mode".
+        sync_replica_modes(root)
         _bring_up(root, state, args.node)
     return 0
 
@@ -952,6 +964,7 @@ def cmd_restart_node(args):
         pids[args.node - 1] = None
         state.update(pids=pids, down=[n for n, pid in zip(NODES, pids) if not pid])
         write_json(root / 'state.json', state)
+        sync_replica_modes(root)
         _bring_up(root, state, args.node)
     return 0
 
@@ -1033,6 +1046,10 @@ def cmd_status(args):
                     problems.append(f'{kind} port {port} is not ready')
         if state.get('applied'):
             for node in NODES:
+                if node in down:
+                    # An intentionally stopped node has no cache to check; its
+                    # absence is expected, not an inconsistency.
+                    continue
                 status, body = http_json(http_port(base, node), '/v1/status')
                 if status != 200 or not isinstance(body, dict) or 'billing/ledger' not in body.get('databases', {}):
                     problems.append(f'node {node} does not report billing/ledger in its control-plane cache')

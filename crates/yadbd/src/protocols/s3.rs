@@ -3,6 +3,32 @@ use super::*;
 use crate::*;
 use axum::{extract::Request, http::Method};
 use base64::Engine;
+use serde::Deserialize;
+
+/// The gateway's ListParts JSON, parsed as a typed document. A missing field is
+/// a malformed internal answer, not a zero value.
+#[derive(Deserialize)]
+struct ListPartsBody {
+    #[serde(rename = "partNumberMarker")]
+    part_number_marker: u32,
+    #[serde(rename = "maxParts")]
+    max_parts: u32,
+    #[serde(rename = "isTruncated")]
+    is_truncated: bool,
+    #[serde(rename = "nextPartNumberMarker", default)]
+    next_part_number_marker: u32,
+    parts: Vec<ListedPart>,
+}
+
+#[derive(Deserialize)]
+struct ListedPart {
+    #[serde(rename = "partNumber")]
+    part_number: u32,
+    etag: String,
+    size: u64,
+    #[serde(rename = "lastModified")]
+    last_modified: u64,
+}
 
 #[derive(Clone)]
 pub struct S3State {
@@ -280,6 +306,8 @@ pub async fn handle(State(st): State<S3State>, request: Request) -> Response {
             "uploads",
             "uploadId",
             "partNumber",
+            "part-number-marker",
+            "max-parts",
         ]
         .contains(&k.as_str())
     }) {
@@ -567,6 +595,7 @@ pub async fn handle(State(st): State<S3State>, request: Request) -> Response {
                 // conditional headers, or a consistent read would silently
                 // ignore them and answer with the whole object.
                 let response = handle_s3_get(
+                    method.clone(),
                     State(st.app.clone()),
                     read_headers(&gateway_headers, &headers),
                     Path(path),
@@ -574,6 +603,14 @@ pub async fn handle(State(st): State<S3State>, request: Request) -> Response {
                 )
                 .await;
                 if response.status().is_success() {
+                    return response;
+                }
+                // A conditional hit is a successful, bodyless answer, not an
+                // error: mapping it would turn 304 into an XML 503.
+                if response.status() == StatusCode::NOT_MODIFIED {
+                    let mut response = response;
+                    response.headers_mut().remove("x-yadb-leader-id");
+                    response.headers_mut().remove(header::CONTENT_TYPE);
                     return response;
                 }
                 return map_error(response).await;
@@ -787,6 +824,10 @@ fn esc_text(v: &str) -> String {
 async fn multipart_error(response: Response) -> Response {
     let status = response.status();
     let retry = response.headers().get("x-yadb-retry").cloned();
+    // A forwarded mutation classified as `unknown` must keep that machine-
+    // readable classification; dropping it would tell the client a failed
+    // write is safe to replay.
+    let outcome = response.headers().get("x-yadb-write-outcome").cloned();
     let body = axum::body::to_bytes(response.into_body(), 65536)
         .await
         .unwrap_or_default();
@@ -806,6 +847,9 @@ async fn multipart_error(response: Response) -> Response {
             _ => "InternalError".into(),
         });
     let mut mapped = err(status, &code, &message);
+    if let Some(value) = outcome {
+        mapped.headers_mut().insert("x-yadb-write-outcome", value);
+    }
     if let Some(value) = retry {
         mapped.headers_mut().insert("x-yadb-retry", value);
     }
@@ -849,14 +893,53 @@ async fn multipart(
         },
         None => None,
     };
+    // ListParts pagination. AWS bounds `max-parts` to 1..=1000; an unparsable or
+    // out-of-range value is refused rather than silently replaced.
+    let part_number_marker = match params.get("part-number-marker") {
+        Some(v) if !v.is_empty() => match v.parse::<u32>() {
+            Ok(v) => v,
+            Err(_) => {
+                return err(
+                    StatusCode::BAD_REQUEST,
+                    "InvalidArgument",
+                    "part-number-marker must be an integer",
+                )
+            }
+        },
+        _ => 0,
+    };
+    let max_parts = match params.get("max-parts") {
+        Some(v) if !v.is_empty() => match v.parse::<u32>() {
+            Ok(v) if (1..=1000).contains(&v) => v,
+            _ => {
+                return err(
+                    StatusCode::BAD_REQUEST,
+                    "InvalidArgument",
+                    "max-parts must be an integer between 1 and 1000",
+                )
+            }
+        },
+        _ => 1000,
+    };
+    // A gateway answer is internal JSON. It is read fallibly and bounded: a
+    // malformed or truncated body must surface as an error, never as an empty
+    // successful result.
     let json = |response: Response| async move {
-        let bytes = axum::body::to_bytes(response.into_body(), 65536)
+        let bytes = axum::body::to_bytes(response.into_body(), 4 * 1024 * 1024)
             .await
-            .unwrap_or_default();
-        serde_json::from_slice::<serde_json::Value>(&bytes).unwrap_or_default()
+            .map_err(|_| ())?;
+        serde_json::from_slice::<serde_json::Value>(&bytes).map_err(|_| ())
     };
     match (method, params.contains_key("uploads"), upload_id) {
         (&Method::POST, true, _) => {
+            // The gateway receives only the headers this listener chose to
+            // carry, so an option such as `x-amz-meta-*` would be invisible to
+            // `handle_s3_create_multipart` and the client's metadata would be
+            // silently dropped. Refuse on the raw client headers, before any
+            // durable upload record exists.
+            if let Some(reason) = unsupported_object_options(headers) {
+                return err(StatusCode::NOT_IMPLEMENTED, "NotImplemented", reason);
+            }
             let response = handle_s3_create_multipart(
                 st.app.clone(),
                 gateway,
@@ -869,8 +952,17 @@ async fn multipart(
             if !response.status().is_success() {
                 return multipart_error(response).await;
             }
-            let Some(upload_id) = json(response)
-                .await
+            let listed = match json(response).await {
+                Ok(value) => value,
+                Err(()) => {
+                    return err(
+                        StatusCode::BAD_GATEWAY,
+                        "InternalError",
+                        "initiate returned a malformed response",
+                    )
+                }
+            };
+            let Some(upload_id) = listed
                 .get("uploadId")
                 .and_then(|v| v.as_str())
                 .map(str::to_owned)
@@ -950,8 +1042,17 @@ async fn multipart(
             if !response.status().is_success() {
                 return multipart_error(response).await;
             }
-            let Some(etag) = json(response)
-                .await
+            let listed = match json(response).await {
+                Ok(value) => value,
+                Err(()) => {
+                    return err(
+                        StatusCode::BAD_GATEWAY,
+                        "InternalError",
+                        "completion returned a malformed response",
+                    )
+                }
+            };
+            let Some(etag) = listed
                 .get("etag")
                 .and_then(|v| v.as_str())
                 .map(str::to_owned)
@@ -969,11 +1070,10 @@ async fn multipart(
             xml(
                 StatusCode::OK,
                 format!(
-                    "<CompleteMultipartUploadResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Location>http://{}/{}/{}/{}</Location><Bucket>{}</Bucket><Key>{}</Key><ETag>{}</ETag></CompleteMultipartUploadResult>",
+                    "<CompleteMultipartUploadResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Location>http://{}/{}/{}</Location><Bucket>{}</Bucket><Key>{}</Key><ETag>{}</ETag></CompleteMultipartUploadResult>",
                     esc(host),
                     esc(&bucket),
                     esc(&key),
-                    esc(&upload_id),
                     esc(&bucket),
                     esc(&key),
                     esc_text(&etag)
@@ -1005,48 +1105,55 @@ async fn multipart(
                 bucket.clone(),
                 key.clone(),
                 upload_id.clone(),
+                part_number_marker,
+                max_parts,
             )
             .await;
             if !response.status().is_success() {
                 return multipart_error(response).await;
             }
-            let listed = json(response).await;
-            let parts = listed
-                .get("parts")
-                .and_then(|v| v.as_array())
-                .cloned()
-                .unwrap_or_default();
-            let limit = 1000usize;
-            let truncated = parts.len() > limit;
+            let listed = match json(response).await {
+                Ok(value) => value,
+                Err(()) => {
+                    return err(
+                        StatusCode::BAD_GATEWAY,
+                        "InternalError",
+                        "list-parts returned a malformed response",
+                    )
+                }
+            };
+            let listed = match serde_json::from_value::<ListPartsBody>(listed) {
+                Ok(listed) => listed,
+                Err(_) => {
+                    return err(
+                        StatusCode::BAD_GATEWAY,
+                        "InternalError",
+                        "list-parts response did not have the expected shape",
+                    )
+                }
+            };
             let mut out = format!(
-                "<ListPartsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Bucket>{}</Bucket><Key>{}</Key><UploadId>{}</UploadId><PartNumberMarker>0</PartNumberMarker><MaxParts>{limit}</MaxParts><IsTruncated>{truncated}</IsTruncated>",
+                "<ListPartsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Bucket>{}</Bucket><Key>{}</Key><UploadId>{}</UploadId><PartNumberMarker>{}</PartNumberMarker><MaxParts>{}</MaxParts><IsTruncated>{}</IsTruncated>",
                 esc(&bucket),
                 esc(&key),
-                esc(&upload_id)
+                esc(&upload_id),
+                listed.part_number_marker,
+                listed.max_parts,
+                listed.is_truncated
             );
-            let shown = parts.iter().take(limit).collect::<Vec<_>>();
-            for part in &shown {
-                let number = part.get("partNumber").and_then(|v| v.as_u64()).unwrap_or(0);
-                let etag = part.get("etag").and_then(|v| v.as_str()).unwrap_or("");
-                let size = part.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
-                let modified = part
-                    .get("lastModified")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
+            for part in &listed.parts {
                 out.push_str(&format!(
-                    "<Part><PartNumber>{number}</PartNumber><LastModified>{}</LastModified><ETag>{}</ETag><Size>{size}</Size></Part>",
-                    date(modified),
-                    esc_text(&format!("\"{}\"", etag.trim_matches('"')))
+                    "<Part><PartNumber>{}</PartNumber><LastModified>{}</LastModified><ETag>{}</ETag><Size>{}</Size></Part>",
+                    part.part_number,
+                    date(part.last_modified),
+                    esc_text(&format!("\"{}\"", part.etag.trim_matches('"'))),
+                    part.size
                 ));
             }
-            if truncated {
-                let last = shown
-                    .last()
-                    .and_then(|p| p.get("partNumber"))
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
+            if listed.is_truncated {
                 out.push_str(&format!(
-                    "<NextPartNumberMarker>{last}</NextPartNumberMarker>"
+                    "<NextPartNumberMarker>{}</NextPartNumberMarker>",
+                    listed.next_part_number_marker
                 ));
             }
             out.push_str("</ListPartsResult>");
@@ -1244,9 +1351,15 @@ mod tests {
         ambiguous
             .headers_mut()
             .insert("x-yadb-retry", "do-not-retry".parse().unwrap());
+        ambiguous
+            .headers_mut()
+            .insert("x-yadb-write-outcome", "unknown".parse().unwrap());
         let mapped = multipart_error(ambiguous).await;
         assert_eq!(mapped.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(mapped.headers()["x-yadb-retry"], "do-not-retry");
+        // The machine-readable outcome must survive the wire-format conversion;
+        // dropping it would tell the client the failed write is safe to replay.
+        assert_eq!(mapped.headers()["x-yadb-write-outcome"], "unknown");
         let body = axum::body::to_bytes(mapped.into_body(), 65536)
             .await
             .unwrap();

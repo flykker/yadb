@@ -394,7 +394,20 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   three-process cluster with the AWS CLI: a 40 MiB object in five 8 MiB parts
   through each of the three listeners (two followers, so forwarded) produced the
   same multipart ETag and byte-identical downloads, and a `?consistent=true`
-  range read after a full restart returned the same bytes. Open: a part is
+  range read after a full restart returned the same bytes. The same run also
+  covers the multipart fixes: `ListParts` pagination (`part-number-marker`,
+  `max-parts` 1..=1000 with an out-of-range page refused as `InvalidArgument`),
+  a Complete `Location` that names the object and no longer leaks the
+  `uploadId`, and an initiation that carries the client's `Content-Type`.
+  An option the object store cannot honour (`x-amz-meta-*`, encryption, ACL) is
+  refused at initiate on **both** wire formats: the gateway checks its own
+  headers, and the native listener checks the raw client headers before any
+  durable upload record exists, because it forwards only a few of them and the
+  gateway would otherwise never see the metadata the client asked to store.
+  Note that a plain `ListParts`/GET on a follower answers from that node's
+  applied state, so a part acknowledged a moment earlier through another node
+  can still be missing there; `?consistent=true` is the opt-in that reads the
+  project-group leader's snapshot. Open: a part is
   capped at 16 MiB (not 5 GiB), there is no `ListMultipartUploads` and no
   `UploadPartCopy`, and orphan collection stays disabled on Multi-Raft, so
   aborted or expired upload fragments are not reclaimed there.
