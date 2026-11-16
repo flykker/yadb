@@ -8,17 +8,17 @@ spec:
       nodes:
         - id: 1
           addr: 127.0.0.1:9101
-          mounts: [/data/az1/disk0, /data/az1/disk1]
+          mounts: [/data/az1/disk0, /data/az1/disk1, /data/az1/disk2]
     - name: az-2
       nodes:
         - id: 2
           addr: 127.0.0.1:9102
-          mounts: [/data/az2/disk0, /data/az2/disk1]
+          mounts: [/data/az2/disk0, /data/az2/disk1, /data/az2/disk2]
     - name: az-3
       nodes:
         - id: 3
           addr: 127.0.0.1:9103
-          mounts: [/data/az3/disk0, /data/az3/disk1]
+          mounts: [/data/az3/disk0, /data/az3/disk1, /data/az3/disk2]
 ---
 apiVersion: yadb.io/v1alpha1
 kind: StoragePool
@@ -29,6 +29,7 @@ spec:
     scheme: mirror
     replicas: 3
   failureDomains: 3
+  handoffSlots: 3
 ---
 apiVersion: yadb.io/v1alpha1
 kind: StoragePool
@@ -40,6 +41,7 @@ spec:
     k: 4
     m: 2
   failureDomains: 3
+  handoffSlots: 3
 ---
 apiVersion: yadb.io/v1alpha1
 kind: Project

@@ -99,6 +99,23 @@ pub struct NodeSpec {
 pub struct StoragePoolSpec {
     pub erasure: ErasureSpec,
     pub failure_domains: usize,
+    /// Fragments a write must land before it is acknowledged. Absent keeps the
+    /// default: every fragment, so an ack promises the pool's full redundancy.
+    /// A pool that sets a lower value accepts degraded writes, and the ack then
+    /// promises only that many durable fragments.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_write_quorum: Option<usize>,
+    /// Spare slots that hold a part when its nominal slot does not answer.
+    ///
+    /// This is YDB's handoff-disk rule: the ack still means every part is
+    /// durable, so the pool keeps its full redundancy across a node loss without
+    /// lowering the write quorum. Absent or zero keeps the historical placement
+    /// exactly: a part whose nominal slot is offline fails the write.
+    ///
+    /// Every slot needs its own mount, so `totalParts + handoffSlots` must fit
+    /// in the cluster's declared mounts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff_slots: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -375,11 +392,31 @@ impl ControlPlaneState {
                     )));
                 }
                 let needed_parts = pool.erasure.to_scheme().total_parts();
-                if needed_parts > total_mounts {
+                let handoff = pool.handoff_slots.unwrap_or(0);
+                // Handoff slots are real placements with their own mount, so the
+                // declared geometry has to have room for them; otherwise the
+                // pool would advertise spares that cannot exist.
+                let needed_slots = needed_parts + handoff;
+                if needed_slots > total_mounts {
                     return Err(ControlError::Validation(format!(
-                        "StoragePool `{pool_name}` requires {needed_parts} mounts for {:?}, cluster has {total_mounts}",
+                        "StoragePool `{pool_name}` requires {needed_slots} mounts \
+                         ({needed_parts} parts + {handoff} handoff) for {:?}, cluster has {total_mounts}",
                         pool.erasure
                     )));
+                }
+                if let Some(quorum) = pool.min_write_quorum {
+                    // Below the read threshold the pool could acknowledge a write
+                    // it cannot read back; above the fragment count the quorum is
+                    // unreachable and every write would be refused.
+                    let scheme = pool.erasure.to_scheme();
+                    let floor = scheme.min_parts_for_read();
+                    if quorum < floor || quorum > needed_parts {
+                        return Err(ControlError::Validation(format!(
+                            "StoragePool `{pool_name}` sets minWriteQuorum {quorum}, \
+                             outside {floor}..={needed_parts} for {:?}",
+                            pool.erasure
+                        )));
+                    }
                 }
             }
         }
@@ -499,5 +536,67 @@ mod tests {
         assert!(state
             .authorize("billing", "user:auditor", Role::ReadWrite)
             .is_err());
+    }
+
+    const THREE_DOMAIN_CLUSTER: &str = "apiVersion: yadb.io/v1alpha1
+kind: Cluster
+metadata: {name: c}
+spec:
+  domains:
+    - name: az-1
+      nodes: [{id: 1, addr: 127.0.0.1:9101, mounts: [/d0, /d1, /d2]}]
+    - name: az-2
+      nodes: [{id: 2, addr: 127.0.0.1:9102, mounts: [/d0, /d1, /d2]}]
+    - name: az-3
+      nodes: [{id: 3, addr: 127.0.0.1:9103, mounts: [/d0, /d1, /d2]}]
+";
+
+    fn pool_doc(extra: &str) -> String {
+        format!(
+            "{THREE_DOMAIN_CLUSTER}---
+apiVersion: yadb.io/v1alpha1
+kind: StoragePool
+metadata: {{name: ec}}
+spec:
+  erasure: {{scheme: reed-solomon, k: 4, m: 2}}
+  failureDomains: 3
+{extra}"
+        )
+    }
+
+    // Handoff slots are real placements with their own mount, so the declared
+    // geometry has to have room for them: 6 parts + 3 handoff fits in the 9
+    // mounts above, 6 + 4 does not.
+    #[test]
+    fn handoff_slots_are_parsed_and_must_fit_the_declared_mounts() {
+        let manifests = parse_manifests(&pool_doc("  handoffSlots: 3\n")).unwrap();
+        let mut state = ControlPlaneState::new();
+        state.apply(&manifests).unwrap();
+        assert_eq!(state.pools["ec"].handoff_slots, Some(3));
+
+        let manifests = parse_manifests(&pool_doc("  handoffSlots: 4\n")).unwrap();
+        let mut state = ControlPlaneState::new();
+        let err = state.apply(&manifests).unwrap_err();
+        assert!(matches!(err, ControlError::Validation(_)), "{err:?}");
+        assert!(format!("{err}").contains("10 mounts"), "{err}");
+    }
+
+    // A quorum below the read threshold would ack a write the pool cannot read
+    // back; one above the fragment count is unreachable and would refuse every
+    // write. Both are rejected before the pool exists.
+    #[test]
+    fn min_write_quorum_is_bounded_by_the_read_threshold_and_the_part_count() {
+        for (quorum, accepted) in [(4usize, true), (6, true), (3, false), (7, false)] {
+            let manifests =
+                parse_manifests(&pool_doc(&format!("  minWriteQuorum: {quorum}\n"))).unwrap();
+            let mut state = ControlPlaneState::new();
+            match state.apply(&manifests) {
+                Ok(_) => assert!(accepted, "minWriteQuorum {quorum} must be rejected"),
+                Err(err) => {
+                    assert!(!accepted, "minWriteQuorum {quorum} must be accepted: {err}");
+                    assert!(matches!(err, ControlError::Validation(_)), "{err:?}");
+                }
+            }
+        }
     }
 }

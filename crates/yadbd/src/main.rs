@@ -359,6 +359,11 @@ struct ScrubSummary {
     /// is not acknowledged, so this is a loss of write availability, not a
     /// backlog of repairs to finish.
     pub refused_puts: usize,
+    /// Writes acknowledged below full redundancy, summed over pools since this
+    /// process started. Only a pool with an explicit `minWriteQuorum` below its
+    /// fragment count can produce one; the fragments are repaired by a later
+    /// pass, so this is the repair backlog rather than a failure.
+    pub degraded_puts: usize,
     pub orphan_blobs_collected: usize,
     pub orphan_collection_error: Option<String>,
     /// Distinct live logical blobs the sweep's final mark found.
@@ -756,9 +761,13 @@ impl AppState {
         for (pool_name, spec) in &cp.pools {
             let scheme = spec.erasure.to_scheme();
             let parts = scheme.total_parts();
-            let mut slots = Vec::with_capacity(parts);
+            // Handoff slots come after the nominal ones, so `select_slot` (which
+            // reduces modulo `parts`) keeps every existing part exactly where it
+            // was. The daemon only has to create the extra slots.
+            let handoff = spec.handoff_slots.unwrap_or(0);
+            let mut slots = Vec::with_capacity(parts + handoff);
 
-            for slot in 0..parts {
+            for slot in 0..(parts + handoff) {
                 let (dom_name, target_node, target_addr) = &targets[slot % targets.len()];
                 if *target_node == my_id {
                     let store = self.open_or_get_local_vdisk(pool_name, slot)?;
@@ -786,6 +795,11 @@ impl AppState {
 
             let striper = Arc::new(
                 PoolStriper::from_slots(pool_name.clone(), scheme, slots)
+                    .and_then(|striper| match spec.min_write_quorum {
+                        // Absent keeps the default: an ack promises full redundancy.
+                        None => Ok(striper),
+                        Some(quorum) => striper.with_min_write_quorum(quorum),
+                    })
                     .map_err(|e| e.to_string())?,
             );
             self.pools
@@ -844,6 +858,13 @@ impl AppState {
                     .unwrap()
                     .values()
                     .map(|striper| striper.refused_put_count() as usize)
+                    .sum(),
+                degraded_puts: self
+                    .pools
+                    .read()
+                    .unwrap()
+                    .values()
+                    .map(|striper| striper.degraded_put_count() as usize)
                     .sum(),
                 orphan_collection_error: Some("scrub disabled for Multi-Raft".into()),
                 gc_refusal: Some(
@@ -963,6 +984,7 @@ impl AppState {
             fragments_repaired,
             blobs_unrecoverable,
             refused_puts: pools_health.iter().map(|p| p.refused_puts as usize).sum(),
+            degraded_puts: pools_health.iter().map(|p| p.degraded_puts as usize).sum(),
             orphan_blobs_collected,
             orphan_collection_error,
             blobs_live: sweep.blobs_live,

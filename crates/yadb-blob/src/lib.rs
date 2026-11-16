@@ -835,6 +835,10 @@ mod tests {
         addr: String,
         store: Arc<std::sync::Mutex<std::collections::BTreeMap<String, Vec<u8>>>>,
         fail_puts: Arc<std::sync::atomic::AtomicBool>,
+        /// Refuses exactly one PUT and then accepts the next one. Models a spare
+        /// that was momentarily unreachable, which the handoff round must survive
+        /// by reassigning the part to another spare instead of failing the write.
+        fail_once: Arc<std::sync::atomic::AtomicBool>,
         seen: Arc<std::sync::Mutex<Vec<String>>>,
         server: Option<std::thread::JoinHandle<()>>,
     }
@@ -847,8 +851,10 @@ mod tests {
             let addr = listener.local_addr().unwrap().to_string();
             let store = Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
             let fail_puts = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let fail_once = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
             let (store_c, fail_c, seen_c) = (store.clone(), fail_puts.clone(), seen.clone());
+            let fail_once_c = fail_once.clone();
             let server = std::thread::spawn(move || loop {
                 let (mut stream, _) = match listener.accept() {
                     Ok(pair) => pair,
@@ -890,6 +896,9 @@ mod tests {
                     "PUT" if fail_c.load(Ordering::Relaxed) => {
                         b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
                     }
+                    "PUT" if fail_once_c.swap(false, Ordering::Relaxed) => {
+                        b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
+                    }
                     "PUT" => {
                         store_c.lock().unwrap().insert(path.to_string(), body);
                         b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
@@ -908,6 +917,16 @@ mod tests {
                         None => b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
                             .to_vec(),
                     },
+                    "DELETE" => {
+                        let existed = store_c.lock().unwrap().remove(&path).is_some();
+                        let body = if existed { "deleted" } else { "absent" };
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        )
+                        .into_bytes()
+                    }
                     _ => b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
                         .to_vec(),
                 };
@@ -918,6 +937,7 @@ mod tests {
                 addr,
                 store,
                 fail_puts,
+                fail_once,
                 seen,
                 server: Some(server),
             }
@@ -1034,6 +1054,273 @@ mod tests {
         let health = striper.health_snapshot(false);
         assert_eq!(health.refused_puts, 0);
         assert_eq!(health.min_write_slots, 6);
+    }
+
+    /// A pool whose every slot is a remote `MockVdisk`, so one slot can be
+    /// failed and later recovered. Slot `i` sits on node `i % 3 + 1`, mirroring
+    /// the daemon's `targets[slot % nodes]` striping: the handoff slots land on
+    /// different nodes from the nominal slots they may have to replace.
+    fn remote_pool(
+        pool: &str,
+        scheme: ErasureScheme,
+        handoff: usize,
+    ) -> (Vec<MockVdisk>, PoolStriper<SimFs>) {
+        let nominal = scheme.total_parts();
+        let mut vdisks = Vec::with_capacity(nominal + handoff);
+        let mut slots = Vec::with_capacity(nominal + handoff);
+        for i in 0..(nominal + handoff) {
+            let vdisk = MockVdisk::start();
+            let node = (i % 3) as u32 + 1;
+            slots.push(PoolSlot::<SimFs>::remote(
+                pool,
+                i,
+                format!("az{node}"),
+                node,
+                vdisk.addr.clone(),
+                None,
+            ));
+            vdisks.push(vdisk);
+        }
+        let striper = PoolStriper::from_slots(pool, scheme, slots).unwrap();
+        (vdisks, striper)
+    }
+
+    fn stop_all(vdisks: Vec<MockVdisk>) {
+        for vdisk in vdisks {
+            vdisk.stop();
+        }
+    }
+
+    fn stored(vdisks: &[MockVdisk], from: usize, to: usize) -> usize {
+        (from..to)
+            .map(|i| vdisks[i].store.lock().unwrap().len())
+            .sum()
+    }
+
+    // YDB's handoff-disk rule: a part whose nominal slot does not answer is
+    // written to a spare slot, and the ack still means every part is durable.
+    // Without it, losing one node made the whole pool read-only for writes.
+    #[test]
+    fn a_failed_nominal_slot_is_handed_off_and_the_ack_stays_fully_redundant() {
+        let scheme = ErasureScheme::ReedSolomon { k: 4, m: 2 };
+        let (vdisks, striper) = remote_pool("pool", scheme, 3);
+        let id = BlobId::new(11, 40, 1, 1, 2, 0);
+        let payload = b"Multi-tenant erasure-coded tablet SSTable block #0001";
+
+        // Nominal slot 2 (node 3) stops answering puts.
+        vdisks[2].fail_puts.store(true, Ordering::Relaxed);
+
+        striper
+            .put_blob(id, payload)
+            .expect("handoff must keep the write available");
+
+        let health = striper.health_snapshot(false);
+        assert_eq!(health.refused_puts, 0);
+        assert_eq!(
+            health.degraded_puts, 0,
+            "a handoff write is fully redundant: every part is durable on its own slot"
+        );
+        assert_eq!(health.handoff_slots, 3);
+        assert_eq!(health.total_slots, 6);
+        assert_eq!(striper.get_blob(id).unwrap(), payload);
+
+        // The failed slot received nothing; exactly one spare took the part.
+        assert_eq!(stored(&vdisks, 2, 3), 0);
+        assert_eq!(stored(&vdisks, 6, 9), 1);
+        stop_all(vdisks);
+    }
+
+    // Sensitivity for the test above: with no handoff slots the same single-slot
+    // failure refuses the write. Remove the handoff fallback from `put_blob` and
+    // the test above fails here instead.
+    #[test]
+    fn without_handoff_a_failed_nominal_slot_refuses_the_write() {
+        let scheme = ErasureScheme::ReedSolomon { k: 4, m: 2 };
+        let (vdisks, striper) = remote_pool("pool", scheme, 0);
+        let id = BlobId::new(11, 41, 1, 1, 2, 0);
+        let payload = b"Multi-tenant erasure-coded tablet SSTable block #0001";
+
+        vdisks[2].fail_puts.store(true, Ordering::Relaxed);
+        match striper.put_blob(id, payload) {
+            Err(BlobError::RedundancyNotMet {
+                written, required, ..
+            }) => {
+                assert_eq!(written, 5);
+                assert_eq!(required, 6);
+            }
+            other => panic!("expected RedundancyNotMet, got {other:?}"),
+        }
+        assert_eq!(striper.health_snapshot(false).refused_puts, 1);
+        stop_all(vdisks);
+    }
+
+    // YDB counts effective replicas per *disk*, not per part: two parts of one
+    // blob on one handoff disk are one replica. So a spare takes at most one
+    // part, and two failures with a single spare must be refused rather than
+    // acked with a hidden double placement.
+    #[test]
+    fn one_handoff_slot_never_takes_two_parts_of_the_same_blob() {
+        let scheme = ErasureScheme::ReedSolomon { k: 4, m: 2 };
+        let (vdisks, striper) = remote_pool("pool", scheme, 1);
+        let id = BlobId::new(11, 42, 1, 1, 2, 0);
+        let payload = b"Multi-tenant erasure-coded tablet SSTable block #0001";
+
+        // Two nominal slots, on nodes 2 and 3, fail; the only spare is on node 1.
+        vdisks[1].fail_puts.store(true, Ordering::Relaxed);
+        vdisks[2].fail_puts.store(true, Ordering::Relaxed);
+
+        match striper.put_blob(id, payload) {
+            Err(BlobError::RedundancyNotMet { written, .. }) => assert_eq!(written, 5),
+            other => panic!("expected RedundancyNotMet, got {other:?}"),
+        }
+        assert_eq!(
+            stored(&vdisks, 6, 7),
+            1,
+            "the single spare holds one part, never two"
+        );
+        stop_all(vdisks);
+    }
+
+    // A handoff copy is invisible to the manifest, so deletion has to tombstone
+    // every candidate. Tombstoning only the nominal slot would let the blob come
+    // back as soon as that slot answered `NotFound`.
+    #[test]
+    fn delete_tombstones_the_handoff_copy_too() {
+        let scheme = ErasureScheme::ReedSolomon { k: 4, m: 2 };
+        let (vdisks, striper) = remote_pool("pool", scheme, 3);
+        let id = BlobId::new(11, 43, 1, 1, 2, 0);
+        let payload = b"Multi-tenant erasure-coded tablet SSTable block #0001";
+
+        vdisks[2].fail_puts.store(true, Ordering::Relaxed);
+        striper.put_blob(id, payload).unwrap();
+        assert_eq!(stored(&vdisks, 6, 9), 1);
+
+        // The node returns, but its nominal slot still has no data.
+        vdisks[2].fail_puts.store(false, Ordering::Relaxed);
+
+        assert!(striper.delete(id).unwrap());
+        assert_eq!(
+            stored(&vdisks, 0, 9),
+            0,
+            "no copy, handoff or nominal, may survive a delete"
+        );
+        assert!(striper.get_blob(id).is_err());
+        stop_all(vdisks);
+    }
+
+    // Assimilation: once the nominal slot answers again, a part living on a
+    // handoff slot is moved back, and only then is the handoff copy removed.
+    #[test]
+    fn repair_moves_a_handoff_part_back_to_its_nominal_slot() {
+        let scheme = ErasureScheme::ReedSolomon { k: 4, m: 2 };
+        let (vdisks, striper) = remote_pool("pool", scheme, 3);
+        let id = BlobId::new(11, 44, 1, 1, 2, 0);
+        let payload = b"Multi-tenant erasure-coded tablet SSTable block #0001";
+
+        vdisks[2].fail_puts.store(true, Ordering::Relaxed);
+        striper.put_blob(id, payload).unwrap();
+        assert_eq!(stored(&vdisks, 6, 9), 1);
+
+        vdisks[2].fail_puts.store(false, Ordering::Relaxed);
+        let report = striper.repair_blob(id).unwrap();
+        assert_eq!(
+            report.repaired_parts, 1,
+            "the one handoff part is moved back"
+        );
+        assert_eq!(report.intact_parts, 6);
+        assert_eq!(
+            stored(&vdisks, 2, 3),
+            1,
+            "the part is back on its nominal slot"
+        );
+        assert_eq!(stored(&vdisks, 6, 9), 0, "the handoff copy is gone");
+        assert_eq!(striper.get_blob(id).unwrap(), payload);
+        stop_all(vdisks);
+    }
+
+    // A spare that refuses one part must not swallow the write: the next round
+    // reassigns the part to another spare. This is the loop that keeps a single
+    // momentarily unreachable spare from costing the pool its redundancy.
+    #[test]
+    fn a_spare_that_refuses_once_is_skipped_by_the_next_round() {
+        let scheme = ErasureScheme::ReedSolomon { k: 4, m: 2 };
+        // Each iteration arms a different spare, so the spare the round picks
+        // first is exercised whichever one the hash order chooses.
+        for armed in 6..9 {
+            let (vdisks, striper) = remote_pool("pool", scheme, 3);
+            let id = BlobId::new(11, 46, 1, 1, 2, armed as u8);
+            let payload = b"Multi-tenant erasure-coded tablet SSTable block #0001";
+
+            vdisks[1].fail_puts.store(true, Ordering::Relaxed);
+            vdisks[2].fail_puts.store(true, Ordering::Relaxed);
+            vdisks[armed].fail_once.store(true, Ordering::Relaxed);
+
+            striper.put_blob(id, payload).unwrap_or_else(|e| {
+                panic!("spare {armed} refusing once must not fail the write: {e:?}")
+            });
+            assert_eq!(
+                stored(&vdisks, 0, 9),
+                6,
+                "every part is still durable exactly once (spare {armed} armed)"
+            );
+            assert_eq!(striper.get_blob(id).unwrap(), payload);
+            stop_all(vdisks);
+        }
+    }
+
+    // Adding handoff slots must not move a single existing part: `select_slot`
+    // reduces modulo the nominal count, not the slot count. Using the slot count
+    // would make every blob written before the upgrade unreadable.
+    #[test]
+    fn appending_handoff_slots_does_not_move_existing_parts() {
+        let scheme = ErasureScheme::ReedSolomon { k: 4, m: 2 };
+        let fs = SimFs::new(9101);
+        let id = BlobId::new(11, 45, 1, 1, 2, 0);
+        let payload = b"Multi-tenant erasure-coded tablet SSTable block #0001";
+
+        let mut slots = Vec::new();
+        for i in 0..6 {
+            let store = Arc::new(
+                VolumeStore::open(fs.clone(), format!("az{i}"), VolumeConfig::default()).unwrap(),
+            );
+            slots.push(PoolSlot::local(
+                i,
+                format!("az{i}"),
+                (i % 3) as u32 + 1,
+                None,
+                store,
+            ));
+        }
+        let before = PoolStriper::from_slots("pool", scheme, slots).unwrap();
+        before.put_blob(id, payload).unwrap();
+
+        let mut slots = Vec::new();
+        let mut extra = Vec::new();
+        for i in 0..9 {
+            let store = Arc::new(
+                VolumeStore::open(fs.clone(), format!("az{i}"), VolumeConfig::default()).unwrap(),
+            );
+            if i >= 6 {
+                extra.push(store.clone());
+            }
+            slots.push(PoolSlot::local(
+                i,
+                format!("az{i}"),
+                (i % 3) as u32 + 1,
+                None,
+                store,
+            ));
+        }
+        let after = PoolStriper::from_slots("pool", scheme, slots).unwrap();
+        assert_eq!(after.get_blob(id).unwrap(), payload);
+        for (i, store) in extra.iter().enumerate() {
+            assert_eq!(
+                store.stats().unwrap().live_blobs,
+                0,
+                "handoff slot {} must stay empty: the old parts did not move",
+                6 + i
+            );
+        }
     }
 
     // S2: a fully present but bit-rotted blob must never be reported as absent.

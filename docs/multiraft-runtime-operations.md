@@ -188,6 +188,44 @@ membership editing interface. In particular, do not reopen a multi-voter group
 as a singleton to recover from quorum loss. The registry also rejects a different
 voters list for the same group/node key.
 
+## Pool placement: nominal slots, handoff slots and the write quorum
+
+A pool is striped over `total_parts()` *nominal* slots, and part `i` of a blob
+lives on nominal slot `(hash(blob) + i) % total_parts()`. Adding slots to a pool
+therefore never moves an existing part: the modulus is the nominal count, not the
+slot count.
+
+A `StoragePool` may declare `handoffSlots`. Those are spare slots appended after
+the nominal ones and used only when a nominal slot does not answer, following
+YDB's handoff disks: the part is written to a spare on a *different* node and the
+write is still acknowledged, because every part is still durable. Without
+handoff slots a single unreachable slot refuses the write
+(`RedundancyNotMet`), which is the historical default and is unchanged.
+
+Two rules keep a handoff placement honest:
+
+* one spare holds at most one part of a given blob, because YDB counts effective
+  replicas per disk, and two parts on one disk are one replica;
+* a spare on the node whose nominal slot failed is skipped — that node is the
+  one that did not answer.
+
+A handoff ack keeps the *erasure* layout whole (all `total_parts()` fragments
+exist), but it does not keep the nominal spread across `failureDomains` until the
+parts are assimilated back: a scrub pass moves a handoff part to its nominal slot
+and only then deletes the spare copy. Size `handoffSlots` so the declared mount
+count covers `total_parts + handoffSlots`, and expect a degraded write window
+after a node loss rather than assuming domain-level redundancy throughout it.
+The daemon exposes the backlog as `degraded_puts` in `/v1/pools/health`; it stays
+zero for a handoff write, because a handoff write is not degraded — it is fully
+placed, just not on the nominal slots.
+
+`minWriteQuorum` is a separate, explicit opt-out from full placement. Its floor is
+the pool's read threshold, because a lower quorum could acknowledge a write the
+pool cannot read back, and its ceiling is `total_parts()`. A pool that sets it
+below `total_parts()` accepts writes it cannot serve with full redundancy and
+counts them in `degraded_puts`; the default is `total_parts()`, so an
+acknowledgement promises every fragment.
+
 ## Normal shutdown
 
 Stop accepting RPCs, cancel and **join** owned handlers, then await OpenRaft core

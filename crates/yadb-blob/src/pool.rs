@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -48,15 +49,26 @@ pub struct PoolHealthSnapshot {
     pub scheme: String,
     pub status: PoolHealthState,
     pub total_slots: usize,
+    /// Spare slots that hold a part when its nominal slot does not answer. They
+    /// are not counted in `total_slots`/`online_slots`: health describes whether
+    /// the canonical placement is whole, and a handoff slot being offline is a
+    /// consequence of the same node being offline.
+    pub handoff_slots: usize,
     pub online_slots: usize,
     pub min_read_slots: usize,
     pub min_write_slots: usize,
     pub total_repairs: u64,
-    /// Writes refused because fewer than `total_slots` fragments landed, i.e.
-    /// because the pool could not promise the redundancy it advertises. A refused
-    /// write is not acknowledged and publishes nothing, so this counter is a loss
-    /// of write availability, not a queue of work to finish later.
+    /// Writes refused because fewer than the pool's write quorum of fragments
+    /// landed. A refused write is not acknowledged and publishes nothing, so this
+    /// counter is a loss of write availability, not a queue of work to finish
+    /// later.
     pub refused_puts: u64,
+    /// Writes acknowledged with fewer than `total_slots` fragments. Only a pool
+    /// that opted into a reduced `minWriteQuorum` can produce one: the ack
+    /// promised the quorum it configured, not the pool's full redundancy. Every
+    /// such write is a blob that a repair pass still has to bring back to full
+    /// redundancy, so this is the observable backlog.
+    pub degraded_puts: u64,
     pub slots: Vec<SlotHealthSnapshot>,
 }
 
@@ -613,10 +625,31 @@ pub struct PoolStriper<FS: StorageFs> {
     codec: ErasureCodec,
     slots: Vec<PoolSlot<FS>>,
     has_remote: bool,
-    /// Writes refused because fewer than `total_parts()` fragments landed.
+    /// Writes refused because fewer than `write_quorum` fragments landed.
     /// A refused write is not acknowledged, so there is nothing to repair: the
     /// counter is the observable signal that the pool lost write availability.
     refused_puts: AtomicU64,
+    /// Writes acknowledged below the pool's full redundancy. Non-zero only for a
+    /// pool whose configured quorum is below `total_parts()`.
+    degraded_puts: AtomicU64,
+    /// Fragments a write must land before it may be acknowledged. Defaults to
+    /// every fragment; a pool opts down explicitly.
+    write_quorum: usize,
+    /// Number of *nominal* slots, i.e. `total_parts()`. Slots `[0, nominal_slots)`
+    /// are the canonical placement of each part; slots `[nominal_slots, len)`
+    /// are handoff slots.
+    ///
+    /// This mirrors YDB's DSProxy. In YDB a subgroup has `BlobSubgroupSize()`
+    /// disks, the first `TotalPartCount()` of which are the main disks for the
+    /// parts, and the rest are *handoff* disks: when a main disk does not answer,
+    /// the part is written to a handoff disk instead and the write is still
+    /// acknowledged with full redundancy. The number of handoff disks bounds how
+    /// many disks may fail while the group can still place every part.
+    ///
+    /// Keeping the nominal count separate from `slots.len()` is what makes the
+    /// layout stable: adding handoff slots must not move existing parts, so
+    /// `select_slot` reduces modulo `nominal_slots`, not modulo the slot count.
+    nominal_slots: usize,
 }
 
 impl<FS: StorageFs> PoolStriper<FS> {
@@ -652,7 +685,42 @@ impl<FS: StorageFs> PoolStriper<FS> {
             slots,
             has_remote,
             refused_puts: AtomicU64::new(0),
+            degraded_puts: AtomicU64::new(0),
+            write_quorum: scheme.total_parts(),
+            nominal_slots: scheme.total_parts(),
         })
+    }
+
+    /// Number of handoff slots: spare placements used when a nominal slot does
+    /// not answer. Zero keeps the historical behaviour exactly.
+    pub fn handoff_slot_count(&self) -> usize {
+        self.slots.len() - self.nominal_slots
+    }
+
+    /// Lowers the fragment count a write must land before it may be acknowledged.
+    ///
+    /// Opt-in per pool. The default is every fragment, so an ack promises the
+    /// pool's full redundancy and a missing fragment is a refused write. A pool
+    /// that sets a lower quorum accepts a degraded write: the ack then promises
+    /// only that `quorum` fragments are durable, and it is counted in
+    /// `degraded_puts` until a repair pass restores full redundancy.
+    ///
+    /// The floor is the read threshold, because a quorum below it could
+    /// acknowledge a write the pool cannot read back. The ceiling is
+    /// `total_parts()`, because more fragments do not exist.
+    pub fn with_min_write_quorum(mut self, quorum: usize) -> Result<Self, BlobError> {
+        let floor = self.min_read_quorum();
+        let ceiling = self.codec.scheme().total_parts();
+        if quorum < floor || quorum > ceiling {
+            return Err(BlobError::InvalidErasure(format!(
+                "minWriteQuorum {quorum} for pool `{}` is outside {floor}..={ceiling} \
+                 (scheme {:?})",
+                self.pool_name,
+                self.codec.scheme()
+            )));
+        }
+        self.write_quorum = quorum;
+        Ok(self)
     }
 
     pub fn pool_name(&self) -> &str {
@@ -680,21 +748,80 @@ impl<FS: StorageFs> PoolStriper<FS> {
 
     /// Number of fragments a write must land before it may be acknowledged.
     ///
-    /// That is every fragment: an ack promises the pool's full redundancy, so a
-    /// missing fragment is a refused write rather than a degraded one. A pool
-    /// with any slot offline is therefore read-only for new writes, which is the
-    /// deliberate trade-off: an ack never means "readable but unprotected".
+    /// Defaults to every fragment: an ack then promises the pool's full
+    /// redundancy, so a missing fragment is a refused write rather than a
+    /// degraded one, and a pool with any slot offline is read-only for new
+    /// writes. A pool that explicitly configured a lower `minWriteQuorum`
+    /// accepts a degraded write instead, and every such ack is counted in
+    /// `degraded_puts` until repair restores the missing fragments.
     /// Reads still need only `k` fragments (Reed-Solomon) or one replica (mirror).
     pub fn min_write_quorum(&self) -> usize {
-        self.codec.scheme().total_parts()
+        self.write_quorum
     }
 
     /// Deterministic subgroup placement based on `BlobId` hash so load spreads evenly across slots
     /// and every node in the cluster computes the exact same slot mapping without extra coordination.
+    ///
+    /// The modulus is `nominal_slots`, never `slots.len()`: appending handoff
+    /// slots must not move a single existing part.
     fn select_slot(&self, logical_id: BlobId, part_index: usize) -> usize {
         let h =
             (logical_id.with_part(0).as_u128() as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) as usize;
-        (h + part_index) % self.slots.len()
+        (h + part_index) % self.nominal_slots
+    }
+
+    /// Handoff slots in the order this blob should try them.
+    ///
+    /// Rotating by the blob hash spreads handoff load across the spare slots
+    /// instead of always filling the first one. The order is deterministic for a
+    /// given id, so two writers that both fall back pick the same slots.
+    fn handoff_order(&self, logical_id: BlobId) -> impl Iterator<Item = usize> + '_ {
+        let count = self.handoff_slot_count();
+        let start = if count == 0 {
+            0
+        } else {
+            let h = (logical_id.with_part(0).as_u128() as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                as usize;
+            h % count
+        };
+        (0..count).map(move |i| self.nominal_slots + (start + i) % count)
+    }
+
+    /// Every slot that may hold part `idx` of `logical_id`, nominal first.
+    ///
+    /// A part is written to exactly one slot, but which one depends on whether
+    /// its nominal slot answered at write time. Reads therefore probe the nominal
+    /// slot and then the handoff slots; there is no location index to consult,
+    /// which is also why deletion must tombstone every candidate.
+    fn part_candidates(&self, logical_id: BlobId, part_index: usize) -> Vec<usize> {
+        let mut out = Vec::with_capacity(1 + self.handoff_slot_count());
+        out.push(self.select_slot(logical_id, part_index));
+        out.extend(self.handoff_order(logical_id));
+        out
+    }
+
+    /// Reads one part from wherever it actually lives. Returns the bytes and the
+    /// slot that supplied them, or `None` if no candidate had it.
+    ///
+    /// A `CorruptData` answer is remembered but does not stop the search: a
+    /// bit-rotted nominal copy must not hide a healthy handoff copy.
+    fn read_part(
+        &self,
+        logical_id: BlobId,
+        part_index: usize,
+        corruption: &mut Option<BlobError>,
+    ) -> Option<(Vec<u8>, usize)> {
+        let part_id = logical_id.with_part((part_index + 1) as u8);
+        for slot_idx in self.part_candidates(logical_id, part_index) {
+            match self.slots[slot_idx].get(part_id) {
+                Ok(bytes) => return Some((bytes, slot_idx)),
+                Err(e @ BlobError::CorruptData { .. }) => {
+                    corruption.get_or_insert(e);
+                }
+                Err(_) => {}
+            }
+        }
+        None
     }
 
     /// Encodes `payload` and writes fragments across failure-domain slots (in parallel over the network).
@@ -714,50 +841,151 @@ impl<FS: StorageFs> PoolStriper<FS> {
     pub fn put_blob(&self, logical_id: BlobId, payload: &[u8]) -> Result<(), BlobError> {
         let fragments = self.codec.encode(payload);
         let required = self.min_write_quorum();
+        let total = self.codec.scheme().total_parts();
 
-        let mut ok_writes = 0usize;
+        // Nominal attempt: one part per nominal slot, all in parallel.
+        let nominal: Vec<usize> = (0..total)
+            .map(|idx| self.select_slot(logical_id, idx))
+            .collect();
+        let mut landed = vec![false; total];
 
         if self.has_remote {
-            let results: Vec<Result<(), BlobError>> = std::thread::scope(|s| {
+            let results: Vec<(usize, Result<(), BlobError>)> = std::thread::scope(|s| {
                 let mut handles = Vec::with_capacity(fragments.len());
                 for (idx, frag) in fragments.iter().enumerate() {
                     let part_id = logical_id.with_part((idx + 1) as u8);
-                    let slot_idx = self.select_slot(logical_id, idx);
-                    let slot = &self.slots[slot_idx];
-                    handles.push(s.spawn(move || slot.put(part_id, frag)));
+                    let slot = &self.slots[nominal[idx]];
+                    handles.push((idx, s.spawn(move || slot.put(part_id, frag))));
                 }
                 handles
                     .into_iter()
-                    .map(|h| {
-                        h.join().unwrap_or_else(|_| {
-                            Err(BlobError::Io(std::io::Error::other(
-                                "slot put thread panicked",
-                            )))
-                        })
+                    .map(|(idx, h)| {
+                        (
+                            idx,
+                            h.join().unwrap_or_else(|_| {
+                                Err(BlobError::Io(std::io::Error::other(
+                                    "slot put thread panicked",
+                                )))
+                            }),
+                        )
                     })
                     .collect()
             });
 
-            for r in results {
-                match r {
-                    Ok(()) => ok_writes += 1,
-                    // The reason is recorded by the slot's own counters; the
-                    // returned error reports only the shortfall.
-                    Err(_) => {}
-                }
+            for (idx, r) in results {
+                // The reason is recorded by the slot's own counters; the write
+                // reports only the shortfall.
+                landed[idx] = r.is_ok();
             }
         } else {
             for (idx, frag) in fragments.iter().enumerate() {
                 let part_id = logical_id.with_part((idx + 1) as u8);
-                let slot_idx = self.select_slot(logical_id, idx);
-                match self.slots[slot_idx].put(part_id, frag) {
-                    Ok(()) => ok_writes += 1,
-                    Err(_) => {}
-                }
+                landed[idx] = self.slots[nominal[idx]].put(part_id, frag).is_ok();
             }
         }
 
-        if ok_writes == required {
+        // Handoff: a part whose nominal slot did not answer is placed on a spare
+        // slot instead of failing the whole write. This is the YDB handoff-disk
+        // rule, and it is why a node loss no longer has to cost redundancy: the
+        // ack still means every part is durable, so the pool keeps its full
+        // redundancy without lowering the write quorum.
+        //
+        // Two rules keep the placement honest:
+        //  * a handoff slot holds at most one part of this blob, because YDB's
+        //    `CountEffectiveReplicas` counts distinct disks — two parts on one
+        //    disk are one replica, not two;
+        //  * a handoff slot on the node that just failed is skipped, since that
+        //    node is the one that did not answer in the first place.
+        //
+        // Every spare attempt in a round runs in parallel, like YDB's batched
+        // puts. Doing them one after another made a node loss cost
+        // `failed_parts * handoff_slots` connection timeouts inside a single
+        // write, which on its own pushed a 24-way burst past the commit budget
+        // and turned a slow node into an election. A round is bounded by one
+        // slot's timeout instead, and the loop only repeats when a spare itself
+        // did not answer.
+        // Slots unavailable to this blob: its nominal slots, plus every spare
+        // that already holds a part or refused one.
+        let mut used: BTreeSet<usize> = nominal.iter().copied().collect();
+        loop {
+            // Assign each still-unplaced part a distinct spare, skipping spares
+            // on the node whose nominal slot failed for that part.
+            let mut assignments: Vec<(usize, usize)> = Vec::new();
+            let mut taken: BTreeSet<usize> = used.clone();
+            for idx in 0..total {
+                if landed[idx] {
+                    continue;
+                }
+                let failed_node = self.slots[nominal[idx]].node_id();
+                let candidate = self.handoff_order(logical_id).find(|&slot| {
+                    !taken.contains(&slot) && self.slots[slot].node_id() != failed_node
+                });
+                if let Some(slot) = candidate {
+                    taken.insert(slot);
+                    assignments.push((idx, slot));
+                }
+            }
+            if assignments.is_empty() {
+                break;
+            }
+            let placed = if self.has_remote {
+                std::thread::scope(|s| {
+                    let handles: Vec<(usize, usize, _)> = assignments
+                        .iter()
+                        .map(|&(idx, slot)| {
+                            let part_id = logical_id.with_part((idx + 1) as u8);
+                            let frag = &fragments[idx];
+                            let target = &self.slots[slot];
+                            (
+                                idx,
+                                slot,
+                                s.spawn(move || target.put(part_id, frag).is_ok()),
+                            )
+                        })
+                        .collect();
+                    handles
+                        .into_iter()
+                        .map(|(idx, slot, h)| (idx, slot, h.join().unwrap_or(false)))
+                        .collect::<Vec<_>>()
+                })
+            } else {
+                assignments
+                    .iter()
+                    .map(|&(idx, slot)| {
+                        let part_id = logical_id.with_part((idx + 1) as u8);
+                        (
+                            idx,
+                            slot,
+                            self.slots[slot].put(part_id, &fragments[idx]).is_ok(),
+                        )
+                    })
+                    .collect()
+            };
+            let mut progressed = false;
+            for (idx, slot, ok) in placed {
+                // The slot is consumed either way: a spare that accepted the part
+                // holds it, and one that refused must not be retried with a
+                // different part of the same blob in the same write.
+                used.insert(slot);
+                if ok {
+                    landed[idx] = true;
+                    progressed = true;
+                }
+            }
+            if !progressed {
+                break;
+            }
+        }
+
+        let ok_writes = landed.iter().filter(|x| **x).count();
+
+        // `>=`, not `==`: a healthy pool lands every fragment, which is above a
+        // reduced quorum. Comparing for equality would refuse a write on a fully
+        // healthy cluster the moment a pool opts into a lower quorum.
+        if ok_writes >= required {
+            if ok_writes < total {
+                self.degraded_puts.fetch_add(1, Ordering::Relaxed);
+            }
             return Ok(());
         }
         // A client-facing body must not leak which peer refused, so the cause is
@@ -770,23 +998,68 @@ impl<FS: StorageFs> PoolStriper<FS> {
         })
     }
 
-    /// Number of writes refused because they could not reach full redundancy.
+    /// Number of writes refused because they could not reach the pool's quorum.
     pub fn refused_put_count(&self) -> u64 {
         self.refused_puts.load(Ordering::Relaxed)
+    }
+
+    /// Number of writes acknowledged below full redundancy.
+    pub fn degraded_put_count(&self) -> u64 {
+        self.degraded_puts.load(Ordering::Relaxed)
     }
 
     /// Tombstones every physical fragment. Success requires every target,
     /// unlike a data write quorum: an unavailable target must be retried so
     /// its orphan cannot be forgotten.
     pub fn delete(&self, logical_id: BlobId) -> Result<bool, BlobError> {
-        let mut deleted = false;
-        let mut error = None;
+        // A part may sit on its nominal slot or on a handoff slot, and no
+        // manifest records which. Every candidate is tombstoned: leaving a
+        // handoff copy behind would let a deleted blob reappear the moment the
+        // nominal slot answered `NotFound`. The candidates are swept in
+        // parallel so a delete still costs one round trip, not one per slot.
+        let mut targets = Vec::new();
         for idx in 0..self.codec.scheme().total_parts() {
             let part_id = logical_id.with_part((idx + 1) as u8);
-            let slot_idx = self.select_slot(logical_id, idx);
-            match self.slots[slot_idx].delete(part_id) {
+            for slot_idx in self.part_candidates(logical_id, idx) {
+                targets.push((part_id, slot_idx));
+            }
+        }
+
+        let results: Vec<Result<bool, BlobError>> = if self.has_remote {
+            std::thread::scope(|s| {
+                let handles: Vec<_> = targets
+                    .iter()
+                    .map(|&(part_id, slot_idx)| {
+                        let slot = &self.slots[slot_idx];
+                        s.spawn(move || slot.delete(part_id))
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| {
+                        h.join().unwrap_or_else(|_| {
+                            Err(BlobError::Io(std::io::Error::other(
+                                "slot delete thread panicked",
+                            )))
+                        })
+                    })
+                    .collect()
+            })
+        } else {
+            targets
+                .iter()
+                .map(|&(part_id, slot_idx)| self.slots[slot_idx].delete(part_id))
+                .collect()
+        };
+
+        let mut deleted = false;
+        let mut error = None;
+        for result in results {
+            match result {
                 Ok(existed) => deleted |= existed,
-                Err(e) => error = Some(e),
+                // Every target must answer: an unreachable slot could still hold
+                // a copy, so its tombstone has to be retried rather than assumed.
+                Err(e) => error = error.or(Some(e)),
             }
         }
         match error {
@@ -809,28 +1082,19 @@ impl<FS: StorageFs> PoolStriper<FS> {
     pub fn get_blob(&self, logical_id: BlobId) -> Result<Vec<u8>, BlobError> {
         let total = self.codec.scheme().total_parts();
 
-        // Fast path for Mirror: try any local slot first (zero network hops!), then fall back to remote peers.
+        // Fast path for Mirror: try parts whose nominal slot is local first
+        // (zero network hops!), then the rest. `read_part` falls back to handoff
+        // slots, so a part written to a spare slot is still found.
         if matches!(self.codec.scheme(), ErasureScheme::Mirror { .. }) {
             let mut order: Vec<usize> = (0..total).collect();
-            order.sort_by_key(|&idx| {
-                let slot_idx = self.select_slot(logical_id, idx);
-                !self.slots[slot_idx].is_local()
-            });
+            order.sort_by_key(|&idx| !self.slots[self.select_slot(logical_id, idx)].is_local());
 
             let mut parts: Vec<Option<Vec<u8>>> = vec![None; total];
             let mut corruption: Option<BlobError> = None;
             for idx in order {
-                let part_id = logical_id.with_part((idx + 1) as u8);
-                let slot_idx = self.select_slot(logical_id, idx);
-                match self.slots[slot_idx].get(part_id) {
-                    Ok(bytes) => {
-                        parts[idx] = Some(bytes);
-                        return self.codec.decode(&parts);
-                    }
-                    Err(e @ BlobError::CorruptData { .. }) => {
-                        corruption.get_or_insert(e);
-                    }
-                    Err(_) => {}
+                if let Some((bytes, _)) = self.read_part(logical_id, idx, &mut corruption) {
+                    parts[idx] = Some(bytes);
+                    return self.codec.decode(&parts);
                 }
             }
             return Err(corruption.unwrap_or(BlobError::NotFound(logical_id)));
@@ -840,41 +1104,36 @@ impl<FS: StorageFs> PoolStriper<FS> {
         let mut parts: Vec<Option<Vec<u8>>> = vec![None; total];
         let mut corruption: Option<BlobError> = None;
         if self.has_remote {
-            let fetched: Vec<Result<Vec<u8>, BlobError>> = std::thread::scope(|s| {
-                let mut handles = Vec::with_capacity(total);
-                for idx in 0..total {
-                    let part_id = logical_id.with_part((idx + 1) as u8);
-                    let slot_idx = self.select_slot(logical_id, idx);
-                    let slot = &self.slots[slot_idx];
-                    handles.push(s.spawn(move || slot.get(part_id)));
-                }
-                handles
-                    .into_iter()
-                    // A panicking fetch thread yields no fragment, which is what the
-                    // old `join().ok().flatten()` did; treat it as unavailable rather
-                    // than inventing an I/O cause.
-                    .map(|h| h.join().unwrap_or(Err(BlobError::NotFound(logical_id))))
-                    .collect()
-            });
-            for (idx, result) in fetched.into_iter().enumerate() {
-                match result {
-                    Ok(bytes) => parts[idx] = Some(bytes),
-                    Err(e @ BlobError::CorruptData { .. }) => {
-                        corruption.get_or_insert(e);
+            let fetched: Vec<(Option<(Vec<u8>, usize)>, Option<BlobError>)> =
+                std::thread::scope(|s| {
+                    let mut handles = Vec::with_capacity(total);
+                    for idx in 0..total {
+                        handles.push(s.spawn(move || {
+                            let mut corruption = None;
+                            let found = self.read_part(logical_id, idx, &mut corruption);
+                            (found, corruption)
+                        }));
                     }
-                    Err(_) => {}
+                    handles
+                        .into_iter()
+                        // A panicking fetch thread yields no fragment, which is what
+                        // the old `join().ok().flatten()` did; treat it as unavailable
+                        // rather than inventing an I/O cause.
+                        .map(|h| h.join().unwrap_or((None, None)))
+                        .collect()
+                });
+            for (idx, (found, corrupt)) in fetched.into_iter().enumerate() {
+                if let Some((bytes, _)) = found {
+                    parts[idx] = Some(bytes);
+                }
+                if let Some(e) = corrupt {
+                    corruption.get_or_insert(e);
                 }
             }
         } else {
-            for (idx, part_slot) in parts.iter_mut().enumerate() {
-                let part_id = logical_id.with_part((idx + 1) as u8);
-                let slot_idx = self.select_slot(logical_id, idx);
-                match self.slots[slot_idx].get(part_id) {
-                    Ok(bytes) => *part_slot = Some(bytes),
-                    Err(e @ BlobError::CorruptData { .. }) => {
-                        corruption.get_or_insert(e);
-                    }
-                    Err(_) => {}
+            for idx in 0..total {
+                if let Some((bytes, _)) = self.read_part(logical_id, idx, &mut corruption) {
+                    parts[idx] = Some(bytes);
                 }
             }
         }
@@ -895,73 +1154,104 @@ impl<FS: StorageFs> PoolStriper<FS> {
     pub fn repair_blob(&self, logical_id: BlobId) -> Result<RepairReport, BlobError> {
         let total = self.codec.scheme().total_parts();
         let mut slots_data: Vec<Option<Vec<u8>>> = vec![None; total];
+        // Which slot actually supplied each part. Repair needs this to tell "on
+        // its nominal slot" from "on a handoff slot that has to be moved back".
+        let mut sources: Vec<Option<usize>> = vec![None; total];
         let mut corruption: Option<BlobError> = None;
 
         if self.has_remote {
-            let fetched: Vec<Result<Vec<u8>, BlobError>> = std::thread::scope(|s| {
-                let mut handles = Vec::with_capacity(total);
-                for idx in 0..total {
-                    let part_id = logical_id.with_part((idx + 1) as u8);
-                    let slot_idx = self.select_slot(logical_id, idx);
-                    let slot = &self.slots[slot_idx];
-                    handles.push(s.spawn(move || slot.get(part_id)));
-                }
-                handles
-                    .into_iter()
-                    .map(|h| h.join().unwrap_or(Err(BlobError::NotFound(logical_id))))
-                    .collect()
-            });
-            for (idx, result) in fetched.into_iter().enumerate() {
-                match result {
-                    Ok(bytes) => slots_data[idx] = Some(bytes),
-                    Err(e @ BlobError::CorruptData { .. }) => {
-                        corruption.get_or_insert(e);
+            let fetched: Vec<(Option<(Vec<u8>, usize)>, Option<BlobError>)> =
+                std::thread::scope(|s| {
+                    let mut handles = Vec::with_capacity(total);
+                    for idx in 0..total {
+                        handles.push(s.spawn(move || {
+                            let mut corruption = None;
+                            let found = self.read_part(logical_id, idx, &mut corruption);
+                            (found, corruption)
+                        }));
                     }
-                    Err(_) => {}
+                    handles
+                        .into_iter()
+                        .map(|h| h.join().unwrap_or((None, None)))
+                        .collect()
+                });
+            for (idx, (found, corrupt)) in fetched.into_iter().enumerate() {
+                if let Some((bytes, slot)) = found {
+                    slots_data[idx] = Some(bytes);
+                    sources[idx] = Some(slot);
+                }
+                if let Some(e) = corrupt {
+                    corruption.get_or_insert(e);
                 }
             }
         } else {
-            for (idx, item) in slots_data.iter_mut().enumerate() {
-                let part_id = logical_id.with_part((idx + 1) as u8);
-                let slot_idx = self.select_slot(logical_id, idx);
-                match self.slots[slot_idx].get(part_id) {
-                    Ok(bytes) => *item = Some(bytes),
-                    Err(e @ BlobError::CorruptData { .. }) => {
-                        corruption.get_or_insert(e);
-                    }
-                    Err(_) => {}
+            for idx in 0..total {
+                if let Some((bytes, slot)) = self.read_part(logical_id, idx, &mut corruption) {
+                    slots_data[idx] = Some(bytes);
+                    sources[idx] = Some(slot);
                 }
             }
         }
 
         let intact_parts = slots_data.iter().filter(|x| x.is_some()).count();
-        if intact_parts == total {
+
+        // Every part present and on its canonical slot: nothing to do.
+        let all_nominal =
+            (0..total).all(|idx| sources[idx] == Some(self.select_slot(logical_id, idx)));
+        if intact_parts == total && all_nominal {
             return Ok(RepairReport {
                 intact_parts,
                 repaired_parts: 0,
             });
         }
 
-        let payload = match self.codec.decode(&slots_data) {
-            Ok(payload) => payload,
-            Err(e) => return Err(corruption.unwrap_or(e)),
+        // Only a missing part needs reconstruction. A part that is present but
+        // living on a handoff slot already has the right bytes; it is moved, not
+        // rebuilt.
+        let rebuilt = if intact_parts < total {
+            match self.codec.decode(&slots_data) {
+                Ok(payload) => Some(self.codec.encode(&payload)),
+                Err(e) => return Err(corruption.unwrap_or(e)),
+            }
+        } else {
+            None
         };
-        let expected_fragments = self.codec.encode(&payload);
-        let mut repaired_parts = 0usize;
 
-        for (idx, slot_val) in slots_data.iter().enumerate() {
-            if slot_val.is_none() {
-                let part_id = logical_id.with_part((idx + 1) as u8);
-                let slot_idx = self.select_slot(logical_id, idx);
-                if self.slots[slot_idx]
-                    .put(part_id, &expected_fragments[idx])
-                    .is_ok()
-                {
-                    self.slots[slot_idx]
-                        .metrics
-                        .repairs_ok
-                        .fetch_add(1, Ordering::Relaxed);
-                    repaired_parts += 1;
+        let mut repaired_parts = 0usize;
+        let mut new_parts = 0usize;
+
+        for idx in 0..total {
+            let nominal = self.select_slot(logical_id, idx);
+            if sources[idx] == Some(nominal) {
+                continue;
+            }
+            let data = match (&rebuilt, &slots_data[idx]) {
+                (Some(fragments), _) => fragments[idx].clone(),
+                (None, Some(bytes)) => bytes.clone(),
+                // Unreachable: a part with no source implies `intact_parts <
+                // total`, which means `rebuilt` is `Some`.
+                (None, None) => continue,
+            };
+            let part_id = logical_id.with_part((idx + 1) as u8);
+            if self.slots[nominal].put(part_id, &data).is_err() {
+                continue;
+            }
+            self.slots[nominal]
+                .metrics
+                .repairs_ok
+                .fetch_add(1, Ordering::Relaxed);
+            repaired_parts += 1;
+            if slots_data[idx].is_none() {
+                new_parts += 1;
+            }
+            // The canonical copy is durable, so the handoff copy may go. This is
+            // YDB's assimilation: a part returns to its main disk once that disk
+            // answers again. Deleting only after the put succeeded is what keeps
+            // a repair from dropping the last good copy; if the delete fails the
+            // blob simply has two identical copies and the next pass retries.
+            if let Some(src) = sources[idx] {
+                if src != nominal {
+                    let _ = self.slots[src].delete(part_id);
                 }
             }
         }
@@ -972,7 +1262,7 @@ impl<FS: StorageFs> PoolStriper<FS> {
         // which is why `intact_parts` counts fragments *after* the repair. Calling
         // this an error would make the scrub report a readable blob as unrecoverable.
         Ok(RepairReport {
-            intact_parts: intact_parts + repaired_parts,
+            intact_parts: intact_parts + new_parts,
             repaired_parts,
         })
     }
@@ -994,8 +1284,11 @@ impl<FS: StorageFs> PoolStriper<FS> {
                 .collect()
         };
 
-        let total_slots = slot_snaps.len();
-        let online_slots = slot_snaps.iter().filter(|s| s.online).count();
+        let total_slots = self.nominal_slots;
+        let online_slots = slot_snaps[..self.nominal_slots]
+            .iter()
+            .filter(|s| s.online)
+            .count();
         let min_read_slots = self.min_read_quorum();
         let min_write_slots = self.min_write_quorum();
         let total_repairs = slot_snaps.iter().map(|s| s.repairs_ok).sum();
@@ -1018,11 +1311,13 @@ impl<FS: StorageFs> PoolStriper<FS> {
             scheme: scheme_str,
             status,
             total_slots,
+            handoff_slots: self.handoff_slot_count(),
             online_slots,
             min_read_slots,
             min_write_slots,
             total_repairs,
             refused_puts: self.refused_puts.load(Ordering::Relaxed),
+            degraded_puts: self.degraded_puts.load(Ordering::Relaxed),
             slots: slot_snaps,
         }
     }
