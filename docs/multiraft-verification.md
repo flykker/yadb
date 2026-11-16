@@ -1356,3 +1356,120 @@ recent manifest set is empty by construction would report `503` forever; the
 test cluster always applies at least the platform manifest. A node that has an
 image but whose control snapshot is corrupt takes the existing fail-closed
 stale path, not `NotReady`.
+
+## pgwire COPY/TLS and forwarded-outcome classification (2026-11-16)
+
+### COPY in text format
+
+`COPY <table> [(columns)] FROM STDIN`, `COPY <table> [(columns)] TO STDOUT` and
+`COPY (<select>) TO STDOUT` are implemented in the pgwire frontend. A `COPY`
+load is typed by the target table's declared column types, read with the new
+`SHOW COLUMNS FROM <table>` statement, so a text column whose values look
+numeric stays text. Rows are sent through the existing gateway transaction path
+as batched `INSERT`s (500 rows or 32 KiB), and the whole load is one
+transaction when the client is not already inside one. Server-side files and
+every option other than `FORMAT text` are refused with `0A000` instead of being
+ignored.
+
+Live evidence on a three-node legacy cluster (port base 24000): `\copy` of a
+4-row file with a tab, an escaped newline, a backslash, an octal and a hex
+escape and a NULL loaded and read back with the expected values; `\copy ... to`
+produced `1\talpha\tt\n2\tline\nbreak\tf\n...` byte for byte; `COPY (SELECT ...)
+TO STDOUT` streamed the same escaping; 5000 rows loaded in one `\copy` and read
+back (`row-3999` for id 4999); inline `COPY ... FROM STDIN` terminated with `\.`
+loaded 2 rows. Failures rolled back completely: a non-integer id, a non-boolean
+value, a duplicate primary key and a short row each left the table unchanged
+(0 rows for the refused id), and `BEGIN; \copy ...; ROLLBACK` left no row. A
+`COPY` combined with another statement in one query is refused with `0A000`.
+
+### TLS and mTLS
+
+`--pg-tls-cert`/`--pg-tls-key` (PEM or DER) make the listener answer
+`SSLRequest` with `S`; `--pg-tls-client-ca` requires a client certificate;
+`--pg-require-tls` refuses cleartext startup. Without the flags the listener is
+byte-for-byte the previous cleartext one, so `sslmode=prefer` keeps working.
+
+Live evidence on the same cluster: `psql` negotiated TLSv1.3
+(`TLS_AES_256_GCM_SHA384`), `sslmode=verify-full` with the configured CA
+connected, a client certificate from a foreign CA was rejected with `unknown
+ca`, a missing client certificate with `certificate required`, and
+`sslmode=disable` against `--pg-require-tls` was refused with `28000`/`TLS is
+required by this server`.
+
+### Concurrent proposals: a Leader now waits for its own entry
+
+The concurrent S3 PUT burst exposed two independent defects, both of which
+refused writes that were committing normally.
+
+`RaftCore::propose` returns the replication messages it built, and the old
+`LocalMetaKv::execute_with` sent them once and immediately looked for the
+result. When several threads propose on the same Leader, a later proposer
+builds messages whose `next_index` already covers an earlier proposer's entry,
+so that earlier `propose` returned no messages at all and its entry was never
+acknowledged by the proposer itself. `execute_with` then read
+`take_applied_result(idx)` before any round trip, found nothing and answered
+`MetaError::UncommittedIndex` — reported to the client as
+`no confirmed result for proposal at log index N; write outcome is unknown`.
+Four of twenty-four concurrent PUTs failed that way.
+
+`execute_with` now waits for the entry it appended: it re-checks the result,
+issues a heartbeat round so a peer that already holds the entry acknowledges
+it, and stops only when the entry is applied, its term no longer matches the
+proposed `(index, term)` (a new leader replaced it), the budget expires, or
+three consecutive rounds reach no peer at all (no quorum to wait for, so the
+refusal is immediate rather than a full-budget poll of refused connections).
+The wait is not a retry of the command: the entry is already in the log and can
+commit at most once, so the wait only decides whether the client sees the
+committed result or an explicit unknown outcome. `COMMIT_WAIT` is 3 s, below
+the forwarding Follower's reply budget so the Leader answers first. A unit test
+injects a first round where both peers time out and asserts the write still
+returns `PutOk`.
+
+### Forwarded writes: budget and outcome classification
+
+The second defect was the Follower's reply budget. `proxy_http_to_peer` used a
+single fixed 5 s `read_timeout` for every request. Measured on a three-node
+local cluster, one SQL statement costs ~130 ms and one S3 PUT ~160 ms: the
+engine serializes statements behind a single lock and each metadata mutation
+costs a synchronous two-peer Raft round. A 24-way burst through a Follower
+therefore needs 4–5 s, so the 5 s budget intermittently expired on writes that
+were committing normally and reported them as
+`reading leader response failed: Resource temporarily unavailable (os error 11)`
+with `x-yadb-write-outcome: unknown`.
+
+The budget is now split: `FORWARD_WRITE_REPLY_BUDGET` is 20 s and
+`FORWARD_READ_REPLY_BUDGET` stays 5 s. This is not a retry policy — an expired
+budget still reports `unknown`/`do-not-retry` and the request is never resent —
+so the larger write budget only widens the window in which a slow success is
+reported as a success. Reads keep the short budget because a read that is
+merely slow can be failed over and retried.
+
+`proxy_http_to_peer` also used to return one `io::Error` for every failure, so
+a refused connect — where the leader provably never received the request — was
+reported with the same `unknown`/`do-not-retry` as a lost reply. The helper now
+returns a `ForwardFailure` that records whether any byte was written: connect
+and socket-setup failures are `not-sent` and are retried inside the existing
+attempt loop, failures after the first write stay `unknown`/`do-not-retry`, and
+a final refusal after only `not-sent` failures reports `not-sent`. Two unit
+tests cover a closed port (`not-sent`) and a peer that accepts the request and
+closes without answering (`unknown`).
+
+After both fixes, `tests/protocols.py` passed 16/16 on five consecutive runs
+and `--native-clients` 17/17; a direct 24-way burst measured 1.5 s wall time
+with no failures through both the Leader's and a Follower's S3 listener.
+
+### Gates
+
+`cargo test -p yadbd --bins` 83/83; `cargo test -p yadb-metakv --lib` 170/170;
+`cargo test -p yadb-db --lib` 46/46; `cargo fmt --all -- --check` clean;
+`tests/protocols.py` 16/16 on five consecutive runs and `--native-clients`
+17/17.
+
+Open: `COPY` supports only the text format, has no `FREEZE`/`WHERE`/CSV/binary
+options, and its implicit transaction still goes through the gateway's
+`BEGIN`/`COMMIT` rather than a dedicated bulk path, so a large load costs one
+HTTP round trip per batch. A partially written forwarded request counts as
+`sent`, which is the conservative choice. The Leader's per-statement
+serialization and one-Raft-round-per-metadata-mutation design means throughput
+on one Leader is bounded by that round trip; the 20 s forwarding budget is sized
+for the 24-way burst this test exercises, not for an unbounded queue.

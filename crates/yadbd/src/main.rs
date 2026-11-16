@@ -95,6 +95,19 @@ struct Args {
     /// Opt-in PostgreSQL v3 Simple Query listener.
     #[arg(long)]
     pg_listen: Option<String>,
+    /// PEM or DER certificate chain for TLS on the pgwire listener.
+    #[arg(long, requires_all = ["pg_tls_key"])]
+    pg_tls_cert: Option<PathBuf>,
+    /// PEM or DER private key matching `--pg-tls-cert`.
+    #[arg(long, requires_all = ["pg_tls_cert"])]
+    pg_tls_key: Option<PathBuf>,
+    /// Optional client CA bundle: when set, pgwire TLS requires a client
+    /// certificate signed by one of these roots (mTLS).
+    #[arg(long, requires_all = ["pg_tls_cert"])]
+    pg_tls_client_ca: Option<PathBuf>,
+    /// Refuse cleartext startup packets on the pgwire listener.
+    #[arg(long, requires_all = ["pg_tls_cert"])]
+    pg_require_tls: bool,
     /// Opt-in AWS S3 path-style listener.
     #[arg(long, requires = "s3_target")]
     s3_listen: Option<String>,
@@ -1291,6 +1304,61 @@ fn forwarded_request(
     request
 }
 
+/// A forwarding attempt that failed.
+///
+/// `sent` records whether any byte of the request reached the peer. A connect
+/// failure provably did not run the mutation, so a client may retry it; a
+/// failure after the first write leaves the outcome unknown, so a mutation must
+/// never be retried automatically. Collapsing the two would either lose writes
+/// (refusing a request that never left) or duplicate them (retrying one that
+/// may have committed).
+#[derive(Debug)]
+struct ForwardFailure {
+    message: String,
+    sent: bool,
+}
+
+impl ForwardFailure {
+    fn not_sent(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            sent: false,
+        }
+    }
+    fn unknown(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            sent: true,
+        }
+    }
+    /// The outcome label a client sees; only `unknown` forbids a retry.
+    fn outcome(&self) -> &'static str {
+        if self.sent {
+            "unknown"
+        } else {
+            "not-sent"
+        }
+    }
+}
+
+/// How long a Follower waits for the Leader's answer to a forwarded request.
+///
+/// This is a client-visible budget, not a retry policy: when it expires the
+/// request has already been delivered, so the outcome is reported as `unknown`
+/// and is never resent. It therefore has to exceed the Leader's legitimate
+/// service time under load, or a slow-but-successful mutation is reported as an
+/// ambiguous failure.
+///
+/// Measured on a three-node local cluster: one SQL statement takes ~130 ms
+/// (the engine serializes statements on a single lock and each metadata
+/// mutation costs a synchronous two-peer Raft round), and one S3 PUT ~160 ms. A
+/// 24-way burst through a Follower therefore needs ~4-5 s, which is why the
+/// previous 5 s budget intermittently refused writes that were committing
+/// normally. Reads keep a short budget: a read that is merely slow can be
+/// failed over and retried, while a mutation cannot.
+const FORWARD_WRITE_REPLY_BUDGET: Duration = Duration::from_secs(20);
+const FORWARD_READ_REPLY_BUDGET: Duration = Duration::from_secs(5);
+
 /// Raw HTTP/1.1 forwarding helper used by Followers to transparently proxy client writes to the Raft Leader.
 fn proxy_http_to_peer(
     peer_addr: &str,
@@ -1302,7 +1370,7 @@ fn proxy_http_to_peer(
     body: &[u8],
     idempotency_key: Option<&str>,
     read: ForwardedRead<'_>,
-) -> Result<ProxyResponse, std::io::Error> {
+) -> Result<ProxyResponse, ForwardFailure> {
     let clean = peer_addr
         .trim()
         .strip_prefix("http://")
@@ -1310,11 +1378,23 @@ fn proxy_http_to_peer(
         .trim_end_matches('/');
     let sock: SocketAddr = clean
         .parse()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+        .map_err(|e| ForwardFailure::not_sent(format!("invalid peer address: {e}")))?;
 
-    let mut stream = TcpStream::connect_timeout(&sock, Duration::from_millis(400))?;
-    stream.set_read_timeout(Some(Duration::from_millis(5000)))?;
-    stream.set_write_timeout(Some(Duration::from_millis(3000)))?;
+    // Nothing has been written yet, so every failure up to the first `write_all`
+    // is `not_sent`: the leader cannot have executed anything.
+    let mut stream = TcpStream::connect_timeout(&sock, Duration::from_millis(400))
+        .map_err(|e| ForwardFailure::not_sent(format!("connect to leader failed: {e}")))?;
+    let reply_budget = if method == "GET" || method == "HEAD" {
+        FORWARD_READ_REPLY_BUDGET
+    } else {
+        FORWARD_WRITE_REPLY_BUDGET
+    };
+    stream
+        .set_read_timeout(Some(reply_budget))
+        .map_err(|e| ForwardFailure::not_sent(format!("socket setup failed: {e}")))?;
+    stream
+        .set_write_timeout(Some(Duration::from_millis(3000)))
+        .map_err(|e| ForwardFailure::not_sent(format!("socket setup failed: {e}")))?;
 
     let req = forwarded_request(
         method,
@@ -1327,24 +1407,31 @@ fn proxy_http_to_peer(
         idempotency_key,
         read,
     );
-    stream.write_all(&req)?;
+    // From here on a partial write may have delivered a prefix of the request,
+    // and a delivered request may commit even when the reply never arrives.
+    stream
+        .write_all(&req)
+        .map_err(|e| ForwardFailure::unknown(format!("sending request to leader failed: {e}")))?;
     if !body.is_empty() {
-        stream.write_all(body)?;
+        stream
+            .write_all(body)
+            .map_err(|e| ForwardFailure::unknown(format!("sending body to leader failed: {e}")))?;
     }
-    stream.flush()?;
+    stream
+        .flush()
+        .map_err(|e| ForwardFailure::unknown(format!("flushing request to leader failed: {e}")))?;
 
     let mut raw = Vec::new();
     stream
         .take((MAX_PROXY_WIRE + 1) as u64)
-        .read_to_end(&mut raw)?;
+        .read_to_end(&mut raw)
+        .map_err(|e| ForwardFailure::unknown(format!("reading leader response failed: {e}")))?;
     if raw.len() > MAX_PROXY_WIRE {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "HTTP response too large",
-        ));
+        return Err(ForwardFailure::unknown("leader response too large"));
     }
 
     parse_proxy_response(&raw)
+        .map_err(|e| ForwardFailure::unknown(format!("malformed response from leader: {e}")))
 }
 
 fn parse_proxy_response(raw: &[u8]) -> Result<ProxyResponse, std::io::Error> {
@@ -1745,14 +1832,25 @@ async fn maybe_forward_write(
                 },
             )
             .map(|response| Some((target, response)))
-            .map_err(|_| {
-                (
-                    "OpenRaft forwarding failed; write outcome unknown, do not automatically retry"
-                        .to_string(),
-                    Some("unknown"),
-                )
+            .map_err(|e| {
+                // A connect failure never reached the leader, so the mutation
+                // provably did not run and the client may retry it.
+                if e.sent {
+                    (
+                        format!("OpenRaft forwarding failed; write outcome unknown, do not automatically retry: {}", e.message),
+                        Some("unknown"),
+                    )
+                } else {
+                    (
+                        format!("OpenRaft leader unreachable; request not sent: {}", e.message),
+                        Some("not-sent"),
+                    )
+                }
             });
         }
+        // The last attempt that never left this node, so a final refusal can
+        // say "not sent" (safe to retry) instead of leaving the outcome blank.
+        let mut unsent: Option<ForwardFailure> = None;
         for attempt in 0..3 {
             let (my_id, cur_role, _, leader_opt, _) = meta.role_info();
             if cur_role == RoleState::Leader {
@@ -1803,13 +1901,27 @@ async fn maybe_forward_write(
                     continue;
                 }
                 Ok(ok_tuple) => return Ok(Some((target_id, ok_tuple))),
-                Err(_) => {
+                Err(e) if !e.sent => {
+                    // The request provably never reached the leader, so nothing
+                    // committed: retrying inside this loop is safe for both
+                    // reads and mutations, and a mutation that still cannot be
+                    // forwarded is reported as not sent rather than unknown.
+                    unsent = Some(e);
+                    let _ = meta.trigger_election();
+                    let (_, new_role, _, _, _) = meta.role_info();
+                    if new_role == RoleState::Leader {
+                        return Ok(None);
+                    }
+                }
+                Err(e) => {
                     // A lost response to a mutation is not evidence that it did
                     // not commit, and an unkeyed write cannot be replayed.
                     if method != "GET" && method != "HEAD" {
                         return Err((
-                            "forwarded request was sent but the write outcome is unknown; do not automatically retry"
-                                .to_string(),
+                            format!(
+                                "forwarded request was sent but the write outcome is unknown; do not automatically retry: {}",
+                                e.message
+                            ),
                             Some("unknown"),
                         ));
                     }
@@ -1822,10 +1934,19 @@ async fn maybe_forward_write(
                 }
             }
         }
-        Err((
-            "cluster has no reachable Raft leader (quorum unavailable)".to_string(),
-            None,
-        ))
+        match unsent {
+            Some(e) => Err((
+                format!(
+                    "cluster has no reachable Raft leader (quorum unavailable); request not sent: {}",
+                    e.message
+                ),
+                Some("not-sent"),
+            )),
+            None => Err((
+                "cluster has no reachable Raft leader (quorum unavailable)".to_string(),
+                None,
+            )),
+        }
     })
     .await;
 
@@ -6280,9 +6401,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if let Some(addr) = &args.pg_listen {
         let listener = std::net::TcpListener::bind(addr)?;
+        let tls = match (&args.pg_tls_cert, &args.pg_tls_key) {
+            (Some(cert), Some(key)) => Some(std::sync::Arc::new(protocols::pg::Tls::load(
+                cert,
+                key,
+                args.pg_tls_client_ca.as_deref(),
+                args.pg_require_tls,
+            )?)),
+            (None, None) => None,
+            _ => return Err("--pg-tls-cert and --pg-tls-key must be given together".into()),
+        };
         let st = state.clone(); let creds = credentials.clone();
-        protocols::serve(listener, move |c| protocols::pg::connection(c,st.clone(),creds.clone()));
-        println!("pgwire Simple Query listening on {addr} (no TLS; trusted networks only)");
+        let handler_tls = tls.clone();
+        protocols::serve(listener, move |c| {
+            protocols::pg::connection(c, st.clone(), creds.clone(), handler_tls.clone())
+        });
+        match tls {
+            Some(_) => println!(
+                "pgwire listening on {addr} ({}; COPY text, extended query, cleartext{})",
+                if args.pg_tls_client_ca.is_some() { "TLS with client certificates" } else { "TLS" },
+                if args.pg_require_tls { " refused" } else { " allowed" }
+            ),
+            None => println!("pgwire listening on {addr} (no TLS; trusted networks only)"),
+        }
     }
     if let Some(addr) = &args.iscsi_listen {
         let listener = std::net::TcpListener::bind(addr)?;
@@ -6499,6 +6640,59 @@ mod security_tests {
         let not_sent = forward_error_response("not sent".into(), Some("not-sent"));
         assert_eq!(not_sent.headers()["x-yadb-write-outcome"], "not-sent");
         assert!(!not_sent.headers().contains_key("x-yadb-retry"));
+    }
+
+    // A refused connection never delivered the request, so the mutation
+    // provably did not run; only a failure after the request left this node is
+    // ambiguous. Reporting both as "unknown" refused writes that were safe to
+    // retry (observed as 4/24 spurious 503s under a concurrent PUT burst).
+    #[test]
+    fn forwarding_distinguishes_not_sent_from_unknown_outcome() {
+        // Reserve a port, then close it, so nothing is listening there.
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = closed.local_addr().unwrap();
+        drop(closed);
+        let failure = proxy_http_to_peer(
+            &addr.to_string(),
+            "PUT",
+            "/v1/apply",
+            "sa:test",
+            None,
+            "application/json",
+            b"{}",
+            None,
+            ForwardedRead::default(),
+        )
+        .unwrap_err();
+        assert!(!failure.sent, "a refused connect must not be ambiguous");
+        assert_eq!(failure.outcome(), "not-sent");
+
+        // A peer that accepts the request and closes without answering leaves
+        // the outcome unknown: the leader may have committed before it died.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let peer = std::thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let _ = stream.peek(&mut buf);
+            }
+            // Dropping the stream closes it without a response.
+        });
+        let failure = proxy_http_to_peer(
+            &addr.to_string(),
+            "PUT",
+            "/v1/apply",
+            "sa:test",
+            None,
+            "application/json",
+            b"{}",
+            None,
+            ForwardedRead::default(),
+        )
+        .unwrap_err();
+        let _ = peer.join();
+        assert!(failure.sent, "a sent request must stay ambiguous");
+        assert_eq!(failure.outcome(), "unknown");
     }
 
     #[test]

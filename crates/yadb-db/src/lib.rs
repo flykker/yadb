@@ -1123,7 +1123,10 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
         let stmts = parse_sql_script(sql)?;
         for stmt in &stmts {
             match stmt {
-                SqlStmt::Select { .. } | SqlStmt::ShowTables | SqlStmt::ShowIndexes { .. } => {}
+                SqlStmt::Select { .. }
+                | SqlStmt::ShowTables
+                | SqlStmt::ShowIndexes { .. }
+                | SqlStmt::ShowColumns { .. } => {}
                 _ => {
                     return Err(DbError::InvalidQuery(
                         "consistent reads support only SELECT and SHOW statements".into(),
@@ -1189,6 +1192,11 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
                 Ok(Self::show_indexes_result(schema))
             }
 
+            SqlStmt::ShowColumns { table } => {
+                let schema = Self::schema_from_snapshot(project_id, db, &table, snapshot)?;
+                Ok(Self::show_columns_result(schema))
+            }
+
             SqlStmt::Select {
                 table,
                 projection,
@@ -1252,6 +1260,34 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
             .collect();
         QueryResult {
             columns: vec!["index_name".into(), "table".into(), "column".into()],
+            rows,
+            rows_affected: 0,
+        }
+    }
+
+    /// Column metadata in declaration order. `COPY` uses it to type a text
+    /// stream; a client can use it to discover the schema.
+    fn show_columns_result(schema: TableSchema) -> QueryResult {
+        let rows = schema
+            .columns
+            .into_iter()
+            .map(|column| {
+                vec![
+                    SqlValue::Text(column.name),
+                    SqlValue::Text(
+                        match column.col_type {
+                            ColumnType::Int => "int",
+                            ColumnType::Text => "text",
+                            ColumnType::Bool => "bool",
+                        }
+                        .into(),
+                    ),
+                    SqlValue::Bool(column.primary_key),
+                ]
+            })
+            .collect();
+        QueryResult {
+            columns: vec!["column".into(), "type".into(), "primary_key".into()],
             rows,
             rows_affected: 0,
         }
@@ -1390,6 +1426,11 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
             SqlStmt::ShowIndexes { table } => {
                 let schema = self.load_schema(project_id, db, &table)?;
                 Ok(Self::show_indexes_result(schema))
+            }
+
+            SqlStmt::ShowColumns { table } => {
+                let schema = self.load_schema(project_id, db, &table)?;
+                Ok(Self::show_columns_result(schema))
             }
 
             SqlStmt::CreateTable {

@@ -275,7 +275,28 @@ def node_command(root, base, node, token):
         '--s3-listen', f'127.0.0.1:{s3_port(base, node)}',
         '--s3-target', S3_TARGET,
         '--raft-token', token,
-    ]
+    ] + pg_tls_args()
+
+
+def pg_tls_args():
+    """Optional pgwire TLS, enabled only when YADB_PG_TLS_CERT names a chain.
+
+    Certificates are supplied by the caller (for example a test harness); the
+    default stays the cleartext listener so nothing changes unless asked.
+    """
+    cert = os.environ.get('YADB_PG_TLS_CERT')
+    if not cert:
+        return []
+    key = os.environ.get('YADB_PG_TLS_KEY')
+    if not key:
+        raise RuntimeError('YADB_PG_TLS_CERT requires YADB_PG_TLS_KEY')
+    args = ['--pg-tls-cert', cert, '--pg-tls-key', key]
+    ca = os.environ.get('YADB_PG_TLS_CLIENT_CA')
+    if ca:
+        args += ['--pg-tls-client-ca', ca]
+    if os.environ.get('YADB_PG_REQUIRE_TLS') == '1':
+        args.append('--pg-require-tls')
+    return args
 
 
 def wait_healthy(base):

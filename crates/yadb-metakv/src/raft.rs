@@ -15,6 +15,17 @@ use crate::{KvValue, MetaError, MetaSnapshot};
 const WAL_COMPACTION_BYTES: u64 = 8 * 1024 * 1024;
 const WAL_COMPACTION_ENTRIES: u64 = 4096;
 
+/// How long a Leader waits for its own proposal to be committed and applied
+/// before answering with an explicit unknown outcome. It must stay below the
+/// forwarding follower's 5 s reply timeout so the Leader can answer first with a
+/// definite refusal instead of the follower reporting a lost response.
+const COMMIT_WAIT: Duration = Duration::from_millis(3000);
+
+/// If this many consecutive replication rounds reach no peer at all, the Leader
+/// has no quorum and there is nothing to wait for: refusing at once beats
+/// polling refused connections for the whole [`COMMIT_WAIT`] budget.
+const COMMIT_WAIT_EMPTY_ROUNDS: u32 = 3;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DurableCheckpoint {
     format_version: u32,
@@ -1222,9 +1233,22 @@ impl<FS: StorageFs> LocalMetaKv<FS> {
 
     fn drive_outbound_with(
         &self,
-        mut pending: Vec<OutboundMsg>,
+        pending: Vec<OutboundMsg>,
         send: &mut impl FnMut(&str, &RaftRpc) -> Result<Option<RaftRpc>, std::io::Error>,
     ) -> Result<(), MetaError> {
+        self.drive_round(pending, send).map(|_| ())
+    }
+
+    /// Runs one cascade of replication rounds and returns how many peer replies
+    /// it applied. Callers that are waiting for a specific entry use the count
+    /// to distinguish "no peer answered at all" from "a peer answered but the
+    /// entry is still not committed".
+    fn drive_round(
+        &self,
+        mut pending: Vec<OutboundMsg>,
+        send: &mut impl FnMut(&str, &RaftRpc) -> Result<Option<RaftRpc>, std::io::Error>,
+    ) -> Result<usize, MetaError> {
+        let mut replies_applied = 0;
         // Bound synchronous cascade rounds (e.g. RequestVote -> become_leader -> AppendEntries -> commit broadcast)
         for _round in 0..8 {
             if pending.is_empty() {
@@ -1246,9 +1270,10 @@ impl<FS: StorageFs> LocalMetaKv<FS> {
             for rep in replies {
                 let next_msgs = guard.step(rep)?;
                 pending.extend(next_msgs);
+                replies_applied += 1;
             }
         }
-        Ok(())
+        Ok(replies_applied)
     }
 
     /// Returns the result only for this proposal's (index, term). An error after
@@ -1275,18 +1300,58 @@ impl<FS: StorageFs> LocalMetaKv<FS> {
             (idx, guard.current_term(), msgs)
         };
         if !msgs.is_empty() {
-            self.drive_outbound_with(msgs, send)?;
+            self.drive_round(msgs, send)?;
         }
-        let mut guard = self.legacy().lock().unwrap();
-        // A new leader may have replaced the uncommitted proposal while the
-        // mutex was released for RPCs. An index alone does not identify an
-        // entry across terms; never return (or consume) the replacement's result.
-        if guard.term_at(idx) != Some(term) {
-            return Err(MetaError::UncommittedIndex(idx));
+        // A proposal that is already in the log can commit at most once, so
+        // waiting for it is not a retry: it only decides whether the client sees
+        // the committed result or an explicit unknown outcome. A concurrent
+        // proposer may have advanced `next_index` past our entry before we sent
+        // it, in which case `propose` returns no messages for us and there is no
+        // acknowledgement of our own to collect. Without this wait, 24 concurrent
+        // PUTs on one Leader reported four committed writes as
+        // `UncommittedIndex` merely because another thread had already shipped
+        // the entry.
+        let deadline = Instant::now() + COMMIT_WAIT;
+        let mut heard_from_peer = false;
+        let mut empty_rounds = 0u32;
+        loop {
+            let nudge = {
+                let mut guard = self.legacy().lock().unwrap();
+                // A new leader may have replaced the uncommitted proposal while
+                // the mutex was released for RPCs. An index alone does not
+                // identify an entry across terms; never return (or consume) the
+                // replacement's result.
+                if guard.term_at(idx) != Some(term) {
+                    return Err(MetaError::UncommittedIndex(idx));
+                }
+                if let Some(res) = guard.take_applied_result(idx) {
+                    return Ok(res);
+                }
+                // A peer may already hold the entry, so a heartbeat round
+                // collects its acknowledgement instead of waiting for the next
+                // timer tick.
+                guard.broadcast_append_entries()
+            };
+            if Instant::now() >= deadline {
+                return Err(MetaError::UncommittedIndex(idx));
+            }
+            let replies = self.drive_round(nudge, send)?;
+            if replies > 0 {
+                heard_from_peer = true;
+                empty_rounds = 0;
+            } else {
+                empty_rounds += 1;
+                // Several rounds without a single peer reply mean there is no
+                // quorum to wait for, so refuse instead of polling refused
+                // connections for the whole budget.
+                if empty_rounds >= COMMIT_WAIT_EMPTY_ROUNDS {
+                    return Err(MetaError::UncommittedIndex(idx));
+                }
+            }
+            // A round that reached a peer is worth retrying immediately; one
+            // that reached nobody should back off rather than spin.
+            std::thread::sleep(Duration::from_millis(if heard_from_peer { 2 } else { 20 }));
         }
-        guard
-            .take_applied_result(idx)
-            .ok_or(MetaError::UncommittedIndex(idx))
     }
 
     pub fn get(&self, key: &str) -> Option<KvValue> {
@@ -1542,6 +1607,41 @@ mod transport_tests {
                 assert_eq!(node.get("ambiguous").is_some(), delivered);
             }
         }
+    }
+
+    // A concurrent burst can time out both of a proposer's replication RPCs
+    // even though its entry is in the log and another proposer will commit it.
+    // Reporting `UncommittedIndex` there refused committed writes: in a 24-way
+    // PUT burst four writes were refused this way. A later round that does reach
+    // a peer must still return the committed result.
+    #[test]
+    fn execute_waits_for_commit_after_a_round_that_reached_no_peer() {
+        let nodes = cluster();
+        let mut sends = 0;
+        let result = nodes[&1].execute_with(
+            KvCommand::Put {
+                key: "burst".into(),
+                value: b"value".to_vec(),
+            },
+            &mut |addr, rpc| {
+                sends += 1;
+                // Both peers of the first round are reported as timed out, as a
+                // real 500 ms Raft RPC timeout under load would be.
+                if sends <= 2 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "injected round timeout",
+                    ));
+                }
+                deliver(&nodes, addr, rpc)
+            },
+        );
+        assert!(matches!(result, Ok(KvResult::PutOk { .. })), "{result:?}");
+        assert!(nodes[&1].get("burst").is_some());
+        assert!(
+            sends > 2,
+            "the wait must retry replication, not the command"
+        );
     }
 
     #[test]

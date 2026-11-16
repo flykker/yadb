@@ -143,6 +143,46 @@ switched. See `docs/multiraft-verification.md`.
   never on failed installation, and retain subscriptions for later applies.
 - [ ] Ensure a lost forwarded mutation response does not trigger automatic
   resubmission in the new runtime; retain explicit unknown-outcome semantics.
+  - [x] Distinguish "not sent" from "outcome unknown" on the legacy forwarding
+    path. `proxy_http_to_peer` returned the same `io::Error` for a failed
+    connect (the leader provably never saw the request) and for a lost reply
+    after the request left the node, and the caller reported both as
+    `unknown`/`do-not-retry`. Under a 24-way concurrent PUT burst through a
+    follower, four writes were refused with a spurious `503` even though
+    nothing had been delivered. The helper now returns a `ForwardFailure` that
+    records whether any byte was written: connect/setup failures are
+    `not-sent` and are retried inside the existing attempt loop (a mutation
+    that never left the node is safe to send again), while failures after the
+    first write stay `unknown`/`do-not-retry`. A final refusal after only
+    `not-sent` failures now reports `not-sent` instead of an empty outcome.
+    Two unit tests pin both branches. Open: a partially written request still
+    counts as sent, which is the conservative choice; the header/body split is
+    not transactional.
+  - [x] Stop a Leader from reporting a committed concurrent proposal as
+    unknown. `RaftCore::propose` returns the replication messages it built, so
+    when several threads propose on one Leader a later proposer's messages
+    already cover an earlier proposer's entry, and that earlier `propose`
+    returns none. `execute_with` sent nothing, found no applied result and
+    answered `UncommittedIndex`; four of twenty-four concurrent S3 PUTs through
+    a follower were refused as `no confirmed result for proposal at log index N`
+    although they committed. `execute_with` now waits for its own
+    `(index, term)`: re-check the result, issue a heartbeat round so a peer that
+    already holds the entry acknowledges it, and stop on apply, term change, the
+    3 s `COMMIT_WAIT` budget, or three consecutive rounds that reach no peer.
+    The wait cannot duplicate the command (the entry is already in the log) and
+    a unit test injects a fully timed-out first round and still gets `PutOk`.
+  - [x] Size the Follower's forwarding reply budget for real load instead of
+    guessing. One fixed 5 s `read_timeout` covered every forwarded request, but
+    one SQL statement costs ~130 ms and one S3 PUT ~160 ms locally (the engine
+    serializes statements behind one lock; every metadata mutation is a
+    synchronous two-peer Raft round), so a 24-way burst needs 4–5 s and the
+    budget intermittently expired on writes that were committing. Writes now get
+    `FORWARD_WRITE_REPLY_BUDGET` (20 s) and reads keep
+    `FORWARD_READ_REPLY_BUDGET` (5 s). This is still a client-visible budget,
+    not a retry: expiry reports `unknown`/`do-not-retry` and nothing is resent.
+    Open: one Leader's throughput stays bounded by the per-statement lock and
+    the per-mutation Raft round; 20 s covers the tested 24-way burst, not an
+    unbounded queue.
 - [ ] Complete post-fix combined offline/locked regressions, address the completed
   independent Sol review's blockers, and keep `production_ready: false` until gates close.
 

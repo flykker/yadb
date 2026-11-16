@@ -1,5 +1,6 @@
-//! PostgreSQL v3 wire frontend: Simple Query and the extended query protocol
-//! (Parse/Bind/Describe/Execute/Close/Flush/Sync), text format only.
+//! PostgreSQL v3 wire frontend: Simple Query, the extended query protocol
+//! (Parse/Bind/Describe/Execute/Close/Flush/Sync) and `COPY` in text format,
+//! over cleartext or server-side TLS. Text format only.
 //!
 //! The engine does not type parameters. `Bind` decodes text values using the OIDs
 //! supplied by `Parse` and substitutes them into the SQL text as literals. OID 0 is
@@ -7,10 +8,155 @@
 //! quote/comment aware so a parameter value can never become SQL syntax.
 use super::*;
 use crate::AppState;
+use std::io::{Read, Write};
+use std::sync::Arc;
+use tokio_rustls::rustls;
+use tokio_rustls::rustls::pki_types::pem::PemObject;
 use yadb_db::{
     eval_scalar_select, parse_sql_script, parse_sql_value, setting_default, QueryResult,
     ScalarContext, SqlStmt, SqlValue,
 };
+
+/// A client connection. `SSLRequest` upgrades a plain socket in place; every
+/// message helper is written against this type so the protocol code is the same
+/// on both transports.
+enum Stream {
+    Plain(TcpStream),
+    Tls(Box<rustls::StreamOwned<rustls::ServerConnection, TcpStream>>),
+}
+impl Read for Stream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Stream::Plain(c) => c.read(buf),
+            Stream::Tls(c) => c.read(buf),
+        }
+    }
+}
+impl Write for Stream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Stream::Plain(c) => c.write(buf),
+            Stream::Tls(c) => c.write(buf),
+        }
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Stream::Plain(c) => c.flush(),
+            Stream::Tls(c) => c.flush(),
+        }
+    }
+}
+impl Stream {
+    /// Completes the server handshake on `c` and returns the encrypted stream.
+    /// The handshake is driven explicitly so a rejected certificate is reported
+    /// before the startup packet is read, not as a mysterious frame error.
+    fn upgrade(c: Stream, config: &Arc<rustls::ServerConfig>) -> io::Result<Stream> {
+        let Stream::Plain(mut sock) = c else {
+            return Err(io::Error::other("TLS is already active"));
+        };
+        let mut conn = rustls::ServerConnection::new(config.clone()).map_err(io::Error::other)?;
+        let mut rounds = 0u32;
+        while conn.is_handshaking() {
+            let (read, written) = conn.complete_io(&mut sock)?;
+            if read == 0 && written == 0 {
+                return Err(io::Error::other("TLS handshake made no progress"));
+            }
+            rounds += 1;
+            if rounds > 64 {
+                return Err(io::Error::other("TLS handshake did not finish"));
+            }
+        }
+        Ok(Stream::Tls(Box::new(rustls::StreamOwned::new(conn, sock))))
+    }
+}
+
+/// Server-side TLS for the pgwire listener.
+///
+/// It is configured only when both a certificate chain and a private key are
+/// given. Without it the listener keeps the legacy cleartext behaviour; with it
+/// `SSLRequest` is answered `S` and a plain startup packet is still accepted
+/// unless `required` is set, so existing clients keep working after a TLS
+/// rollout and can be forced to encrypt once they are reconfigured.
+pub struct Tls {
+    config: Arc<rustls::ServerConfig>,
+    required: bool,
+}
+
+impl Tls {
+    pub fn load(
+        cert: &Path,
+        key: &Path,
+        client_ca: Option<&Path>,
+        required: bool,
+    ) -> io::Result<Self> {
+        const MAX_TLS_FILE: u64 = 256 * 1024;
+        let read = |path: &Path| -> io::Result<Vec<u8>> {
+            let meta = std::fs::metadata(path)?;
+            if meta.len() > MAX_TLS_FILE {
+                return Err(io::Error::other(format!(
+                    "{} is larger than {MAX_TLS_FILE} bytes",
+                    path.display()
+                )));
+            }
+            std::fs::read(path)
+        };
+        let chain = certificates(&read(cert)?)?;
+        if chain.is_empty() {
+            return Err(io::Error::other("TLS certificate chain is empty"));
+        }
+        let key = private_key(&read(key)?)?;
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let builder = rustls::ServerConfig::builder_with_provider(provider.clone())
+            .with_safe_default_protocol_versions()
+            .map_err(io::Error::other)?;
+        let builder = match client_ca {
+            Some(path) => {
+                let mut roots = rustls::RootCertStore::empty();
+                for ca in certificates(&read(path)?)? {
+                    roots.add(ca).map_err(io::Error::other)?;
+                }
+                if roots.is_empty() {
+                    return Err(io::Error::other("TLS client CA bundle is empty"));
+                }
+                let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+                    Arc::new(roots),
+                    provider,
+                )
+                .build()
+                .map_err(io::Error::other)?;
+                builder.with_client_cert_verifier(verifier)
+            }
+            None => builder.with_no_client_auth(),
+        };
+        let config = builder
+            .with_single_cert(chain, key)
+            .map_err(io::Error::other)?;
+        Ok(Self {
+            config: Arc::new(config),
+            required,
+        })
+    }
+}
+
+/// PEM when the file starts with a PEM marker, DER otherwise, so the test
+/// fixtures and certificates produced by `openssl` both load unchanged.
+fn certificates(bytes: &[u8]) -> io::Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
+    if bytes.starts_with(b"-----BEGIN") {
+        rustls::pki_types::CertificateDer::pem_slice_iter(bytes)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(io::Error::other)
+    } else {
+        Ok(vec![bytes.to_vec().into()])
+    }
+}
+
+fn private_key(bytes: &[u8]) -> io::Result<rustls::pki_types::PrivateKeyDer<'static>> {
+    if bytes.starts_with(b"-----BEGIN") {
+        rustls::pki_types::PrivateKeyDer::from_pem_slice(bytes).map_err(io::Error::other)
+    } else {
+        rustls::pki_types::PrivateKeyDer::try_from(bytes.to_vec()).map_err(io::Error::other)
+    }
+}
 
 /// Bounds on session state; exceeding either answers a clean error instead of growing.
 const MAX_PREPARED: usize = 64;
@@ -19,23 +165,27 @@ const MAX_SETTINGS: usize = 256;
 const MAX_NAME: usize = 256;
 const MAX_SQL: usize = 64 * 1024;
 const MAX_PARAMS: u32 = 32_767;
+/// Bounds on one `COPY` line and on one generated `INSERT` batch.
+const MAX_COPY_LINE: usize = 1024 * 1024;
+const COPY_BATCH_ROWS: usize = 500;
+const COPY_BATCH_BYTES: usize = 32 * 1024;
 
-fn packet(c: &mut TcpStream, kind: u8, data: &[u8]) -> io::Result<()> {
+fn packet(c: &mut Stream, kind: u8, data: &[u8]) -> io::Result<()> {
     c.write_all(&[kind])?;
     c.write_all(&((data.len() + 4) as u32).to_be_bytes())?;
     c.write_all(data)
 }
-fn error(c: &mut TcpStream, code: &str, msg: &str) -> io::Result<()> {
+fn error(c: &mut Stream, code: &str, msg: &str) -> io::Result<()> {
     packet(
         c,
         b'E',
         format!("SERROR\0VERROR\0C{code}\0M{}\0\0", msg.replace('\0', "")).as_bytes(),
     )
 }
-fn ready(c: &mut TcpStream, status: u8) -> io::Result<()> {
+fn ready(c: &mut Stream, status: u8) -> io::Result<()> {
     packet(c, b'Z', &[status])
 }
-fn frame(c: &mut TcpStream) -> io::Result<Vec<u8>> {
+fn frame(c: &mut Stream) -> io::Result<Vec<u8>> {
     let mut n = [0; 4];
     c.read_exact(&mut n)?;
     let n = u32::from_be_bytes(n) as usize;
@@ -68,7 +218,7 @@ fn row_description(columns: &[String]) -> Vec<u8> {
     }
     desc
 }
-fn data_rows(c: &mut TcpStream, res: &QueryResult) -> io::Result<()> {
+fn data_rows(c: &mut Stream, res: &QueryResult) -> io::Result<()> {
     for row in &res.rows {
         let mut data = Vec::new();
         data.extend_from_slice(&(row.len() as u16).to_be_bytes());
@@ -91,7 +241,7 @@ fn data_rows(c: &mut TcpStream, res: &QueryResult) -> io::Result<()> {
     Ok(())
 }
 /// Simple Query result: RowDescription (when there are columns) followed by DataRows.
-fn rows(c: &mut TcpStream, res: &QueryResult) -> io::Result<()> {
+fn rows(c: &mut Stream, res: &QueryResult) -> io::Result<()> {
     if !res.columns.is_empty() {
         packet(c, b'T', &row_description(&res.columns))?;
     }
@@ -608,6 +758,70 @@ impl<'a> Words<'a> {
         self.rest().is_empty()
     }
 
+    /// Reads the body of a parenthesised group after its `(` has been
+    /// consumed, up to and including the matching `)`, and returns the text
+    /// between them. Used by `COPY (<query>) TO STDOUT`.
+    fn group(&mut self) -> Result<&'a str, PgError> {
+        self.skip_ws();
+        let start = self.pos;
+        let mut depth = 0i32;
+        while let Some(&b) = self.bytes.get(self.pos) {
+            match b {
+                b'\'' => {
+                    self.pos += 1;
+                    loop {
+                        match self.bytes.get(self.pos) {
+                            None => {
+                                return Err(PgError::new("42601", "unterminated string literal"))
+                            }
+                            Some(b'\'') if self.bytes.get(self.pos + 1) == Some(&b'\'') => {
+                                self.pos += 2;
+                            }
+                            Some(b'\'') => {
+                                self.pos += 1;
+                                break;
+                            }
+                            Some(_) => self.pos += 1,
+                        }
+                    }
+                }
+                b'"' => {
+                    self.pos += 1;
+                    loop {
+                        match self.bytes.get(self.pos) {
+                            None => {
+                                return Err(PgError::new("42601", "unterminated quoted identifier"))
+                            }
+                            Some(b'"') if self.bytes.get(self.pos + 1) == Some(&b'"') => {
+                                self.pos += 2;
+                            }
+                            Some(b'"') => {
+                                self.pos += 1;
+                                break;
+                            }
+                            Some(_) => self.pos += 1,
+                        }
+                    }
+                }
+                b'(' => {
+                    depth += 1;
+                    self.pos += 1;
+                }
+                b')' => {
+                    if depth == 0 {
+                        let inner = &self.text[start..self.pos];
+                        self.pos += 1;
+                        return Ok(inner.trim());
+                    }
+                    depth -= 1;
+                    self.pos += 1;
+                }
+                _ => self.pos += 1,
+            }
+        }
+        Err(PgError::new("42601", "unterminated parenthesis in COPY"))
+    }
+
     /// Reads one comma/parenthesis-delimited argument, quote aware.
     fn arg(&mut self) -> Result<&'a str, PgError> {
         self.skip_ws();
@@ -660,6 +874,31 @@ enum SessionCmd {
         all: bool,
         name: String,
     },
+    CopyIn(CopySpec),
+    CopyOut(CopySpec),
+}
+
+/// One `COPY` statement. Only the client streams are accepted: a server-side
+/// file would let a database user read and write daemon files.
+#[derive(Debug)]
+struct CopySpec {
+    /// `COPY <table> [(columns)]`, or `None` for `COPY (<query>)`.
+    table: Option<(String, Option<Vec<String>>)>,
+    query: Option<String>,
+}
+
+/// The column types `COPY` needs to turn one text field into a typed literal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CopyType {
+    Int,
+    Text,
+    Bool,
+}
+
+#[derive(Debug, Clone)]
+struct CopyColumn {
+    name: String,
+    kind: CopyType,
 }
 
 fn type_oid(name: &str) -> Result<u32, PgError> {
@@ -820,7 +1059,148 @@ fn session_cmd(text: &str) -> Result<Option<SessionCmd>, PgError> {
         w.word();
         return parse_deallocate(&mut w).map(Some);
     }
+    if first.eq_ignore_ascii_case("COPY") {
+        w.word();
+        return parse_copy(&mut w).map(Some);
+    }
     Ok(None)
+}
+
+/// Parses `COPY <table> [(columns)] {FROM STDIN | TO STDOUT}` and
+/// `COPY (<query>) TO STDOUT`, in text format with the default settings.
+fn parse_copy(w: &mut Words<'_>) -> Result<SessionCmd, PgError> {
+    let (table, query) = if w.eat(b'(') {
+        (None, Some(w.group()?.to_string()))
+    } else {
+        let table = w
+            .word()
+            .ok_or_else(|| PgError::new("42601", "COPY requires a table name"))?;
+        if table.len() > MAX_NAME {
+            return Err(PgError::new("54000", "table name is too long"));
+        }
+        let mut columns = None;
+        if w.eat(b'(') {
+            let mut cols = Vec::new();
+            loop {
+                let name = w
+                    .word()
+                    .ok_or_else(|| PgError::new("42601", "malformed COPY column list"))?;
+                if name.len() > MAX_NAME {
+                    return Err(PgError::new("54000", "column name is too long"));
+                }
+                cols.push(name.to_string());
+                if w.eat(b',') {
+                    continue;
+                }
+                if w.eat(b')') {
+                    break;
+                }
+                return Err(PgError::new("42601", "malformed COPY column list"));
+            }
+            if cols.is_empty() {
+                return Err(PgError::new("42601", "COPY column list is empty"));
+            }
+            columns = Some(cols);
+        }
+        (Some((table.to_string(), columns)), None)
+    };
+    let from = if w.eat_kw("FROM") {
+        true
+    } else if w.eat_kw("TO") {
+        false
+    } else {
+        return Err(PgError::new(
+            "42601",
+            "COPY requires FROM STDIN or TO STDOUT",
+        ));
+    };
+    if w.peek_byte() == Some(b'\'') {
+        // `COPY ... FROM 'file'` reads a daemon file as the database user.
+        return Err(PgError::new(
+            "0A000",
+            "server-side COPY files are not supported; use STDIN or STDOUT",
+        ));
+    }
+    let stream = w
+        .word()
+        .ok_or_else(|| PgError::new("42601", "COPY requires STDIN or STDOUT"))?;
+    if from && !stream.eq_ignore_ascii_case("STDIN") {
+        return Err(PgError::new(
+            "0A000",
+            "server-side COPY FROM is not supported; use COPY ... FROM STDIN",
+        ));
+    }
+    if !from && !stream.eq_ignore_ascii_case("STDOUT") {
+        return Err(PgError::new(
+            "0A000",
+            "server-side COPY TO is not supported; use COPY ... TO STDOUT",
+        ));
+    }
+    if from && query.is_some() {
+        return Err(PgError::new("42601", "COPY FROM requires a table"));
+    }
+    // Only the text format with default settings is implemented. Accepting an
+    // option and ignoring it would silently change what the client's data
+    // means, so every other spelling is refused.
+    if !w.at_end() {
+        let _ = w.eat_kw("WITH");
+        if w.eat(b'(') {
+            loop {
+                let name = w
+                    .word()
+                    .ok_or_else(|| PgError::new("42601", "malformed COPY option list"))?;
+                if !name.eq_ignore_ascii_case("format") {
+                    return Err(PgError::new(
+                        "0A000",
+                        format!("COPY option \"{name}\" is not supported"),
+                    ));
+                }
+                let value = w
+                    .word()
+                    .ok_or_else(|| PgError::new("42601", "COPY FORMAT requires a value"))?;
+                if !value.eq_ignore_ascii_case("text") {
+                    return Err(PgError::new(
+                        "0A000",
+                        "only the COPY text format is supported",
+                    ));
+                }
+                if w.eat(b',') {
+                    continue;
+                }
+                if w.eat(b')') {
+                    break;
+                }
+                return Err(PgError::new("42601", "malformed COPY option list"));
+            }
+        } else if w.eat_kw("FORMAT") {
+            let value = w
+                .word()
+                .ok_or_else(|| PgError::new("42601", "COPY FORMAT requires a value"))?;
+            if !value.eq_ignore_ascii_case("text") {
+                return Err(PgError::new(
+                    "0A000",
+                    "only the COPY text format is supported",
+                ));
+            }
+        } else {
+            return Err(PgError::new(
+                "0A000",
+                "COPY options are not supported except FORMAT text",
+            ));
+        }
+        if !w.at_end() {
+            return Err(PgError::new(
+                "0A000",
+                "COPY options are not supported except FORMAT text",
+            ));
+        }
+    }
+    let spec = CopySpec { table, query };
+    Ok(if from {
+        SessionCmd::CopyIn(spec)
+    } else {
+        SessionCmd::CopyOut(spec)
+    })
 }
 
 /// One statement's outcome: rows, the command tag to report, and whether the
@@ -864,7 +1244,7 @@ fn report_name(name: &str) -> &str {
 
 /// Echoes a `GUC_REPORT` parameter change as a ParameterStatus message, which is
 /// how drivers observe `SET client_encoding` and friends.
-fn report_setting(c: &mut TcpStream, name: &str, value: &str) -> io::Result<()> {
+fn report_setting(c: &mut Stream, name: &str, value: &str) -> io::Result<()> {
     if matches!(
         name,
         "client_encoding"
@@ -890,7 +1270,7 @@ fn report_setting(c: &mut TcpStream, name: &str, value: &str) -> io::Result<()> 
 /// Statements the pgwire session owns: `SET`, `RESET`, `SHOW` and `SELECT`
 /// without `FROM`. Returns `None` for everything the engine must execute.
 fn local_stmt(
-    c: &mut TcpStream,
+    c: &mut Stream,
     cx: &Conn,
     tx: &TxState,
     session: &mut Session,
@@ -994,7 +1374,7 @@ fn local_stmt(
 /// Runs one parsed statement: session statements locally, everything else
 /// through the engine over HTTP.
 fn run_stmt(
-    c: &mut TcpStream,
+    c: &mut Stream,
     cx: &Conn,
     tx: &mut TxState,
     session: &mut Session,
@@ -1018,7 +1398,7 @@ fn run_stmt(
 /// Parses and runs exactly one SQL statement (no `PREPARE`/`EXECUTE`/
 /// `DEALLOCATE`, which only the statement text itself can introduce).
 fn run_single_sql(
-    c: &mut TcpStream,
+    c: &mut Stream,
     cx: &Conn,
     tx: &mut TxState,
     session: &mut Session,
@@ -1067,7 +1447,7 @@ fn plan_text(text: &str) -> Result<TextItem<'_>, PgError> {
 
 /// Runs one already split statement of client text.
 fn run_text(
-    c: &mut TcpStream,
+    c: &mut Stream,
     cx: &Conn,
     tx: &mut TxState,
     session: &mut Session,
@@ -1082,7 +1462,7 @@ fn run_text(
 }
 
 fn exec_session_cmd(
-    c: &mut TcpStream,
+    c: &mut Stream,
     cx: &Conn,
     tx: &mut TxState,
     session: &mut Session,
@@ -1095,6 +1475,8 @@ fn exec_session_cmd(
         SessionCmd::Prepare { name, oids, sql } => Ok(prepare_sql(session, name, oids, sql)),
         SessionCmd::Execute { name, args } => exec_prepared(c, cx, tx, session, name, args),
         SessionCmd::Deallocate { all, name } => Ok(deallocate(session, all, name)),
+        SessionCmd::CopyIn(spec) => copy_in(c, cx, tx, session, spec),
+        SessionCmd::CopyOut(spec) => copy_out(c, cx, tx, session, spec),
     }
 }
 
@@ -1172,7 +1554,7 @@ fn check_arg_types(name: &str, args: &[SqlValue], oids: &[u32]) -> Result<(), Pg
 }
 
 fn exec_prepared(
-    c: &mut TcpStream,
+    c: &mut Stream,
     cx: &Conn,
     tx: &mut TxState,
     session: &mut Session,
@@ -1478,7 +1860,7 @@ fn close_ext(
 /// only knows column names after execution. Read-only statements are executed with
 /// `NULL` for every parameter and their rows discarded; nothing mutating is executed.
 fn describe_sql(
-    c: &mut TcpStream,
+    c: &mut Stream,
     cx: &Conn,
     tx: &TxState,
     session: &Session,
@@ -1532,7 +1914,7 @@ fn describe_sql(
 }
 
 fn describe_ext(
-    c: &mut TcpStream,
+    c: &mut Stream,
     cx: &Conn,
     tx: &TxState,
     session: &Session,
@@ -1583,7 +1965,7 @@ fn describe_ext(
 }
 
 fn execute_ext(
-    c: &mut TcpStream,
+    c: &mut Stream,
     cx: &Conn,
     tx: &mut TxState,
     session: &mut Session,
@@ -1629,7 +2011,7 @@ fn execute_ext(
 /// Dispatch one extended-protocol message. Returns false when an ErrorResponse was
 /// sent and the caller must ignore messages until Sync.
 fn extended(
-    c: &mut TcpStream,
+    c: &mut Stream,
     cx: &Conn,
     tx: &mut TxState,
     session: &mut Session,
@@ -1753,17 +2135,515 @@ fn tag(stmt: &SqlStmt, res: &QueryResult, aborted_commit: bool) -> String {
     }
 }
 
-pub fn connection(mut c: TcpStream, st: AppState, credentials: Credentials) -> io::Result<()> {
+/// Column metadata for one `COPY` target. The engine is the only authority on
+/// column types, so the target table is described with `SHOW COLUMNS` before the
+/// text stream is typed; guessing from the values would silently corrupt a text
+/// column that happens to look numeric.
+fn copy_schema(cx: &Conn, table: &str) -> Result<Vec<CopyColumn>, PgError> {
+    let body = serde_json::to_vec(&serde_json::json!({
+        "sql": format!("SHOW COLUMNS FROM {table}"),
+        "force_leader": true,
+    }))
+    .map_err(|e| PgError::new("XX000", e.to_string()))?;
+    let (code, body) = http(&cx.st.listen_addr, "POST", cx.path, cx.subject, &body)
+        .map_err(|e| PgError::new("08006", e.to_string()))?;
+    if code != 200 {
+        return Err(PgError::new(
+            if code == 404 { "42P01" } else { "XX000" },
+            String::from_utf8_lossy(&body),
+        ));
+    }
+    let result: QueryResult =
+        serde_json::from_slice(&body).map_err(|e| PgError::new("XX000", e.to_string()))?;
+    let mut columns = Vec::with_capacity(result.rows.len());
+    for row in result.rows {
+        let (Some(SqlValue::Text(name)), Some(SqlValue::Text(kind))) = (row.first(), row.get(1))
+        else {
+            return Err(PgError::new("XX000", "malformed column metadata"));
+        };
+        let kind = match kind.as_str() {
+            "int" => CopyType::Int,
+            "text" => CopyType::Text,
+            "bool" => CopyType::Bool,
+            other => {
+                return Err(PgError::new(
+                    "XX000",
+                    format!("unknown column type \"{other}\""),
+                ))
+            }
+        };
+        columns.push(CopyColumn {
+            name: name.clone(),
+            kind,
+        });
+    }
+    Ok(columns)
+}
+
+/// Unescapes one `COPY` text-format field. The result is bytes because an octal
+/// or hex escape can produce any octet; the caller validates UTF-8.
+fn copy_unescape(raw: &[u8]) -> Result<Vec<u8>, PgError> {
+    let mut out = Vec::with_capacity(raw.len());
+    let mut i = 0;
+    while i < raw.len() {
+        if raw[i] != b'\\' {
+            out.push(raw[i]);
+            i += 1;
+            continue;
+        }
+        i += 1;
+        let Some(&next) = raw.get(i) else {
+            return Err(PgError::new("22P04", "unterminated COPY escape sequence"));
+        };
+        i += 1;
+        match next {
+            b'b' => out.push(8),
+            b'f' => out.push(12),
+            b'n' => out.push(b'\n'),
+            b'r' => out.push(b'\r'),
+            b't' => out.push(b'\t'),
+            b'v' => out.push(11),
+            b'\\' => out.push(b'\\'),
+            b'.' => out.push(b'.'),
+            b'x' => {
+                let mut value: u32 = 0;
+                let mut digits = 0;
+                while digits < 2 {
+                    match raw.get(i).and_then(|c| (*c as char).to_digit(16)) {
+                        Some(digit) => {
+                            value = value * 16 + digit;
+                            i += 1;
+                            digits += 1;
+                        }
+                        None => break,
+                    }
+                }
+                if digits == 0 {
+                    return Err(PgError::new("22P04", "invalid COPY hex escape"));
+                }
+                out.push(value as u8);
+            }
+            b'0'..=b'7' => {
+                let mut value = u32::from(next - b'0');
+                let mut digits = 1;
+                while digits < 3 {
+                    match raw.get(i) {
+                        Some(c @ b'0'..=b'7') => {
+                            value = value * 8 + u32::from(c - b'0');
+                            i += 1;
+                            digits += 1;
+                        }
+                        _ => break,
+                    }
+                }
+                if value > 255 {
+                    return Err(PgError::new("22P04", "invalid COPY octal escape"));
+                }
+                out.push(value as u8);
+            }
+            other => out.push(other),
+        }
+    }
+    Ok(out)
+}
+
+/// Turns one raw field into the SQL literal an ordinary `INSERT` would carry.
+fn copy_literal(raw: &[u8], kind: CopyType) -> Result<String, PgError> {
+    if raw == b"\\N" {
+        return Ok("NULL".into());
+    }
+    let value = String::from_utf8(copy_unescape(raw)?)
+        .map_err(|_| PgError::new("22021", "invalid byte sequence for encoding \"UTF8\""))?;
+    match kind {
+        CopyType::Text => Ok(quote(&value)),
+        CopyType::Int => value.parse::<i64>().map(|v| v.to_string()).map_err(|_| {
+            PgError::new(
+                "22P02",
+                format!("invalid input syntax for type integer: \"{value}\""),
+            )
+        }),
+        CopyType::Bool => bool_literal(&value),
+    }
+}
+
+fn copy_row(line: &[u8], columns: &[CopyColumn]) -> Result<Vec<String>, PgError> {
+    let fields: Vec<&[u8]> = line.split(|b| *b == b'\t').collect();
+    if fields.len() < columns.len() {
+        return Err(PgError::new(
+            "22P04",
+            format!("missing data for column \"{}\"", columns[fields.len()].name),
+        ));
+    }
+    if fields.len() > columns.len() {
+        return Err(PgError::new(
+            "22P04",
+            format!(
+                "extra data after last expected column (expected {}, got {})",
+                columns.len(),
+                fields.len()
+            ),
+        ));
+    }
+    fields
+        .iter()
+        .zip(columns)
+        .map(|(raw, column)| copy_literal(raw, column.kind))
+        .collect()
+}
+
+fn copy_insert(table: &str, columns: &[CopyColumn], batch: &[Vec<String>]) -> String {
+    let mut sql = String::from("INSERT INTO ");
+    sql.push_str(table);
+    sql.push_str(" (");
+    for (index, column) in columns.iter().enumerate() {
+        if index > 0 {
+            sql.push(',');
+        }
+        sql.push_str(&column.name);
+    }
+    sql.push_str(") VALUES ");
+    for (row_index, row) in batch.iter().enumerate() {
+        if row_index > 0 {
+            sql.push(',');
+        }
+        sql.push('(');
+        for (index, value) in row.iter().enumerate() {
+            if index > 0 {
+                sql.push(',');
+            }
+            sql.push_str(value);
+        }
+        sql.push(')');
+    }
+    sql
+}
+
+fn copy_flush(
+    c: &mut Stream,
+    cx: &Conn,
+    tx: &mut TxState,
+    session: &mut Session,
+    table: &str,
+    columns: &[CopyColumn],
+    batch: &mut Vec<Vec<String>>,
+) -> io::Result<Result<(), PgError>> {
+    let sql = copy_insert(table, columns, batch);
+    batch.clear();
+    match run_text(c, cx, tx, session, &sql)? {
+        Ok(_) => Ok(Ok(())),
+        Err(e) => Ok(Err(e)),
+    }
+}
+
+fn copy_in(
+    c: &mut Stream,
+    cx: &Conn,
+    tx: &mut TxState,
+    session: &mut Session,
+    spec: CopySpec,
+) -> io::Result<Result<Completed, PgError>> {
+    if tx.status == b'E' {
+        return Ok(Err(aborted_error()));
+    }
+    let Some((table, listed)) = spec.table else {
+        return Ok(Err(PgError::new("42601", "COPY FROM requires a table")));
+    };
+    let schema = match copy_schema(cx, &table) {
+        Ok(schema) => schema,
+        Err(e) => return Ok(Err(e)),
+    };
+    let mut columns: Vec<CopyColumn> = Vec::new();
+    match &listed {
+        None => columns.extend(schema.iter().cloned()),
+        Some(names) => {
+            for name in names {
+                let Some(column) = schema.iter().find(|c| c.name.eq_ignore_ascii_case(name)) else {
+                    return Ok(Err(PgError::new(
+                        "42703",
+                        format!("column \"{name}\" of relation \"{table}\" does not exist"),
+                    )));
+                };
+                if columns
+                    .iter()
+                    .any(|c| c.name.eq_ignore_ascii_case(&column.name))
+                {
+                    return Ok(Err(PgError::new(
+                        "42701",
+                        format!("column \"{name}\" specified more than once"),
+                    )));
+                }
+                columns.push(column.clone());
+            }
+        }
+    }
+    // CopyInResponse: text format, one format code per column.
+    let mut body = vec![0u8];
+    body.extend_from_slice(&(columns.len() as u16).to_be_bytes());
+    for _ in &columns {
+        body.extend_from_slice(&0u16.to_be_bytes());
+    }
+    packet(c, b'G', &body)?;
+    c.flush()?;
+
+    // Outside an explicit transaction the whole COPY is one transaction, so a
+    // failure halfway cannot leave a partial load behind. Inside one, the
+    // client's transaction already provides that.
+    let implicit_tx = tx.status != b'T';
+    let mut implicit = if implicit_tx {
+        Some(TxState {
+            status: b'I',
+            term: 0,
+        })
+    } else {
+        None
+    };
+    let work = implicit.as_mut().unwrap_or(tx);
+    if implicit_tx {
+        match run_text(c, cx, work, session, "BEGIN")? {
+            Ok(_) => {}
+            Err(e) => return Ok(Err(e)),
+        }
+    }
+
+    let mut pending: Vec<u8> = Vec::new();
+    let mut batch: Vec<Vec<String>> = Vec::new();
+    let mut batch_bytes = 0usize;
+    let mut rows = 0u64;
+    let mut failed: Option<PgError> = None;
+    let mut end_of_data = false;
+    loop {
+        let mut kind = [0];
+        if let Err(e) = c.read_exact(&mut kind) {
+            // A client that disappears mid-COPY must not leave its rows behind.
+            if implicit_tx {
+                let _ = run_text(c, cx, work, session, "ROLLBACK");
+            }
+            return Err(e);
+        }
+        let data = frame(c)?;
+        match kind[0] {
+            b'd' if !end_of_data => {
+                pending.extend_from_slice(&data);
+                if pending.len() > MAX_COPY_LINE {
+                    failed = Some(PgError::new("54000", "COPY line is too long"));
+                    pending.clear();
+                    end_of_data = true;
+                    continue;
+                }
+                while let Some(position) = pending.iter().position(|b| *b == b'\n') {
+                    let mut line: Vec<u8> = pending.drain(..=position).collect();
+                    line.pop();
+                    if line == b"\\." {
+                        // The text format's explicit end-of-data marker.
+                        end_of_data = true;
+                        pending.clear();
+                        break;
+                    }
+                    if failed.is_some() {
+                        continue;
+                    }
+                    match copy_row(&line, &columns) {
+                        Ok(values) => {
+                            batch_bytes += line.len() + 3;
+                            batch.push(values);
+                            rows += 1;
+                            if batch.len() >= COPY_BATCH_ROWS || batch_bytes >= COPY_BATCH_BYTES {
+                                match copy_flush(
+                                    c, cx, work, session, &table, &columns, &mut batch,
+                                )? {
+                                    Ok(()) => {}
+                                    Err(e) => failed = Some(e),
+                                }
+                                batch_bytes = 0;
+                            }
+                        }
+                        Err(e) => {
+                            failed = Some(e);
+                            batch.clear();
+                        }
+                    }
+                }
+            }
+            b'd' => {}
+            b'c' => break,
+            b'f' => {
+                let message = cstr(&data).unwrap_or("client aborted");
+                if implicit_tx {
+                    let _ = run_text(c, cx, work, session, "ROLLBACK");
+                }
+                return Ok(Err(PgError::new(
+                    "57014",
+                    format!("COPY from stdin failed: {message}"),
+                )));
+            }
+            b'H' => {}
+            b'X' => {
+                if implicit_tx {
+                    let _ = run_text(c, cx, work, session, "ROLLBACK");
+                }
+                return Err(io::Error::other("client terminated during COPY"));
+            }
+            _ => {
+                if implicit_tx {
+                    let _ = run_text(c, cx, work, session, "ROLLBACK");
+                }
+                return Ok(Err(PgError::new("08P01", "unexpected message during COPY")));
+            }
+        }
+    }
+    // A trailing line without its newline is still a row.
+    if failed.is_none() && !end_of_data && !pending.is_empty() {
+        match copy_row(&pending, &columns) {
+            Ok(values) => {
+                batch.push(values);
+                rows += 1;
+            }
+            Err(e) => failed = Some(e),
+        }
+    }
+    if failed.is_none() && !batch.is_empty() {
+        match copy_flush(c, cx, work, session, &table, &columns, &mut batch)? {
+            Ok(()) => {}
+            Err(e) => failed = Some(e),
+        }
+    }
+    match failed {
+        Some(e) => {
+            if implicit_tx {
+                let _ = run_text(c, cx, work, session, "ROLLBACK");
+            }
+            Ok(Err(e))
+        }
+        None => {
+            if implicit_tx {
+                match run_text(c, cx, work, session, "COMMIT")? {
+                    Ok(_) => {}
+                    Err(e) => return Ok(Err(e)),
+                }
+            }
+            Ok(Ok(Completed {
+                result: empty_result(),
+                tag: format!("COPY {rows}"),
+                ends_transaction: false,
+            }))
+        }
+    }
+}
+
+/// Appends one value to a `COPY TO STDOUT` line, escaping what the text format
+/// reserves: the backslash, the tab and the newline.
+fn copy_field(out: &mut String, value: &SqlValue) {
+    match value {
+        SqlValue::Null => out.push_str("\\N"),
+        SqlValue::Int(v) => out.push_str(&v.to_string()),
+        SqlValue::Bool(v) => out.push(if *v { 't' } else { 'f' }),
+        SqlValue::Text(v) => {
+            for ch in v.chars() {
+                match ch {
+                    '\\' => out.push_str("\\\\"),
+                    '\t' => out.push_str("\\t"),
+                    '\n' => out.push_str("\\n"),
+                    '\r' => out.push_str("\\r"),
+                    '\u{8}' => out.push_str("\\b"),
+                    '\u{c}' => out.push_str("\\f"),
+                    '\u{b}' => out.push_str("\\v"),
+                    other => out.push(other),
+                }
+            }
+        }
+    }
+}
+
+fn copy_out(
+    c: &mut Stream,
+    cx: &Conn,
+    tx: &mut TxState,
+    session: &mut Session,
+    spec: CopySpec,
+) -> io::Result<Result<Completed, PgError>> {
+    if tx.status == b'E' {
+        return Ok(Err(aborted_error()));
+    }
+    let sql = match (spec.table, spec.query) {
+        (Some((table, Some(columns))), _) => {
+            format!("SELECT {} FROM {table}", columns.join(", "))
+        }
+        (Some((table, None)), _) => format!("SELECT * FROM {table}"),
+        (None, Some(query)) => query,
+        (None, None) => return Ok(Err(PgError::new("42601", "COPY TO requires a table"))),
+    };
+    let completed = match run_text(c, cx, tx, session, &sql)? {
+        Ok(completed) => completed,
+        Err(e) => return Ok(Err(e)),
+    };
+    let result = completed.result;
+    let mut body = vec![0u8];
+    body.extend_from_slice(&(result.columns.len() as u16).to_be_bytes());
+    for _ in &result.columns {
+        body.extend_from_slice(&0u16.to_be_bytes());
+    }
+    packet(c, b'H', &body)?;
+    let mut rows = 0u64;
+    for row in &result.rows {
+        let mut line = String::new();
+        for (index, value) in row.iter().enumerate() {
+            if index > 0 {
+                line.push('\t');
+            }
+            copy_field(&mut line, value);
+        }
+        line.push('\n');
+        packet(c, b'd', line.as_bytes())?;
+        rows += 1;
+    }
+    packet(c, b'c', &[])?;
+    c.flush()?;
+    Ok(Ok(Completed {
+        result: empty_result(),
+        tag: format!("COPY {rows}"),
+        ends_transaction: false,
+    }))
+}
+
+pub fn connection(
+    sock: TcpStream,
+    st: AppState,
+    credentials: Credentials,
+    tls: Option<Arc<Tls>>,
+) -> io::Result<()> {
+    let mut c = Stream::Plain(sock);
     let mut startup = frame(&mut c)?;
-    // libpq can probe either GSS encryption or TLS. TLS termination is external in this version.
+    // libpq can probe GSS encryption (80877104) or TLS (80877103) before the
+    // startup packet. A GSS probe is always refused; a TLS probe is accepted
+    // when the listener has a certificate and refused otherwise, which keeps the
+    // cleartext default byte-for-byte the same as before.
     for _ in 0..2 {
-        if startup == 80877103u32.to_be_bytes() || startup == 80877104u32.to_be_bytes() {
+        if startup == 80877103u32.to_be_bytes() {
+            match &tls {
+                Some(tls) => {
+                    c.write_all(b"S")?;
+                    c.flush()?;
+                    c = Stream::upgrade(c, &tls.config)?;
+                }
+                None => c.write_all(b"N")?,
+            }
+            startup = frame(&mut c)?;
+        } else if startup == 80877104u32.to_be_bytes() {
             c.write_all(b"N")?;
             startup = frame(&mut c)?;
+        } else {
+            break;
         }
     }
     if startup.len() < 5 || startup[..4] != 196608u32.to_be_bytes() {
         return Err(io::Error::other("unsupported startup protocol"));
+    }
+    if tls.as_ref().is_some_and(|t| t.required) && matches!(c, Stream::Plain(_)) {
+        // The password below would travel in the clear, so a listener that
+        // requires TLS refuses instead of degrading.
+        error(&mut c, "28000", "TLS is required by this server")?;
+        c.flush()?;
+        return Ok(());
     }
     let fields: Vec<&str> = std::str::from_utf8(&startup[4..])
         .map_err(io::Error::other)?
@@ -1933,6 +2813,31 @@ pub fn connection(mut c: TcpStream, st: AppState, credentials: Credentials) -> i
                             }
                             if plan.is_empty() {
                                 error(&mut c, "42601", &parse_error.to_string())?;
+                                if tx.status == b'T' {
+                                    tx.status = b'E';
+                                }
+                                ready(&mut c, tx.status)?;
+                                continue;
+                            }
+                            // The client streams COPY data after the response,
+                            // so a COPY cannot be planned next to another
+                            // statement: its data would arrive while the server
+                            // was still running the rest of the script.
+                            if plan.len() > 1
+                                && plan.iter().any(|item| {
+                                    matches!(
+                                        item,
+                                        TextItem::Session(
+                                            SessionCmd::CopyIn(_) | SessionCmd::CopyOut(_)
+                                        )
+                                    )
+                                })
+                            {
+                                error(
+                                    &mut c,
+                                    "0A000",
+                                    "COPY must be the only statement in a query",
+                                )?;
                                 if tx.status == b'T' {
                                     tx.status = b'E';
                                 }
@@ -2531,5 +3436,136 @@ mod tests {
             };
             assert_eq!(tag(&stmt, res, false), expected, "{sql}");
         }
+    }
+
+    #[test]
+    fn copy_parses_table_and_query_forms() {
+        match session_cmd("COPY t FROM STDIN").unwrap() {
+            Some(SessionCmd::CopyIn(spec)) => {
+                assert_eq!(spec.table, Some(("t".to_string(), None)));
+                assert!(spec.query.is_none());
+            }
+            other => panic!("{other:?}"),
+        }
+        match session_cmd("COPY t (a, b) FROM STDIN WITH (FORMAT text)").unwrap() {
+            Some(SessionCmd::CopyIn(spec)) => assert_eq!(
+                spec.table,
+                Some(("t".to_string(), Some(vec!["a".into(), "b".into()])))
+            ),
+            other => panic!("{other:?}"),
+        }
+        match session_cmd("COPY (SELECT a, 'b)' FROM t WHERE a > 1) TO STDOUT").unwrap() {
+            Some(SessionCmd::CopyOut(spec)) => {
+                assert_eq!(
+                    spec.query.as_deref(),
+                    Some("SELECT a, 'b)' FROM t WHERE a > 1")
+                );
+                assert!(spec.table.is_none());
+            }
+            other => panic!("{other:?}"),
+        }
+        match session_cmd("COPY t TO STDOUT").unwrap() {
+            Some(SessionCmd::CopyOut(spec)) => {
+                assert_eq!(spec.table, Some(("t".to_string(), None)))
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn copy_refuses_what_it_cannot_do() {
+        for (sql, code) in [
+            ("COPY t FROM '/etc/passwd'", "0A000"),
+            ("COPY t TO '/tmp/out'", "0A000"),
+            ("COPY t FROM STDIN WITH (FORMAT csv)", "0A000"),
+            ("COPY t FROM STDIN WITH (DELIMITER ',')", "0A000"),
+            ("COPY (SELECT 1) FROM STDIN", "42601"),
+            ("COPY t FROM", "42601"),
+            ("COPY t (a,) FROM STDIN", "42601"),
+        ] {
+            let error = match session_cmd(sql) {
+                Ok(other) => panic!("{sql} parsed as {other:?}"),
+                Err(e) => e,
+            };
+            assert_eq!(error.code, code, "{sql}");
+        }
+    }
+
+    #[test]
+    fn copy_text_fields_round_trip() {
+        // Escapes the text format defines, including an octal and a hex byte.
+        assert_eq!(
+            copy_unescape(b"a\\b\\tc\\nd\\\\e\\101\\x42").unwrap(),
+            b"a\x08\tc\nd\\eAB"
+        );
+        let mut line = String::new();
+        copy_field(&mut line, &SqlValue::Text("a\tb\nc\\d".into()));
+        line.push('\t');
+        copy_field(&mut line, &SqlValue::Null);
+        line.push('\t');
+        copy_field(&mut line, &SqlValue::Int(-3));
+        line.push('\t');
+        copy_field(&mut line, &SqlValue::Bool(true));
+        assert_eq!(line, "a\\tb\\nc\\\\d\t\\N\t-3\tt");
+    }
+
+    #[test]
+    fn copy_rows_are_typed_and_bounded() {
+        let columns = vec![
+            CopyColumn {
+                name: "id".into(),
+                kind: CopyType::Int,
+            },
+            CopyColumn {
+                name: "name".into(),
+                kind: CopyType::Text,
+            },
+            CopyColumn {
+                name: "ok".into(),
+                kind: CopyType::Bool,
+            },
+        ];
+        assert_eq!(
+            copy_row(b"7\tit's\tt", &columns).unwrap(),
+            vec!["7".to_string(), "'it''s'".to_string(), "true".to_string()]
+        );
+        assert_eq!(
+            copy_row(b"\\N\t\\N\t\\N", &columns).unwrap(),
+            vec!["NULL".to_string(), "NULL".to_string(), "NULL".to_string()]
+        );
+        // A text column that looks numeric must stay text: typing is by the
+        // declared column type, never by the value.
+        assert_eq!(copy_row(b"1\t007\tf", &columns).unwrap()[1], "'007'");
+        assert_eq!(copy_row(b"x\ta\tt", &columns).unwrap_err().code, "22P02");
+        assert_eq!(copy_row(b"1\ta", &columns).unwrap_err().code, "22P04");
+        assert_eq!(
+            copy_row(b"1\ta\tt\textra", &columns).unwrap_err().code,
+            "22P04"
+        );
+        assert_eq!(copy_unescape(b"bad\\x").unwrap_err().code, "22P04");
+        // An octal escape above one byte is refused rather than truncated.
+        assert_eq!(copy_unescape(b"\\777").unwrap_err().code, "22P04");
+    }
+
+    #[test]
+    fn copy_batches_build_one_insert() {
+        let columns = vec![
+            CopyColumn {
+                name: "id".into(),
+                kind: CopyType::Int,
+            },
+            CopyColumn {
+                name: "name".into(),
+                kind: CopyType::Text,
+            },
+        ];
+        let batch = vec![
+            vec!["1".to_string(), "'a'".to_string()],
+            vec!["2".to_string(), "NULL".to_string()],
+        ];
+        assert_eq!(
+            copy_insert("t", &columns, &batch),
+            "INSERT INTO t (id,name) VALUES (1,'a'),(2,NULL)"
+        );
     }
 }

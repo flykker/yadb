@@ -9,7 +9,7 @@ name = "yadbd"
 path = "src/main.rs"
 
 [features]
-openraft-storage = ["yadb-metakv/openraft-storage", "dep:openraft", "dep:tokio-rustls"]
+openraft-storage = ["yadb-metakv/openraft-storage", "dep:openraft"]
 
 [dependencies]
 yadb-io = { path = "../yadb-io" }
@@ -20,7 +20,9 @@ yadb-s3 = { path = "../yadb-s3" }
 yadb-db = { path = "../yadb-db" }
 yadb-block = { path = "../yadb-block" }
 openraft = { workspace = true, optional = true }
-tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring"], optional = true }
+# Blocking TLS for the opt-in pgwire listener; also used by the OpenRaft peer
+# transport, which is why it is not optional.
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring"] }
 axum.workspace = true
 bytes.workspace = true
 clap.workspace = true

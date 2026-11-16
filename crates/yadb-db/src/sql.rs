@@ -221,6 +221,12 @@ pub enum SqlStmt {
     ShowIndexes {
         table: String,
     },
+    /// `SHOW COLUMNS FROM <table>`: column name, type and primary-key flag in
+    /// declaration order. `COPY` needs it to type a text stream; it is also the
+    /// smallest schema introspection this engine can honestly offer.
+    ShowColumns {
+        table: String,
+    },
     CreateTable {
         table: String,
         if_not_exists: bool,
@@ -303,6 +309,7 @@ impl SqlStmt {
         match self {
             SqlStmt::ShowTables
             | SqlStmt::ShowIndexes { .. }
+            | SqlStmt::ShowColumns { .. }
             | SqlStmt::Select { .. }
             | SqlStmt::SelectNoFrom { .. }
             | SqlStmt::Set { .. }
@@ -988,6 +995,13 @@ impl Parser {
                 }
                 let table = self.expect_ident()?;
                 return Ok(SqlStmt::ShowIndexes { table });
+            }
+            if self.eat_kw("COLUMNS") {
+                if !self.eat_kw("FROM") {
+                    self.expect_kw("IN")?;
+                }
+                let table = self.expect_ident()?;
+                return Ok(SqlStmt::ShowColumns { table });
             }
             return self.parse_show_setting();
         }
@@ -1716,6 +1730,15 @@ mod tests {
             parse_sql("SHOW INDEXES ON t").unwrap(),
             SqlStmt::ShowIndexes { table: "t".into() }
         );
+        assert_eq!(
+            parse_sql("SHOW COLUMNS FROM t").unwrap(),
+            SqlStmt::ShowColumns { table: "t".into() }
+        );
+        assert_eq!(
+            parse_sql("SHOW COLUMNS IN t").unwrap(),
+            SqlStmt::ShowColumns { table: "t".into() }
+        );
+        assert!(!parse_sql("SHOW COLUMNS FROM t").unwrap().is_write());
         // UPDATE ... SET is still the update statement.
         assert!(matches!(
             parse_sql("UPDATE t SET v = 1 WHERE id = 2").unwrap(),

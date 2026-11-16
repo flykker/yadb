@@ -126,9 +126,36 @@ at `Execute`.
 `Describe` obtains column names only by executing a read-only statement (`SELECT` or
 `SHOW`) through the gateway with `NULL` parameters and discarding the rows; a mutating
 statement answers `NoData` without being executed. Execute row limits
-(`PortalSuspended`) are refused. COPY, TLS termination and binary formats remain
-unsupported. Put TLS/mTLS in front of the listener (or use a private network): the
-password exchange is cleartext inside the TCP connection.
+(`PortalSuspended`) are refused.
+
+`COPY` is implemented in the **text** format only:
+
+- `COPY <table> [(<columns>)] FROM STDIN` reads the client stream, types each field by
+  the table's declared column types (obtained with `SHOW COLUMNS FROM <table>`), and
+  loads the rows as batched `INSERT`s through the normal transaction path. The text
+  escapes (`\t`, `\n`, `\\`, `\b`, `\f`, `\r`, `\v`, octal, `\xHH`) and `\N` for NULL
+  are honoured. Outside an explicit `BEGIN`, the whole `COPY` is one transaction, so a
+  malformed row, a duplicate key or a failed batch rolls the entire load back; inside
+  one, the client's transaction provides that. `COPY ... FROM STDIN` must be the only
+  statement in a query, because its data arrives after the response.
+- `COPY <table> [(<columns>)] TO STDOUT` and `COPY (<select>) TO STDOUT` stream rows in
+  the same text format.
+- Server-side files (`COPY ... FROM '/path'`) and any option other than `FORMAT text`
+  are refused with `0A000` rather than silently ignored. CSV and binary formats are not
+  implemented, and `PortalSuspended` remains unsupported.
+
+`SHOW COLUMNS FROM <table>` (also `SHOW COLUMNS IN <table>`) answers `column`, `type`
+and `primary_key` in declaration order. It exists because `COPY` needs the declared
+types: inferring them from the values would silently turn a text column that looks
+numeric into an integer.
+
+TLS is opt-in per listener. `--pg-tls-cert` and `--pg-tls-key` (PEM or DER) make the
+listener answer `SSLRequest` with `S` and complete a TLS handshake; `--pg-tls-client-ca`
+additionally requires a client certificate signed by that CA (mTLS), and
+`--pg-require-tls` refuses a cleartext startup packet with `28000`. Without these flags
+the behaviour is unchanged: `SSLRequest` answers `N`, and the password exchange is
+cleartext inside the TCP connection, so keep the listener on a trusted network or put
+TLS/mTLS in front of it. Binary formats remain unsupported.
 
 The database name is `project/database`, and the PostgreSQL user is the credentials-file
 access-key:
@@ -137,6 +164,15 @@ access-key:
 PGPASSWORD='replace-with-a-random-secret-at-least-12-chars' \
   psql 'host=10.0.0.11 port=5433 user=backend dbname=billing/ledger sslmode=disable' \
   -c 'SELECT id, owner, balance FROM accounts ORDER BY id;'
+```
+
+With TLS configured, the same listener accepts `sslmode=verify-full` when the client
+trusts the configured certificate:
+
+```bash
+PGPASSWORD='...' psql \
+  'host=db.internal port=5433 user=backend dbname=billing/ledger sslmode=verify-full sslrootcert=ca.pem' \
+  -c 'COPY accounts FROM STDIN'
 ```
 
 For production use, terminate TLS with a sidecar/reverse proxy and restrict the listener
