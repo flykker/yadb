@@ -4852,12 +4852,531 @@ async fn handle_s3_list(
     }
 }
 
+/// Query parameters of a keyed S3 write. Multipart part upload, completion and
+/// abort are the only operations that read them; a single `PUT`/`DELETE` leaves
+/// every field empty and keeps its previous path byte-for-byte.
+#[derive(Deserialize, Default)]
+struct S3WriteQuery {
+    /// Present (usually with an empty value) on `POST ...?uploads`.
+    #[serde(default)]
+    uploads: Option<String>,
+    #[serde(default, rename = "uploadId", alias = "upload_id")]
+    upload_id: Option<String>,
+    #[serde(default, rename = "partNumber", alias = "part_number")]
+    part_number: Option<u32>,
+}
+
+/// Maps an engine multipart error onto the gateway's JSON error convention.
+///
+/// `ConcurrentModification` means the single completion transaction lost its
+/// revision guard: the manifest may or may not have been published by a racing
+/// attempt, so the caller must not replay it. It is reported as an ambiguous
+/// failure with the explicit no-retry marker the forwarding path uses.
+fn s3_multipart_err(st: &AppState, err: S3Error) -> Response {
+    let (status, code, message) = match err {
+        S3Error::MultipartUploadNotFound(id) => (
+            StatusCode::NOT_FOUND,
+            "NoSuchUpload",
+            format!("upload `{id}` does not exist"),
+        ),
+        S3Error::InvalidPart { part, reason } => {
+            (StatusCode::BAD_REQUEST, "InvalidPart", format!("part {part}: {reason}"))
+        }
+        S3Error::InvalidPartOrder => (
+            StatusCode::BAD_REQUEST,
+            "InvalidPartOrder",
+            "parts must be listed in strictly ascending order".into(),
+        ),
+        S3Error::PartTooLarge { part, size, max } => (
+            StatusCode::BAD_REQUEST,
+            "EntityTooLarge",
+            format!("part {part} is {size} bytes, over the {max}-byte part limit"),
+        ),
+        S3Error::MalformedMultipart(reason) => (
+            StatusCode::BAD_REQUEST,
+            "MalformedXML",
+            format!("malformed completion request: {reason}"),
+        ),
+        S3Error::Meta(me) => return meta_err_resp(st, me),
+        S3Error::Blob(BlobError::RedundancyNotMet { .. }) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "ServiceUnavailable",
+            "storage pool cannot reach full redundancy; the write was refused".into(),
+        ),
+        S3Error::ConcurrentModification => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "ServiceUnavailable",
+            "multipart state changed under the request; the outcome is ambiguous, do not retry automatically".into(),
+        ),
+        e => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "InternalError",
+            e.to_string(),
+        ),
+    };
+    let mut response = (
+        status,
+        Json(serde_json::json!({ "error": message, "code": code })),
+    )
+        .into_response();
+    if matches!(status, StatusCode::SERVICE_UNAVAILABLE) {
+        response
+            .headers_mut()
+            .insert("x-yadb-retry", HeaderValue::from_static("do-not-retry"));
+    }
+    response
+}
+
+/// Uploads one part of a multipart upload.
+///
+/// The body is bounded to 16 MiB by the daemon's body limit before this runs and
+/// re-checked by the engine. The part ETag is computed by the engine from the
+/// bytes it stored, so a client-supplied digest is never trusted.
+async fn handle_s3_upload_part(
+    st: AppState,
+    headers: HeaderMap,
+    project: String,
+    store: String,
+    bucket: String,
+    key: String,
+    upload_id: String,
+    part_number: u32,
+    body: Bytes,
+) -> Response {
+    if let Some(proxied) = maybe_forward_write(
+        &st,
+        &headers,
+        Some(&project),
+        "PUT",
+        format!(
+            "/s3/{}/{}/{}/{}?uploadId={}&partNumber={part_number}",
+            protocols::url(&project),
+            protocols::url(&store),
+            protocols::url(&bucket),
+            key.split('/')
+                .map(protocols::url)
+                .collect::<Vec<_>>()
+                .join("/"),
+            protocols::url(&upload_id),
+        ),
+        "application/octet-stream".into(),
+        body.clone(),
+    )
+    .await
+    {
+        return proxied;
+    }
+    let subject = extract_subject(&headers, st.subject_secret.as_deref());
+    let (project_id, _) = {
+        let cp = match st.control_for_authorization_async().await {
+            Ok(cp) => cp,
+            Err(e) => return e.into_response(),
+        };
+        match resolve_s3_target(&cp, &project, &store, &bucket, &subject, Role::ReadWrite) {
+            Ok(v) => v,
+            Err(resp) => return resp,
+        }
+    };
+    let s3 = st.s3.clone();
+    let res = tokio::task::spawn_blocking(move || {
+        s3.upload_part(
+            project_id,
+            &store,
+            &bucket,
+            &key,
+            &upload_id,
+            part_number,
+            &body,
+        )
+    })
+    .await;
+    match res {
+        Ok(Ok(etag)) => (
+            StatusCode::OK,
+            [(header::ETAG, format!("\"{etag}\""))],
+            Json(serde_json::json!({ "partNumber": part_number, "etag": etag })),
+        )
+            .into_response(),
+        Ok(Err(e)) => s3_multipart_err(&st, e),
+        Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+/// Starts a multipart upload. The record is durable before this returns, so the
+/// id it hands out always names a collectable upload.
+async fn handle_s3_create_multipart(
+    st: AppState,
+    headers: HeaderMap,
+    project: String,
+    store: String,
+    bucket: String,
+    key: String,
+) -> Response {
+    if let Some(proxied) = maybe_forward_write(
+        &st,
+        &headers,
+        Some(&project),
+        "POST",
+        format!(
+            "/s3/{}/{}/{}/{}?uploads",
+            protocols::url(&project),
+            protocols::url(&store),
+            protocols::url(&bucket),
+            key.split('/')
+                .map(protocols::url)
+                .collect::<Vec<_>>()
+                .join("/"),
+        ),
+        "application/octet-stream".into(),
+        Bytes::new(),
+    )
+    .await
+    {
+        return proxied;
+    }
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream")
+        .to_string();
+    let subject = extract_subject(&headers, st.subject_secret.as_deref());
+    let (project_id, pool_name) = {
+        let cp = match st.control_for_authorization_async().await {
+            Ok(cp) => cp,
+            Err(e) => return e.into_response(),
+        };
+        match resolve_s3_target(&cp, &project, &store, &bucket, &subject, Role::ReadWrite) {
+            Ok(v) => v,
+            Err(resp) => return resp,
+        }
+    };
+    let s3 = st.s3.clone();
+    let res = tokio::task::spawn_blocking(move || {
+        let upload_id = s3.create_multipart_upload(
+            project_id,
+            &store,
+            &pool_name,
+            &bucket,
+            &key,
+            &content_type,
+        )?;
+        Ok::<_, S3Error>((upload_id, bucket, key))
+    })
+    .await;
+    match res {
+        Ok(Ok((upload_id, bucket, key))) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "bucket": bucket,
+                "key": key,
+                "uploadId": upload_id,
+            })),
+        )
+            .into_response(),
+        Ok(Err(e)) => s3_multipart_err(&st, e),
+        Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+/// Publishes a completed multipart upload in the engine's one guarded
+/// transaction, then reports the object exactly as a single PUT would.
+async fn handle_s3_complete_multipart(
+    st: AppState,
+    headers: HeaderMap,
+    project: String,
+    store: String,
+    bucket: String,
+    key: String,
+    upload_id: String,
+    body: Bytes,
+) -> Response {
+    if let Some(proxied) = maybe_forward_write(
+        &st,
+        &headers,
+        Some(&project),
+        "POST",
+        format!(
+            "/s3/{}/{}/{}/{}?uploadId={}",
+            protocols::url(&project),
+            protocols::url(&store),
+            protocols::url(&bucket),
+            key.split('/')
+                .map(protocols::url)
+                .collect::<Vec<_>>()
+                .join("/"),
+            protocols::url(&upload_id),
+        ),
+        "application/xml".into(),
+        body.clone(),
+    )
+    .await
+    {
+        return proxied;
+    }
+    let parts = match parse_complete_multipart(&body) {
+        Ok(parts) => parts,
+        Err(e) => return s3_multipart_err(&st, e),
+    };
+    let subject = extract_subject(&headers, st.subject_secret.as_deref());
+    let (project_id, _) = {
+        let cp = match st.control_for_authorization_async().await {
+            Ok(cp) => cp,
+            Err(e) => return e.into_response(),
+        };
+        match resolve_s3_target(&cp, &project, &store, &bucket, &subject, Role::ReadWrite) {
+            Ok(v) => v,
+            Err(resp) => return resp,
+        }
+    };
+    let s3 = st.s3.clone();
+    let res = tokio::task::spawn_blocking(move || {
+        s3.complete_multipart_upload(project_id, &store, &bucket, &key, &upload_id, &parts)
+    })
+    .await;
+    match res {
+        Ok(Ok(mf)) => (
+            StatusCode::OK,
+            [(header::ETAG, mf.etag.clone())],
+            Json(serde_json::json!({
+                "etag": mf.etag,
+                "size": mf.size,
+                "chunks": mf.chunks.len(),
+                "pool": mf.pool,
+            })),
+        )
+            .into_response(),
+        Ok(Err(e)) => s3_multipart_err(&st, e),
+        Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+/// Abandons a multipart upload. Its record and every still-live part intent are
+/// retired in one transaction; the existing collector reclaims the fragments
+/// after the documented grace.
+async fn handle_s3_abort_multipart(
+    st: AppState,
+    headers: HeaderMap,
+    project: String,
+    store: String,
+    bucket: String,
+    key: String,
+    upload_id: String,
+) -> Response {
+    if let Some(proxied) = maybe_forward_write(
+        &st,
+        &headers,
+        Some(&project),
+        "DELETE",
+        format!(
+            "/s3/{}/{}/{}/{}?uploadId={}",
+            protocols::url(&project),
+            protocols::url(&store),
+            protocols::url(&bucket),
+            key.split('/')
+                .map(protocols::url)
+                .collect::<Vec<_>>()
+                .join("/"),
+            protocols::url(&upload_id),
+        ),
+        "application/octet-stream".into(),
+        Bytes::new(),
+    )
+    .await
+    {
+        return proxied;
+    }
+    let subject = extract_subject(&headers, st.subject_secret.as_deref());
+    let (project_id, _) = {
+        let cp = match st.control_for_authorization_async().await {
+            Ok(cp) => cp,
+            Err(e) => return e.into_response(),
+        };
+        match resolve_s3_target(&cp, &project, &store, &bucket, &subject, Role::ReadWrite) {
+            Ok(v) => v,
+            Err(resp) => return resp,
+        }
+    };
+    let s3 = st.s3.clone();
+    let res = tokio::task::spawn_blocking(move || {
+        s3.abort_multipart_upload(project_id, &store, &bucket, &key, &upload_id)
+    })
+    .await;
+    match res {
+        Ok(Ok(())) => Json(serde_json::json!({ "aborted": true })).into_response(),
+        Ok(Err(e)) => s3_multipart_err(&st, e),
+        Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+/// `GET ...?uploadId=...` — the parts registered so far.
+async fn handle_s3_list_parts(
+    st: AppState,
+    headers: HeaderMap,
+    project: String,
+    store: String,
+    bucket: String,
+    key: String,
+    upload_id: String,
+) -> Response {
+    let subject = extract_subject(&headers, st.subject_secret.as_deref());
+    let (project_id, _) = {
+        let cp = match st.control_for_authorization_async().await {
+            Ok(cp) => cp,
+            Err(e) => return e.into_response(),
+        };
+        match resolve_s3_target(&cp, &project, &store, &bucket, &subject, Role::ReadOnly) {
+            Ok(v) => v,
+            Err(resp) => return resp,
+        }
+    };
+    let s3 = st.s3.clone();
+    let res = tokio::task::spawn_blocking(move || {
+        let parts = s3.list_multipart_parts(project_id, &store, &bucket, &key, &upload_id)?;
+        Ok::<_, S3Error>((parts, bucket, key, upload_id))
+    })
+    .await;
+    match res {
+        Ok(Ok((parts, bucket, key, upload_id))) => Json(serde_json::json!({
+            "bucket": bucket,
+            "key": key,
+            "uploadId": upload_id,
+            "parts": parts.iter().map(|part| serde_json::json!({
+                "partNumber": part.part_number,
+                "etag": part.etag,
+                "size": part.size,
+                "lastModified": part.last_modified,
+            })).collect::<Vec<_>>(),
+        }))
+        .into_response(),
+        Ok(Err(e)) => s3_multipart_err(&st, e),
+        Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+/// Reads the `<Part><PartNumber>`/`<ETag>` list out of a completion document.
+///
+/// The parser is deliberately narrow: it accepts the document S3 clients send
+/// and rejects anything it cannot read as a whole, rather than guessing. An
+/// empty list is refused here as well as in the engine.
+fn parse_complete_multipart(body: &[u8]) -> Result<Vec<(u32, String)>, S3Error> {
+    let text = std::str::from_utf8(body)
+        .map_err(|_| S3Error::MalformedMultipart("body is not UTF-8".into()))?;
+    if !text.contains("<CompleteMultipartUpload") {
+        return Err(S3Error::MalformedMultipart(
+            "expected a CompleteMultipartUpload document".into(),
+        ));
+    }
+    // A truncated document is refused rather than read as a shorter list: the
+    // client's list is the authority on what the object must contain.
+    if !text.contains("</CompleteMultipartUpload>") {
+        return Err(S3Error::MalformedMultipart(
+            "unterminated CompleteMultipartUpload document".into(),
+        ));
+    }
+    let mut parts = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("<Part>") {
+        let after = &rest[start + "<Part>".len()..];
+        let Some(end) = after.find("</Part>") else {
+            return Err(S3Error::MalformedMultipart(
+                "unterminated <Part> element".into(),
+            ));
+        };
+        let block = &after[..end];
+        let number = tag_value(block, "PartNumber")
+            .ok_or_else(|| S3Error::MalformedMultipart("a <Part> has no <PartNumber>".into()))?;
+        let number = number.trim().parse::<u32>().map_err(|_| {
+            S3Error::MalformedMultipart(format!("invalid part number `{}`", number.trim()))
+        })?;
+        let etag = tag_value(block, "ETag")
+            .ok_or_else(|| S3Error::MalformedMultipart("a <Part> has no <ETag>".into()))?;
+        parts.push((number, xml_unescape(etag.trim())));
+        rest = &after[end + "</Part>".len()..];
+    }
+    if parts.is_empty() {
+        return Err(S3Error::MalformedMultipart(
+            "at least one part is required".into(),
+        ));
+    }
+    Ok(parts)
+}
+
+fn tag_value<'a>(input: &'a str, tag: &str) -> Option<&'a str> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = input.find(&open)? + open.len();
+    let end = start + input[start..].find(&close)?;
+    Some(&input[start..end])
+}
+
+/// XML entity decoding for the handful of entities an ETag can carry. `&amp;`
+/// is expanded last so a literal `&amp;quot;` is not decoded twice.
+fn xml_unescape(value: &str) -> String {
+    value
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
+/// `POST /s3/{project}/{store}/{bucket}/{key}`: create or complete a multipart
+/// upload, selected by the subresource the client sent.
+async fn handle_s3_multipart(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path((project, store, bucket, key)): Path<(String, String, String, String)>,
+    Query(q): Query<S3WriteQuery>,
+    body: Bytes,
+) -> Response {
+    if q.uploads.is_some() {
+        return handle_s3_create_multipart(st, headers, project, store, bucket, key).await;
+    }
+    match q.upload_id {
+        Some(upload_id) => {
+            handle_s3_complete_multipart(st, headers, project, store, bucket, key, upload_id, body)
+                .await
+        }
+        None => api_err(
+            StatusCode::NOT_IMPLEMENTED,
+            "unsupported S3 POST subresource",
+        ),
+    }
+}
+
 async fn handle_s3_put(
     State(st): State<AppState>,
     headers: HeaderMap,
     Path((project, store, bucket, key)): Path<(String, String, String, String)>,
+    Query(q): Query<S3WriteQuery>,
     body: Bytes,
 ) -> Response {
+    if let Some(upload_id) = q.upload_id {
+        let Some(part_number) = q.part_number else {
+            return api_err(
+                StatusCode::BAD_REQUEST,
+                "partNumber is required when uploadId is present",
+            );
+        };
+        return handle_s3_upload_part(
+            st,
+            headers,
+            project,
+            store,
+            bucket,
+            key,
+            upload_id,
+            part_number,
+            body,
+        )
+        .await;
+    }
+    if q.part_number.is_some() || q.uploads.is_some() {
+        return api_err(
+            StatusCode::BAD_REQUEST,
+            "partNumber requires uploadId, and uploads is only valid on POST",
+        );
+    }
     if headers.contains_key("idempotency-key") {
         // A legacy runtime has no record store, so the key is refused before
         // authorization or any fragment write.
@@ -5298,7 +5817,12 @@ async fn handle_s3_delete(
     State(st): State<AppState>,
     headers: HeaderMap,
     Path((project, store, bucket, key)): Path<(String, String, String, String)>,
+    Query(q): Query<S3WriteQuery>,
 ) -> Response {
+    if let Some(upload_id) = q.upload_id {
+        return handle_s3_abort_multipart(st, headers, project, store, bucket, key, upload_id)
+            .await;
+    }
     if headers.contains_key("idempotency-key") {
         if !st.meta.is_openraft() {
             return unsupported_idempotency();
@@ -6503,7 +7027,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/s3/{project}/{store}/{bucket}", get(handle_s3_list))
         .route(
             "/s3/{project}/{store}/{bucket}/{*key}",
-            put(handle_s3_put).get(handle_s3_get).delete(handle_s3_delete),
+            put(handle_s3_put)
+                .get(handle_s3_get)
+                .delete(handle_s3_delete)
+                .post(handle_s3_multipart),
         )
         .layer(axum::extract::DefaultBodyLimit::max(16 * 1024 * 1024))
         ;
@@ -7894,6 +8421,327 @@ mod security_tests {
         let response = get("empty", headers).await;
         assert_eq!(response.status(), StatusCode::RANGE_NOT_SATISFIABLE);
         assert_eq!(response.headers()[header::CONTENT_RANGE], "bytes */0");
+    }
+
+    /// A gateway state whose one ObjectStore is usable end to end: one mirror
+    /// pool, one project and one declared `proj/store` ObjectStore.
+    fn s3_multipart_state(tag: &str) -> (AppState, std::path::PathBuf) {
+        let (state, dir) = legacy_fragment_state_with_dir(tag);
+        let mut st = state;
+        st.s3 = ObjectStoreEngine::new(st.meta.clone(), 4096);
+        st.s3
+            .register_pool("data", st.pools.read().unwrap()["data"].clone());
+        st.control.write().unwrap().object_stores.insert(
+            "proj/store".into(),
+            yadb_control::ObjectStoreSpec {
+                pool: "data".into(),
+                isolation: Default::default(),
+                buckets: vec![],
+            },
+        );
+        (st, dir)
+    }
+
+    // The multipart gateway handlers publish through the same engine as a single
+    // PUT, so the assembled object must be indistinguishable from one written in
+    // one piece: same bytes, same chunk offsets, and an ETag derived from the
+    // part digests.
+    #[tokio::test]
+    async fn gateway_multipart_upload_assembles_an_object_identical_to_a_single_put() {
+        let (state, dir) = s3_multipart_state("s3-multipart-roundtrip");
+        let _dir = TempDirGuard(dir);
+        let st = state;
+        let key = "big/object.bin";
+        let parts: [Vec<u8>; 3] = [vec![1u8; 5000], vec![2u8; 4096], vec![3u8; 17]];
+        let expected: Vec<u8> = parts.iter().flat_map(|p| p.iter().copied()).collect();
+
+        let response = handle_s3_create_multipart(
+            st.clone(),
+            HeaderMap::new(),
+            "proj".into(),
+            "store".into(),
+            "bucket".into(),
+            key.into(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let created: serde_json::Value =
+            serde_json::from_slice(&body_bytes(response).await).unwrap();
+        let upload_id = created["uploadId"].as_str().unwrap().to_string();
+        assert!(upload_id.starts_with("mpu-"), "{upload_id}");
+
+        let mut etags = Vec::new();
+        for (index, part) in parts.iter().enumerate() {
+            let response = handle_s3_upload_part(
+                st.clone(),
+                HeaderMap::new(),
+                "proj".into(),
+                "store".into(),
+                "bucket".into(),
+                key.into(),
+                upload_id.clone(),
+                index as u32 + 1,
+                Bytes::copy_from_slice(part),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let etag = response.headers()[header::ETAG]
+                .to_str()
+                .unwrap()
+                .to_string();
+            assert_eq!(etag, format!("\"{}\"", yadb_s3::md5_hex(part)));
+            etags.push((index as u32 + 1, etag.trim_matches('"').to_string()));
+        }
+
+        // An ETag the client did not upload is refused with InvalidPart, and the
+        // upload survives the refusal so the client can retry correctly.
+        let mut wrong = etags.clone();
+        wrong[0].1 = "0".repeat(32);
+        let response = handle_s3_complete_multipart(
+            st.clone(),
+            HeaderMap::new(),
+            "proj".into(),
+            "store".into(),
+            "bucket".into(),
+            key.into(),
+            upload_id.clone(),
+            Bytes::from(completion_xml(&wrong)),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let refusal = String::from_utf8(body_bytes(response).await).unwrap();
+        assert!(refusal.contains("\"code\":\"InvalidPart\""), "{refusal}");
+        assert!(st.s3.head_object(1, "store", "bucket", key).is_err());
+
+        let response = handle_s3_complete_multipart(
+            st.clone(),
+            HeaderMap::new(),
+            "proj".into(),
+            "store".into(),
+            "bucket".into(),
+            key.into(),
+            upload_id.clone(),
+            Bytes::from(completion_xml(&etags)),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let completed: serde_json::Value =
+            serde_json::from_slice(&body_bytes(response).await).unwrap();
+        let etag = completed["etag"].as_str().unwrap().to_string();
+        assert_eq!(
+            etag,
+            format!(
+                "\"{}-3\"",
+                yadb_s3::md5_hex(
+                    &parts
+                        .iter()
+                        .flat_map(|p| yadb_s3::md5(p).to_vec())
+                        .collect::<Vec<_>>()
+                )
+            )
+        );
+
+        // The published manifest is a normal object: HEAD, full GET and a range
+        // read all agree with the concatenated parts.
+        let head = st.s3.head_object(1, "store", "bucket", key).unwrap();
+        assert_eq!(head.size, expected.len() as u64);
+        assert_eq!(head.etag, etag);
+        let response = handle_s3_get(
+            State(st.clone()),
+            HeaderMap::new(),
+            Path(("proj".into(), "store".into(), "bucket".into(), key.into())),
+            Query(S3GetQuery { consistent: false }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_bytes(response).await, expected);
+        let mut headers = HeaderMap::new();
+        headers.insert(header::RANGE, "bytes=4096-4999".parse().unwrap());
+        let response = handle_s3_get(
+            State(st.clone()),
+            headers,
+            Path(("proj".into(), "store".into(), "bucket".into(), key.into())),
+            Query(S3GetQuery { consistent: false }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(body_bytes(response).await, vec![1u8; 904]);
+
+        // A second completion of the consumed upload is NoSuchUpload, not a
+        // second publication.
+        let response = handle_s3_complete_multipart(
+            st.clone(),
+            HeaderMap::new(),
+            "proj".into(),
+            "store".into(),
+            "bucket".into(),
+            key.into(),
+            upload_id,
+            Bytes::from(completion_xml(&etags)),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn gateway_multipart_abort_removes_the_upload_and_leaves_no_object() {
+        let (state, dir) = s3_multipart_state("s3-multipart-abort");
+        let _dir = TempDirGuard(dir);
+        let st = state;
+        let response = handle_s3_create_multipart(
+            st.clone(),
+            HeaderMap::new(),
+            "proj".into(),
+            "store".into(),
+            "bucket".into(),
+            "aborted".into(),
+        )
+        .await;
+        let created: serde_json::Value =
+            serde_json::from_slice(&body_bytes(response).await).unwrap();
+        let upload_id = created["uploadId"].as_str().unwrap().to_string();
+        handle_s3_upload_part(
+            st.clone(),
+            HeaderMap::new(),
+            "proj".into(),
+            "store".into(),
+            "bucket".into(),
+            "aborted".into(),
+            upload_id.clone(),
+            1,
+            Bytes::from_static(b"payload"),
+        )
+        .await;
+        let response = handle_s3_abort_multipart(
+            st.clone(),
+            HeaderMap::new(),
+            "proj".into(),
+            "store".into(),
+            "bucket".into(),
+            "aborted".into(),
+            upload_id.clone(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(st.s3.head_object(1, "store", "bucket", "aborted").is_err());
+        // The upload cannot be continued or aborted twice.
+        let response = handle_s3_upload_part(
+            st.clone(),
+            HeaderMap::new(),
+            "proj".into(),
+            "store".into(),
+            "bucket".into(),
+            "aborted".into(),
+            upload_id.clone(),
+            2,
+            Bytes::from_static(b"late"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let response = handle_s3_abort_multipart(
+            st.clone(),
+            HeaderMap::new(),
+            "proj".into(),
+            "store".into(),
+            "bucket".into(),
+            "aborted".into(),
+            upload_id,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn gateway_multipart_refuses_a_bad_completion_document() {
+        let (state, dir) = s3_multipart_state("s3-multipart-malformed");
+        let _dir = TempDirGuard(dir);
+        let st = state;
+        let response = handle_s3_create_multipart(
+            st.clone(),
+            HeaderMap::new(),
+            "proj".into(),
+            "store".into(),
+            "bucket".into(),
+            "key".into(),
+        )
+        .await;
+        let created: serde_json::Value =
+            serde_json::from_slice(&body_bytes(response).await).unwrap();
+        let upload_id = created["uploadId"].as_str().unwrap().to_string();
+        for (document, code) in [
+            ("<not-a-completion/>".to_string(), "MalformedXML"),
+            (
+                "<CompleteMultipartUpload></CompleteMultipartUpload>".to_string(),
+                "MalformedXML",
+            ),
+            (
+                "<CompleteMultipartUpload><Part><PartNumber>x</PartNumber><ETag>\"a\"</ETag></Part></CompleteMultipartUpload>".to_string(),
+                "MalformedXML",
+            ),
+        ] {
+            let response = handle_s3_complete_multipart(
+                st.clone(),
+                HeaderMap::new(),
+                "proj".into(),
+                "store".into(),
+                "bucket".into(),
+                "key".into(),
+                upload_id.clone(),
+                Bytes::from(document.clone()),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{document}");
+            let body = String::from_utf8(body_bytes(response).await).unwrap();
+            assert!(body.contains(&format!("\"code\":\"{code}\"")), "{body}");
+        }
+    }
+
+    fn completion_xml(parts: &[(u32, String)]) -> String {
+        let mut out = String::from("<CompleteMultipartUpload>");
+        for (number, etag) in parts {
+            out.push_str(&format!(
+                "<Part><PartNumber>{number}</PartNumber><ETag>&quot;{etag}&quot;</ETag></Part>"
+            ));
+        }
+        out.push_str("</CompleteMultipartUpload>");
+        out
+    }
+
+    #[test]
+    fn completion_parser_reads_the_part_list_and_rejects_what_it_cannot_read() {
+        let parsed = parse_complete_multipart(
+            br#"<?xml version="1.0" encoding="UTF-8"?>
+            <CompleteMultipartUpload xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+              <Part><PartNumber>1</PartNumber><ETag>"abc"</ETag></Part>
+              <Part><PartNumber>2</PartNumber><ETag>&quot;def&quot;</ETag></Part>
+            </CompleteMultipartUpload>"#,
+        )
+        .unwrap();
+        assert_eq!(
+            parsed,
+            vec![(1, "\"abc\"".to_string()), (2, "\"def\"".to_string())]
+        );
+        // A body that is not a completion document, a part without an ETag, an
+        // empty list and a non-numeric number are all refused, never guessed.
+        for body in [
+            &b"<Delete/>"[..],
+            b"<CompleteMultipartUpload><Part><PartNumber>1</PartNumber></Part></CompleteMultipartUpload>",
+            b"<CompleteMultipartUpload></CompleteMultipartUpload>",
+            b"<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>\"a\"</ETag></Part>",
+        ] {
+            assert!(
+                matches!(
+                    parse_complete_multipart(body),
+                    Err(S3Error::MalformedMultipart(_))
+                ),
+                "{}",
+                String::from_utf8_lossy(body)
+            );
+        }
+        assert!(matches!(
+            parse_complete_multipart(b"\xff\xfe"),
+            Err(S3Error::MalformedMultipart(_))
+        ));
     }
 
     // A restarted node accepts connections before the control watcher has
