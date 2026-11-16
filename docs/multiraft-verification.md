@@ -942,7 +942,17 @@ failed precondition answers `412`, a matching `If-None-Match` answers a bodyless
 `304`, and a read over 16 MiB answers `400 InvalidRequest` before any fragment is
 fetched. `Last-Modified` and `Accept-Ranges` come from that manifest and the
 internal `x-yadb-leader-id` hop header is removed, so a follower response is the
-one a local read would have produced. A
+one a local read would have produced. Conditions follow RFC 9110 rather than a
+byte comparison of the header: `*` matches the representation (which exists,
+since a manifest was read), a list is split on commas outside the quotes, and
+`If-Match` uses strong comparison while `If-None-Match` uses weak comparison
+(so `W/"a"` matches `"a"`). A field value that cannot be parsed is ignored, as
+RFC 9110 permits, instead of being guessed at. The gateway `/s3/...` GET applies
+the same rule, including the 16 MiB cap, which it did not before: that is a
+deliberate change, because a follower's proxied read has to fit the forwarding
+wire cap. Native `HEAD` on a legacy follower is the one read that stays local —
+it fetches no fragments and takes no lease, so its `ETag`, size and
+`Last-Modified` can lag the leader. A
 read-only statement whose lease did not survive is refused with `503`; a
 statement that committed a write keeps its result even if the fence was lost,
 because the mutation is already durable and reporting it as failed would make the
@@ -987,7 +997,13 @@ read path is covered by `proxy_response_preserves_allowlisted_entity_headers_and
 `a_read_applies_the_local_conditional_contract`,
 `a_read_applies_the_local_range_and_size_rules`,
 `map_error_frames_gateway_range_errors_as_s3_errors` and
-`map_error_frames_gateway_bad_requests_as_invalid_request`. Byte
+`map_error_frames_gateway_bad_requests_as_invalid_request`. Conditional and
+range semantics are covered by `conditional_reads_follow_rfc_9110_matching`,
+`a_forwarded_read_carries_its_range_and_conditions` and
+`gateway_read_enforces_the_16_mib_cap` (a real 16 MiB+1 object through the
+gateway handler: full read `400`, slice `206`, oversized slice `400`, small
+object `200`, and an empty object `200` / `416` with `Content-Range: bytes */0`
+for a range). Byte
 counts are real bytes on disk across the three slots of an in-process mirror
 pool, measured before and after one pass:
 
@@ -1053,7 +1069,15 @@ gateway and the native listener now share one decision. Three
 longer parks a reader lease. After one 64 KiB block overwrite plus reads through
 all three paths the pass refused on `2 live lease(s) (2 reader, 0 writer)` and
 the next pass reclaimed 48 fragments / 198,291 bytes with the block, the S3
-object and the 602 rows intact. Gates on this tree: `yadbd --bins` **71/71**,
+object and the 602 rows intact. A fourth run checked RFC 9110 matching on both
+the leader and a follower: `If-None-Match: *`, `If-None-Match: W/"630a9e70-11"`
+and `If-None-Match: "old", "630a9e70-11"` all answered a bodyless `304`, a
+non-matching `If-None-Match` answered `200` with the bytes, `If-Match: *` and
+`If-Match: "old", "630a9e70-11"` answered `200`, and `If-Match: W/"630a9e70-11"`
+(weak) and a non-matching `If-Match` answered `412`; the gateway `/s3/...` path
+agreed on all of them. A pass issued right after those reads refused with
+`1 live lease(s) (1 reader, 0 writer)` and the next pass completed cleanly with
+the object and the 602 rows intact. Gates on this tree: `yadbd --bins` **74/74**,
 `yadb-metakv` **169/169**, `yadb-block`
 **25/25**, `yadb-db` **46/46**, `yadb-s3` **26/26**, `cargo fmt --all --
 --check` clean, `tests/protocols.py` **16/16** and

@@ -581,7 +581,16 @@ unsatisfiable range still answers `416 InvalidRange` with `Content-Range: bytes
 `Last-Modified`/`Accept-Ranges` are preserved. The gateway `/s3/...` GET accepts
 the same conditional headers. A proxied read is bounded by the
 forwarding wire cap (16 MiB of body); larger block or object reads must be sent
-to the leader directly.
+to the leader directly. For that reason the gateway `GET /s3/...` path applies
+the same 16 MiB rule as the native listener (a larger full read or slice is
+`400 InvalidRequest`); before this it had no limit, so this is a deliberate
+change, not an accident. Native `HEAD` on a legacy follower is the one read that
+stays local: it fetches no fragments, so it takes no lease, and its `ETag`,
+size and `Last-Modified` can lag the leader. The forwarded `Range`,
+`If-Match` and `If-None-Match` values are copied from validated header values
+and carry no explicit size limit of their own; they are bounded by the HTTP
+parser's header limits, and a value that could add a header line is rejected
+before it reaches the proxy.
 
 The metadata Raft log is bounded: once `metakv/raft.wal` passes 8 MiB (or 4096
 applied entries above its base) each node writes an atomic

@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
-use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
@@ -1174,8 +1174,62 @@ struct ProxyResponse {
     body: Vec<u8>,
 }
 
+/// The read headers a proxied request must carry unchanged.
+///
+/// Every value comes from an already-parsed `HeaderValue`, which cannot contain
+/// CR or LF, so a forwarded value cannot add a header line. There is no separate
+/// size bound here: the front-end HTTP parser bounds inbound header values.
+#[derive(Clone, Copy, Default)]
+struct ForwardedRead<'a> {
+    range: Option<&'a str>,
+    if_match: Option<&'a str>,
+    if_none_match: Option<&'a str>,
+}
+
+/// The internal HTTP/1.1 request `proxy_http_to_peer` writes. It is a separate
+/// function so the forwarded-header contract can be asserted without a peer.
+fn forwarded_request(
+    method: &str,
+    path_and_query: &str,
+    host: &str,
+    subject: &str,
+    subject_signature: Option<&str>,
+    content_type: &str,
+    body_len: usize,
+    idempotency_key: Option<&str>,
+    read: ForwardedRead<'_>,
+) -> String {
+    let signature_header = match subject_signature {
+        Some(signature) => format!("x-yadb-subject-signature: {signature}\r\n"),
+        None => String::new(),
+    };
+    let key_header = idempotency_key
+        .map(|key| format!("Idempotency-Key: {key}\r\n"))
+        .unwrap_or_default();
+    // A proxied read must ask the leader for the same byte range the caller
+    // asked for: without this header the leader would answer 200 with the whole
+    // object (or block) instead of the requested 206 slice.
+    let range_header = read
+        .range
+        .map(|range| format!("Range: {range}\r\n"))
+        .unwrap_or_default();
+    // Conditional reads are decided by the node that reads the manifest, so a
+    // forwarded read carries the caller's conditions instead of evaluating them
+    // against the follower's possibly lagging metadata.
+    let if_match_header = read
+        .if_match
+        .map(|value| format!("If-Match: {value}\r\n"))
+        .unwrap_or_default();
+    let if_none_match_header = read
+        .if_none_match
+        .map(|value| format!("If-None-Match: {value}\r\n"))
+        .unwrap_or_default();
+    format!(
+        "{method} {path_and_query} HTTP/1.1\r\nHost: {host}\r\nx-yadb-subject: {subject}\r\n{signature_header}{key_header}{range_header}{if_match_header}{if_none_match_header}x-yadb-forwarded: 1\r\nContent-Type: {content_type}\r\nContent-Length: {body_len}\r\nConnection: close\r\n\r\n"
+    )
+}
+
 /// Raw HTTP/1.1 forwarding helper used by Followers to transparently proxy client writes to the Raft Leader.
-#[allow(clippy::too_many_arguments)]
 fn proxy_http_to_peer(
     peer_addr: &str,
     method: &str,
@@ -1185,9 +1239,7 @@ fn proxy_http_to_peer(
     content_type: &str,
     body: &[u8],
     idempotency_key: Option<&str>,
-    range: Option<&str>,
-    if_match: Option<&str>,
-    if_none_match: Option<&str>,
+    read: ForwardedRead<'_>,
 ) -> Result<ProxyResponse, std::io::Error> {
     let clean = peer_addr
         .trim()
@@ -1202,31 +1254,16 @@ fn proxy_http_to_peer(
     stream.set_read_timeout(Some(Duration::from_millis(5000)))?;
     stream.set_write_timeout(Some(Duration::from_millis(3000)))?;
 
-    let signature_header = match subject_signature {
-        Some(signature) => format!("x-yadb-subject-signature: {signature}\r\n"),
-        None => String::new(),
-    };
-    let key_header = idempotency_key
-        .map(|key| format!("Idempotency-Key: {key}\r\n"))
-        .unwrap_or_default();
-    // A proxied read must ask the leader for the same byte range the caller
-    // asked for: without this header the leader would answer 200 with the whole
-    // object (or block) instead of the requested 206 slice.
-    let range_header = range
-        .map(|range| format!("Range: {range}\r\n"))
-        .unwrap_or_default();
-    // Conditional reads are decided by the node that reads the manifest, so a
-    // forwarded read carries the caller's conditions instead of evaluating them
-    // against the follower's possibly lagging metadata.
-    let if_match_header = if_match
-        .map(|value| format!("If-Match: {value}\r\n"))
-        .unwrap_or_default();
-    let if_none_match_header = if_none_match
-        .map(|value| format!("If-None-Match: {value}\r\n"))
-        .unwrap_or_default();
-    let req = format!(
-        "{method} {path_and_query} HTTP/1.1\r\nHost: {clean}\r\nx-yadb-subject: {subject}\r\n{signature_header}{key_header}{range_header}{if_match_header}{if_none_match_header}x-yadb-forwarded: 1\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
+    let req = forwarded_request(
+        method,
+        path_and_query,
+        clean,
+        subject,
+        subject_signature,
+        content_type,
+        body.len(),
+        idempotency_key,
+        read,
     );
     stream.write_all(req.as_bytes())?;
     if !body.is_empty() {
@@ -1642,9 +1679,11 @@ async fn maybe_forward_write(
                 &content_type,
                 &body,
                 idempotency_key.as_deref(),
-                range.as_deref(),
-                if_match.as_deref(),
-                if_none_match.as_deref(),
+                ForwardedRead {
+                    range: range.as_deref(),
+                    if_match: if_match.as_deref(),
+                    if_none_match: if_none_match.as_deref(),
+                },
             )
             .map(|response| Some((target, response)))
             .map_err(|_| {
@@ -1691,9 +1730,11 @@ async fn maybe_forward_write(
                 &content_type,
                 &body,
                 idempotency_key.as_deref(),
-                range.as_deref(),
-                if_match.as_deref(),
-                if_none_match.as_deref(),
+                ForwardedRead {
+                    range: range.as_deref(),
+                    if_match: if_match.as_deref(),
+                    if_none_match: if_none_match.as_deref(),
+                },
             ) {
                 Ok(ref response)
                     if response.code == 409
@@ -1842,22 +1883,131 @@ pub(crate) enum Conditional {
     NotModified,
 }
 
+/// One RFC 9110 entity-tag: its opaque value and whether it carried the `W/`
+/// weak marker.
+#[derive(Clone, Copy)]
+struct EntityTag<'a> {
+    opaque: &'a str,
+    weak: bool,
+}
+
+/// Splits one `entity-tag` off the front of `value`, returning it and the
+/// remainder.
+///
+/// `entity-tag = [ "W/" ] DQUOTE *etagc DQUOTE`, and `etagc` excludes `DQUOTE`.
+/// The first closing quote therefore ends the tag, so a comma inside the quotes
+/// is part of the opaque value and not a list separator.
+fn split_entity_tag(value: &str) -> Option<(EntityTag<'_>, &str)> {
+    let value = value.trim_start();
+    let (weak, value) = match value.strip_prefix("W/") {
+        Some(rest) => (true, rest),
+        None => (false, value),
+    };
+    let value = value.strip_prefix('"')?;
+    let end = value.find('"')?;
+    Some((
+        EntityTag {
+            opaque: &value[..end],
+            weak,
+        },
+        &value[end + 1..],
+    ))
+}
+
+/// A parsed `If-Match`/`If-None-Match` value: `*`, or a non-empty list of
+/// entity-tags.
+enum ETagCondition<'a> {
+    /// `*`: the condition is about the representation existing, not about a
+    /// particular version of it.
+    Any,
+    Tags(Vec<EntityTag<'a>>),
+}
+
+/// Parses a conditional value as RFC 9110 `*` / `#entity-tag`.
+///
+/// `None` means the field is empty or syntactically invalid. Such a field is
+/// ignored (RFC 9110 permits ignoring a field value it cannot parse) rather
+/// than acted on, because neither reading of a value we cannot parse is
+/// defensible: guessing "match" would serve bytes the caller asked to be
+/// refused, and guessing "no match" would tell a client its cached copy is
+/// current.
+fn parse_etag_condition(value: &str) -> Option<ETagCondition<'_>> {
+    if value.trim() == "*" {
+        return Some(ETagCondition::Any);
+    }
+    let mut tags = Vec::new();
+    let mut rest = value;
+    loop {
+        let (tag, tail) = split_entity_tag(rest)?;
+        tags.push(tag);
+        rest = tail.trim_start();
+        if rest.is_empty() {
+            break;
+        }
+        rest = rest.strip_prefix(',')?;
+    }
+    (!tags.is_empty()).then_some(ETagCondition::Tags(tags))
+}
+
+/// Every well-formed condition carried by `name`. A list header may be sent as
+/// several field lines, and one unparsable line does not discard the others.
+fn etag_conditions<'a>(headers: &'a HeaderMap, name: &HeaderName) -> Vec<ETagCondition<'a>> {
+    headers
+        .get_all(name)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .filter_map(parse_etag_condition)
+        .collect()
+}
+
+/// The manifest ETag as an entity-tag. A manifest writes it as a quoted tag; if
+/// a stored value is not well-formed, it is compared verbatim as a strong tag
+/// rather than silently dropping the precondition.
+fn manifest_tag(etag: &str) -> EntityTag<'_> {
+    match split_entity_tag(etag) {
+        Some((tag, rest)) if rest.trim().is_empty() => tag,
+        _ => EntityTag {
+            opaque: etag.trim().trim_matches('"'),
+            weak: false,
+        },
+    }
+}
+
 /// Evaluates the conditional headers against the ETag a read actually
 /// produced. The native listener renders this as an S3 XML error and the
 /// gateway as an API error, but both must decide it from the same manifest the
 /// bytes came from.
+///
+/// `If-Match` uses RFC 9110's strong comparison and `If-None-Match` its weak
+/// comparison, both support `*` and a list of tags, and both are evaluated
+/// against the representation we hold (the manifest exists by construction, so
+/// `*` matches).
 pub(crate) fn evaluate_conditions(headers: &HeaderMap, etag: &str) -> Conditional {
-    if headers
-        .get(header::IF_MATCH)
-        .is_some_and(|v| v.as_bytes() != etag.as_bytes())
-    {
-        return Conditional::Failed;
+    let tag = manifest_tag(etag);
+    let if_match = etag_conditions(headers, &header::IF_MATCH);
+    if !if_match.is_empty() {
+        let matched = if_match.iter().any(|condition| match condition {
+            ETagCondition::Any => true,
+            // Strong comparison: neither side may be weak.
+            ETagCondition::Tags(tags) => tags
+                .iter()
+                .any(|c| !c.weak && !tag.weak && c.opaque == tag.opaque),
+        });
+        if !matched {
+            return Conditional::Failed;
+        }
     }
-    if headers
-        .get(header::IF_NONE_MATCH)
-        .is_some_and(|v| v.as_bytes() == etag.as_bytes())
-    {
-        return Conditional::NotModified;
+    let if_none_match = etag_conditions(headers, &header::IF_NONE_MATCH);
+    if !if_none_match.is_empty() {
+        let matched = if_none_match.iter().any(|condition| match condition {
+            ETagCondition::Any => true,
+            // Weak comparison: the opaque values are equivalent regardless of
+            // either side's weak marker.
+            ETagCondition::Tags(tags) => tags.iter().any(|c| c.opaque == tag.opaque),
+        });
+        if matched {
+            return Conditional::NotModified;
+        }
     }
     Conditional::Passed
 }
@@ -6345,6 +6495,62 @@ mod security_tests {
         assert!(!freshness.is_fresh_at(now + Duration::from_millis(2000)));
     }
 
+    // A proxied read must arrive at the leader with the caller's byte range and
+    // conditions, because the leader (not the follower) decides them from the
+    // manifest it serves.
+    #[test]
+    fn a_forwarded_read_carries_its_range_and_conditions() {
+        let request = forwarded_request(
+            "GET",
+            "/s3/proj/store/bucket/key",
+            "127.0.0.1:1",
+            "sa:billing",
+            None,
+            "application/octet-stream",
+            0,
+            None,
+            ForwardedRead {
+                range: Some("bytes=7-999"),
+                if_match: Some("\"a\", \"b\""),
+                if_none_match: Some("W/\"c\""),
+            },
+        );
+        assert!(
+            request.starts_with("GET /s3/proj/store/bucket/key HTTP/1.1\r\n"),
+            "{request}"
+        );
+        for line in [
+            "Range: bytes=7-999\r\n",
+            "If-Match: \"a\", \"b\"\r\n",
+            "If-None-Match: W/\"c\"\r\n",
+            "x-yadb-forwarded: 1\r\n",
+        ] {
+            assert!(request.contains(line), "missing {line:?} in {request}");
+        }
+        assert!(request.ends_with("\r\n\r\n"), "{request}");
+
+        // A read with no conditions carries none of these headers, so a plain
+        // read is unchanged by this path.
+        let plain = forwarded_request(
+            "GET",
+            "/s3/x",
+            "127.0.0.1:1",
+            "sa:billing",
+            None,
+            "text/plain",
+            0,
+            None,
+            ForwardedRead::default(),
+        );
+        for line in ["Range:", "If-Match:", "If-None-Match:"] {
+            assert!(!plain.contains(line), "{line} must be absent from {plain}");
+        }
+
+        // These values reach the request only as `HeaderValue`s, and one that
+        // would add a header line cannot be built at all.
+        assert!(HeaderValue::from_str("bytes=0-1\r\nX-Injected: 1").is_err());
+    }
+
     #[test]
     fn proxy_response_accepts_a_bodyless_304_without_content_length() {
         // A peer may omit Content-Length on a 304. It is not a close-delimited
@@ -7141,6 +7347,98 @@ mod security_tests {
         );
     }
 
+    // The gateway read path applies the same 16 MiB rule as the native
+    // listener. Serving any size here used to be possible, so this is a
+    // deliberate change: it is what keeps a follower's proxied read inside the
+    // forwarding wire cap, and it is documented in the README.
+    #[tokio::test]
+    async fn gateway_read_enforces_the_16_mib_cap() {
+        let mut st = legacy_fragment_state("s3-read-cap");
+        // Few large chunks keep this test to a handful of fragments; the blob
+        // layer caps a single fragment at 10 MiB.
+        st.s3 = ObjectStoreEngine::new(st.meta.clone(), 8 * 1024 * 1024);
+        st.s3
+            .register_pool("data", st.pools.read().unwrap()["data"].clone());
+        st.control.write().unwrap().object_stores.insert(
+            "proj/store".into(),
+            yadb_control::ObjectStoreSpec {
+                pool: "data".into(),
+                isolation: Default::default(),
+                buckets: vec![],
+            },
+        );
+        let big = vec![7u8; S3_READ_CAP as usize + 1];
+        st.s3
+            .put_object(1, "store", "data", "bucket", "big", "text/plain", &big)
+            .unwrap();
+        st.s3
+            .put_object(
+                1,
+                "store",
+                "data",
+                "bucket",
+                "small",
+                "text/plain",
+                b"hello",
+            )
+            .unwrap();
+        st.s3
+            .put_object(1, "store", "data", "bucket", "empty", "text/plain", b"")
+            .unwrap();
+
+        let get = |key: &'static str, headers: HeaderMap| {
+            let st = st.clone();
+            async move {
+                handle_s3_get(
+                    State(st),
+                    headers,
+                    Path((
+                        "proj".to_string(),
+                        "store".to_string(),
+                        "bucket".to_string(),
+                        key.to_string(),
+                    )),
+                    Query(S3GetQuery { consistent: false }),
+                )
+                .await
+            }
+        };
+
+        // A full read over the cap is the documented 400 on this path too, not
+        // a 200 that a follower could not carry across the wire.
+        assert_eq!(
+            get("big", HeaderMap::new()).await.status(),
+            StatusCode::BAD_REQUEST
+        );
+        // A range within the cap is served from the same object.
+        let mut headers = HeaderMap::new();
+        headers.insert(header::RANGE, "bytes=0-9".parse().unwrap());
+        let response = get("big", headers).await;
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(body_bytes(response).await, vec![7u8; 10]);
+        // A range larger than the cap is refused the same way.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::RANGE,
+            format!("bytes=0-{S3_READ_CAP}").parse().unwrap(),
+        );
+        assert_eq!(get("big", headers).await.status(), StatusCode::BAD_REQUEST);
+        // An object at or under the cap is unaffected.
+        let response = get("small", HeaderMap::new()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_bytes(response).await, b"hello");
+        // An empty object reads as an empty `200`, and any range on it is the
+        // local `416` with `Content-Range: bytes */0`.
+        let response = get("empty", HeaderMap::new()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_bytes(response).await, b"");
+        let mut headers = HeaderMap::new();
+        headers.insert(header::RANGE, "bytes=0-0".parse().unwrap());
+        let response = get("empty", headers).await;
+        assert_eq!(response.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(response.headers()[header::CONTENT_RANGE], "bytes */0");
+    }
+
     // The dedicated endpoint is the explicit-error surface: a refusal is a 409
     // with the reason in the body, never a 200 that looks like "nothing to do".
     #[tokio::test]
@@ -7165,5 +7463,61 @@ mod security_tests {
         assert!(reason.contains("collector lease"), "{reason}");
         assert_eq!(outcome.fragments_deleted, 0);
         held.release().unwrap();
+    }
+
+    // A conditional read must follow RFC 9110, not a byte comparison of the
+    // whole header value: `*`, lists and weak tags are all valid inputs, and
+    // serving bytes for one of them would violate the condition the caller sent.
+    #[test]
+    fn conditional_reads_follow_rfc_9110_matching() {
+        let etag = "\"abc-11\"";
+        let check = |pairs: &[(&str, &str)]| evaluate_conditions(&headers_with(pairs), etag);
+        let failed = |pairs: &[(&str, &str)]| matches!(check(pairs), Conditional::Failed);
+        let not_modified =
+            |pairs: &[(&str, &str)]| matches!(check(pairs), Conditional::NotModified);
+        let passed = |pairs: &[(&str, &str)]| matches!(check(pairs), Conditional::Passed);
+
+        // If-Match: exact version, `*`, and a list containing the version.
+        assert!(passed(&[("if-match", "\"abc-11\"")]));
+        assert!(passed(&[("if-match", "*")]));
+        assert!(passed(&[("if-match", "\"other\", \"abc-11\"")]));
+        assert!(failed(&[("if-match", "\"other\"")]));
+        assert!(failed(&[("if-match", "\"other\", \"third\"")]));
+        // Strong comparison: a weak tag never satisfies If-Match.
+        assert!(failed(&[("if-match", "W/\"abc-11\"")]));
+        // A comma inside the opaque tag is part of the tag, not a separator.
+        assert!(matches!(
+            evaluate_conditions(&headers_with(&[("if-match", "\"a,b\"")]), "\"a,b\""),
+            Conditional::Passed
+        ));
+        assert!(matches!(
+            evaluate_conditions(&headers_with(&[("if-match", "\"a,b\"")]), "\"a\""),
+            Conditional::Failed
+        ));
+
+        // If-None-Match: exact version, `*`, a list, and weak comparison.
+        assert!(not_modified(&[("if-none-match", "\"abc-11\"")]));
+        assert!(not_modified(&[("if-none-match", "*")]));
+        assert!(not_modified(&[("if-none-match", "\"other\", \"abc-11\"")]));
+        assert!(not_modified(&[("if-none-match", "W/\"abc-11\"")]));
+        assert!(passed(&[("if-none-match", "\"other\"")]));
+        assert!(passed(&[("if-none-match", "\"other\", \"third\"")]));
+
+        // A field value that cannot be parsed is ignored (RFC 9110 allows
+        // ignoring a field value it cannot parse) rather than guessed at.
+        assert!(passed(&[("if-match", "not a tag")]));
+        assert!(passed(&[("if-none-match", "")]));
+
+        // A list header may arrive as several field lines; a match on any of
+        // them satisfies the condition.
+        let mut repeated = headers_with(&[("if-match", "\"other\"")]);
+        repeated.append(header::IF_MATCH, HeaderValue::from_static("\"abc-11\""));
+        assert!(matches!(
+            evaluate_conditions(&repeated, etag),
+            Conditional::Passed
+        ));
+
+        // No conditional headers at all.
+        assert!(passed(&[]));
     }
 }

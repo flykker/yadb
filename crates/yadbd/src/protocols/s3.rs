@@ -877,6 +877,18 @@ mod tests {
             crate::evaluate_conditions(&request_headers(&[]), "\"a\""),
             crate::Conditional::Passed
         ));
+        // `*` and a list are valid values the wire handler must honour too.
+        assert!(matches!(
+            crate::evaluate_conditions(&request_headers(&[("if-none-match", "*")]), "\"a\""),
+            crate::Conditional::NotModified
+        ));
+        assert!(matches!(
+            crate::evaluate_conditions(
+                &request_headers(&[("if-match", "\"old\", \"a\"")]),
+                "\"a\""
+            ),
+            crate::Conditional::Passed
+        ));
         // The native rendering of that decision.
         assert_eq!(
             condition_refusal(&request_headers(&[("if-match", "\"b\"")]), "\"a\"")
