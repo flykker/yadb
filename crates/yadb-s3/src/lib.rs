@@ -1292,11 +1292,25 @@ impl<FS: StorageFs> ObjectStoreEngine<FS> {
     }
 
     fn collect_orphans_at(&self, project_id: u32, now: u64) -> Result<usize, S3Error> {
+        let intents = self.meta.scan_prefix(&Self::intent_prefix(project_id));
+        self.collect_orphans_from(project_id, now, intents)
+    }
+
+    /// One collection pass over a scan of the project's intents.
+    ///
+    /// Split from [`Self::collect_orphans_at`] so a test can hand it the stale
+    /// scan a real pass may hold: the pass reads the record it is about to
+    /// delete only through its guard, and must re-read after losing that guard.
+    fn collect_orphans_from(
+        &self,
+        project_id: u32,
+        now: u64,
+        intents: Vec<(String, KvValue)>,
+    ) -> Result<usize, S3Error> {
         let current_revision = self
             .meta
             .revision_for_key(&Self::intent_prefix(project_id))?;
         let mut removed = 0usize;
-        let intents = self.meta.scan_prefix(&Self::intent_prefix(project_id));
 
         // Multipart upload records name parts, never fragments, so they carry no
         // allocation id and the fragment checks below do not apply to them. A
@@ -3189,9 +3203,10 @@ mod tests {
         assert!(refreshed.lease_until_revision > 0);
 
         // A collector aborting the part must make registration refuse rather
-        // than return an ETag for bytes it is reclaiming. Passing the stale
-        // `Prepared` value is exactly the interleaving: the guard sees that the
-        // part changed.
+        // than return an ETag for bytes it is reclaiming. The value passed here
+        // is the aborted record's own current revision, so the revision guard
+        // matches and only the state check can refuse: otherwise the test would
+        // pass on a stale revision alone and prove nothing about the state.
         let kv = s3.meta.get(&part_key).unwrap();
         let mut aborted: UploadIntent = serde_json::from_slice(&kv.value).unwrap();
         aborted.state = UploadState::Aborted;
@@ -3207,9 +3222,65 @@ mod tests {
                 }],
             })
             .unwrap();
+        let aborted_now = s3.meta.get(&part_key).unwrap();
+        let aborted_record: UploadIntent = serde_json::from_slice(&aborted_now.value).unwrap();
+        assert_eq!(aborted_record.state, UploadState::Aborted);
         assert!(matches!(
-            s3.register_multipart_part(&upload_key, &upload_id, &part, &stale),
+            s3.register_multipart_part(&upload_key, &upload_id, &part, &aborted_now),
             Err(S3Error::MultipartUploadNotFound(_))
         ));
+    }
+
+    #[test]
+    fn orphan_collection_re_reads_a_record_whose_guard_it_lost() {
+        let s3 = multipart_engine(7200);
+        let upload_id = s3
+            .create_multipart_upload(1, "store", "pool", "bucket", "key", "text/plain")
+            .unwrap();
+        s3.upload_part(1, "store", "bucket", "key", &upload_id, 1, b"one")
+            .unwrap();
+        let upload_key = ObjectStoreEngine::<SimFs>::intent_key(1, &upload_id);
+        let part_one = {
+            let record: UploadIntent =
+                serde_json::from_slice(&s3.meta.get(&upload_key).unwrap().value).unwrap();
+            record.parts[0].intent_key.clone()
+        };
+
+        // Make the upload record look expired, take the scan a collector would
+        // hold, and only then register a second part. Registration refreshes the
+        // record's lease and bumps its revision, so the collector's delete guard
+        // fails — the interleaving this branch exists for.
+        let kv = s3.meta.get(&upload_key).unwrap();
+        let mut expired: UploadIntent = serde_json::from_slice(&kv.value).unwrap();
+        expired.lease_until_unix_secs = 0;
+        expired.lease_until_revision = 0;
+        s3.meta
+            .execute(KvCommand::RevisionTxn {
+                guards: vec![RevisionGuard {
+                    key: upload_key.clone(),
+                    expected_mod_revision: kv.mod_revision,
+                }],
+                ops: vec![TxnOp::Put {
+                    key: upload_key.clone(),
+                    value: serde_json::to_vec(&expired).unwrap(),
+                }],
+            })
+            .unwrap();
+        let stale = s3
+            .meta
+            .scan_prefix(&ObjectStoreEngine::<SimFs>::intent_prefix(1));
+        s3.upload_part(1, "store", "bucket", "key", &upload_id, 2, b"two")
+            .unwrap();
+
+        // The pass must not abort the parts it saw in the stale scan.
+        assert_eq!(s3.collect_orphans_from(1, u64::MAX, stale).unwrap(), 0);
+        for key in [&part_one, &upload_key] {
+            let kv = s3.meta.get(key).expect("record survives the pass");
+            let record: UploadIntent = serde_json::from_slice(&kv.value).unwrap();
+            assert_ne!(record.state, UploadState::Aborted, "{key}");
+        }
+        let record: UploadIntent =
+            serde_json::from_slice(&s3.meta.get(&upload_key).unwrap().value).unwrap();
+        assert_eq!(record.parts.len(), 2);
     }
 }

@@ -819,10 +819,10 @@ def cmd_stop(args):
             # Keep the node-indexed PID slots: a compacted list of only the
             # still-running PIDs loses which node each one belongs to and makes
             # later lifecycle operations fail with a generic "expected 3 PIDs".
-            remaining = list(pids)
-            for node, pid in live:
-                if (node, pid) not in still:
-                    remaining[node - 1] = None
+            # Every slot that is not a still-running node is cleared, including a
+            # node that had already exited or was never recorded.
+            still_pids = {pid for _, pid in still}
+            remaining = [pid if pid in still_pids else None for pid in pids]
             state.update(phase='stopping', pids=remaining,
                          error=f'PID(s) did not exit after SIGTERM: {still}')
             write_json(root / 'state.json', state)

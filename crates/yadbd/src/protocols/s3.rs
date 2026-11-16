@@ -893,10 +893,13 @@ async fn multipart(
         },
         None => None,
     };
-    // ListParts pagination. AWS bounds `max-parts` to 1..=1000; an unparsable or
-    // out-of-range value is refused rather than silently replaced.
+    // ListParts pagination. AWS bounds `max-parts` to 1..=1000. Presence with an
+    // unparsable value — including an empty one — is refused rather than
+    // silently replaced: `?max-parts=` is a client error, not an absent page
+    // size, and treating it as 1000 would answer a different request than the
+    // one sent.
     let part_number_marker = match params.get("part-number-marker") {
-        Some(v) if !v.is_empty() => match v.parse::<u32>() {
+        Some(v) => match v.parse::<u32>() {
             Ok(v) => v,
             Err(_) => {
                 return err(
@@ -906,10 +909,10 @@ async fn multipart(
                 )
             }
         },
-        _ => 0,
+        None => 0,
     };
     let max_parts = match params.get("max-parts") {
-        Some(v) if !v.is_empty() => match v.parse::<u32>() {
+        Some(v) => match v.parse::<u32>() {
             Ok(v) if (1..=1000).contains(&v) => v,
             _ => {
                 return err(
@@ -919,7 +922,7 @@ async fn multipart(
                 )
             }
         },
-        _ => 1000,
+        None => 1000,
     };
     // A gateway answer is internal JSON. It is read fallibly and bounded: a
     // malformed or truncated body must surface as an error, never as an empty

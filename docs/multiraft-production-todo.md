@@ -625,6 +625,37 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   referenced by another group's manifest. None of that exists; a Multi-Raft
   deployment still reclaims nothing.
 
+  Implementation plan from the read-only analysis of the current primitives:
+
+  * **Cross-group references are impossible, so the mark can stay group-scoped.**
+    Every fragment id carries its `project_id`, and a manifest only names
+    fragments of its own project; a project maps to exactly one data group.
+    A pass that marks one group therefore cannot orphan another group's
+    fragments. The existing refusal is about *atomicity*, not about a shared
+    fragment namespace.
+  * **Enumeration is already available, atomicity is not.** `scan("/db/")`,
+    `scan("/s3/")` and `scan("/block/")` fan out over every data group from
+    local applied state (`openraft_client.rs`), so a mark over all groups is
+    possible on any node — but it is a set of per-group snapshots at different
+    points in time, which is exactly what the legacy fence is meant to exclude.
+  * **The missing fence is per group, and only its leader can provide it.**
+    A pass must be leader of group G and take a linearizable snapshot of G
+    (`try_linearizable_snapshot` / `ensure_linearizable`) before marking G's
+    manifests; a follower's applied state can lag a committed manifest and
+    would delete a fragment that manifest still references. The collector lease
+    (`/gc/collector`) is currently one control-group key and must become
+    per-group.
+  * **In-flight writes need a fence the legacy path gets from a lease.**
+    `acquire_writer_if_legacy` returns `None` on OpenRaft, so SQL tablet
+    writes and S3 puts currently have no writer fence there. S3 is covered by
+    the `Prepared` intent committed before its fragments plus the intent
+    lease, and the collector must treat an unexpired intent as live. SQL has no
+    equivalent intent record, so a per-group writer lease (or an intent
+    committed before the fragment) is a prerequisite, not an optimization.
+  * **Order of work:** per-group collector lease and writer fence → leader-only
+    per-group sweep with the intent grace → a drill that kills the group leader
+    between fragment write and manifest commit and proves nothing is reclaimed.
+
 Backup and restore are **out of scope by owner decision**, not an oversight: no
 command, artifact format, fence or validator exists, and none is planned. A lost
 data root is a lost deployment. Reintroducing the capability requires its own

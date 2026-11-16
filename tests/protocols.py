@@ -259,6 +259,16 @@ class Pg:
         self.send(b"S", b"")
         return self.until_ready()
 
+    def copy_in(self, sql, lines):
+        """COPY ... FROM STDIN in text format; returns the messages after CopyDone."""
+        self.send(b"Q", sql.encode()+b"\0")
+        kind, data = self.packet()
+        assert kind == b"G", (kind, data)
+        for line in lines:
+            self.send(b"d", line)
+        self.send(b"c", b"")
+        return self.until_ready()
+
     def extended(self, sql, params=(), oids=(), results=()):
         self.parse(sql, oids=oids)
         self.bind(params=params, results=results)
@@ -775,6 +785,35 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
             assert any(k == b"E" and b"C34000\0" in d for k, d in out), out
             print("PASS pgwire extended query: literal binding, describe, errors, transactions")
             a.close()
+            # COPY is typed from the declared schema (`SHOW COLUMNS`), runs as one
+            # transaction outside BEGIN, and a bad row must roll the whole load
+            # back: a cleanup that silently failed would leave a partial table or
+            # an open transaction the client cannot see.
+            b = Pg(19102)
+            b.query("CREATE TABLE bulk (id INT PRIMARY KEY, name TEXT);")
+            assert [c[0] for c in b.rows("SHOW COLUMNS FROM bulk;")] == ["id", "name"]
+            out = b.copy_in("COPY bulk (id, name) FROM STDIN;",
+                            [b"1\talpha\n", b"2\tbeta\n"])
+            assert (b"C", b"COPY 2\0") in out and out[-1] == (b"Z", b"I"), out
+            assert b.rows("SELECT id FROM bulk ORDER BY id;") == [["1"], ["2"]]
+            # A row that does not parse aborts the COPY: nothing from it survives
+            # and the session is idle again, not stuck in a failed transaction.
+            out = b.copy_in("COPY bulk (id, name) FROM STDIN;",
+                            [b"3\tgamma\n", b"bad\tdelta\n"])
+            assert any(k == b"E" for k, _ in out), out
+            assert out[-1] == (b"Z", b"I"), out
+            assert b.rows("SELECT id FROM bulk ORDER BY id;") == [["1"], ["2"]]
+            # CRLF is one terminator; the CR is not part of the value.
+            out = b.copy_in("COPY bulk (id, name) FROM STDIN;", [b"4\tcrlf\r\n"])
+            assert (b"C", b"COPY 1\0") in out, out
+            assert b.rows("SELECT name FROM bulk WHERE id = 4;") == [["crlf"]]
+            # A COPY statement cannot be combined with another statement: it is
+            # refused before the copy-in handshake, so no data can be half-sent.
+            out = b.query("COPY bulk (id, name) FROM STDIN; SELECT 1;", fail=True)
+            assert out[-1] == (b"Z", b"I"), out
+            assert b.rows("SELECT id FROM bulk WHERE id = 5;") == []
+            b.close()
+            print("PASS pgwire COPY: declared schema, commit, rollback on a bad row, CRLF")
             print("PASS pgwire password, result framing, multi-statements, session isolation, rollback")
             print("PASS pgwire index backfill and cross-portal indexed DML")
 
@@ -883,6 +922,12 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
             status, _, body = signed(
                 19202, "GET", f"{mp_key}?uploadId={upload_id}&max-parts=0")
             assert status == 400 and b"<Code>InvalidArgument</Code>" in body, (status, body)
+            # An explicit empty value is a client error, not an absent page size:
+            # defaulting `max-parts=` to 1000 would answer a different request.
+            for empty in ("max-parts=", "part-number-marker="):
+                status, _, body = signed(
+                    19202, "GET", f"{mp_key}?uploadId={upload_id}&{empty}")
+                assert status == 400 and b"<Code>InvalidArgument</Code>" in body, (status, body)
             # A wrong ETag and an out-of-order list are refused with the S3 codes,
             # and neither consumes the upload.
             wrong = [(mp_etags[0][0], "0" * 32)] + mp_etags[1:]
@@ -900,6 +945,11 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
             assert status == 200, (status, body)
             expected = multipart_etag(mp_parts)
             assert ET.fromstring(body).find("{*}ETag").text == expected, body
+            # Location names the object and must not leak the upload id: it is
+            # the client's resume token for an upload that no longer exists.
+            location = ET.fromstring(body).find("{*}Location")
+            assert location is not None, body
+            assert "uploadId" not in location.text, location.text
             joined = b"".join(mp_parts)
             status, hs, body = signed(19203, "GET", mp_key)
             assert status == 200 and body == joined, (status, body[:64])

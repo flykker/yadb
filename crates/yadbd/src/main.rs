@@ -5536,9 +5536,7 @@ fn xml_token<'a>(input: &mut &'a str) -> Result<XmlToken<'a>, S3Error> {
             return Ok(XmlToken::Close { name });
         }
         if let Some(rest) = input.strip_prefix('<') {
-            let end = rest
-                .find('>')
-                .ok_or_else(|| S3Error::MalformedMultipart("unterminated opening tag".into()))?;
+            let end = xml_tag_end(rest)?;
             let mut inner = rest[..end].trim_end();
             let self_closing = inner.ends_with('/');
             if self_closing {
@@ -5551,6 +5549,11 @@ fn xml_token<'a>(input: &mut &'a str) -> Result<XmlToken<'a>, S3Error> {
             if name.is_empty() || !name.starts_with(|c: char| c.is_ascii_alphabetic()) {
                 return Err(S3Error::MalformedMultipart("invalid opening tag".into()));
             }
+            // Everything after the element name is an attribute list. It is
+            // validated instead of discarded: an unvalidated attribute can hide
+            // the real tag end, so `<Part ignored="><PartNumber>1<...` used to be
+            // read as a normal `<Part>` and could publish an object.
+            xml_validate_attributes(&inner[name_end..])?;
             *input = &rest[end + 1..];
             return Ok(XmlToken::Open { name, self_closing });
         }
@@ -5558,6 +5561,77 @@ fn xml_token<'a>(input: &mut &'a str) -> Result<XmlToken<'a>, S3Error> {
         let text = &input[..end];
         *input = &input[end..];
         return Ok(XmlToken::Text(text));
+    }
+}
+
+/// Index of the `>` that closes an opening tag, ignoring a `>` inside an
+/// attribute value. A tag whose quote never closes is unterminated, not a tag
+/// that ends at the first `>`: treating the latter as the end is how a
+/// malformed attribute could smuggle a real element past the parser.
+fn xml_tag_end(rest: &str) -> Result<usize, S3Error> {
+    let mut quote: Option<char> = None;
+    for (index, ch) in rest.char_indices() {
+        match quote {
+            Some(q) if ch == q => quote = None,
+            Some(_) => {}
+            None if ch == '"' || ch == '\'' => quote = Some(ch),
+            None if ch == '>' => return Ok(index),
+            None if ch == '<' => {
+                return Err(S3Error::MalformedMultipart(
+                    "unterminated opening tag".into(),
+                ))
+            }
+            None => {}
+        }
+    }
+    Err(S3Error::MalformedMultipart(if quote.is_some() {
+        "unterminated attribute value".into()
+    } else {
+        "unterminated opening tag".into()
+    }))
+}
+
+/// Validates the attribute list of an opening tag: `name="value"` or
+/// `name='value'`, whitespace separated, nothing else. The completion document
+/// needs no attribute semantics, but its syntax must still be well-formed —
+/// an unquoted or unterminated value is a malformed document, not something to
+/// ignore.
+fn xml_validate_attributes(mut rest: &str) -> Result<(), S3Error> {
+    let malformed = || S3Error::MalformedMultipart("malformed attribute list".into());
+    loop {
+        rest = rest.trim_start();
+        if rest.is_empty() {
+            return Ok(());
+        }
+        let name_end = rest
+            .find(|c: char| c.is_ascii_whitespace() || c == '=')
+            .ok_or_else(malformed)?;
+        let name = &rest[..name_end];
+        if name.is_empty()
+            || !name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+            || !name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+        {
+            return Err(malformed());
+        }
+        let after_name = rest[name_end..].trim_start();
+        let after_eq = after_name
+            .strip_prefix('=')
+            .ok_or_else(malformed)?
+            .trim_start();
+        let quote = match after_eq.chars().next() {
+            Some(q @ ('"' | '\'')) => q,
+            _ => return Err(malformed()),
+        };
+        let value = &after_eq[quote.len_utf8()..];
+        let end = value
+            .find(quote)
+            .ok_or_else(|| S3Error::MalformedMultipart("unterminated attribute value".into()))?;
+        if value[..end].contains('<') {
+            return Err(malformed());
+        }
+        rest = &value[end + quote.len_utf8()..];
     }
 }
 
@@ -9065,6 +9139,16 @@ mod security_tests {
             b"<CompleteMultipartUpload><Extra/><Part><PartNumber>1</PartNumber><ETag>\"a\"</ETag></Part></CompleteMultipartUpload>",
             // A duplicate element would otherwise let the last one win.
             b"<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><PartNumber>2</PartNumber><ETag>\"a\"</ETag></Part></CompleteMultipartUpload>",
+            // An attribute whose quote never closes must not end the tag at the
+            // `>` inside it: that read the rest as a real `<Part>` and could
+            // publish an object from a malformed document.
+            b"<CompleteMultipartUpload><Part ignored=\"><PartNumber>1</PartNumber><ETag>\"a\"</ETag></Part></CompleteMultipartUpload>",
+            // Unterminated or unquoted attribute values are malformed too.
+            b"<CompleteMultipartUpload><Part x=1><PartNumber>1</PartNumber><ETag>\"a\"</ETag></Part></CompleteMultipartUpload>",
+            b"<CompleteMultipartUpload><Part x=\"a><PartNumber>1</PartNumber></Part></CompleteMultipartUpload>",
+            b"<CompleteMultipartUpload><Part =\"a\"><PartNumber>1</PartNumber></Part></CompleteMultipartUpload>",
+            // A closing tag may not carry attributes.
+            b"<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>\"a\"</ETag></Part x=\"1\"></CompleteMultipartUpload>",
         ] {
             assert!(
                 matches!(
@@ -9075,6 +9159,14 @@ mod security_tests {
                 String::from_utf8_lossy(body)
             );
         }
+
+        // A well-formed attribute list is still accepted: the namespace S3
+        // clients send on the root element must not break completion.
+        let parsed = parse_complete_multipart(
+            b"<CompleteMultipartUpload xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\" note='ok'><Part><PartNumber>1</PartNumber><ETag>\"a\"</ETag></Part></CompleteMultipartUpload>",
+        )
+        .unwrap();
+        assert_eq!(parsed, vec![(1, "\"a\"".to_string())]);
     }
 
     #[test]
