@@ -447,14 +447,44 @@ def provision(root, base):
     print(f'  control group {CONTROL_GROUP}; project groups {PROJECT_GROUPS}')
 
 
-def flip_to_open(root):
-    """Restart every group with explicit open mode; never initialize again."""
-    for node in NODES:
-        for group in GROUPS:
+def replica_path(config):
+    """On-disk replica directory the daemon derives from one group config."""
+    cluster = ''.join(f'{b:02x}' for b in config['cluster'])
+    return (Path(config['root'])
+            / f"{cluster}-{config['group']}-{config['incarnation']}-{config['node']}")
+
+
+def sync_replica_modes(root):
+    """Reopen replicas that exist; create the ones that never did.
+
+    `stop` records a settled state even when a previous start failed before the
+    daemon could create a replica (for example it exited at argument parsing, or
+    the binary lacked the required cargo feature). The presence of the replica
+    directory — not the recorded phase — therefore decides between open and
+    create; flipping a never-created replica to `open` made every later start
+    fail with "replica path conflicts with explicit create/open mode". A group
+    whose replicas are only partly on disk was partially bootstrapped, which
+    cannot be repaired by guessing, so it is refused.
+    """
+    for group in GROUPS:
+        configs = []
+        for node in NODES:
             path = root / 'config' / f'node-{node}-group-{group}.json'
-            cfg = LOCAL.load(path)
-            cfg.update(mode='open', initialize=False)
-            LOCAL.replace(path, cfg)
+            configs.append((path, LOCAL.load(path)))
+        present = [replica_path(cfg).is_dir() for _, cfg in configs]
+        if all(present):
+            for path, cfg in configs:
+                cfg.update(mode='open', initialize=False)
+                LOCAL.replace(path, cfg)
+        elif not any(present):
+            for path, cfg in configs:
+                cfg.update(mode='create', initialize=cfg['node'] == cfg['group'])
+                LOCAL.replace(path, cfg)
+        else:
+            missing = [cfg['node'] for (_, cfg), exists in zip(configs, present) if not exists]
+            raise RuntimeError(
+                f'group {group} has replicas on disk for some nodes but none for {missing}; '
+                f'a partial bootstrap cannot be repaired automatically. Inspect {root}')
 
 
 def wait_healthy(base):
@@ -639,7 +669,6 @@ def cmd_start(args):
                         f'them, or rerun start with --force only after confirming they are this cluster')
                 print(f'WARNING: "stopped" state has live recorded PID(s) {alive}; continuing '
                       f'with --force.', file=sys.stderr)
-            flip_to_open(root)
         elif phase != 'prepared':
             if not args.force:
                 raise RuntimeError(
@@ -648,6 +677,12 @@ def cmd_start(args):
                     f'--force if the recorded processes are gone. No data is wiped or re-initialised')
             print(f'WARNING: previous phase {phase!r}; continuing because --force was given.',
                   file=sys.stderr)
+
+        # Decide open vs create from what is actually on disk, not from the
+        # recorded phase: a start that failed before the daemon created a
+        # replica still leaves a settled phase behind, and the recorded phase
+        # says nothing about whether the replica directories exist.
+        sync_replica_modes(root)
 
         busy = busy_ports(args.port_base)
         if busy:

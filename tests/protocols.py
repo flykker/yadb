@@ -757,6 +757,12 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
             assert signed(19202, "PUT", "/invoices-2026/bad", b"bad", {"x-amz-checksum-crc32": "AAAAAA=="})[0] == 400
             assert signed(19202, "PUT", "/invoices-2026/bad-md5", b"bad", {"content-md5": "AAAAAAAAAAAAAAAAAAAAAA=="})[0] == 400
             assert signed(19202, "POST", "/invoices-2026/multipart?uploads")[0] == 501
+            # An opt-in quorum-confirmed read cannot be served by legacy
+            # metadata, so the native listener must refuse it instead of
+            # silently answering from the locally applied manifest.
+            consistent = signed(19202, "GET", key + "?consistent=true")
+            assert consistent[0] == 501, consistent
+            assert b"consistent reads require OpenRaft metadata" in consistent[2], consistent
             print("PASS S3 SigV4, XML listing, escaped keys, PUT/GET/HEAD/Range/DELETE, bad signatures")
 
             concurrent_results = []

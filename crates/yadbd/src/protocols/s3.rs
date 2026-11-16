@@ -276,6 +276,7 @@ pub async fn handle(State(st): State<S3State>, request: Request) -> Response {
             "encoding-type",
             "location",
             "x-id",
+            "consistent",
         ]
         .contains(&k.as_str())
     }) {
@@ -575,6 +576,25 @@ pub async fn handle(State(st): State<S3State>, request: Request) -> Response {
             }
         }
         Method::GET | Method::HEAD => {
+            // An opt-in quorum-confirmed read must be decided by the gateway: it
+            // takes the snapshot on the project-group leader and refuses on
+            // legacy metadata. Serving it from the local applied state here would
+            // silently return exactly the stale read the option exists to
+            // refuse — observed as a `404` for an object that had just been
+            // acknowledged through another node.
+            if params.get("consistent").is_some_and(|v| *v == "true") {
+                let response = handle_s3_get(
+                    State(st.app.clone()),
+                    gateway_headers.clone(),
+                    Path(path),
+                    Query(S3GetQuery { consistent: true }),
+                )
+                .await;
+                if response.status().is_success() {
+                    return response;
+                }
+                return map_error(response).await;
+            }
             // A legacy read is fenced by a reader lease, and only the
             // metadata leader can publish one. A follower therefore forwards
             // the request it has already authenticated, together with the
