@@ -4961,12 +4961,22 @@ async fn handle_s3_get(
     // fetch must both happen under one lease: an overwrite or delete retires the
     // previous manifest, so the chunks this read is about to fetch can become
     // unreferenced between the two steps.
-    let st_fence = st.clone();
-    let fence = tokio::task::spawn_blocking(move || st_fence.begin_read_lease(project_id)).await;
-    let lease = match fence {
-        Ok(Ok(lease)) => lease,
-        Ok(Err(error)) => return api_err(StatusCode::SERVICE_UNAVAILABLE, error.to_string()),
-        Err(error) => return api_err(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+    //
+    // Multi-Raft has no collector (collection is refused there), so there is no
+    // pass to fence against and no watermark to compare: the lease machinery
+    // would publish and verify records that nothing ever consults. The block and
+    // SQL read paths skip it for the same reason.
+    let lease = if st.meta.is_openraft() {
+        None
+    } else {
+        let st_fence = st.clone();
+        let fence =
+            tokio::task::spawn_blocking(move || st_fence.begin_read_lease(project_id)).await;
+        match fence {
+            Ok(Ok(lease)) => Some(lease),
+            Ok(Err(error)) => return api_err(StatusCode::SERVICE_UNAVAILABLE, error.to_string()),
+            Err(error) => return api_err(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+        }
     };
 
     let response = s3_get_fenced(
@@ -4980,6 +4990,9 @@ async fn handle_s3_get(
     )
     .await;
 
+    let Some(lease) = lease else {
+        return response;
+    };
     let st_fence = st.clone();
     match tokio::task::spawn_blocking(move || st_fence.end_read_lease(&lease)).await {
         Ok(Ok(())) => response,

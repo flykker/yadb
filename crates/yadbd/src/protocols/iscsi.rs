@@ -604,6 +604,7 @@ fn command(c: &mut TcpStream, st: &AppState, s: &mut Session, p: Pdu) -> io::Res
                     "PUT",
                     &format!("{base}?offset={offset}"),
                     &s.subject,
+                    st.subject_secret.as_deref(),
                     &data,
                 ) {
                     Ok((200, _)) => good(c, s, &p),
@@ -615,6 +616,7 @@ fn command(c: &mut TcpStream, st: &AppState, s: &mut Session, p: Pdu) -> io::Res
                     "GET",
                     &format!("{base}?offset={offset}&len={len}&consistent=true"),
                     &s.subject,
+                    st.subject_secret.as_deref(),
                     &[],
                 ) {
                     Ok((200, data)) if data.len() == len as usize => send_data(c, s, &p, data),
@@ -628,6 +630,7 @@ fn command(c: &mut TcpStream, st: &AppState, s: &mut Session, p: Pdu) -> io::Res
                 "GET",
                 &format!("{base}?offset=0&len=0&consistent=true"),
                 &s.subject,
+                st.subject_secret.as_deref(),
                 &[],
             ) {
                 Ok((200, _)) => good(c, s, &p),
@@ -653,6 +656,7 @@ fn command(c: &mut TcpStream, st: &AppState, s: &mut Session, p: Pdu) -> io::Res
                 "POST",
                 &format!("{base}/unmap"),
                 &s.subject,
+                st.subject_secret.as_deref(),
                 &body,
             ) {
                 Ok((200, _)) => good(c, s, &p),

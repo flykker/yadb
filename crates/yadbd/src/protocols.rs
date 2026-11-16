@@ -122,11 +122,18 @@ pub fn serve(
 }
 
 /// Bounded HTTP bridge to existing gateway handlers. Mutations retain their existing leader routing.
+///
+/// A configured `--subject-secret` makes the gateway treat an unsigned
+/// `x-yadb-subject` header as anonymous, so the bridge signs the subject it
+/// already authenticated over the protocol. Without this, pgwire and iSCSI
+/// sessions would be authorized as `anonymous` on every OpenRaft daemon, where
+/// the subject secret is mandatory.
 pub fn http(
     addr: &str,
     method: &str,
     path: &str,
     subject: &str,
+    secret: Option<&str>,
     body: &[u8],
 ) -> io::Result<(u16, Vec<u8>)> {
     let addr = addr
@@ -139,7 +146,19 @@ pub fn http(
     if subject.contains(['\r', '\n']) || path.contains(['\r', '\n', ' ']) {
         return Err(io::Error::other("invalid HTTP field"));
     }
-    write!(conn,"{method} {path} HTTP/1.1\r\nHost: {addr}\r\nx-yadb-subject: {subject}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",body.len())?;
+    let signature = secret.map(|secret| crate::subject_signature(secret, subject));
+    write!(
+        conn,
+        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nx-yadb-subject: {subject}\r\n"
+    )?;
+    if let Some(signature) = signature {
+        write!(conn, "x-yadb-subject-signature: {signature}\r\n")?;
+    }
+    write!(
+        conn,
+        "Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )?;
     conn.write_all(body)?;
     let mut raw = Vec::new();
     conn.take(32 * 1024 * 1024 + 1).read_to_end(&mut raw)?;

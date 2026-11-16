@@ -1521,7 +1521,14 @@ fn describe_sql(
         "force_leader": true,
     }))
     .map_err(io::Error::other)?;
-    let (code, body) = http(&cx.st.listen_addr, "POST", cx.path, cx.subject, &body)?;
+    let (code, body) = http(
+        &cx.st.listen_addr,
+        "POST",
+        cx.path,
+        cx.subject,
+        cx.st.subject_secret.as_deref(),
+        &body,
+    )?;
     let Ok(result) = serde_json::from_slice::<QueryResult>(&body) else {
         return packet(c, b'n', &[]);
     };
@@ -1710,7 +1717,14 @@ fn exec_one(
         "require_transaction": tx.status == b'T' && !rollback,
     }))
     .map_err(io::Error::other)?;
-    let (code, body) = http(&cx.st.listen_addr, "POST", cx.path, cx.subject, &body)?;
+    let (code, body) = http(
+        &cx.st.listen_addr,
+        "POST",
+        cx.path,
+        cx.subject,
+        cx.st.subject_secret.as_deref(),
+        &body,
+    )?;
     if code != 200 {
         if tx.status == b'T' {
             tx.status = b'E';
@@ -1993,7 +2007,14 @@ pub fn connection(mut c: TcpStream, st: AppState, credentials: Credentials) -> i
         &serde_json::json!({"sql":"ROLLBACK;","session_id":session_id,"force_leader":true}),
     )
     .unwrap();
-    let _ = http(&st.listen_addr, "POST", &path, &cred.subject, &body);
+    let _ = http(
+        &st.listen_addr,
+        "POST",
+        &path,
+        &cred.subject,
+        st.subject_secret.as_deref(),
+        &body,
+    );
     result
 }
 

@@ -832,7 +832,7 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
         let mut writer_lease = yadb_metakv::gc::acquire_writer_if_legacy(
             &lease_meta,
             project_id,
-            self.meta.revision(),
+            self.meta.legacy_revision(),
             yadb_metakv::gc::WRITER_TTL_MS,
         )?;
 
