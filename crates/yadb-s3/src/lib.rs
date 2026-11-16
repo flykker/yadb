@@ -3250,6 +3250,12 @@ mod tests {
         // hold, and only then register a second part. Registration refreshes the
         // record's lease and bumps its revision, so the collector's delete guard
         // fails — the interleaving this branch exists for.
+        //
+        // Part 1's own leases are expired too. Otherwise its revision lease
+        // (extended by 32 revisions at registration) would outlive the few
+        // revisions a second registration advances, and the collector would
+        // retain it on that lease alone even without re-pinning the record it
+        // just failed to delete — the test would pass with the branch removed.
         let kv = s3.meta.get(&upload_key).unwrap();
         let mut expired: UploadIntent = serde_json::from_slice(&kv.value).unwrap();
         expired.lease_until_unix_secs = 0;
@@ -3263,6 +3269,22 @@ mod tests {
                 ops: vec![TxnOp::Put {
                     key: upload_key.clone(),
                     value: serde_json::to_vec(&expired).unwrap(),
+                }],
+            })
+            .unwrap();
+        let part_kv = s3.meta.get(&part_one).unwrap();
+        let mut expired_part: UploadIntent = serde_json::from_slice(&part_kv.value).unwrap();
+        expired_part.lease_until_unix_secs = 0;
+        expired_part.lease_until_revision = 0;
+        s3.meta
+            .execute(KvCommand::RevisionTxn {
+                guards: vec![RevisionGuard {
+                    key: part_one.clone(),
+                    expected_mod_revision: part_kv.mod_revision,
+                }],
+                ops: vec![TxnOp::Put {
+                    key: part_one.clone(),
+                    value: serde_json::to_vec(&expired_part).unwrap(),
                 }],
             })
             .unwrap();

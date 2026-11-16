@@ -1766,6 +1766,19 @@ only cleared slots for nodes that were live but had exited, so a node that had
 already exited kept a stale PID. Every slot that is not a still-running node is
 now cleared.
 
+### Live evidence
+
+Same three-process root at port base 23500.
+
+| Check | Observed |
+| --- | --- |
+| `GET ?uploadId=…&max-parts=` and `&part-number-marker=` | `400 InvalidArgument` for both, on a real upload with one part. |
+| `max-parts=0`, `=1001`, `=abc` | `400 InvalidArgument`. |
+| No pagination parameters | `200` with `MaxParts=1000`. |
+| Complete with an unterminated attribute quote, an unquoted value, and an attribute with no name, each carrying the part's real ETag | `400 MalformedXML` for all three; the upload survived and the well-formed document then completed it, and the object read back byte-identical. |
+| `stop-node --node 3` | `state.json` kept `pids [.., .., null]` with `down [3]`, and `status` reported node 3 as intentionally stopped rather than as corruption. |
+| `start-node --node 3` | Node 3 restarted and became HTTP-ready; this is the path that previously failed with "replica path conflicts with explicit create/open mode". A PUT through node 3 then answered `200` and read back through node 1. |
+
 ### Gates
 
 `cargo fmt --all -- --check` clean; `cargo test -p yadbd --bins` 94/94;
@@ -1774,3 +1787,28 @@ now cleared.
 scripts/test_yadb_openraft_dev.py` 3/3; `tests/protocols.py` 18/18;
 `tests/protocols.py --native-clients` 20/20.
 
+## Third review round: strict XML framing and a test that proves the guard (2026-11-16)
+
+The re-review of `2fe061a` returned BLOCK with two majors in the completion
+tokenizer and one minor in a test. The tokenizer now rejects malformed
+documents that the previous version silently normalised.
+
+| Issue | Fix |
+| --- | --- |
+| An attribute list accepted `a="1"b="2"` (no separating whitespace), repeated names (`a="1" a="2"`) and undeclared entity references (`a="&undeclared;"`), so a strict parser would reject a document that could still publish. | `xml_validate_attributes` requires whitespace before every attribute, rejects a duplicate name, and validates each value with `xml_validate_attribute_value`: no raw `<`, and every `&` must be a declared entity or a `&#N;`/`&#xN;` character reference (`valid_char_reference`). |
+| A comment containing `--` or ending in `-`, and an XML declaration inside the root, were skipped as if valid; `</ Part>` was read as `</Part>` because the closing name was trimmed. | Comments are validated (`--` and a trailing `-` are `MalformedMultipart`); `<?xml …?>` is its own `XmlToken::Declaration`, accepted only once and only before the root; a closing tag allows trailing whitespace but no whitespace after `</`. |
+| The collector regression still passed with the re-read branch removed, because part 1 kept the revision lease its registration had extended and `u64::MAX` only expires the time lease. | The test expires **both** leases of part 1 before taking the stale scan. With the re-read branch disabled it now fails (`removed == 1`), and with the branch in place the part survives. |
+
+The new regressions all carry a real `<PartNumber>`/`<ETag>` pair inside the
+normal root, so accepting any of them would publish an object rather than fail
+for an unrelated reason. Well-formed documents with a legal declaration, a
+namespace, a comment, entity/character references and newline-separated
+attributes are still accepted.
+
+### Gates
+
+`cargo fmt --all -- --check` clean; `cargo test -p yadbd --bins` 94/94;
+`cargo test -p yadbd --bins --features openraft-storage` 103/103;
+`cargo test -p yadb-s3 --lib` 39/39; `python3 -m unittest
+scripts/test_yadb_openraft_dev.py` 3/3; `tests/protocols.py` 18/18 on three
+consecutive runs; `tests/protocols.py --native-clients` 20/20.

@@ -5373,9 +5373,26 @@ fn parse_complete_multipart(body: &[u8]) -> Result<Vec<(u32, String)>, S3Error> 
         .map_err(|_| S3Error::MalformedMultipart("body is not UTF-8".into()))?;
     let mut input = text;
     // Only whitespace, an XML declaration and comments may precede the root.
+    // The declaration is accepted only at the very start of the document: XML
+    // puts it before everything else, so one found later is a malformed
+    // document, not a token to skip.
+    let mut at_start = true;
     loop {
         match xml_token(&mut input)? {
-            XmlToken::Text(text) if text.trim().is_empty() => continue,
+            XmlToken::Declaration if at_start => {
+                // Only one declaration, and only before any content.
+                at_start = false;
+                continue;
+            }
+            XmlToken::Declaration => {
+                return Err(S3Error::MalformedMultipart(
+                    "an XML declaration is only allowed at the start of the document".into(),
+                ))
+            }
+            XmlToken::Text(text) if text.trim().is_empty() => {
+                at_start = false;
+                continue;
+            }
             XmlToken::Open {
                 name: "CompleteMultipartUpload",
                 self_closing: false,
@@ -5494,8 +5511,15 @@ fn read_element_text(input: &mut &str, name: &str) -> Result<String, S3Error> {
 /// tokenizer; `<!` constructs it does not understand are refused rather than
 /// treated as text.
 enum XmlToken<'a> {
-    Open { name: &'a str, self_closing: bool },
-    Close { name: &'a str },
+    Open {
+        name: &'a str,
+        self_closing: bool,
+    },
+    Close {
+        name: &'a str,
+    },
+    /// `<?xml ...?>`. Legal only before the root element.
+    Declaration,
     Text(&'a str),
     Eof,
 }
@@ -5509,13 +5533,42 @@ fn xml_token<'a>(input: &mut &'a str) -> Result<XmlToken<'a>, S3Error> {
             let end = rest.find("?>").ok_or_else(|| {
                 S3Error::MalformedMultipart("unterminated processing instruction".into())
             })?;
+            let body = &rest[..end];
+            let target_end = body
+                .find(|c: char| c.is_ascii_whitespace())
+                .unwrap_or(body.len());
+            let target = &body[..target_end];
+            if target.is_empty() {
+                return Err(S3Error::MalformedMultipart(
+                    "processing instruction without a target".into(),
+                ));
+            }
             *input = &rest[end + 2..];
+            // `xml` is reserved for the declaration. It is reported as its own
+            // token so the caller can enforce that it appears only at the very
+            // start of the document: a declaration inside the root is not a
+            // processing instruction that may be skipped.
+            if target == "xml" {
+                return Ok(XmlToken::Declaration);
+            }
+            if target.eq_ignore_ascii_case("xml") {
+                return Err(S3Error::MalformedMultipart(
+                    "reserved processing-instruction target".into(),
+                ));
+            }
             continue;
         }
         if let Some(rest) = input.strip_prefix("<!--") {
             let end = rest
                 .find("-->")
                 .ok_or_else(|| S3Error::MalformedMultipart("unterminated XML comment".into()))?;
+            let body = &rest[..end];
+            // XML forbids `--` inside a comment and a comment ending in `-`.
+            // Skipping an invalid comment would let a document that a strict
+            // parser rejects still complete an upload.
+            if body.contains("--") || body.ends_with('-') {
+                return Err(S3Error::MalformedMultipart("malformed XML comment".into()));
+            }
             *input = &rest[end + 3..];
             continue;
         }
@@ -5528,7 +5581,9 @@ fn xml_token<'a>(input: &mut &'a str) -> Result<XmlToken<'a>, S3Error> {
             let end = rest
                 .find('>')
                 .ok_or_else(|| S3Error::MalformedMultipart("unterminated closing tag".into()))?;
-            let name = rest[..end].trim();
+            // Only trailing whitespace before `>` is allowed: `</ Part>` names no
+            // element in XML and must not be read as `</Part>`.
+            let name = rest[..end].trim_end();
             if name.is_empty() || name.contains(|c: char| c.is_ascii_whitespace()) {
                 return Err(S3Error::MalformedMultipart("invalid closing tag".into()));
             }
@@ -5598,8 +5653,19 @@ fn xml_tag_end(rest: &str) -> Result<usize, S3Error> {
 /// ignore.
 fn xml_validate_attributes(mut rest: &str) -> Result<(), S3Error> {
     let malformed = || S3Error::MalformedMultipart("malformed attribute list".into());
+    let mut names: BTreeSet<&str> = BTreeSet::new();
     loop {
-        rest = rest.trim_start();
+        if rest.is_empty() {
+            return Ok(());
+        }
+        // The element name ends at the first whitespace, so every attribute must
+        // be separated from what precedes it by whitespace. `<Part a="1"b="2">`
+        // is malformed XML and must not be read as two attributes.
+        let after_space = rest.trim_start();
+        if after_space.len() == rest.len() {
+            return Err(malformed());
+        }
+        rest = after_space;
         if rest.is_empty() {
             return Ok(());
         }
@@ -5615,6 +5681,10 @@ fn xml_validate_attributes(mut rest: &str) -> Result<(), S3Error> {
         {
             return Err(malformed());
         }
+        // XML forbids repeating an attribute name on one element.
+        if !names.insert(name) {
+            return Err(malformed());
+        }
         let after_name = rest[name_end..].trim_start();
         let after_eq = after_name
             .strip_prefix('=')
@@ -5628,10 +5698,45 @@ fn xml_validate_attributes(mut rest: &str) -> Result<(), S3Error> {
         let end = value
             .find(quote)
             .ok_or_else(|| S3Error::MalformedMultipart("unterminated attribute value".into()))?;
-        if value[..end].contains('<') {
-            return Err(malformed());
-        }
+        xml_validate_attribute_value(&value[..end])?;
         rest = &value[end + quote.len_utf8()..];
+    }
+}
+
+/// Validates one attribute value: no raw `<`, and every `&` starts a declared
+/// entity or a character reference. An undeclared reference is a malformed
+/// document that a strict parser rejects.
+fn xml_validate_attribute_value(value: &str) -> Result<(), S3Error> {
+    if value.contains('<') {
+        return Err(S3Error::MalformedMultipart(
+            "malformed attribute value".into(),
+        ));
+    }
+    let mut rest = value;
+    while let Some(amp) = rest.find('&') {
+        let after = &rest[amp + 1..];
+        let end = after
+            .find(';')
+            .ok_or_else(|| S3Error::MalformedMultipart("unterminated entity reference".into()))?;
+        let entity = &after[..end];
+        let valid = matches!(entity, "amp" | "lt" | "gt" | "quot" | "apos")
+            || entity.strip_prefix('#').is_some_and(valid_char_reference);
+        if !valid {
+            return Err(S3Error::MalformedMultipart(format!(
+                "unknown entity reference `&{entity};`"
+            )));
+        }
+        rest = &after[end + 1..];
+    }
+    Ok(())
+}
+
+/// `&#123;` or `&#x1F;`: a non-empty decimal or hexadecimal character
+/// reference, and nothing else.
+fn valid_char_reference(reference: &str) -> bool {
+    match reference.strip_prefix(['x', 'X']) {
+        Some(hex) => !hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit()),
+        None => !reference.is_empty() && reference.bytes().all(|b| b.is_ascii_digit()),
     }
 }
 
@@ -9147,8 +9252,28 @@ mod security_tests {
             b"<CompleteMultipartUpload><Part x=1><PartNumber>1</PartNumber><ETag>\"a\"</ETag></Part></CompleteMultipartUpload>",
             b"<CompleteMultipartUpload><Part x=\"a><PartNumber>1</PartNumber></Part></CompleteMultipartUpload>",
             b"<CompleteMultipartUpload><Part =\"a\"><PartNumber>1</PartNumber></Part></CompleteMultipartUpload>",
-            // A closing tag may not carry attributes.
+            // Attributes must be separated by whitespace, may not repeat, and
+            // their values may not carry an undeclared reference. Each body
+            // still names a real part, so accepting it would publish.
+            b"<CompleteMultipartUpload><Part a=\"1\"b=\"2\"><PartNumber>1</PartNumber><ETag>\"a\"</ETag></Part></CompleteMultipartUpload>",
+            b"<CompleteMultipartUpload><Part a=\"1\" a=\"2\"><PartNumber>1</PartNumber><ETag>\"a\"</ETag></Part></CompleteMultipartUpload>",
+            b"<CompleteMultipartUpload><Part a=\"&undeclared;\"><PartNumber>1</PartNumber><ETag>\"a\"</ETag></Part></CompleteMultipartUpload>",
+            b"<CompleteMultipartUpload><Part a=\"&amp\"><PartNumber>1</PartNumber><ETag>\"a\"</ETag></Part></CompleteMultipartUpload>",
+            // A closing tag may not carry attributes, and `</ Part>` is not a
+            // closing tag: XML does not allow whitespace after `</`.
             b"<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>\"a\"</ETag></Part x=\"1\"></CompleteMultipartUpload>",
+            b"<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>\"a\"</ETag></ Part></CompleteMultipartUpload>",
+            // `--` inside a comment is forbidden, and a malformed comment must
+            // not be skipped as if it were valid.
+            b"<CompleteMultipartUpload><!-- bad -- comment --><Part><PartNumber>1</PartNumber><ETag>\"a\"</ETag></Part></CompleteMultipartUpload>",
+            b"<CompleteMultipartUpload><!-- ends with dash ---><Part><PartNumber>1</PartNumber><ETag>\"a\"</ETag></Part></CompleteMultipartUpload>",
+            // A declaration belongs before the root, never inside it.
+            b"<CompleteMultipartUpload><?xml version=\"1.0\"?><Part><PartNumber>1</PartNumber><ETag>\"a\"</ETag></Part></CompleteMultipartUpload>",
+            // `xml` is reserved: a processing instruction may not use it.
+            b"<CompleteMultipartUpload><?XML version=\"1.0\"?><Part><PartNumber>1</PartNumber><ETag>\"a\"</ETag></Part></CompleteMultipartUpload>",
+            // Only one declaration, and only before the root.
+            b"<?xml version=\"1.0\"?><?xml version=\"1.0\"?><CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>\"a\"</ETag></Part></CompleteMultipartUpload>",
+            b"<?xml version=\"1.0\"?><CompleteMultipartUpload><?xml version=\"1.0\"?><Part><PartNumber>1</PartNumber><ETag>\"a\"</ETag></Part></CompleteMultipartUpload>",
         ] {
             assert!(
                 matches!(
@@ -9160,13 +9285,22 @@ mod security_tests {
             );
         }
 
-        // A well-formed attribute list is still accepted: the namespace S3
-        // clients send on the root element must not break completion.
-        let parsed = parse_complete_multipart(
-            b"<CompleteMultipartUpload xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\" note='ok'><Part><PartNumber>1</PartNumber><ETag>\"a\"</ETag></Part></CompleteMultipartUpload>",
-        )
-        .unwrap();
-        assert_eq!(parsed, vec![(1, "\"a\"".to_string())]);
+        // Well-formed documents are still accepted: the namespace S3 clients
+        // send, a legal declaration at the start, a valid entity reference and a
+        // character reference in an attribute value, and a comment between the
+        // root and its parts.
+        for body in [
+            &b"<CompleteMultipartUpload xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\" note='ok'><Part><PartNumber>1</PartNumber><ETag>\"a\"</ETag></Part></CompleteMultipartUpload>"[..],
+            b"<?xml version=\"1.0\" encoding=\"UTF-8\"?><CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>\"a\"</ETag></Part></CompleteMultipartUpload>",
+            b"<CompleteMultipartUpload><!-- a comment --><Part><PartNumber>1</PartNumber><ETag>\"a\"</ETag></Part></CompleteMultipartUpload>",
+            b"<CompleteMultipartUpload><Part a=\"&amp;&#65;&#x41;\"><PartNumber>1</PartNumber><ETag>\"a\"</ETag></Part></CompleteMultipartUpload>",
+            b"<CompleteMultipartUpload><Part\n a=\"1\"\t b='2' ><PartNumber>1</PartNumber><ETag>\"a\"</ETag></Part ></CompleteMultipartUpload>",
+        ] {
+            let parsed = parse_complete_multipart(body).unwrap_or_else(|e| {
+                panic!("{}: {e:?}", String::from_utf8_lossy(body))
+            });
+            assert_eq!(parsed, vec![(1, "\"a\"".to_string())]);
+        }
     }
 
     #[test]
