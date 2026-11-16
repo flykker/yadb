@@ -374,6 +374,10 @@ struct ScrubSummary {
     pub gc_refusal: Option<String>,
     /// Mounted pools the sweep declined to touch, with the reason.
     pub gc_pools_refused: Vec<String>,
+    /// Multi-Raft metadata groups the sweep refused, with the reason. Empty on
+    /// legacy metadata, which is a single namespace.
+    #[serde(default)]
+    pub gc_groups_refused: Vec<String>,
     /// Barrier or compaction failures after the refusal point. Reported, never
     /// swallowed: a failed compaction means space was not actually reclaimed.
     pub gc_errors: Vec<String>,
@@ -811,12 +815,11 @@ impl AppState {
     /// Runs one mark-and-sweep pass without the repair scan. Same snapshot and
     /// fence rules as [`Self::scrub_all_pools`]; a refusal is returned to the
     /// caller as an error response, not hidden in a 200 body.
+    ///
+    /// On Multi-Raft this is a per-group pass: each group is swept by its own
+    /// leader under its own collector lease, and a group that cannot prove its
+    /// fence is refused with its reason in the outcome.
     fn gc_all_pools(&self) -> gc::SweepOutcome {
-        if self.meta.is_openraft() {
-            return gc::SweepOutcome::refuse(
-                "garbage collection disabled for Multi-Raft: no single atomic cross-group metadata snapshot",
-            );
-        }
         let control = self.control.read().unwrap().clone();
         let pools = self.pools.read().unwrap().clone();
         gc::sweep(&self.meta, &pools, &control)
@@ -836,7 +839,19 @@ impl AppState {
         // bit-rotted fragment), which is a different failure and needs the manifest
         // scan to know which blobs should exist.
         if self.meta.is_openraft() {
-            // Global orphan scans are unsafe without per-group leader fencing.
+            // The global repair scan needs one whole-deployment view, which
+            // Multi-Raft does not have. The collection pass does not: it runs
+            // per group under that group's leader and collector lease, so it
+            // still reclaims garbage. Only the repair half is refused here.
+            let sweep_outcome = if sweep {
+                let control = self.control.read().unwrap().clone();
+                let pools = self.pools.read().unwrap().clone();
+                gc::sweep(&self.meta, &pools, &control)
+            } else {
+                gc::SweepOutcome::refuse(
+                    "collection skipped in this repair scan: it runs every five minutes and on POST /v1/pools/gc",
+                )
+            };
             let summary = ScrubSummary {
                 refused_puts: self
                     .pools
@@ -846,10 +861,14 @@ impl AppState {
                     .map(|striper| striper.refused_put_count() as usize)
                     .sum(),
                 orphan_collection_error: Some("scrub disabled for Multi-Raft".into()),
-                gc_refusal: Some(
-                    "garbage collection disabled for Multi-Raft: no single atomic cross-group metadata snapshot"
-                        .into(),
-                ),
+                blobs_live: sweep_outcome.blobs_live,
+                fragments_deleted: sweep_outcome.fragments_deleted,
+                bytes_reclaimed: sweep_outcome.bytes_reclaimed,
+                leases_live: sweep_outcome.leases_live,
+                gc_refusal: sweep_outcome.refusal,
+                gc_pools_refused: sweep_outcome.pools_refused,
+                gc_groups_refused: sweep_outcome.groups_refused,
+                gc_errors: sweep_outcome.errors,
                 ..ScrubSummary::default()
             };
             *self.last_scrub.write().unwrap() = Some(summary.clone());
@@ -971,6 +990,7 @@ impl AppState {
             leases_live: sweep.leases_live,
             gc_refusal: sweep.refusal,
             gc_pools_refused: sweep.pools_refused,
+            gc_groups_refused: sweep.groups_refused,
             gc_errors: sweep.errors,
             pools: pools_health,
         };
@@ -6228,10 +6248,13 @@ async fn handle_s3_get(
     // previous manifest, so the chunks this read is about to fetch can become
     // unreferenced between the two steps.
     //
-    // Multi-Raft has no collector (collection is refused there), so there is no
-    // pass to fence against and no watermark to compare: the lease machinery
-    // would publish and verify records that nothing ever consults. The block and
-    // SQL read paths skip it for the same reason.
+    // Multi-Raft takes no reader lease: its collector runs per group and fences
+    // on that group's writer lease and S3 `Prepared` intent, not on reader
+    // records. A read that races an overwrite or delete and a pass can therefore
+    // find a chunk reclaimed between the manifest read and the fetch; that
+    // surfaces as an error response, never as a short or zero-filled body. The
+    // lease machinery stays legacy-only because only the legacy collector
+    // consults reader records.
     let lease = if st.meta.is_openraft() {
         None
     } else {
@@ -6348,9 +6371,13 @@ async fn s3_get_fenced(
 /// is no fallback to the locally applied manifest and no retry.
 ///
 /// No reader lease is taken here: this path only runs on OpenRaft metadata (the
-/// legacy runtime answers 501 above), and collection refuses on OpenRaft because
-/// no single atomic cross-group snapshot exists. The legacy reader fence would
-/// add a metadata round trip to a read that no collector can race.
+/// legacy runtime answers 501 above). Multi-Raft collection is per group and
+/// fences on that group's writer lease and S3 `Prepared` intent, not on reader
+/// records. The manifest comes from a linearizable snapshot, so it is committed
+/// and any later pass marks the chunks it names; if an overwrite retires it
+/// before the fetch, a reclaimed chunk surfaces as an error rather than a short
+/// or zero-filled body. The legacy reader fence would add a metadata round trip
+/// to a read that no legacy collector can race.
 async fn s3_get_consistent(
     st: AppState,
     project_id: u32,

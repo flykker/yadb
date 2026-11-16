@@ -1113,7 +1113,10 @@ cluster.
 **Open.** The collector is legacy-only: on Multi-Raft both endpoints refuse with
 `garbage collection disabled for Multi-Raft: no single atomic cross-group
 metadata snapshot`, because one node cannot enumerate every group's manifests
-while deletion is pool-scoped. A pass needs each node read-idle for one lease TTL
+while deletion is pool-scoped. (Superseded for Multi-Raft by the per-group
+collector described in "Per-group garbage collection on Multi-Raft" below; the
+legacy behaviour in this section is unchanged.) A pass needs each node read-idle
+for one lease TTL
 (30 s), because a node keeps its reader lease for reuse instead of deleting it
 per statement; a continuously busy node refuses instead of waiting. A read that
 outlives its own lease is not refreshed mid-read, so a query longer than 30 s is
@@ -1517,6 +1520,9 @@ the same `gc_refusal` field and an empty pool list: the repair scan runs, and it
 reports that collection was skipped rather than silently reporting zero
 collected fragments.
 
+(That was the behaviour at `234d49a`. The per-group collector replaces it; see
+"Per-group garbage collection on Multi-Raft" below.)
+
 ### Failure drills
 
 | Drill | Observed |
@@ -1874,3 +1880,71 @@ version restored it fails on all three runs; with the fix it passes.
 `python3 -m unittest scripts/test_yadb_openraft_dev.py` 3/3;
 `tests/protocols.py` 18/18; `tests/protocols.py --native-clients` 20/20 on six
 consecutive runs after the fix.
+
+## Per-group garbage collection on Multi-Raft (2026-11-17)
+
+Multi-Raft collection no longer refuses as a whole. `POST /v1/pools/gc` and the
+sweep phase of `POST /v1/pools/scrub` run one pass per metadata group, and each
+pass either completes under a fence it can prove or refuses that group and
+deletes nothing for it. Legacy metadata keeps its single-namespace pass byte for
+byte; nothing below changes legacy keys, ordering or behaviour.
+
+The design is the one in `multiraft-production-todo.md`: cross-group references
+are impossible (a fragment id carries its `project_id`, a manifest only names
+fragments of its own project, and a project maps to exactly one data group), so
+the live set stays group-scoped and no cross-group snapshot is needed.
+
+| Concern | Per-group rule |
+| --- | --- |
+| Leadership | The pass runs only on the leader of group G, read through `role_info_for_group`. A follower refuses with the leader it knows. |
+| Snapshot | `try_linearizable_group_snapshot(G)` names the group directly and returns a quorum-confirmed snapshot. Followers and unavailable quorums are errors, never a fallback to local applied state. |
+| Collector lease | `/gc/g<group>/collector`, one key per group, held for `COLLECTOR_LEASE_MS` (120 s) and renewed before each pool. Two passes over different groups do not block each other. |
+| Writer fence | `/gc/g<group>/writer/<id>` (TTL 300 s) and `/gc/g<group>/reader/<id>` (TTL 30 s). A live lease in G refuses G only. The fence is read before admission closes and again after the collector record is acquired, so a writer cannot slip into the window between the check and the mark. |
+| S3 intent | An unexpired `Prepared` intent is part of the mark, so chunks appended before publication are kept. |
+| Deletion | Only ids whose `project_id` the group's scope covers, and only when the pool enumerated successfully. A refused pool is left untouched for every group. |
+| Refusal | Not leader, unreadable fence, collector lease held, snapshot failure or an unprovable live set refuses the group with the reason in `gc_groups_refused`; `/v1/pools/gc` answers `409` with that reason. Other groups are unaffected. |
+| Compaction | Physical and fenced by durable barriers, so it runs once after the groups. A pass in which every group refused touches no volume. |
+
+The repair (orphan) scan still refuses on Multi-Raft (`scrub disabled for
+Multi-Raft`): it needs one whole-deployment view, which Multi-Raft does not have.
+
+### Tests
+
+| Test | Proves |
+| --- | --- |
+| `gc::tests::openraft_tests::a_multigroup_pass_reclaims_each_groups_dead_fragments` | Two data groups over projects 1 and 2 each keep exactly the newest generation (16 fragments) and serve their newest bytes after the pass. |
+| `gc::tests::openraft_tests::a_follower_group_refuses_and_deletes_nothing` | Group 2 is a two-node cluster whose local node is a follower. The pass refuses group 2, deletes nothing, and the group 2 leader then reclaims the same fragments — so the refusal, not the data, kept them. |
+| `gc::tests::openraft_tests::a_group_writer_lease_protects_an_unpublished_fragment` | An unexpired writer lease in group 2 keeps an appended, unpublished fragment alive and refuses group 2, while group 3 still reclaims its own garbage. Releasing the lease makes the fragment provably dead. |
+| `gc::tests::openraft_tests::a_prepared_s3_intent_protects_its_chunks` | A `Prepared` intent keeps its chunks through a pass with `fragments_deleted: 0`; deleting the intent makes the same chunks dead. |
+| `yadb_metakv::gc::tests::group_leases_are_scoped_to_their_group` | A group 2 writer record lands in `/gc/g2/writer/`, fences group 2, does not fence group 3 and does not appear in the legacy namespace. |
+| `yadb_metakv::gc::tests::group_collectors_are_independent_and_close_admission_per_group` | Two groups hold collector records at once; admission closes per group and reopens independently. |
+
+### Sensitivity
+
+Disabling the post-admission fence re-check (`if !live.is_empty()` →
+`if false && !live.is_empty()` in both per-group checks) makes
+`a_group_writer_lease_protects_an_unpublished_fragment` fail:
+`groups_refused` is empty and the pass deletes 483 fragments while a writer
+lease is live (`left: 0, right: 1`). The check was restored; the suite is green
+with it.
+
+### Gates
+
+`cargo fmt --all` then `cargo fmt --all -- --check` clean;
+`cargo test -p yadb-metakv --lib` 172/172;
+`cargo test -p yadbd --bins` 96/96;
+`cargo test -p yadbd --bins --features openraft-storage` 109/109;
+`cargo test -p yadb-s3` 39/39 plus 0 doc-tests. All with `--offline --locked
+-j 2`. The full `yadb-metakv` run was green on the second attempt; the first
+failed five TLS/process tests with `request timeout` under load, and each
+passes when run alone (pre-existing timing sensitivity, not touched here).
+
+### Open
+
+* No live-cluster drill of the per-group path: the evidence is in-process
+  fixtures, not a three-node deployment with a killed group leader.
+* Readers on Multi-Raft take no reader lease (`begin_read_lease` is still
+  legacy-gated), so only the per-group writer lease and the S3 `Prepared` intent
+  fence in-flight writes there.
+* A pass over a group whose project set is empty still takes and releases its
+  collector record; the cost is one round trip, not a correctness issue.
