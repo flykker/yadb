@@ -1747,3 +1747,30 @@ if it ever fails again.
   state, so a part or object acknowledged a moment earlier through another node
   can be missing until it applies; `?consistent=true` is the opt-in read.
 * Per-group GC on Multi-Raft, and `InstallSnapshot`, remain unimplemented.
+
+## Second review round: XML framing, pagination and the stop path (2026-11-16)
+
+The re-review of `4016497` returned BLOCK with three issues; two were real
+defects introduced by the first round of fixes.
+
+| Issue | Fix |
+| --- | --- |
+| Opening tags ended at the first `>` even inside an attribute value, and the attribute list was never validated. `<Part ignored="><PartNumber>1</PartNumber><ETag>"<matching>"</ETag></Part>` was read as a normal `<Part>`, so a malformed document could publish an object. | `xml_tag_end` scans quote-aware and `xml_validate_attributes` accepts only whitespace-separated `name="value"`/`name='value'`. Unterminated quotes, unquoted values, a missing name and a `<` inside a value are `MalformedMultipart`; a well-formed `xmlns` list is still accepted. |
+| `?max-parts=` and `?part-number-marker=` were silently defaulted: an empty value was treated as an absent parameter. | Only a missing parameter defaults; presence with an unparsable value (including empty) is `InvalidArgument`. |
+| The aborted-part test passed a revision captured before the successful registration, so it refused on the stale revision and proved nothing about the state. | The test passes the aborted record's own revision, so only the state check can refuse. |
+| The collector's lost-guard branch had no test. | `collect_orphans_from` takes the scan, so a test can hand a pass the stale scan it would hold, refresh the record through a registration in between, and assert the pass re-reads and leaves both parts alive. |
+| No automated regression for the stop timeout, the start-node replica-mode reconciliation, `Location`, or COPY cleanup. | `scripts/test_yadb_openraft_dev.py` (3 tests) covers the stop-timeout PID slots and that `start-node`/`restart-node` reconcile replica modes before spawning; `tests/protocols.py` now runs COPY end to end and asserts `Location` carries no `uploadId` and that empty pagination values are refused. |
+
+The new stop-path test found that the first PID-slot fix was still wrong: it
+only cleared slots for nodes that were live but had exited, so a node that had
+already exited kept a stale PID. Every slot that is not a still-running node is
+now cleared.
+
+### Gates
+
+`cargo fmt --all -- --check` clean; `cargo test -p yadbd --bins` 94/94;
+`cargo test -p yadbd --bins --features openraft-storage` 103/103;
+`cargo test -p yadb-s3 --lib` 39/39; `python3 -m unittest
+scripts/test_yadb_openraft_dev.py` 3/3; `tests/protocols.py` 18/18;
+`tests/protocols.py --native-clients` 20/20.
+
