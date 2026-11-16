@@ -481,27 +481,30 @@ pub async fn handle(State(st): State<S3State>, request: Request) -> Response {
             Err(_) => return err(StatusCode::FORBIDDEN, "AccessDenied", "invalid subject"),
         },
     );
+    // SigV4 proved this subject, so the gateway must be told that it is proven.
+    // A daemon started with `--subject-secret` (mandatory in OpenRaft mode)
+    // treats an unsigned `x-yadb-subject` as anonymous, which would turn every
+    // S3 request into a `403` for `anonymous`. The signature is added for every
+    // method, not only keyed mutations.
+    if let Some(secret) = st.app.subject_secret.as_deref() {
+        match subject_signature(secret, &subject).parse() {
+            Ok(v) => {
+                gateway_headers.insert("x-yadb-subject-signature", v);
+            }
+            Err(_) => return err(StatusCode::FORBIDDEN, "AccessDenied", "invalid subject"),
+        }
+    }
     if let Some(ct) = headers.get(header::CONTENT_TYPE) {
         gateway_headers.insert(header::CONTENT_TYPE, ct.clone());
     }
     // A keyed mutation is scoped by subject and the gateway handlers require a
-    // proven identity. SigV4 already proved it here, so forward the key and
-    // vouch for the same subject with the internal signature. This is only done
-    // for keyed PUT/DELETE: an unkeyed request keeps its previous headers
-    // byte-for-byte.
+    // proven identity. The forwarded signature above already vouches for the
+    // subject; a keyed request additionally carries its key.
     if (method == Method::PUT || method == Method::DELETE)
         && headers.contains_key("idempotency-key")
     {
         if let Some(value) = headers.get("idempotency-key") {
             gateway_headers.insert("idempotency-key", value.clone());
-        }
-        if let Some(secret) = st.app.subject_secret.as_deref() {
-            match subject_signature(secret, &subject).parse() {
-                Ok(v) => {
-                    gateway_headers.insert("x-yadb-subject-signature", v);
-                }
-                Err(_) => return err(StatusCode::FORBIDDEN, "AccessDenied", "invalid subject"),
-            }
         }
     }
     let path = (

@@ -630,7 +630,13 @@ spec: {pool: data, sizeBytes: 8192}
         before + 4
     );
     assert_eq!(generation(), before + 4);
-    let (status, _, _) = request_extra(
+    // Keyed block writes are a project-scope idempotency operation, not an
+    // unsupported endpoint: the first write commits and records its outcome,
+    // and the same key with the same body replays that record instead of
+    // writing again. (This assertion used to expect 501, from before keyed
+    // block writes were implemented; on a node with OpenRaft metadata the
+    // request reached the keyed path and failed with 500 instead.)
+    let (status, _, keyed_write_body) = request_extra(
         public,
         "PUT",
         "/block/alpha/disk?offset=0",
@@ -638,7 +644,30 @@ spec: {pool: data, sizeBytes: 8192}
         "application/octet-stream",
         "Idempotency-Key: unsupported\r\n",
     );
-    assert_eq!(status, 501);
+    assert_eq!(
+        status,
+        200,
+        "keyed block write: {}",
+        String::from_utf8_lossy(&keyed_write_body)
+    );
+    let (replay_status, _, replay_body) = request_extra(
+        public,
+        "PUT",
+        "/block/alpha/disk?offset=0",
+        b"x",
+        "application/octet-stream",
+        "Idempotency-Key: unsupported\r\n",
+    );
+    assert_eq!(
+        replay_status,
+        200,
+        "keyed block write replay: {}",
+        String::from_utf8_lossy(&replay_body)
+    );
+    assert_eq!(
+        replay_body, keyed_write_body,
+        "a replayed keyed write must return the recorded response"
+    );
     // Give both volumes real content first: "reads back as zeros" is also true
     // for a volume that was never written, so without this the UNMAP assertion
     // would not prove the discard happened.

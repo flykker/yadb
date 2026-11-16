@@ -311,7 +311,7 @@ impl<FS: StorageFs> BlockVolumeEngine<FS> {
             let mut writer_lease = yadb_metakv::gc::acquire_writer_if_legacy(
                 &self.meta,
                 project_id,
-                self.meta.revision(),
+                self.meta.legacy_revision(),
                 yadb_metakv::gc::WRITER_TTL_MS,
             )?;
 

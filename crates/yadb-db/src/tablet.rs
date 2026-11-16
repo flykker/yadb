@@ -913,7 +913,7 @@ impl<FS: StorageFs> DataShardTablet<FS> {
         let mut writer_lease = yadb_metakv::gc::acquire_writer_if_legacy(
             &lease_meta,
             self.manifest.project_id,
-            self.meta.revision(),
+            self.meta.legacy_revision(),
             yadb_metakv::gc::WRITER_TTL_MS,
         )?;
 
@@ -979,7 +979,7 @@ impl<FS: StorageFs> DataShardTablet<FS> {
         let mut writer_lease = yadb_metakv::gc::acquire_writer_if_legacy(
             &lease_meta,
             self.manifest.project_id,
-            self.meta.revision(),
+            self.meta.legacy_revision(),
             yadb_metakv::gc::WRITER_TTL_MS,
         )?;
         let mut merged: BTreeMap<Vec<u8>, RowEntry> = BTreeMap::new();

@@ -117,6 +117,75 @@ See `docs/openraft-empty-test-cluster.md` for the known limitations. Do not
 interpret a successful status request as a write/replication test or resolve an
 ambiguous mutation by blindly retrying it.
 
+## Multi-Raft launcher with protocol frontends
+
+`scripts/yadb-openraft-dev.py` is the explicit-OpenRaft sibling of
+`scripts/yadb-local.py`. `yadb-local.py` stays the legacy/default launcher and
+its behaviour is unchanged; this one always starts every daemon with
+`--metadata-runtime openraft` and the feature-enabled binary, and it also enables
+the PostgreSQL, S3 and iSCSI listeners so the same protocols can be exercised
+against the Multi-Raft runtime.
+
+```sh
+# Provision a fresh root (never reuses an existing one):
+python3 scripts/yadb-openraft-dev.py prepare \
+    --root /data/data/com.foxdebug.acodefree/cache/opencode/yadb-openraft-dev
+
+# Start it. The first start applies examples/platform.yaml once, signed.
+python3 scripts/yadb-openraft-dev.py start --root /absolute/path/to/root
+
+# Read-only comparison of state.json with live PIDs, ports and leaders:
+python3 scripts/yadb-openraft-dev.py status --root /absolute/path/to/root
+
+# Signed apply of another manifest (HTTP 200 + generation):
+python3 scripts/yadb-openraft-dev.py apply --root /absolute/path/to/root \
+    --file examples/platform.yaml
+
+# Tail every node log:
+python3 scripts/yadb-openraft-dev.py logs --root /absolute/path/to/root --lines 40
+
+# Stop all three (SIGTERM, waits, then reports):
+python3 scripts/yadb-openraft-dev.py stop --root /absolute/path/to/root
+```
+
+Failure drills are explicit subcommands so `state.json` stays truthful while one
+node is down:
+
+```sh
+python3 scripts/yadb-openraft-dev.py restart-node --root ROOT --node 1
+python3 scripts/yadb-openraft-dev.py restart-node --root ROOT --node 2 --signal KILL
+python3 scripts/yadb-openraft-dev.py stop-node    --root ROOT --node 3
+python3 scripts/yadb-openraft-dev.py start-node   --root ROOT --node 3
+```
+
+`stop-node` records a `null` PID and a `down` list, so `status` treats the
+missing node as intentional instead of inconsistent. `start-node` refuses when
+the recorded PID is alive or the HTTP port is already bound, and it waits for
+that node's health endpoint before returning.
+
+Port layout for base `B`: HTTP `B..B+2`, Raft `B+100..B+108`, PostgreSQL
+`B+200..B+202`, S3 `B+300..B+302`, iSCSI `B+400..B+402`. The default base is
+23500, i.e. HTTP 23500–23502, Raft 23600–23608, PostgreSQL 23700–23702, S3
+23800–23802 and iSCSI 23900–23902. A base is rejected unless all offsets stay
+below 65536, and the recorded base is fixed for the life of a root.
+
+The launcher reuses the version-1 group config / version-2 manifest format and
+the certificate and signing helpers from `scripts/yadb-local.py` (loaded with
+`importlib.util` because the filename contains a hyphen), so there is one
+provisioning format rather than two. It creates one control group plus two data
+groups, three replicas each, with route map `{"1": 2, "2": 3}` and preferred
+leaders 1/2/3. The admin allowlist subject is `local-operator`; the protocol user
+`backend` resolves to the member subject `sa:billing-backend`, which
+`examples/platform.yaml` grants `readWrite` on `billing`.
+
+Boundaries, all deliberate: it never wipes a data directory, never re-applies a
+manifest to an existing root, never retries an ambiguous `/v1/apply`, and never
+converts a legacy root. Restarting a stopped root rewrites every group config to
+`mode: "open", initialize: false` before launch. A `start` on a `running`
+`state.json` whose PIDs are gone requires `--force`, because that is a crash, not
+a restart. Per-group garbage collection is refused on Multi-Raft (see below), so
+`scrub`/`gc` are evidence commands, not maintenance commands.
+
 ## Local smoke readback
 
 On a running **empty** local cluster, explicitly run once:

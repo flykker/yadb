@@ -1473,3 +1473,107 @@ HTTP round trip per batch. A partially written forwarded request counts as
 serialization and one-Raft-round-per-metadata-mutation design means throughput
 on one Leader is bounded by that round trip; the 20 s forwarding budget is sized
 for the 24-way burst this test exercises, not for an unbounded queue.
+
+## Live three-process Multi-Raft run (2026-11-16)
+
+A fresh root was provisioned and run with `scripts/yadb-openraft-dev.py` at port
+base 23500: three daemon processes, each hosting control group 1 and data groups
+2 and 3 (three replicas per group), mutual TLS, `--metadata-runtime openraft`,
+and the PostgreSQL, S3 and iSCSI listeners enabled. Every node reported
+`metadata_runtime: multiraft`, `client_traffic: multiraft` and
+`production_ready: false`. Initial leaders were g1 = node 1, g2 = node 2,
+g3 = node 3 at term 1.
+
+### Control plane
+
+A signed `POST /v1/apply` of `examples/platform.yaml` returned HTTP 200 with
+generation 1; a second, different manifest returned HTTP 200 with generation 2.
+All three nodes served the same `/v1/status` (`generation: 2`, projects `billing`
+and `beta`) and the same control-group leader.
+
+### Protocols
+
+* PostgreSQL through pgwire (`psql` on 23700/23701/23702): `CREATE TABLE`,
+  `INSERT` ×3 and `SELECT count(*), sum(id), min(note)` returned `3|6|alpha` on
+  every node.
+* Native S3 through the gateway on 23800/23801/23802: a 64 KiB PUT and GET were
+  byte-identical on all three nodes (`cmp` clean, SHA-256 prefix `de3f3404`).
+* Block: a 4 KiB PUT returned `{"bytes_written":4096,"offset":0}`; the
+  consistent GET on 23500/23501/23502 returned 200 with matching bytes. Writes
+  to a follower returned `x-yadb-leader-id` naming the data-group leader.
+* iSCSI through the target on 23900/23901: CHAP login reached full feature phase,
+  `WRITE(16)` and `READ(16)` both returned SCSI status `0x00`, and the 4096 bytes
+  read back were identical to the written pattern. A kernel initiator was not
+  available (`iscsi_tcp` could not be inserted), so the initiator was a
+  hand-written RFC 7143 login/SCSI client; this proves the target's wire
+  behaviour, not kernel-initiator interoperability.
+
+### GC and scrub refusal
+
+With Multi-Raft metadata, `POST /v1/pools/gc` returned **409** on all three
+nodes with `gc_refusal: "garbage collection disabled for Multi-Raft: no single
+atomic cross-group metadata snapshot"`. `POST /v1/pools/scrub` returned 200 with
+the same `gc_refusal` field and an empty pool list: the repair scan runs, and it
+reports that collection was skipped rather than silently reporting zero
+collected fragments.
+
+### Failure drills
+
+| Drill | Observed |
+| --- | --- |
+| Graceful restart of node 1 (control leader) | g1 re-elected node 2 at term 2 within one poll; after node 1 returned it followed node 2. SQL, S3 and block readback unchanged. |
+| `SIGKILL` of node 2 (g2 leader) | g2 had no leader for one poll, then elected node 3 at term 2. Writes through nodes 1 and 3 returned `503 "storage pool cannot reach full redundancy; the write was refused"`; consistent reads returned 200 with matching bytes. |
+| One node down (reads vs writes) | Reads kept serving from the remaining replicas; writes were refused with the documented `503` full-redundancy error instead of being accepted with fewer copies. |
+| `SIGKILL` of a leader during a 256 KiB block write (20 ms in) | The client got a closed connection (unknown outcome, no false success). After recovery the target range was entirely the old value: no torn bytes. |
+| `SIGKILL` of a leader during a 256 KiB block write (100 ms in) | The client got `503 "OpenRaft forwarding failed; write outcome unknown, do not automatically retry"`. After recovery the range was again entirely the old value. |
+| Full process-tree restart (all three killed externally) | `start --force` reopened every group from disk (`mode: open`), re-elected leaders, and reported `generation: 2`. SQL `3|6|alpha`, the 64 KiB S3 object and both block ranges were intact. |
+| Keyed block write + replay | Two `PUT`s with the same `Idempotency-Key` both returned 200 with the recorded body, and the volume changed once. |
+
+### Defects found and fixed by this run
+
+1. **pgwire/iSCSI bridge sent an unsigned subject.** `protocols::http` forwarded
+   `x-yadb-subject` without a signature, so every session authorized as
+   `anonymous` and got `403 access denied for 'anonymous' on project 'billing'`.
+   The bridge now signs with the daemon's subject secret; call sites in
+   `protocols/pg.rs` and `protocols/iscsi.rs` pass it.
+2. **SQL writes panicked with "multi-group metadata has no global revision".**
+   `gc::acquire_writer_if_legacy(..., self.meta.revision(), ...)` evaluated
+   `revision()` eagerly, and `revision()` asserts on multi-group metadata even
+   when the legacy branch is not taken. Added `LocalMetaKv::legacy_revision()`
+   (returns 0 on OpenRaft) and used it in `yadb-db` and `yadb-block`.
+3. **S3 gateway returned `403 access denied for 'anonymous'`.** The
+   `x-yadb-subject-signature` header was only added for keyed PUT/DELETE, so an
+   unkeyed PUT/GET proved no subject. The SigV4-verified subject is now always
+   signed.
+4. **Plain S3 reads panicked on Multi-Raft.** `handle_s3_get` took the legacy GC
+   reader lease unconditionally, and `begin_read_lease` calls
+   `meta.revision()`, which asserts on multi-group metadata. The SQL and block
+   read paths already skipped the lease when `meta.is_openraft()`; the S3 path
+   now does too, and skips the corresponding release. Without this, a
+   non-`consistent=true` S3 GET answered `500 task ... panicked with message
+   "multi-group metadata has no global revision"`.
+5. **A stale daemon-test assertion.** `openraft_daemon` expected `501` for a
+   keyed block write, from before keyed block writes were implemented. On the
+   base commit the same assertion saw `500` (defect 2); with defect 2 fixed the
+   request correctly returns `200`. The test now asserts the implemented
+   contract: 200, then a replay that returns the recorded response.
+
+### Gates
+
+`cargo fmt` clean; `cargo test -p yadbd --bins` 77/77;
+`cargo test -p yadbd --features openraft-storage --test openraft_daemon` 4/4
+(the daemon test suite failed at `ff335e1` at the keyed-block-write assertion,
+returning 500 instead of the expected 501).
+
+### Open items
+
+* Per-group GC on Multi-Raft is refused by design and not implemented; the
+  refusal is the contract, not a gap in this evidence.
+* `production_ready` stays false: this run proves the runtime works on three
+  processes, not that the durability and authorization gates for production are
+  met.
+* After the kill drills all three groups ended up led by node 1, so the soft
+  leadership preference for groups 2 and 3 was not met. That is allowed and
+  documented; a preferred node does not reclaim leadership automatically.
+* A kernel iSCSI initiator was unavailable in this environment, so iSCSI was
+  exercised with a hand-written initiator.

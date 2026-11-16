@@ -1474,6 +1474,20 @@ impl<FS: StorageFs> LocalMetaKv<FS> {
         self.legacy().lock().unwrap().revision()
     }
 
+    /// Revision to stamp a *legacy-only* GC lease with, or `0` on OpenRaft.
+    ///
+    /// Multi-Raft metadata has no global revision (`revision()` asserts that),
+    /// and collection is disabled there, so no lease is ever published and the
+    /// value is unused. Callers that pass a revision to
+    /// `gc::acquire_writer_if_legacy` must use this: evaluating `revision()`
+    /// eagerly as an argument panics before the legacy check can run.
+    pub fn legacy_revision(&self) -> u64 {
+        if self.is_openraft() {
+            return 0;
+        }
+        self.legacy().lock().unwrap().revision()
+    }
+
     pub fn watch_prefix(&self, prefix: impl Into<String>) -> Receiver<WatchEvent> {
         #[cfg(any(test, feature = "openraft-storage"))]
         if let Some(client) = &self.openraft {
