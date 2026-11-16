@@ -1797,7 +1797,11 @@ pub fn connection(mut c: TcpStream, st: AppState, credentials: Credentials) -> i
     {
         let cp = match st.control_for_authorization() {
             Ok(cp) => cp,
-            Err(_) => {
+            Err(crate::ControlAuthError::NotReady) => {
+                error(&mut c, "57P03", crate::CONTROL_NOT_READY)?;
+                return Ok(());
+            }
+            Err(crate::ControlAuthError::Stale) => {
                 error(&mut c, "57P03", "control plane stale or unavailable")?;
                 return Ok(());
             }

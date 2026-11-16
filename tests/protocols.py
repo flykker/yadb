@@ -367,6 +367,29 @@ def wait(port):
     raise RuntimeError("daemon not ready")
 
 
+def wait_leader(nodes=(1, 2, 3), timeout=20):
+    """Wait until every listed node names the same elected leader.
+
+    A restarted node binds its listeners before Raft has elected a leader. A
+    read forwarded in that window is refused with "known leader: None", which
+    is correct cluster behavior, so the harness waits for the election instead
+    of treating the refusal as a test result.
+    """
+    deadline = time.monotonic()+timeout
+    statuses = []
+    while time.monotonic() < deadline:
+        try:
+            statuses = [json.loads(request(19000+i, "GET", "/raft/status")[2])
+                        for i in nodes]
+        except OSError:
+            statuses = []
+        if statuses and len({s["leader_id"] for s in statuses}) == 1 \
+                and statuses[0]["leader_id"] is not None:
+            return statuses[0]["leader_id"]
+        time.sleep(.05)
+    raise RuntimeError(f"no agreed Raft leader: {statuses}")
+
+
 def native(command, env=None):
     """Run a real client and include its output in failures."""
     result = subprocess.run(command, text=True, capture_output=True, env=env, timeout=45)
@@ -509,6 +532,10 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
                 nodes.append(start_node(i))
             for i in range(1, 4):
                 wait(19000+i)
+            # A bound listener is not an elected cluster. Forwarding the
+            # bootstrap apply before a leader is known is refused (correctly),
+            # so wait for the election rather than racing it.
+            wait_leader()
             body = json.dumps({"yaml": (ROOT/"examples/platform.yaml").read_text()}).encode()
             assert request(19002, "POST", "/v1/apply", body, {"Content-Type": "application/json"})[0] == 200
             for i in range(1, 4):
@@ -863,6 +890,7 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
                 while "billing/ledger" not in json.loads(request(19000+i, "GET", "/v1/status")[2])["databases"]:
                     assert time.monotonic() < deadline, "control cache not recovered"
                     time.sleep(.05)
+            wait_leader()
             restored = Pg(19102)
             assert restored.rows("SELECT balance FROM wire WHERE id=1;") == [["90"]]
             assert restored.rows("SELECT id FROM wire WHERE balance=90;") == [["1"]]
@@ -989,6 +1017,7 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
                 while "billing/ledger" not in json.loads(request(19000+i, "GET", "/v1/status")[2])["databases"]:
                     assert time.monotonic() < deadline, "control cache not recovered after ambiguous writes"
                     time.sleep(.05)
+            wait_leader()
             restart_s3 = signed(19202, "GET", ambiguous_s3_key)
             assert (restart_s3[0], restart_s3[2]) == s3_outcome, (s3_outcome, restart_s3)
             restart_sql = Pg(19102)

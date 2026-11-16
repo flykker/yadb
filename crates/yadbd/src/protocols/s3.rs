@@ -289,7 +289,14 @@ pub async fn handle(State(st): State<S3State>, request: Request) -> Response {
     let (pid, pool, buckets) = {
         let cp = match st.app.control_for_authorization_async().await {
             Ok(cp) => cp,
-            Err(_) => {
+            Err(ControlAuthError::NotReady) => {
+                return err(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "ServiceUnavailable",
+                    CONTROL_NOT_READY,
+                )
+            }
+            Err(ControlAuthError::Stale) => {
                 return err(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "ServiceUnavailable",

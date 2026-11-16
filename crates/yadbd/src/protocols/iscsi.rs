@@ -128,6 +128,7 @@ pub fn connection(
         r.h[8..14].copy_from_slice(&p.h[8..14]);
         r.h[14..16].copy_from_slice(&1u16.to_be_bytes());
         let mut failed = false;
+        let mut target_not_ready = false;
         if stage == 0 {
             if let (Some(name), Some(response)) = (kv.get("CHAP_N"), kv.get("CHAP_R")) {
                 let cred = creds.users.get(name);
@@ -217,7 +218,18 @@ pub fn connection(
             );
             text(&mut r, "MaxBurstLength", &s.max_burst.to_string());
             text(&mut r, "FirstBurstLength", &s.first_burst.to_string());
-            if !s.discovery && target(&st, &s, Role::ReadOnly).is_err() {
+            // A node that has bound its listener but not installed a control
+            // image cannot name or authorize a target. A target-error login
+            // response makes the initiator retry, unlike an authentication
+            // failure, which it treats as final. Discovery is refused too:
+            // an empty target list would be cached as "nothing here".
+            if matches!(
+                st.control_for_authorization(),
+                Err(crate::ControlAuthError::NotReady)
+            ) {
+                failed = true;
+                target_not_ready = true;
+            } else if !s.discovery && target(&st, &s, Role::ReadOnly).is_err() {
                 failed = true;
             }
             if p.h[1] & 0x80 != 0 && p.h[1] & 3 == 3 {
@@ -228,8 +240,13 @@ pub fn connection(
             failed = true;
         }
         if failed {
-            r.h[36] = 2;
-            r.h[37] = 1;
+            if target_not_ready {
+                r.h[36] = 3; // target error: the target is not ready for a session yet
+                r.h[37] = 0; // no detail; there is nothing the initiator did wrong
+            } else {
+                r.h[36] = 2;
+                r.h[37] = 1;
+            }
         }
         s.sequence(&mut r, true);
         r.send(&mut c)?;

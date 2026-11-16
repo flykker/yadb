@@ -636,6 +636,18 @@ design; the removed draft is not kept in the tree.
   `Io`/`StorageUnavailable` from `guard.step(reply)` *after* the proposal was
   appended, which is also ambiguous, and those variants are not distinguished from
   a pre-append failure.
+- [x] Answer "not ready" while no control image has been applied. A restarted
+  node binds its listeners before its applied metadata necessarily contains the
+  control image, so authorization could run against an empty `ControlPlaneState`:
+  every subject looked like a stranger and S3 clients received `403 AccessDenied`,
+  which they do not retry. The shared authorization snapshot now tells `Stale`
+  from `NotReady` (`generation == 0`) and maps the latter to `503` / `57P03` /
+  iSCSI target error. `/v1/apply` and `/v1/status` are not gated, and a node with
+  an installed image keeps the previous `403`/`404` mapping. Evidence: 63 S3 GETs
+  during a node restart produced 27 pre-bind refusals, 5 readiness `503`s and 31
+  `200`s with no `403`; 170 pgwire attempts produced 2 `57P03`s and 133 logins
+  with no `42501`; and 60 concurrent 1 MiB PUTs produced 30 `200`s whose bytes
+  were identical and 30 absent keys, including after collection.
 - [ ] Implement a multi-group registry: several independent groups per node,
   per-group directories, per-group failure isolation and bounded resources.
   An in-process registry provides separate directories and a

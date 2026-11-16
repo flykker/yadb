@@ -555,6 +555,15 @@ The iSCSI target is `iqn.2026-11.io.yadb:billing:vm-root` on `base+300..302` wit
 CHAP user `backend`; discovery advertises all three portals. These listeners are
 cleartext on loopback: keep them local and treat the whole root as secret.
 
+A restarted node may bind its listeners before it has applied a control image.
+Until `generation` is nonzero it answers a retryable "not ready" instead of
+denying the request: native S3 returns `503 ServiceUnavailable`, the gateway
+returns a JSON `503`, PostgreSQL-wire returns `57P03`, and an iSCSI login gets a
+target-error status. `/v1/apply` and `/v1/status` are not gated, so bootstrap and
+diagnosis still work. A cluster that has never had a manifest applied therefore
+answers `503` on client paths rather than `403`; once the image is installed the
+historical `403`/`404` answers are unchanged.
+
 Reclaiming disk: overwritten blocks, folded WAL blobs, replaced SSTs and
 overwritten S3 objects leave their old fragments behind. `POST /v1/pools/gc`
 runs one collection pass and returns `blobs_live`, `fragments_deleted`,

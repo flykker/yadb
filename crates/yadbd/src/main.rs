@@ -170,15 +170,31 @@ fn control_authorization_fresh(openraft: bool, freshness: &ControlFreshness, now
     !openraft || freshness.is_fresh_at(now)
 }
 
+/// Why an authorization snapshot was refused.
 #[derive(Debug)]
-struct ControlAuthError;
+enum ControlAuthError {
+    /// The locally applied snapshot is too old, or quorum cannot confirm it.
+    Stale,
+    /// No control image has been applied on this node yet. Authorization would
+    /// treat every subject as a stranger and answer `403`, which clients do not
+    /// retry — even though the same request can succeed moments later.
+    NotReady,
+}
+
+/// A node that has bound its listeners but not installed a control image cannot
+/// decide any request. Answer "not ready" so retrying clients retry and
+/// operators see catch-up, rather than a denial that looks final.
+const CONTROL_NOT_READY: &str = "control plane has not applied an image yet; the node is not ready";
 
 impl std::fmt::Display for ControlAuthError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "control-plane authorization state is stale or control quorum is unavailable; refusing access"
-        )
+        match self {
+            Self::Stale => write!(
+                f,
+                "control-plane authorization state is stale or control quorum is unavailable; refusing access"
+            ),
+            Self::NotReady => f.write_str(CONTROL_NOT_READY),
+        }
     }
 }
 
@@ -445,9 +461,13 @@ impl AppState {
             &self.control_freshness.lock().unwrap(),
             Instant::now(),
         ) {
-            return Err(ControlAuthError);
+            return Err(ControlAuthError::Stale);
         }
-        Ok(self.control.read().unwrap())
+        let cp = self.control.read().unwrap();
+        if cp.generation == 0 {
+            return Err(ControlAuthError::NotReady);
+        }
+        Ok(cp)
     }
 
     /// Run the blocking refresh path off the async runtime. A panic or runtime
@@ -7471,6 +7491,9 @@ mod security_tests {
                 size_bytes: 1 << 20,
             },
         );
+        // Fixtures describe a configured cluster; a zero generation is reserved
+        // for a node whose control image has not been installed yet.
+        control.generation = 1;
         let block = BlockVolumeEngine::new(meta.clone(), DEFAULT_BLOCK_SIZE);
         block.register_pool("data", pool.clone());
         let state = AppState {
@@ -7664,6 +7687,59 @@ mod security_tests {
         let response = get("empty", headers).await;
         assert_eq!(response.status(), StatusCode::RANGE_NOT_SATISFIABLE);
         assert_eq!(response.headers()[header::CONTENT_RANGE], "bytes */0");
+    }
+
+    // A restarted node accepts connections before the control watcher has
+    // installed the persisted image. Authorization must classify that window as
+    // "not ready" (retryable) rather than "unknown project" (403, which S3
+    // clients treat as final), and must keep the old denial/not-found answers
+    // once an image is installed.
+    #[tokio::test]
+    async fn an_unapplied_control_image_is_reported_as_not_ready() {
+        let (state, dir) = legacy_fragment_state_with_dir("startup-window");
+        let _dir = TempDirGuard(dir);
+        let mut st = state;
+        st.control.write().unwrap().object_stores.insert(
+            "proj/store".into(),
+            yadb_control::ObjectStoreSpec {
+                pool: "data".into(),
+                isolation: Default::default(),
+                buckets: vec![],
+            },
+        );
+        let get = |st: AppState, subject: &'static str| async move {
+            handle_s3_get(
+                State(st),
+                headers_with(&[("x-yadb-subject", subject)]),
+                Path((
+                    "proj".to_string(),
+                    "store".to_string(),
+                    "bucket".to_string(),
+                    "missing".to_string(),
+                )),
+                Query(S3GetQuery { consistent: false }),
+            )
+            .await
+        };
+
+        // A configured cluster keeps its historical answers: a member reaches
+        // object lookup, a stranger is denied.
+        assert_eq!(
+            get(st.clone(), "anonymous").await.status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            get(st.clone(), "stranger").await.status(),
+            StatusCode::FORBIDDEN
+        );
+
+        // A node without an installed image has not learned the project yet. It
+        // must not turn that into a denial the client will not retry.
+        st.control.write().unwrap().generation = 0;
+        let response = get(st, "anonymous").await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = String::from_utf8(body_bytes(response).await).unwrap();
+        assert!(body.contains(CONTROL_NOT_READY), "{body}");
     }
 
     // The dedicated endpoint is the explicit-error surface: a refusal is a 409

@@ -1266,3 +1266,91 @@ Open: no install-snapshot path, so a peer behind the compacted base is refused
 rather than re-seeded; the checkpoint is a full image rather than incremental
 history; compaction runs under the Raft mutex, so a pass briefly stalls
 proposals; and a single-node cluster bounds itself by its own applied index.
+
+## Startup readiness without a control image (2026-11-16)
+
+### Defect
+
+A restarted node bound its client listeners before its control watcher had
+installed the persisted image. In that window `ControlPlaneState` was empty
+(`generation == 0`), `resolve_s3_target` saw no project, and the node answered
+native S3 and gateway requests with `403 AccessDenied` ("project access
+denied"). A `403` is terminal for S3 clients: the same request succeeded about
+200 ms later, but the client had already given up. The window was reproduced on
+the three-node root by restarting one node under a GET loop.
+
+### Fix
+
+`ControlAuthError` now distinguishes `Stale` (the existing quorum-freshness
+refusal) from `NotReady` (no image applied yet). `AppState::authorization_snapshot`
+returns `NotReady` while `generation == 0`, and each frontend maps it to a
+retryable answer:
+
+* native S3: `503 ServiceUnavailable`, message `control plane has not applied an
+  image yet; the node is not ready`;
+* gateway/HTTP: JSON `503` with the same message;
+* pgwire: `57P03` (`cannot_connect_now`);
+* iSCSI login and discovery: login status class 3 (target error), detail 0 —
+  the initiator retries instead of caching an empty target list.
+
+`/v1/apply` and `/v1/status` are not gated, so bootstrap and diagnosis still
+work on a node with no image. Once an image is installed the historical `403`
+(stranger) and `404` (absent object) answers are unchanged; the new unit test
+`an_unapplied_control_image_is_reported_as_not_ready` asserts both directions.
+The GC fixture was given `generation = 1`, because it describes a configured
+cluster.
+
+The test harness also gained `wait_leader()`: a restarted node binds its
+listeners before Raft has elected a leader, and a read forwarded in that window
+is correctly refused with "known leader: None". Waiting for the election
+removes that race rather than retrying the read.
+
+### Live evidence
+
+One node of the migrated three-node root was restarted and hammered throughout
+the restart:
+
+* native S3 GET churn, 63 requests in 2.5 s: 27 connection refusals (listener
+  not bound), 5 readiness `503`s, 31 `200`s, **0 `403`s**;
+* pgwire, 170 attempts: 35 refusals, 2 `57P03`, 133 successful logins, **no
+  permission error**;
+* 60 concurrent 1 MiB PUTs to the restarting node: 29 refusals, 1 `503`, 30
+  `200`. Every acknowledged key read back byte-identical and every non-`200`
+  key was absent (`404`), before and after a collection pass — no partial
+  object, no acknowledged-then-missing write.
+
+A leader `SIGKILL` during an 8 MiB PUT through a follower left the client with
+`503`, the object absent, and node 3 as the new leader (term 47). Node 1
+returned, all three converged at revision 2046 / commit 2059 with
+`compaction_error: null` on every node, and the 1002 SQL rows, the 1 MiB and
+8 MiB objects and the surviving race keys were intact after GC.
+
+The aborted 8 MiB PUT left a prepared `/s3-intent/` record naming eight
+reserved chunks; a GC pass counts intents as live, which is why the pass
+immediately after the kill reported `blobs_live: 199` against the 191-blob live
+set. Expiry is enforced by the collector: after the 300 s / 32-revision grace,
+the leader's periodic maintenance (the same `scrub_all_pools` pass, every four
+seconds, with collection due every 300 s) aborts an expired intent and then
+deletes its record and any unreachable chunks. The explicit
+`POST /v1/pools/scrub` that followed reported `orphan_blobs_collected: 0` with
+no error, and its own sweep already found `blobs_live: 191`: the expired intent
+and its eight reserved chunk ids were no longer part of the live set, and no
+fragment remained. The next explicit GC reported `blobs_live: 191`,
+`fragments_deleted: 0`, `bytes_reclaimed: 0` again, and the repair scan checked
+191 blobs and found 191 intact. `dev_load` still had 1002
+rows, `accounts` 602, the 1 KiB, 1 MiB and 8 MiB objects and the probe were
+byte-identical, and the 60 race keys still split 30 present / 30 absent.
+
+### Gates
+
+`cargo test -p yadbd --bins` 77/77; `yadb-metakv` 169/169 (one transient
+failure when run in the same process group as the other crates did not
+reproduce solo); `yadb-block` 25, `yadb-db` 46, `yadb-s3` 26, `yadb-control` 1;
+`cargo fmt --all -- --check` clean. `tests/protocols.py` passed 16/16 four
+times in a row and `--native-clients` 17/17 with the readiness gate in place.
+
+Open: the readiness gate keys on `generation == 0`, so a cluster whose most
+recent manifest set is empty by construction would report `503` forever; the
+test cluster always applies at least the platform manifest. A node that has an
+image but whose control snapshot is corrupt takes the existing fail-closed
+stale path, not `NotReady`.
