@@ -563,9 +563,12 @@ pub async fn handle(State(st): State<S3State>, request: Request) -> Response {
             // refuse — observed as a `404` for an object that had just been
             // acknowledged through another node.
             if params.get("consistent").is_some_and(|v| *v == "true") {
+                // The delegated read must see the client's range and
+                // conditional headers, or a consistent read would silently
+                // ignore them and answer with the whole object.
                 let response = handle_s3_get(
                     State(st.app.clone()),
-                    gateway_headers.clone(),
+                    read_headers(&gateway_headers, &headers),
                     Path(path),
                     Query(S3GetQuery { consistent: true }),
                 )
@@ -597,15 +600,7 @@ pub async fn handle(State(st): State<S3State>, request: Request) -> Response {
                         }
                     }
                 }
-                // `Range` is single-valued; a conditional header may arrive as
-                // several field lines, and dropping one would give the leader a
-                // weaker condition than the caller sent. `gateway_headers` is
-                // fresh, so every line is appended once.
-                for name in [header::RANGE, header::IF_MATCH, header::IF_NONE_MATCH] {
-                    for value in headers.get_all(&name) {
-                        forwarded.append(name.clone(), value.clone());
-                    }
-                }
+                forwarded = read_headers(&forwarded, &headers);
                 let gateway_path = format!(
                     "/s3/{}/{}/{}/{}",
                     crate::protocols::url(&st.project),
@@ -1115,6 +1110,22 @@ fn verify_upload_checksums(headers: &HeaderMap, body: &[u8]) -> Option<Response>
     None
 }
 
+/// The gateway headers for a read: the authenticated subject the caller already
+/// built, plus every `Range` and conditional field line the client sent.
+///
+/// `Range` is single-valued; a conditional header may arrive as several field
+/// lines, and dropping one would give the leader a weaker condition than the
+/// caller sent. The base map is fresh per request, so every line is added once.
+fn read_headers(base: &HeaderMap, headers: &HeaderMap) -> HeaderMap {
+    let mut forwarded = base.clone();
+    for name in [header::RANGE, header::IF_MATCH, header::IF_NONE_MATCH] {
+        for value in headers.get_all(&name) {
+            forwarded.append(name.clone(), value.clone());
+        }
+    }
+    forwarded
+}
+
 async fn map_error(response: Response) -> Response {
     let status = response.status();
     // Preserve the gateway's machine-readable mutation outcome. Dropping it
@@ -1281,6 +1292,21 @@ mod tests {
             map.insert(*name, value.parse().unwrap());
         }
         map
+    }
+
+    #[test]
+    fn a_read_keeps_the_subject_and_every_conditional_line() {
+        // A consistent read is delegated to the gateway handler, so the headers
+        // it would otherwise decide on must travel with it. Two `If-Match` field
+        // lines are two conditions, not one; collapsing them would make the read
+        // pass a check the client asked to fail.
+        let base = request_headers(&[("x-yadb-subject", "sa:billing-backend")]);
+        let mut incoming = request_headers(&[("range", "bytes=0-9"), ("if-match", "\"a\"")]);
+        incoming.append("if-match", "\"b\"".parse().unwrap());
+        let out = read_headers(&base, &incoming);
+        assert_eq!(out["x-yadb-subject"], "sa:billing-backend");
+        assert_eq!(out["range"], "bytes=0-9");
+        assert_eq!(out.get_all("if-match").iter().count(), 2);
     }
 
     #[test]
