@@ -162,6 +162,20 @@ replace or share a locked directory with legacy code, which does not participate
 in these locks. Network filesystems and hostile local path mutation are outside
 the current ownership contract.
 
+`scripts/yadb-openraft-dev.py` does this provisioning for a disposable
+three-process cluster: `prepare` writes credentials, per-node group configs and
+the version-2 manifests, and `start` refuses to reuse a root that holds node data
+without a matching `state.json`. Use it instead of hand-writing a root when you
+need the PostgreSQL, S3 and iSCSI frontends as well; `scripts/yadb-local.py`
+remains the legacy/default launcher.
+
+Reads on Multi-Raft do **not** take the legacy GC reader lease. Collection is
+refused there, so there is no pass to fence against, and the lease record's
+`revision` is a legacy-only value that multi-group metadata cannot supply
+(`LocalMetaKv::revision()` asserts). The SQL, block and S3 read paths therefore
+skip the lease when `meta.is_openraft()`, and a plain (non-`consistent=true`)
+read is served from the locally applied view.
+
 `PersistentGroup::create` requires a new replica directory. It reserves that
 directory, syncs its parent, writes a versioned `replica.json` binding the exact
 cluster/group/incarnation/node and bootstrap voters, then creates separate log
