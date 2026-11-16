@@ -559,8 +559,9 @@ A restarted node may bind its listeners before it has applied a control image.
 Until `generation` is nonzero it answers a retryable "not ready" instead of
 denying the request: native S3 returns `503 ServiceUnavailable`, the gateway
 returns a JSON `503`, PostgreSQL-wire returns `57P03`, and an iSCSI login gets a
-target-error status. `/v1/apply` and `/v1/status` are not gated, so bootstrap and
-diagnosis still work. A cluster that has never had a manifest applied therefore
+target-error status. An iSCSI login during a control-quorum outage gets the same
+target-error status rather than an authentication failure. `/v1/apply` and
+`/v1/status` are not gated, so bootstrap and diagnosis still work. A cluster that has never had a manifest applied therefore
 answers `503` on client paths rather than `403`; once the image is installed the
 historical `403`/`404` answers are unchanged.
 

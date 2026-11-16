@@ -1291,7 +1291,9 @@ retryable answer:
 * gateway/HTTP: JSON `503` with the same message;
 * pgwire: `57P03` (`cannot_connect_now`);
 * iSCSI login and discovery: login status class 3 (target error), detail 0 —
-  the initiator retries instead of caching an empty target list.
+  the initiator retries instead of caching an empty target list. This covers a
+  stale control quorum as well as an uninstalled image, so a transient control
+  outage is never reported as an authentication failure.
 
 `/v1/apply` and `/v1/status` are not gated, so bootstrap and diagnosis still
 work on a node with no image. Once an image is installed the historical `403`

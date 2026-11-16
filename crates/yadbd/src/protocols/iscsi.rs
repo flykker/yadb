@@ -219,14 +219,12 @@ pub fn connection(
             text(&mut r, "MaxBurstLength", &s.max_burst.to_string());
             text(&mut r, "FirstBurstLength", &s.first_burst.to_string());
             // A node that has bound its listener but not installed a control
-            // image cannot name or authorize a target. A target-error login
-            // response makes the initiator retry, unlike an authentication
-            // failure, which it treats as final. Discovery is refused too:
-            // an empty target list would be cached as "nothing here".
-            if matches!(
-                st.control_for_authorization(),
-                Err(crate::ControlAuthError::NotReady)
-            ) {
+            // image (or cannot prove its control quorum fresh) cannot name or
+            // authorize a target. A target-error login response makes the
+            // initiator retry, unlike an authentication failure, which it
+            // treats as final. Discovery is refused too: an empty target list
+            // would be cached as "nothing here".
+            if st.control_for_authorization().is_err() {
                 failed = true;
                 target_not_ready = true;
             } else if !s.discovery && target(&st, &s, Role::ReadOnly).is_err() {
@@ -241,7 +239,7 @@ pub fn connection(
         }
         if failed {
             if target_not_ready {
-                r.h[36] = 3; // target error: the target is not ready for a session yet
+                r.h[36] = 3; // target error: no image or no fresh quorum yet
                 r.h[37] = 0; // no detail; there is nothing the initiator did wrong
             } else {
                 r.h[36] = 2;
