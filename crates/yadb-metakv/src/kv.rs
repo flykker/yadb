@@ -184,6 +184,41 @@ impl MetaStateMachine {
         }
     }
 
+    /// Install a snapshot received from the leader. Runtime-owned watch
+    /// subscriptions survive, unlike a restart, so every key the image changes
+    /// is reported to the matching watchers as a single delta.
+    pub(crate) fn install_durable_snapshot(&mut self, snapshot: MetaSnapshot) {
+        let revision = snapshot.revision;
+        let mut events = Vec::new();
+        for (key, old) in &self.kv {
+            if snapshot.values.get(key) != Some(old) {
+                events.push(WatchEvent::Delete {
+                    key: key.clone(),
+                    revision,
+                });
+            }
+        }
+        for (key, value) in &snapshot.values {
+            if self.kv.get(key) != Some(value) {
+                events.push(WatchEvent::Put {
+                    key: key.clone(),
+                    value: value.value.clone(),
+                    version: value.version,
+                    revision,
+                });
+            }
+        }
+        self.revision = snapshot.revision;
+        self.kv = snapshot.values;
+        #[cfg(any(test, feature = "openraft-storage"))]
+        {
+            self.deferred = None;
+        }
+        for event in events {
+            self.deliver(event);
+        }
+    }
+
     /// Replace durable data while retaining runtime-owned watch subscriptions.
     #[cfg(any(test, feature = "openraft-storage"))]
     pub(crate) fn replace_durable_snapshot(&mut self, snapshot: MetaSnapshot) {

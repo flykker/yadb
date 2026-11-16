@@ -687,11 +687,16 @@ The metadata Raft log is bounded: once `metakv/raft.wal` passes 8 MiB (or 4096
 applied entries above its base) each node writes an atomic
 `metakv/checkpoint.json` state image and rewrites the log, keeping everything
 above a replicated compaction floor. `GET /raft/status` reports `base_index`,
-`compaction_floor`, `wal_bytes` and `compaction_error`. Two limitations remain:
-a node that falls behind the compacted base cannot be re-seeded (there is no
-install-snapshot path, so it is refused explicitly and needs a fresh root), and
-the checkpoint is a full image, so its size tracks live metadata rather than
-history.
+`compaction_floor`, `wal_bytes` and `compaction_error`. A node that falls behind
+the compacted base is re-seeded with that same image: the leader streams
+`checkpoint.json` in 64 KiB `InstallSnapshot` chunks over the authenticated Raft
+RPC (bounded at 64 MiB, resumable per group, leader and snapshot id), and the
+receiver validates the group, membership, last included index/term and
+whole-image checksum before publishing it with one atomic rename, rewriting its
+log to the new base, and only then moving its applied pointer, so a crash leaves
+either the old or the new base. After the install it is an ordinary log
+follower. The checkpoint is still a full image, so its size tracks live metadata
+rather than history.
 
 ## Quickstart
 

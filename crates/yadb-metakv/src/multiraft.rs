@@ -93,6 +93,8 @@ impl ReplicaIdentity {
             RaftRpc::RequestVoteReply { from, .. } => *from,
             RaftRpc::AppendEntries { leader_id, .. } => *leader_id,
             RaftRpc::AppendEntriesReply { from, .. } => *from,
+            RaftRpc::InstallSnapshot { leader_id, .. } => *leader_id,
+            RaftRpc::InstallSnapshotReply { from, .. } => *from,
         };
         if claimed != peer {
             return Err(IdentityError::SenderMismatch);
@@ -1014,6 +1016,11 @@ impl DeterministicGroupCore {
                 self.next_index.insert(envelope.sender, *current + 1);
                 self.advance_commit();
                 Ok(Vec::new())
+            }
+            // This memory-only prototype has no durable image to install. The
+            // production core in `raft.rs` owns the snapshot transfer.
+            RaftRpc::InstallSnapshot { .. } | RaftRpc::InstallSnapshotReply { .. } => {
+                Err(GroupCoreError::Protocol)
             }
         }
     }

@@ -1232,22 +1232,44 @@ a crash between the two renames is harmless and idempotent. A `Base > 0` with a
 missing or unparsable checkpoint, a checkpoint below the WAL base, and a
 checkpoint term disagreeing with the base term all refuse to start.
 
-Tests (`cargo test -p yadb-metakv`, 165 tests):
+Tests (`cargo test -p yadb-metakv`, 177 tests):
 - `compaction_bounds_the_wal_and_preserves_state_across_reopen`: 51 puts, forced
   threshold, base advances, WAL shrinks, every key reads back, reopen reproduces
   base/floor/revision and does not append.
 - `checkpoint_renamed_before_the_wal_rewrite_is_reconciled_on_open`: the crash
   window; the stale WAL is rewritten on open, state and revision are identical,
   and the file shrinks.
-- `a_compacted_base_without_a_checkpoint_refuses_to_start` and
-  `an_unparsable_checkpoint_refuses_to_start`: explicit `Checkpoint` errors.
+- `a_compacted_base_without_a_checkpoint_refuses_to_start`,
+  `an_unparsable_checkpoint_refuses_to_start` and
+  `a_checkpoint_from_another_membership_refuses_to_start`: explicit `Checkpoint`
+  errors.
 - `term_and_vote_survive_compaction`: the rewritten WAL itself carries the hard
   state, so replay cannot rewind the term.
 - `compaction_never_drops_an_entry_above_a_stopped_peer_match`: 3-node cluster,
   one peer stopped, leader's base and floor stop at that peer's match, and the
   peer catches up after healing.
-- `a_peer_below_the_compacted_base_is_refused_explicitly`: both the leader
-  (broadcast and back-off) and the follower (prefix below its own base) refuse.
+- `a_peer_below_the_compacted_base_is_sent_the_durable_image`: the leader sends
+  one `InstallSnapshot` chunk with the base index/term, the group id and the
+  membership instead of refusing, while the follower still refuses an append
+  whose prefix is below its own base.
+- `a_replica_that_lost_its_log_rejoins_through_the_durable_image`: a replica
+  replaced with an empty directory gets the image, publishes
+  `checkpoint.json`, has its WAL rewritten, and then receives the entries above
+  the base through the ordinary log.
+- `a_snapshot_from_another_group_or_membership_is_refused`: wrong group id and
+  wrong membership are refused with the state and files untouched.
+- `a_corrupted_or_stale_snapshot_is_refused_without_publishing`: a flipped byte
+  fails the whole-image checksum, a retried intact image still installs, and an
+  image below the base or with another term is refused.
+- `a_snapshot_transfer_resumes_without_duplicating_bytes`: 32-byte chunks, a
+  retransmitted chunk keeps the offset, an out-of-order chunk is refused with
+  the offset the receiver still needs, and the resumed transfer completes.
+- `an_install_interrupted_by_a_power_cut_leaves_the_old_state`: two chunks, a
+  power cut, and the reopened node keeps base 0 with no partial image.
+- `a_crash_after_publishing_the_image_keeps_the_new_base`: the rename reaches
+  the disk and the following sync fails; the in-memory base does not move, the
+  published image survives the power cut, and the reopened node adopts it and
+  rewrites its log.
 - WAL layer: `base_marker_replays_and_rewrite_preserves_hard_state`,
   `rewrite_replaces_the_whole_file_and_shrinks_it`, `a_gap_above_the_base_is_corruption`,
   `an_append_below_the_base_is_corruption`.
@@ -1262,10 +1284,16 @@ two kept writing was refused for writes (full redundancy is required) and caught
 up from the leader's retained suffix when restarted. `tests/protocols.py` passed
 16/16, `cargo test -p yadbd --bins` 63 tests, `cargo fmt --all -- --check` clean.
 
-Open: no install-snapshot path, so a peer behind the compacted base is refused
-rather than re-seeded; the checkpoint is a full image rather than incremental
-history; compaction runs under the Raft mutex, so a pass briefly stalls
-proposals; and a single-node cluster bounds itself by its own applied index.
+A peer behind the compacted base is re-seeded from the same checkpoint image:
+the leader streams it in 64 KiB `InstallSnapshot` chunks (64 MiB bound,
+resumable per group/leader/snapshot id), the receiver validates group,
+membership, index/term and whole-image checksum, publishes with one atomic
+rename, rewrites its log, and only then moves its applied pointer; a crash
+leaves the old or the new base. Open: the checkpoint is a full image rather
+than incremental history; compaction runs under the Raft mutex, so a pass
+briefly stalls proposals; a single-node cluster bounds itself by its own
+applied index; and a refused install retries from offset 0 on the next
+heartbeat instead of remembering the failure.
 
 ## Startup readiness without a control image (2026-11-16)
 

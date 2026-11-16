@@ -48,7 +48,7 @@ pub enum MetaError {
     #[error("corrupt metadata checkpoint: {0}")]
     Checkpoint(String),
 
-    #[error("peer {0} is behind the compacted log base; adding or re-seeding a node needs an install-snapshot path that does not exist")]
+    #[error("peer {0} cannot be served from the compacted log base")]
     PeerBehindCompactedBase(u32),
 
     #[error("metadata log compaction failed ({0}); this node refuses further work until it is restarted")]
@@ -632,7 +632,11 @@ mod tests {
         cluster.drain_network();
         assert!(cluster.nodes[&2].commit_index() >= majority_index);
         cluster.heal_all();
-        let msgs = cluster.nodes[&2].broadcast_append_entries();
+        let msgs = cluster
+            .nodes
+            .get_mut(&2)
+            .unwrap()
+            .broadcast_append_entries();
         cluster.enqueue_from(2, msgs);
         cluster.drain_network();
         assert_eq!(cluster.nodes[&1].role(), RoleState::Follower);
@@ -709,7 +713,11 @@ mod tests {
         );
 
         // The old leader converges; the value is not silently rolled back.
-        let msgs = cluster.nodes.get(&2).unwrap().broadcast_append_entries();
+        let msgs = cluster
+            .nodes
+            .get_mut(&2)
+            .unwrap()
+            .broadcast_append_entries();
         cluster.enqueue_from(2, msgs);
         cluster.drain_network();
         for id in 1..=3 {
@@ -798,7 +806,11 @@ mod tests {
 
         // Heal partition: old leader 1 steps down, truncates uncommitted minority entry, and converges to `gen2-majority`!
         cluster.heal_all();
-        let heal_hb = cluster.nodes[&3].broadcast_append_entries();
+        let heal_hb = cluster
+            .nodes
+            .get_mut(&3)
+            .unwrap()
+            .broadcast_append_entries();
         cluster.enqueue_from(3, heal_hb);
         cluster.drain_network();
 
