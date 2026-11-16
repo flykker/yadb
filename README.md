@@ -265,22 +265,23 @@ backfill and per-collection snapshots do not change those limits.
 
 The S3 listener is path-style and binds one declarative `Project/ObjectStore` per listener.
 It supports AWS Signature Version 4, `PUT`, `GET`, `HEAD`, `DELETE`, XML `ListObjectsV2`,
-conditional reads, byte ranges, continuation tokens, and CRC32/SHA256/Content-MD5 validation. Multipart
-upload, server-side copy, ACLs, custom metadata, and streaming chunk signatures are
-explicitly rejected until implemented.
+multipart upload, conditional reads, byte ranges, continuation tokens, and
+CRC32/SHA256/Content-MD5 validation. Server-side copy, ACLs, custom metadata, and
+streaming chunk signatures are explicitly rejected until implemented.
 
 ```bash
 export AWS_ACCESS_KEY_ID=backend
 export AWS_SECRET_ACCESS_KEY='replace-with-a-random-secret-at-least-12-chars'
 export AWS_DEFAULT_REGION=us-east-1
 
-# Current API buffers uploads, with a 16 MiB request limit and no multipart API.
-# Use s3api put-object for a file <= 16 MiB (high-level `s3 cp` can choose multipart).
+# A single request body is limited to 16 MiB; larger objects use multipart.
 aws --endpoint-url http://10.0.0.11:9000 s3api put-object \
   --bucket invoices-2026 --key sample.txt --body sample.txt
 aws --endpoint-url http://10.0.0.11:9000 s3 ls s3://invoices-2026/ --recursive
 aws --endpoint-url http://10.0.0.11:9000 s3api head-object \
   --bucket invoices-2026 --key image.raw
+# High-level copy picks multipart automatically above the configured threshold.
+aws --endpoint-url http://10.0.0.11:9000 s3 cp image.raw s3://invoices-2026/image.raw
 ```
 
 Use a separate listener (`--s3-target project/store`) for each tenant ObjectStore, or put
@@ -288,6 +289,29 @@ an authenticated proxy in front if host-style virtual buckets are required. Conf
 AWS clients for path-style addressing. GET/Range responses are also limited to 16 MiB;
 presigned URLs, session tokens, native TLS, and a complete AWS S3 implementation are not
 provided yet. Credentials and object bytes require HTTPS termination or a trusted network.
+
+#### Multipart upload
+
+`POST ?uploads`, `PUT ?partNumber=N&uploadId=...`, `POST ?uploadId=...`,
+`GET ?uploadId=...` (ListParts) and `DELETE ?uploadId=...` (Abort) are implemented on
+the native listener. Each part is limited to **16 MiB** (the same bound as a single
+PUT); a larger part is refused with `413 EntityTooLarge` and the upload stays usable.
+Part numbers are `1..=10000`. `CompleteMultipartUpload` must list parts in strictly
+ascending order with the ETags the upload returned; a wrong ETag or size is
+`400 InvalidPart`, a repeated or descending part number is `400 InvalidPartOrder`, and
+an unreadable document is `400 MalformedXML`.
+
+Each part is its own durable allocation: its intent is committed in `/s3-intent/`
+before any fragment is written, and the upload record names the parts. Completion is a
+single revision-guarded transaction that publishes the manifest, retires the previous
+version, deletes the upload record and deletes every part intent. The published ETag is
+the S3 multipart form `"<md5 of the concatenated part digests>-<part count>"`. If that
+transaction loses a guard the response is `503` with `x-yadb-retry: do-not-retry`:
+the outcome is ambiguous, so a client must not replay the completion automatically.
+Aborting deletes the record and marks every live part intent `Aborted`; the scrubber
+then reclaims the fragments after the usual grace. An upload that is never completed or
+aborted is collected the same way after the five-minute/32-revision grace, so it cannot
+leak.
 
 `GET` and range `GET` accept `?consistent=true`. The object manifest is then read
 through exactly one quorum-confirmed snapshot on the project-group leader and the
@@ -318,6 +342,14 @@ metadata writes. A consensus-confirmed transition to `Aborted` fences publicatio
 then exact, persistent tombstones fence every physical part, including absent parts,
 against delayed PUT/repair. Every target must acknowledge its tombstone, not merely a
 write quorum. Failed cleanup keeps the aborted intent for a later retry/restart.
+
+A multipart upload adds two kinds of `/s3-intent/` record: the upload record (which
+names its parts and no fragments) and one ordinary part intent per part. The upload
+record refreshes its lease whenever a part is registered, and while it is live it pins
+its parts past their own lease, so a slow upload stays completable. An upload that
+expires uncompleted is deleted by the same collector; its parts then become unreferenced
+intents and are reclaimed normally, so an abandoned multipart upload cannot leak
+fragments.
 Clock changes can affect cleanup timing, but are not the publication safety fence.
 In clustered mode the leader runs scrub periodically; `/v1/pools/scrub` also requests it
 explicitly. `orphan_blobs_collected` counts logical blobs, not physical fragments;
@@ -468,8 +500,10 @@ and lost commit notifications, but not all end-to-end protocol failure boundarie
 Native-client checks were run on aarch64 Alpine with **psql 17.11**, **AWS CLI 2.22.10**,
 and **libiscsi 1.20.3**. Verified cases include SQL queries/commit and bad passwords;
 S3 PUT (default Content-MD5 and explicit CRC32), HEAD/GET/LIST, Unicode/escaped keys,
-Range and bad credentials; iSCSI CHAP, INQUIRY, READ CAPACITY(16), and a 512 KiB
-WRITE(16) using R2T/Data-Out followed by byte-for-byte READ(16) verification.
+Range and bad credentials; a 40 MiB `aws s3 cp` multipart upload in 8 MiB parts with a
+byte-identical download, the multipart ETag, HEAD and a Range read; iSCSI CHAP, INQUIRY,
+READ CAPACITY(16), and a 512 KiB WRITE(16) using R2T/Data-Out followed by byte-for-byte
+READ(16) verification.
 This is not a claim of complete PostgreSQL/S3/SCSI conformance.
 
 To repeat the optional native checks, install psql and AWS CLI, and install libiscsi

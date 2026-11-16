@@ -158,6 +158,21 @@ def signed(port, method, path, body=b"", extra=None, secret=SECRET):
     return request(port, method, path, body, headers)
 
 
+def complete_multipart_xml(parts):
+    """The `CompleteMultipartUpload` document AWS clients send for `parts`."""
+    body = "".join(
+        f"<Part><PartNumber>{number}</PartNumber><ETag>&quot;{etag}&quot;</ETag></Part>"
+        for number, etag in parts
+    )
+    return f"<CompleteMultipartUpload>{body}</CompleteMultipartUpload>".encode()
+
+
+def multipart_etag(parts):
+    """S3's multipart ETag: MD5 of the concatenated part digests, then `-N`."""
+    digest = hashlib.md5(b"".join(hashlib.md5(p).digest() for p in parts)).hexdigest()
+    return f'"{digest}-{len(parts)}"'
+
+
 class Pg:
     def __init__(self, port):
         self.s = socket.create_connection(("127.0.0.1", port), timeout=30)
@@ -496,6 +511,61 @@ def native_client_checks(temp, pg_port, s3_port):
         "aws", "--endpoint-url", endpoint, "s3api", "head-object",
         "--bucket", "invoices-2026", "--key", "native/aws.txt", "--no-cli-pager",
     ], bad_aws, "403")
+
+    # A multipart upload driven by the CLI itself: 40 MiB in 8 MiB parts, so the
+    # client really initiates, uploads five parts and completes. The result must
+    # be byte-identical on download, with the S3 multipart ETag, and readable
+    # through HEAD and a Range GET.
+    multipart_env = aws_env.copy()
+    multipart_config = Path(temp)/"aws-multipart-config"
+    multipart_config.write_text(
+        "[default]\nregion = us-east-1\ns3 =\n"
+        "    addressing_style = path\n"
+        "    multipart_threshold = 8MB\n"
+        "    multipart_chunksize = 8MB\n"
+    )
+    multipart_env["AWS_CONFIG_FILE"] = str(multipart_config)
+    part_size = 8 * 1024 * 1024
+    big_parts = [bytes([i + 1]) * part_size for i in range(5)]
+    big_path = Path(temp) / "native-multipart.bin"
+    big_path.write_bytes(b"".join(big_parts))
+    native([
+        "aws", "--endpoint-url", endpoint, "s3", "cp", str(big_path),
+        "s3://invoices-2026/native/multipart.bin", "--no-progress",
+    ], multipart_env)
+    expected_etag = multipart_etag(big_parts)
+    head = json.loads(native([
+        "aws", "--endpoint-url", endpoint, "s3api", "head-object",
+        "--bucket", "invoices-2026", "--key", "native/multipart.bin",
+        "--no-cli-pager",
+    ], multipart_env))
+    assert head["ContentLength"] == len(b"".join(big_parts)), head
+    assert head["ETag"] == expected_etag, head
+    big_download = Path(temp) / "native-multipart-downloaded.bin"
+    native([
+        "aws", "--endpoint-url", endpoint, "s3", "cp",
+        "s3://invoices-2026/native/multipart.bin", str(big_download),
+        "--no-progress",
+    ], multipart_env)
+    assert big_download.read_bytes() == big_path.read_bytes()
+    ranged = Path(temp) / "native-multipart-range.bin"
+    native([
+        "aws", "--endpoint-url", endpoint, "s3api", "get-object",
+        "--bucket", "invoices-2026", "--key", "native/multipart.bin",
+        "--range", f"bytes={part_size}-{2 * part_size - 1}", str(ranged),
+        "--no-cli-pager",
+    ], multipart_env)
+    assert ranged.read_bytes() == big_parts[1]
+    native([
+        "aws", "--endpoint-url", endpoint, "s3", "rm",
+        "s3://invoices-2026/native/multipart.bin",
+    ], multipart_env)
+    native_error([
+        "aws", "--endpoint-url", endpoint, "s3api", "head-object",
+        "--bucket", "invoices-2026", "--key", "native/multipart.bin",
+        "--no-cli-pager",
+    ], multipart_env, "404")
+    print("PASS native AWS CLI 2 multipart upload (40 MiB, 8 MiB parts, ETag, HEAD, Range)")
     print("PASS native psql 17 and AWS CLI 2 (Simple Query, transaction, S3 PUT/HEAD/GET/LIST)")
 
 
@@ -756,7 +826,90 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
             assert ET.fromstring(second).find("{*}Contents/{*}Key").text == "page/b"
             assert signed(19202, "PUT", "/invoices-2026/bad", b"bad", {"x-amz-checksum-crc32": "AAAAAA=="})[0] == 400
             assert signed(19202, "PUT", "/invoices-2026/bad-md5", b"bad", {"content-md5": "AAAAAAAAAAAAAAAAAAAAAA=="})[0] == 400
-            assert signed(19202, "POST", "/invoices-2026/multipart?uploads")[0] == 501
+            # Multipart upload: the parts are real durable allocations, and the
+            # completed object must be indistinguishable from a single PUT.
+            mp_key = "/invoices-2026/multipart/object.bin"
+            status, _, body = signed(19202, "POST", mp_key + "?uploads")
+            assert status == 200, (status, body)
+            upload_id = ET.fromstring(body).find("{*}UploadId").text
+            assert upload_id.startswith("mpu-"), upload_id
+            mp_parts = [b"a" * 4096, b"b" * 5000, b"c" * 7]
+            mp_etags = []
+            for number, part in enumerate(mp_parts, 1):
+                status, hs, body = signed(
+                    19202, "PUT",
+                    f"{mp_key}?partNumber={number}&uploadId={upload_id}", part)
+                assert status == 200, (status, body)
+                etag = next(v for k, v in hs.items() if k.lower() == "etag")
+                assert etag == '"' + hashlib.md5(part).hexdigest() + '"', etag
+                mp_etags.append((number, etag.strip('"')))
+            status, _, body = signed(19202, "GET", f"{mp_key}?uploadId={upload_id}")
+            assert status == 200, (status, body)
+            assert len(ET.fromstring(body).findall("{*}Part")) == 3, body
+            # A wrong ETag and an out-of-order list are refused with the S3 codes,
+            # and neither consumes the upload.
+            wrong = [(mp_etags[0][0], "0" * 32)] + mp_etags[1:]
+            status, _, body = signed(
+                19202, "POST", f"{mp_key}?uploadId={upload_id}",
+                complete_multipart_xml(wrong))
+            assert status == 400 and b"<Code>InvalidPart</Code>" in body, (status, body)
+            status, _, body = signed(
+                19202, "POST", f"{mp_key}?uploadId={upload_id}",
+                complete_multipart_xml(list(reversed(mp_etags))))
+            assert status == 400 and b"<Code>InvalidPartOrder</Code>" in body, (status, body)
+            status, hs, body = signed(
+                19202, "POST", f"{mp_key}?uploadId={upload_id}",
+                complete_multipart_xml(mp_etags))
+            assert status == 200, (status, body)
+            expected = multipart_etag(mp_parts)
+            assert ET.fromstring(body).find("{*}ETag").text == expected, body
+            joined = b"".join(mp_parts)
+            status, hs, body = signed(19203, "GET", mp_key)
+            assert status == 200 and body == joined, (status, body[:64])
+            assert next(v for k, v in hs.items() if k.lower() == "etag") == expected
+            status, hs, _ = signed(19203, "HEAD", mp_key)
+            assert status == 200
+            assert int(next(v for k, v in hs.items() if k.lower() == "content-length")) == len(joined)
+            status, hs, body = signed(19203, "GET", mp_key, extra={"range": "bytes=4096-9095"})
+            assert status == 206 and body == joined[4096:9096], (status, body)
+            # The consumed upload cannot be completed twice.
+            status, _, body = signed(
+                19202, "POST", f"{mp_key}?uploadId={upload_id}",
+                complete_multipart_xml(mp_etags))
+            assert status == 404 and b"<Code>NoSuchUpload</Code>" in body, (status, body)
+            # Abort removes the upload, and its parts are no longer usable.
+            status, _, body = signed(19202, "POST", "/invoices-2026/multipart/aborted?uploads")
+            assert status == 200, (status, body)
+            abort_id = ET.fromstring(body).find("{*}UploadId").text
+            aborted = "/invoices-2026/multipart/aborted"
+            assert signed(
+                19202, "PUT", f"{aborted}?partNumber=1&uploadId={abort_id}", b"x")[0] == 200
+            assert signed(19202, "DELETE", f"{aborted}?uploadId={abort_id}")[0] == 204
+            assert signed(
+                19202, "PUT", f"{aborted}?partNumber=2&uploadId={abort_id}", b"y")[0] == 404
+            assert signed(19203, "GET", aborted)[0] == 404
+            # The same flow through the other node: exactly one of 19202/19203
+            # is the leader, so at least one round is forwarded, and a
+            # follower must reach the same state.
+            follow_key = "/invoices-2026/multipart/forwarded.bin"
+            status, _, body = signed(19203, "POST", follow_key + "?uploads")
+            assert status == 200, (status, body)
+            follow_id = ET.fromstring(body).find("{*}UploadId").text
+            follow_parts = [b"f" * 32, b"g" * 64]
+            follow_etags = []
+            for number, part in enumerate(follow_parts, 1):
+                status, hs, body = signed(
+                    19203, "PUT",
+                    f"{follow_key}?partNumber={number}&uploadId={follow_id}", part)
+                assert status == 200, (status, body)
+                follow_etags.append(
+                    (number, next(v for k, v in hs.items() if k.lower() == "etag").strip('"')))
+            status, _, body = signed(
+                19203, "POST", f"{follow_key}?uploadId={follow_id}",
+                complete_multipart_xml(follow_etags))
+            assert status == 200, (status, body)
+            assert signed(19202, "GET", follow_key)[2] == b"".join(follow_parts)
+            print("PASS S3 multipart: initiate, parts, list, complete, HEAD/Range, abort")
             print("PASS S3 SigV4, XML listing, escaped keys, PUT/GET/HEAD/Range/DELETE, bad signatures")
 
             concurrent_results = []

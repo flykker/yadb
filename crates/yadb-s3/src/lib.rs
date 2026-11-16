@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -15,6 +15,110 @@ pub const S3_CHANNEL: u8 = 4;
 const INTENT_GRACE_SECS: u64 = 300;
 const INTENT_GRACE_REVISIONS: u64 = 32;
 const MAX_ALLOCATION: u64 = (1u64 << 56) - 1;
+/// Largest single multipart part the engine accepts. The daemon applies the
+/// same bound to the request body before calling in, so a part is always
+/// buffered once, never streamed unbounded.
+pub const MULTIPART_PART_MAX: usize = 16 * 1024 * 1024;
+/// Largest part number an S3 multipart upload may name (AWS: 1..=10000).
+pub const MULTIPART_MAX_PARTS: u32 = 10_000;
+
+/// RFC 1321 MD5, used for S3 part and multipart ETags. Kept here so the S3
+/// engine owns the ETag it publishes instead of trusting a caller-supplied
+/// digest.
+pub fn md5(input: &[u8]) -> [u8; 16] {
+    const S: [u32; 64] = [
+        7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5,
+        9, 14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10,
+        15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
+    ];
+    const K: [u32; 64] = [
+        0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee, 0xf57c0faf, 0x4787c62a, 0xa8304613,
+        0xfd469501, 0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be, 0x6b901122, 0xfd987193,
+        0xa679438e, 0x49b40821, 0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa, 0xd62f105d,
+        0x02441453, 0xd8a1e681, 0xe7d3fbc8, 0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed,
+        0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a, 0xfffa3942, 0x8771f681, 0x6d9d6122,
+        0xfde5380c, 0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70, 0x289b7ec6, 0xeaa127fa,
+        0xd4ef3085, 0x04881d05, 0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665, 0xf4292244,
+        0x432aff97, 0xab9423a7, 0xfc93a039, 0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
+        0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1, 0xf7537e82, 0xbd3af235, 0x2ad7d2bb,
+        0xeb86d391,
+    ];
+    fn compress(state: &mut [u32; 4], chunk: &[u8], s: &[u32; 64], k: &[u32; 64]) {
+        let mut m = [0u32; 16];
+        for (i, b) in chunk.chunks_exact(4).enumerate() {
+            m[i] = u32::from_le_bytes(b.try_into().unwrap());
+        }
+        let [a0, b0, c0, d0] = *state;
+        let (mut a, mut b, mut c, mut d) = (a0, b0, c0, d0);
+        for i in 0..64 {
+            let (f, g) = if i < 16 {
+                ((b & c) | (!b & d), i)
+            } else if i < 32 {
+                ((d & b) | (!d & c), (5 * i + 1) % 16)
+            } else if i < 48 {
+                (b ^ c ^ d, (3 * i + 5) % 16)
+            } else {
+                (c ^ (b | !d), (7 * i) % 16)
+            };
+            let next = b.wrapping_add(
+                a.wrapping_add(f)
+                    .wrapping_add(k[i])
+                    .wrapping_add(m[g])
+                    .rotate_left(s[i]),
+            );
+            a = d;
+            d = c;
+            c = b;
+            b = next;
+        }
+        state[0] = state[0].wrapping_add(a);
+        state[1] = state[1].wrapping_add(b);
+        state[2] = state[2].wrapping_add(c);
+        state[3] = state[3].wrapping_add(d);
+    }
+
+    let mut state = [0x67452301u32, 0xefcdab89u32, 0x98badcfeu32, 0x10325476u32];
+    let mut blocks = input.chunks_exact(64);
+    for chunk in &mut blocks {
+        compress(&mut state, chunk, &S, &K);
+    }
+    // Only the tail is copied, so hashing a 16 MiB part does not duplicate it.
+    let bits = (input.len() as u64) * 8;
+    let mut tail = Vec::with_capacity(128);
+    tail.extend_from_slice(blocks.remainder());
+    tail.push(0x80);
+    while tail.len() % 64 != 56 {
+        tail.push(0);
+    }
+    tail.extend_from_slice(&bits.to_le_bytes());
+    for chunk in tail.chunks_exact(64) {
+        compress(&mut state, chunk, &S, &K);
+    }
+    let mut out = [0u8; 16];
+    for (i, word) in state.iter().enumerate() {
+        out[i * 4..i * 4 + 4].copy_from_slice(&word.to_le_bytes());
+    }
+    out
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn unhex(s: &str) -> Option<Vec<u8>> {
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+        .collect()
+}
+
+/// Lowercase hex MD5, the form S3 uses for a part ETag.
+pub fn md5_hex(input: &[u8]) -> String {
+    hex(&md5(input))
+}
 
 fn unix_seconds() -> u64 {
     SystemTime::now()
@@ -49,6 +153,21 @@ pub enum S3Error {
 
     #[error("invalid byte range [{start}..={end}] for object size {size}")]
     InvalidRange { start: u64, end: u64, size: u64 },
+
+    #[error("multipart upload not found: {0}")]
+    MultipartUploadNotFound(String),
+
+    #[error("invalid part {part}: {reason}")]
+    InvalidPart { part: u32, reason: String },
+
+    #[error("multipart parts are not in strictly ascending order")]
+    InvalidPartOrder,
+
+    #[error("part {part} is {size} bytes, over the {max}-byte part limit")]
+    PartTooLarge { part: u32, size: u64, max: usize },
+
+    #[error("malformed multipart completion request: {0}")]
+    MalformedMultipart(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -118,6 +237,60 @@ struct UploadIntent {
     /// Intents written by earlier engines are retained, never guessed safe.
     #[serde(default)]
     allocation_id: Option<u64>,
+    /// Set on the one record that represents a multipart upload. Its `parts`
+    /// name the per-part `v2-` intent records; the upload record itself owns no
+    /// fragments, so it adds nothing to the mark set.
+    #[serde(default)]
+    multipart: bool,
+    /// Content type captured at initiate time and applied on completion.
+    #[serde(default)]
+    content_type: String,
+    /// Registered parts, strictly ascending by part number.
+    #[serde(default)]
+    parts: Vec<MultipartPartRef>,
+}
+
+/// One registered part of a multipart upload. The part bytes live in the
+/// separate `intent_key` record, which is an ordinary single-allocation intent
+/// so the existing collector can validate and reclaim it without changes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct MultipartPartRef {
+    part_number: u32,
+    intent_key: String,
+    /// Lowercase hex MD5 of the part bytes, without quotes.
+    etag: String,
+    size: u64,
+    #[serde(default)]
+    last_modified: u64,
+}
+
+impl Default for UploadIntent {
+    fn default() -> Self {
+        Self {
+            upload_id: String::new(),
+            manifest_key: String::new(),
+            generation: 0,
+            pool: String::new(),
+            chunks: Vec::new(),
+            state: UploadState::Prepared,
+            created_revision: 0,
+            lease_until_revision: 0,
+            lease_until_unix_secs: 0,
+            allocation_id: None,
+            multipart: false,
+            content_type: String::new(),
+            parts: Vec::new(),
+        }
+    }
+}
+
+/// A registered multipart part as seen by the wire layer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MultipartPartInfo {
+    pub part_number: u32,
+    pub etag: String,
+    pub size: u64,
+    pub last_modified: u64,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -337,6 +510,7 @@ impl<FS: StorageFs> ObjectStoreEngine<FS> {
             lease_until_revision: intent_lease,
             lease_until_unix_secs: unix_seconds().saturating_add(INTENT_GRACE_SECS),
             allocation_id: Some(allocation_id),
+            ..UploadIntent::default()
         };
         let created = self.meta.execute(KvCommand::CompareAndSwap {
             key: intent_key.clone(),
@@ -368,6 +542,414 @@ impl<FS: StorageFs> ObjectStoreEngine<FS> {
         let extra = prepare(&manifest)?;
         self.publish_upload_with(project_id, store, &manifest, &intent_key, extra)?;
         Ok(manifest)
+    }
+
+    /// Starts a multipart upload and durably records it before any part exists.
+    ///
+    /// The returned id is derived from a fresh allocation, so it cannot collide
+    /// with a concurrent or restarted initiator. The record lives under
+    /// `/s3-intent/` and names no fragments itself; each part is registered in
+    /// its own single-allocation intent record.
+    pub fn create_multipart_upload(
+        &self,
+        project_id: u32,
+        store: &str,
+        pool_name: &str,
+        bucket: &str,
+        key: &str,
+        content_type: &str,
+    ) -> Result<String, S3Error> {
+        self.get_pool(pool_name)?;
+        let allocation = self.reserve_upload(project_id)?;
+        let upload_id = format!("mpu-{allocation:014x}");
+        let intent_key = Self::intent_key(project_id, &upload_id);
+        let revision = self.meta.revision_for_key(&intent_key)?;
+        let intent = UploadIntent {
+            upload_id: upload_id.clone(),
+            manifest_key: Self::meta_key(project_id, store, bucket, key),
+            pool: pool_name.to_string(),
+            state: UploadState::Prepared,
+            created_revision: revision,
+            lease_until_revision: revision.saturating_add(INTENT_GRACE_REVISIONS),
+            lease_until_unix_secs: unix_seconds().saturating_add(INTENT_GRACE_SECS),
+            multipart: true,
+            content_type: content_type.to_string(),
+            ..UploadIntent::default()
+        };
+        let created = self.meta.execute(KvCommand::CompareAndSwap {
+            key: intent_key,
+            expected_version: 0,
+            new_value: Some(serde_json::to_vec(&intent)?),
+        })?;
+        if !matches!(created, KvResult::CasOk { .. }) {
+            return Err(S3Error::ConcurrentModification);
+        }
+        Ok(upload_id)
+    }
+
+    /// Reads and validates the multipart upload record for `upload_id`.
+    fn multipart_upload(
+        &self,
+        project_id: u32,
+        store: &str,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+    ) -> Result<(String, yadb_metakv::KvValue, UploadIntent), S3Error> {
+        let intent_key = Self::intent_key(project_id, upload_id);
+        let kv = self
+            .meta
+            .get(&intent_key)
+            .ok_or_else(|| S3Error::MultipartUploadNotFound(upload_id.to_string()))?;
+        let intent: UploadIntent = serde_json::from_slice(&kv.value)?;
+        if !intent.multipart
+            || intent.state != UploadState::Prepared
+            || intent.manifest_key != Self::meta_key(project_id, store, bucket, key)
+        {
+            return Err(S3Error::MultipartUploadNotFound(upload_id.to_string()));
+        }
+        Ok((intent_key, kv, intent))
+    }
+
+    /// Writes one part as its own durable allocation, then registers it in the
+    /// upload record.
+    ///
+    /// Ordering is the safety property: the part intent (which names the
+    /// fragments and the MD5 the client will complete with) is committed before
+    /// a fragment is written, so a crash or a refused registration leaves only
+    /// collectable state. The upload record is updated only after the fragments
+    /// are durable, so it never points at a part that cannot be read.
+    pub fn upload_part(
+        &self,
+        project_id: u32,
+        store: &str,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        part_number: u32,
+        payload: &[u8],
+    ) -> Result<String, S3Error> {
+        if part_number == 0 || part_number > MULTIPART_MAX_PARTS {
+            return Err(S3Error::InvalidPart {
+                part: part_number,
+                reason: format!("part number must be 1..={MULTIPART_MAX_PARTS}"),
+            });
+        }
+        if payload.len() > MULTIPART_PART_MAX {
+            return Err(S3Error::PartTooLarge {
+                part: part_number,
+                size: payload.len() as u64,
+                max: MULTIPART_PART_MAX,
+            });
+        }
+        let (upload_key, _, upload) =
+            self.multipart_upload(project_id, store, bucket, key, upload_id)?;
+        let pool = self.get_pool(&upload.pool)?;
+        let allocation = self.reserve_upload(project_id)?;
+        let owner_id = (allocation >> 24) as u32;
+        let generation = (allocation & BlobId::MAX_U24 as u64) as u32;
+        let mut chunks = Vec::new();
+        let mut offset = 0u64;
+        for (index, slice) in payload.chunks(self.chunk_size).enumerate() {
+            let step = u32::try_from(index + 1)
+                .ok()
+                .filter(|v| *v <= BlobId::MAX_U24)
+                .ok_or(S3Error::GenerationExhausted)?;
+            chunks.push(ChunkRef {
+                blob_id: BlobId::new(project_id, owner_id, generation, step, S3_CHANNEL, 0),
+                offset,
+                len: slice.len() as u32,
+            });
+            offset += slice.len() as u64;
+        }
+        let part_upload_id = format!("v2-{allocation:014x}");
+        let part_intent_key = Self::intent_key(project_id, &part_upload_id);
+        let part_revision = self.meta.revision_for_key(&part_intent_key)?;
+        let part_intent = UploadIntent {
+            upload_id: part_upload_id,
+            manifest_key: upload.manifest_key.clone(),
+            generation,
+            pool: upload.pool.clone(),
+            chunks: chunks.clone(),
+            state: UploadState::Prepared,
+            created_revision: part_revision,
+            lease_until_revision: part_revision.saturating_add(INTENT_GRACE_REVISIONS),
+            lease_until_unix_secs: unix_seconds().saturating_add(INTENT_GRACE_SECS),
+            allocation_id: Some(allocation),
+            ..UploadIntent::default()
+        };
+        let created = self.meta.execute(KvCommand::CompareAndSwap {
+            key: part_intent_key.clone(),
+            expected_version: 0,
+            new_value: Some(serde_json::to_vec(&part_intent)?),
+        })?;
+        if !matches!(created, KvResult::CasOk { .. }) {
+            return Err(S3Error::ConcurrentModification);
+        }
+
+        for (slice, chunk) in payload.chunks(self.chunk_size).zip(chunks.iter()) {
+            pool.put_blob(chunk.blob_id, slice)?;
+        }
+
+        let etag = md5_hex(payload);
+        let part = MultipartPartRef {
+            part_number,
+            intent_key: part_intent_key,
+            etag: etag.clone(),
+            size: payload.len() as u64,
+            last_modified: unix_seconds(),
+        };
+        // Registration is a small, bounded CAS retry: a parallel part changes
+        // the same record. The part intent is already durable, so exhausting
+        // the retries leaves collectable state, never an unreferenced fragment.
+        for _ in 0..64 {
+            let current = self
+                .meta
+                .get(&upload_key)
+                .ok_or_else(|| S3Error::MultipartUploadNotFound(upload_id.to_string()))?;
+            let mut record: UploadIntent = serde_json::from_slice(&current.value)?;
+            if !record.multipart || record.state != UploadState::Prepared {
+                return Err(S3Error::MultipartUploadNotFound(upload_id.to_string()));
+            }
+            record.parts.retain(|p| p.part_number != part_number);
+            record.parts.push(part.clone());
+            record.parts.sort_by_key(|p| p.part_number);
+            let revision = self.meta.revision_for_key(&upload_key)?;
+            record.lease_until_revision = revision.saturating_add(INTENT_GRACE_REVISIONS);
+            record.lease_until_unix_secs = unix_seconds().saturating_add(INTENT_GRACE_SECS);
+            let result = self.meta.execute(KvCommand::RevisionTxn {
+                guards: vec![RevisionGuard {
+                    key: upload_key.clone(),
+                    expected_mod_revision: current.mod_revision,
+                }],
+                ops: vec![TxnOp::Put {
+                    key: upload_key.clone(),
+                    value: serde_json::to_vec(&record)?,
+                }],
+            })?;
+            if matches!(result, KvResult::TxnOk { .. }) {
+                return Ok(etag);
+            }
+        }
+        Err(S3Error::ConcurrentModification)
+    }
+
+    /// Registers nothing and returns the parts the upload currently holds.
+    pub fn list_multipart_parts(
+        &self,
+        project_id: u32,
+        store: &str,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+    ) -> Result<Vec<MultipartPartInfo>, S3Error> {
+        let (_, _, upload) = self.multipart_upload(project_id, store, bucket, key, upload_id)?;
+        Ok(upload
+            .parts
+            .iter()
+            .map(|part| MultipartPartInfo {
+                part_number: part.part_number,
+                etag: part.etag.clone(),
+                size: part.size,
+                last_modified: part.last_modified,
+            })
+            .collect())
+    }
+
+    /// Completes a multipart upload in one revision-guarded transaction:
+    /// manifest publication, retirement of the previous manifest, deletion of
+    /// the upload record and deletion of every named part intent.
+    ///
+    /// The client's part list is checked against the recorded parts before the
+    /// transaction. The transaction guards the upload record and every part
+    /// intent, so a concurrent part upload, abort or collector transition makes
+    /// it fail rather than publish a manifest that disagrees with what it read.
+    /// The caller must not retry blindly on `ConcurrentModification`.
+    pub fn complete_multipart_upload(
+        &self,
+        project_id: u32,
+        store: &str,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        requested: &[(u32, String)],
+    ) -> Result<ObjectManifest, S3Error> {
+        if requested.is_empty() {
+            return Err(S3Error::MalformedMultipart(
+                "at least one part is required".into(),
+            ));
+        }
+        let (upload_key, upload_kv, upload) =
+            self.multipart_upload(project_id, store, bucket, key, upload_id)?;
+        // Fail before any guard is built if the pool is no longer mounted: the
+        // transaction publishes ids that were written under this pool name.
+        self.get_pool(&upload.pool)?;
+        let mut previous_part = 0u32;
+        for (part_number, _) in requested {
+            if *part_number <= previous_part {
+                return Err(S3Error::InvalidPartOrder);
+            }
+            previous_part = *part_number;
+        }
+
+        let mut chunks = Vec::new();
+        let mut offset = 0u64;
+        let mut part_digests = Vec::with_capacity(requested.len() * 16);
+        let mut guards = vec![RevisionGuard {
+            key: upload_key.clone(),
+            expected_mod_revision: upload_kv.mod_revision,
+        }];
+        let mut ops = vec![TxnOp::Delete {
+            key: upload_key.clone(),
+        }];
+        for (part_number, etag) in requested {
+            let part = upload
+                .parts
+                .iter()
+                .find(|p| p.part_number == *part_number)
+                .ok_or_else(|| S3Error::InvalidPart {
+                    part: *part_number,
+                    reason: "part was not uploaded".into(),
+                })?;
+            let expected = part.etag.trim_matches('"');
+            if !expected.eq_ignore_ascii_case(etag.trim_matches('"')) {
+                return Err(S3Error::InvalidPart {
+                    part: *part_number,
+                    reason: "ETag mismatch".into(),
+                });
+            }
+            let kv = self
+                .meta
+                .get(&part.intent_key)
+                .ok_or_else(|| S3Error::InvalidPart {
+                    part: *part_number,
+                    reason: "part data was collected".into(),
+                })?;
+            let intent: UploadIntent = serde_json::from_slice(&kv.value)?;
+            if intent.state != UploadState::Prepared {
+                return Err(S3Error::InvalidPart {
+                    part: *part_number,
+                    reason: "part data was collected".into(),
+                });
+            }
+            let recorded: u64 = intent.chunks.iter().map(|c| c.len as u64).sum();
+            if recorded != part.size {
+                return Err(S3Error::InvalidPart {
+                    part: *part_number,
+                    reason: "part size changed".into(),
+                });
+            }
+            let mut local = 0u64;
+            for chunk in &intent.chunks {
+                if chunk.offset != local || chunk.len as u64 > MULTIPART_PART_MAX as u64 {
+                    return Err(S3Error::InvalidPart {
+                        part: *part_number,
+                        reason: "part chunk layout is invalid".into(),
+                    });
+                }
+                chunks.push(ChunkRef {
+                    blob_id: chunk.blob_id,
+                    offset,
+                    len: chunk.len,
+                });
+                local += chunk.len as u64;
+                offset += chunk.len as u64;
+            }
+            let digest = unhex(expected).ok_or_else(|| S3Error::InvalidPart {
+                part: *part_number,
+                reason: "stored ETag is not an MD5 digest".into(),
+            })?;
+            if digest.len() != 16 {
+                return Err(S3Error::InvalidPart {
+                    part: *part_number,
+                    reason: "stored ETag is not an MD5 digest".into(),
+                });
+            }
+            part_digests.extend_from_slice(&digest);
+            guards.push(RevisionGuard {
+                key: part.intent_key.clone(),
+                expected_mod_revision: kv.mod_revision,
+            });
+            ops.push(TxnOp::Delete {
+                key: part.intent_key.clone(),
+            });
+        }
+
+        let etag = format!("\"{}-{}\"", hex(&md5(&part_digests)), requested.len());
+        let manifest = ObjectManifest {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            size: offset,
+            etag,
+            content_type: upload.content_type.clone(),
+            pool: upload.pool.clone(),
+            chunks,
+            last_modified: unix_seconds(),
+        };
+        let mkey = Self::meta_key(project_id, store, bucket, key);
+        let previous = self.meta.get(&mkey);
+        if let Some(value) = &previous {
+            let old: ObjectManifest = serde_json::from_slice(&value.value)?;
+            ops.push(TxnOp::Put {
+                key: Self::retired_key(project_id, store, bucket, key, value.mod_revision),
+                value: serde_json::to_vec(&old)?,
+            });
+        }
+        guards.push(RevisionGuard {
+            key: mkey.clone(),
+            expected_mod_revision: previous.as_ref().map_or(0, |v| v.mod_revision),
+        });
+        ops.push(TxnOp::Put {
+            key: mkey,
+            value: serde_json::to_vec(&manifest)?,
+        });
+        match self.meta.execute(KvCommand::RevisionTxn { guards, ops })? {
+            KvResult::TxnOk { .. } => Ok(manifest),
+            _ => Err(S3Error::ConcurrentModification),
+        }
+    }
+
+    /// Aborts an upload: deletes its record and marks every still-live part
+    /// intent `Aborted` in the same transaction. The part fragments are then
+    /// reclaimed by the existing collector, which re-confirms each transition
+    /// through consensus before deleting anything.
+    pub fn abort_multipart_upload(
+        &self,
+        project_id: u32,
+        store: &str,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+    ) -> Result<(), S3Error> {
+        let (upload_key, upload_kv, upload) =
+            self.multipart_upload(project_id, store, bucket, key, upload_id)?;
+        let mut guards = vec![RevisionGuard {
+            key: upload_key.clone(),
+            expected_mod_revision: upload_kv.mod_revision,
+        }];
+        let mut ops = vec![TxnOp::Delete { key: upload_key }];
+        for part in &upload.parts {
+            let Some(kv) = self.meta.get(&part.intent_key) else {
+                continue;
+            };
+            let mut intent: UploadIntent = serde_json::from_slice(&kv.value)?;
+            if intent.state != UploadState::Prepared {
+                continue;
+            }
+            intent.state = UploadState::Aborted;
+            guards.push(RevisionGuard {
+                key: part.intent_key.clone(),
+                expected_mod_revision: kv.mod_revision,
+            });
+            ops.push(TxnOp::Put {
+                key: part.intent_key.clone(),
+                value: serde_json::to_vec(&intent)?,
+            });
+        }
+        match self.meta.execute(KvCommand::RevisionTxn { guards, ops })? {
+            KvResult::TxnOk { .. } => Ok(()),
+            _ => Err(S3Error::ConcurrentModification),
+        }
     }
 
     // Used by the tests that publish a hand-built manifest; production paths go
@@ -653,10 +1235,50 @@ impl<FS: StorageFs> ObjectStoreEngine<FS> {
             .revision_for_key(&Self::intent_prefix(project_id))?;
         let mut removed = 0usize;
         let intents = self.meta.scan_prefix(&Self::intent_prefix(project_id));
+
+        // Multipart upload records name parts, never fragments, so they carry no
+        // allocation id and the fragment checks below do not apply to them. A
+        // live record pins its parts: a part's own lease may lapse while the
+        // upload is still being assembled, and collecting it would break a
+        // completion the client is entitled to make. An expired record is
+        // deleted here (one guarded transaction, so a completion that commits in
+        // between wins and this pass does nothing); its parts then become
+        // ordinary unreferenced intents and are reclaimed by the loop below
+        // once their own grace has elapsed.
+        let mut pinned_parts: BTreeSet<String> = BTreeSet::new();
+        for (key, value) in &intents {
+            let Ok(record) = serde_json::from_slice::<UploadIntent>(&value.value) else {
+                continue;
+            };
+            if !record.multipart
+                || record.allocation_id.is_some()
+                || key != &Self::intent_key(project_id, &record.upload_id)
+            {
+                continue;
+            }
+            if record.state == UploadState::Prepared
+                && (record.lease_until_revision > current_revision
+                    || record.lease_until_unix_secs > now)
+            {
+                pinned_parts.extend(record.parts.iter().map(|part| part.intent_key.clone()));
+                continue;
+            }
+            self.meta.execute(KvCommand::RevisionTxn {
+                guards: vec![RevisionGuard {
+                    key: key.clone(),
+                    expected_mod_revision: value.mod_revision,
+                }],
+                ops: vec![TxnOp::Delete { key: key.clone() }],
+            })?;
+        }
+
         for (key, value) in intents {
             let Ok(intent) = serde_json::from_slice::<UploadIntent>(&value.value) else {
                 continue;
             };
+            if pinned_parts.contains(&key) {
+                continue;
+            }
             let Some(allocation) = intent
                 .allocation_id
                 .filter(|id| *id > 0 && *id <= MAX_ALLOCATION)
@@ -956,6 +1578,7 @@ mod tests {
             lease_until_revision: s3.meta.revision() + INTENT_GRACE_REVISIONS,
             lease_until_unix_secs: 1000,
             allocation_id: Some(allocation),
+            ..UploadIntent::default()
         };
         s3.meta
             .execute(KvCommand::CompareAndSwap {
@@ -1650,6 +2273,7 @@ mod tests {
             lease_until_revision: 0,
             lease_until_unix_secs: 0,
             allocation_id: Some(77),
+            ..UploadIntent::default()
         };
         s3.meta
             .execute(KvCommand::Put {
@@ -1983,5 +2607,466 @@ mod tests {
             s3.head_object(1, "store", "bucket", "key"),
             Err(S3Error::ObjectNotFound { .. })
         ));
+    }
+
+    // ---- multipart upload -------------------------------------------------
+
+    #[test]
+    fn md5_matches_rfc_1321_vectors() {
+        // Padding boundary cases matter here: a part's ETag is the MD5 of its
+        // bytes, and the multipart ETag is the MD5 of the concatenated digests.
+        for (input, expected) in [
+            ("", "d41d8cd98f00b204e9800998ecf8427e"),
+            ("abc", "900150983cd24fb0d6963f7d28e17f72"),
+            (
+                "The quick brown fox jumps over the lazy dog",
+                "9e107d9d372bb6826bd81d3542a419d6",
+            ),
+            (
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "ef1772b6dff9a122358552954ad0df65",
+            ),
+            (
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "3b0c8ac703f828b04c6c197006d17218",
+            ),
+            (
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "014842d480b571495a4a0363793f7367",
+            ),
+        ] {
+            assert_eq!(hex(&md5(input.as_bytes())), expected, "len {}", input.len());
+        }
+    }
+
+    fn multipart_engine(tag: u64) -> ObjectStoreEngine<SimFs> {
+        let meta_fs = SimFs::new(tag);
+        let disks = [
+            SimFs::new(tag + 1),
+            SimFs::new(tag + 2),
+            SimFs::new(tag + 3),
+        ];
+        engine(&meta_fs, &disks)
+    }
+
+    fn expected_multipart_etag(parts: &[&[u8]]) -> String {
+        let mut digests = Vec::new();
+        for part in parts {
+            digests.extend_from_slice(&md5(part));
+        }
+        format!("\"{}-{}\"", hex(&md5(&digests)), parts.len())
+    }
+
+    #[test]
+    fn multipart_roundtrip_assembles_parts_in_order_and_retires_the_previous_object() {
+        let s3 = multipart_engine(7100);
+        s3.put_object(
+            1,
+            "store",
+            "pool",
+            "bucket",
+            "key",
+            "text/plain",
+            b"previous",
+        )
+        .unwrap();
+        let previous = s3
+            .meta
+            .get(&ObjectStoreEngine::<SimFs>::meta_key(
+                1, "store", "bucket", "key",
+            ))
+            .unwrap();
+
+        let upload_id = s3
+            .create_multipart_upload(1, "store", "pool", "bucket", "key", "text/plain")
+            .unwrap();
+        assert!(upload_id.starts_with("mpu-"), "{upload_id}");
+
+        let parts: [&[u8]; 3] = [&[7u8; 5000], &[8u8; 4096], &[9u8; 100]];
+        let mut etags = Vec::new();
+        for (index, part) in parts.iter().enumerate() {
+            let etag = s3
+                .upload_part(
+                    1,
+                    "store",
+                    "bucket",
+                    "key",
+                    &upload_id,
+                    index as u32 + 1,
+                    part,
+                )
+                .unwrap();
+            assert_eq!(etag, hex(&md5(part)));
+            etags.push((index as u32 + 1, etag));
+        }
+
+        let listed = s3
+            .list_multipart_parts(1, "store", "bucket", "key", &upload_id)
+            .unwrap();
+        assert_eq!(listed.len(), 3);
+        assert_eq!(listed[0].part_number, 1);
+        assert_eq!(listed[0].size, 5000);
+        assert_eq!(listed[2].part_number, 3);
+
+        let manifest = s3
+            .complete_multipart_upload(1, "store", "bucket", "key", &upload_id, &etags)
+            .unwrap();
+        assert_eq!(manifest.size, 5000 + 4096 + 100);
+        assert_eq!(manifest.etag, expected_multipart_etag(&parts));
+        assert_eq!(manifest.content_type, "text/plain");
+        // Part boundaries are not chunk boundaries: the 5000-byte part spans two
+        // 4096-byte chunks, so the assembled object is four chunks.
+        assert_eq!(manifest.chunks.len(), 4);
+        assert_eq!(manifest.chunks[1].offset, 4096);
+        assert_eq!(manifest.chunks[2].offset, 5000);
+
+        let (_, bytes) = s3.get_object(1, "store", "bucket", "key").unwrap();
+        let expected: Vec<u8> = parts.iter().flat_map(|p| p.iter().copied()).collect();
+        assert_eq!(bytes, expected);
+
+        // The upload record and every part intent are gone in the same
+        // transaction that published the manifest.
+        let upload_key = ObjectStoreEngine::<SimFs>::intent_key(1, &upload_id);
+        assert!(s3.meta.get(&upload_key).is_none());
+        for (_, value) in s3
+            .meta
+            .scan_prefix(&ObjectStoreEngine::<SimFs>::intent_prefix(1))
+        {
+            panic!(
+                "an intent survived completion: {}",
+                String::from_utf8_lossy(&value.value)
+            );
+        }
+        // The replaced object is retained as a retirement record, not deleted.
+        assert!(s3
+            .meta
+            .get(&ObjectStoreEngine::<SimFs>::retired_key(
+                1,
+                "store",
+                "bucket",
+                "key",
+                previous.mod_revision
+            ))
+            .is_some());
+        // A second completion of the same upload is NoSuchUpload, never a
+        // second publication.
+        assert!(matches!(
+            s3.complete_multipart_upload(1, "store", "bucket", "key", &upload_id, &etags),
+            Err(S3Error::MultipartUploadNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn multipart_rejects_a_part_that_was_never_uploaded() {
+        let s3 = multipart_engine(7110);
+        let upload_id = s3
+            .create_multipart_upload(1, "store", "pool", "bucket", "key", "text/plain")
+            .unwrap();
+        s3.upload_part(1, "store", "bucket", "key", &upload_id, 1, b"first")
+            .unwrap();
+        let err = s3
+            .complete_multipart_upload(
+                1,
+                "store",
+                "bucket",
+                "key",
+                &upload_id,
+                &[(1, hex(&md5(b"first"))), (2, hex(&md5(b"second")))],
+            )
+            .unwrap_err();
+        assert!(matches!(err, S3Error::InvalidPart { part: 2, .. }), "{err}");
+        // The refused completion published nothing and left the upload intact.
+        assert!(s3.head_object(1, "store", "bucket", "key").is_err());
+        assert_eq!(
+            s3.list_multipart_parts(1, "store", "bucket", "key", &upload_id)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn multipart_rejects_a_wrong_part_etag_and_a_changed_part_size() {
+        let s3 = multipart_engine(7120);
+        let upload_id = s3
+            .create_multipart_upload(1, "store", "pool", "bucket", "key", "text/plain")
+            .unwrap();
+        let etag = s3
+            .upload_part(1, "store", "bucket", "key", &upload_id, 1, b"payload")
+            .unwrap();
+        // A digest the client did not upload is refused.
+        let err = s3
+            .complete_multipart_upload(
+                1,
+                "store",
+                "bucket",
+                "key",
+                &upload_id,
+                &[(1, hex(&md5(b"other")))],
+            )
+            .unwrap_err();
+        assert!(matches!(err, S3Error::InvalidPart { part: 1, .. }), "{err}");
+        // A record whose size disagrees with the stored intent is refused too:
+        // the size is re-derived from the durable part, not trusted from the
+        // upload record.
+        let upload_key = ObjectStoreEngine::<SimFs>::intent_key(1, &upload_id);
+        let kv = s3.meta.get(&upload_key).unwrap();
+        let mut record: UploadIntent = serde_json::from_slice(&kv.value).unwrap();
+        record.parts[0].size += 1;
+        s3.meta
+            .execute(KvCommand::RevisionTxn {
+                guards: vec![RevisionGuard {
+                    key: upload_key.clone(),
+                    expected_mod_revision: kv.mod_revision,
+                }],
+                ops: vec![TxnOp::Put {
+                    key: upload_key,
+                    value: serde_json::to_vec(&record).unwrap(),
+                }],
+            })
+            .unwrap();
+        let err = s3
+            .complete_multipart_upload(1, "store", "bucket", "key", &upload_id, &[(1, etag)])
+            .unwrap_err();
+        assert!(matches!(err, S3Error::InvalidPart { part: 1, .. }), "{err}");
+        assert!(s3.head_object(1, "store", "bucket", "key").is_err());
+    }
+
+    #[test]
+    fn multipart_rejects_duplicate_and_out_of_order_parts() {
+        let s3 = multipart_engine(7130);
+        let upload_id = s3
+            .create_multipart_upload(1, "store", "pool", "bucket", "key", "text/plain")
+            .unwrap();
+        let one = s3
+            .upload_part(1, "store", "bucket", "key", &upload_id, 1, b"one")
+            .unwrap();
+        let two = s3
+            .upload_part(1, "store", "bucket", "key", &upload_id, 2, b"two")
+            .unwrap();
+        for requested in [
+            vec![(2, two.clone()), (1, one.clone())],
+            vec![(1, one.clone()), (1, one.clone())],
+        ] {
+            let err = s3
+                .complete_multipart_upload(1, "store", "bucket", "key", &upload_id, &requested)
+                .unwrap_err();
+            assert!(matches!(err, S3Error::InvalidPartOrder), "{err}");
+        }
+        let err = s3
+            .complete_multipart_upload(1, "store", "bucket", "key", &upload_id, &[])
+            .unwrap_err();
+        assert!(matches!(err, S3Error::MalformedMultipart(_)), "{err}");
+    }
+
+    #[test]
+    fn multipart_rejects_out_of_range_part_numbers_and_oversized_parts() {
+        let s3 = multipart_engine(7140);
+        let upload_id = s3
+            .create_multipart_upload(1, "store", "pool", "bucket", "key", "text/plain")
+            .unwrap();
+        for part in [0, MULTIPART_MAX_PARTS + 1] {
+            let err = s3
+                .upload_part(1, "store", "bucket", "key", &upload_id, part, b"x")
+                .unwrap_err();
+            assert!(matches!(err, S3Error::InvalidPart { .. }), "{err}");
+        }
+        let oversized = vec![0u8; MULTIPART_PART_MAX + 1];
+        let err = s3
+            .upload_part(1, "store", "bucket", "key", &upload_id, 1, &oversized)
+            .unwrap_err();
+        assert!(
+            matches!(err, S3Error::PartTooLarge { part: 1, max, .. } if max == MULTIPART_PART_MAX),
+            "{err}"
+        );
+        // Nothing was registered by any refusal.
+        assert!(s3
+            .list_multipart_parts(1, "store", "bucket", "key", &upload_id)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn multipart_reupload_of_one_part_replaces_the_earlier_bytes() {
+        let s3 = multipart_engine(7150);
+        let upload_id = s3
+            .create_multipart_upload(1, "store", "pool", "bucket", "key", "text/plain")
+            .unwrap();
+        let stale = s3
+            .upload_part(1, "store", "bucket", "key", &upload_id, 1, b"stale")
+            .unwrap();
+        let fresh = s3
+            .upload_part(1, "store", "bucket", "key", &upload_id, 1, b"fresh!")
+            .unwrap();
+        assert_ne!(stale, fresh);
+        let listed = s3
+            .list_multipart_parts(1, "store", "bucket", "key", &upload_id)
+            .unwrap();
+        assert_eq!(listed.len(), 1, "one part number is one part");
+        assert_eq!(listed[0].etag, fresh);
+        // The superseded ETag is no longer completable.
+        assert!(matches!(
+            s3.complete_multipart_upload(1, "store", "bucket", "key", &upload_id, &[(1, stale)]),
+            Err(S3Error::InvalidPart { .. })
+        ));
+        s3.complete_multipart_upload(
+            1,
+            "store",
+            "bucket",
+            "key",
+            &upload_id,
+            &[(1, fresh.clone())],
+        )
+        .unwrap();
+        assert_eq!(
+            s3.get_object(1, "store", "bucket", "key").unwrap().1,
+            b"fresh!"
+        );
+    }
+
+    #[test]
+    fn multipart_completion_reads_every_part_from_its_own_durable_intent() {
+        // The completion does not trust the upload record for sizes: it re-reads
+        // each part intent and re-derives the byte count. A record whose size
+        // disagrees is refused rather than published.
+        let s3 = multipart_engine(7160);
+        let upload_id = s3
+            .create_multipart_upload(1, "store", "pool", "bucket", "key", "text/plain")
+            .unwrap();
+        let etag = s3
+            .upload_part(1, "store", "bucket", "key", &upload_id, 1, b"payload")
+            .unwrap();
+        let upload_key = ObjectStoreEngine::<SimFs>::intent_key(1, &upload_id);
+        let kv = s3.meta.get(&upload_key).unwrap();
+        let mut record: UploadIntent = serde_json::from_slice(&kv.value).unwrap();
+        record.parts[0].size = 1;
+        s3.meta
+            .execute(KvCommand::RevisionTxn {
+                guards: vec![RevisionGuard {
+                    key: upload_key.clone(),
+                    expected_mod_revision: kv.mod_revision,
+                }],
+                ops: vec![TxnOp::Put {
+                    key: upload_key.clone(),
+                    value: serde_json::to_vec(&record).unwrap(),
+                }],
+            })
+            .unwrap();
+        let err = s3
+            .complete_multipart_upload(1, "store", "bucket", "key", &upload_id, &[(1, etag)])
+            .unwrap_err();
+        assert!(matches!(err, S3Error::InvalidPart { part: 1, .. }), "{err}");
+        assert!(s3.head_object(1, "store", "bucket", "key").is_err());
+        assert!(s3.meta.get(&upload_key).is_some());
+    }
+
+    #[test]
+    fn multipart_abort_retires_the_record_and_lets_the_collector_reclaim_parts() {
+        let s3 = multipart_engine(7170);
+        let upload_id = s3
+            .create_multipart_upload(1, "store", "pool", "bucket", "key", "text/plain")
+            .unwrap();
+        s3.upload_part(1, "store", "bucket", "key", &upload_id, 1, &[1u8; 5000])
+            .unwrap();
+        let upload_key = ObjectStoreEngine::<SimFs>::intent_key(1, &upload_id);
+        assert!(s3.meta.get(&upload_key).is_some());
+        s3.abort_multipart_upload(1, "store", "bucket", "key", &upload_id)
+            .unwrap();
+        assert!(s3.meta.get(&upload_key).is_none());
+        // The part intent is still present but marked Aborted, so the collector
+        // reclaims its fragments without waiting for the lease.
+        assert!(matches!(
+            s3.upload_part(1, "store", "bucket", "key", &upload_id, 2, b"late"),
+            Err(S3Error::MultipartUploadNotFound(_))
+        ));
+        assert!(matches!(
+            s3.abort_multipart_upload(1, "store", "bucket", "key", &upload_id),
+            Err(S3Error::MultipartUploadNotFound(_))
+        ));
+        // Two chunks of 4096 + 904 bytes.
+        assert_eq!(s3.collect_orphans(1).unwrap(), 2);
+        for (key, _) in s3
+            .meta
+            .scan_prefix(&ObjectStoreEngine::<SimFs>::intent_prefix(1))
+        {
+            panic!("aborted part intent `{key}` survived collection");
+        }
+        assert!(s3.head_object(1, "store", "bucket", "key").is_err());
+    }
+
+    #[test]
+    fn incomplete_multipart_upload_is_collected_after_the_grace_and_not_before() {
+        let s3 = multipart_engine(7180);
+        let upload_id = s3
+            .create_multipart_upload(1, "store", "pool", "bucket", "key", "text/plain")
+            .unwrap();
+        s3.upload_part(1, "store", "bucket", "key", &upload_id, 1, &[2u8; 5000])
+            .unwrap();
+        let upload_key = ObjectStoreEngine::<SimFs>::intent_key(1, &upload_id);
+        // Neither grace alone is enough.
+        assert_eq!(s3.collect_orphans_at(1, 1).unwrap(), 0);
+        assert!(s3.meta.get(&upload_key).is_some());
+        advance_revisions(&s3);
+        assert_eq!(
+            s3.collect_orphans_at(1, unix_seconds() + INTENT_GRACE_SECS + 1)
+                .unwrap(),
+            2
+        );
+        assert!(s3.meta.get(&upload_key).is_none());
+        for (key, _) in s3
+            .meta
+            .scan_prefix(&ObjectStoreEngine::<SimFs>::intent_prefix(1))
+        {
+            panic!("incomplete upload `{key}` leaked");
+        }
+        // The client learns the upload is gone instead of completing a
+        // half-collected upload.
+        assert!(matches!(
+            s3.upload_part(1, "store", "bucket", "key", &upload_id, 2, b"late"),
+            Err(S3Error::MultipartUploadNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn a_live_multipart_record_pins_its_parts_past_their_own_lease() {
+        let s3 = multipart_engine(7190);
+        let upload_id = s3
+            .create_multipart_upload(1, "store", "pool", "bucket", "key", "text/plain")
+            .unwrap();
+        let etag = s3
+            .upload_part(1, "store", "bucket", "key", &upload_id, 1, b"pinned")
+            .unwrap();
+        // Expire only the part intent: an upload that takes longer than the
+        // part lease must still be completable.
+        let upload_key = ObjectStoreEngine::<SimFs>::intent_key(1, &upload_id);
+        let kv = s3.meta.get(&upload_key).unwrap();
+        let record: UploadIntent = serde_json::from_slice(&kv.value).unwrap();
+        let part_key = record.parts[0].intent_key.clone();
+        let part_kv = s3.meta.get(&part_key).unwrap();
+        let mut part: UploadIntent = serde_json::from_slice(&part_kv.value).unwrap();
+        part.lease_until_unix_secs = 0;
+        part.lease_until_revision = 0;
+        s3.meta
+            .execute(KvCommand::RevisionTxn {
+                guards: vec![RevisionGuard {
+                    key: part_key.clone(),
+                    expected_mod_revision: part_kv.mod_revision,
+                }],
+                ops: vec![TxnOp::Put {
+                    key: part_key.clone(),
+                    value: serde_json::to_vec(&part).unwrap(),
+                }],
+            })
+            .unwrap();
+        assert_eq!(s3.collect_orphans_at(1, u64::MAX).unwrap(), 0);
+        assert!(s3.meta.get(&part_key).is_some());
+        let manifest = s3
+            .complete_multipart_upload(1, "store", "bucket", "key", &upload_id, &[(1, etag)])
+            .unwrap();
+        assert_eq!(manifest.size, 6);
+        assert_eq!(
+            s3.get_object(1, "store", "bucket", "key").unwrap().1,
+            b"pinned"
+        );
     }
 }

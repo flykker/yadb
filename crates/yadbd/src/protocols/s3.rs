@@ -276,6 +276,9 @@ pub async fn handle(State(st): State<S3State>, request: Request) -> Response {
             "encoding-type",
             "location",
             "x-id",
+            "uploads",
+            "uploadId",
+            "partNumber",
         ]
         .contains(&k.as_str())
     }) {
@@ -344,15 +347,11 @@ pub async fn handle(State(st): State<S3State>, request: Request) -> Response {
             "bucket is not declared",
         );
     }
-    if params.contains_key("uploads")
-        || params.contains_key("uploadId")
-        || params.contains_key("delete")
-        || headers.contains_key("x-amz-copy-source")
-    {
+    if params.contains_key("delete") || headers.contains_key("x-amz-copy-source") {
         return err(
             StatusCode::NOT_IMPLEMENTED,
             "NotImplemented",
-            "multipart uploads, bulk delete and server-side copy are not supported yet",
+            "bulk delete and server-side copy are not supported yet",
         );
     }
     if key.is_empty() {
@@ -510,6 +509,13 @@ pub async fn handle(State(st): State<S3State>, request: Request) -> Response {
         bucket.to_string(),
         key.to_string(),
     );
+    // Multipart uploads are keyed operations on one object; the subresource in
+    // the query selects the step. The body has already been authenticated as
+    // the signed payload above, and the per-part bound is the 16 MiB buffer the
+    // listener enforced before this point.
+    if params.contains_key("uploads") || params.contains_key("uploadId") {
+        return multipart(&st, &method, &headers, gateway_headers, path, &params, body).await;
+    }
     match method {
         Method::PUT => {
             if headers
@@ -524,43 +530,17 @@ pub async fn handle(State(st): State<S3State>, request: Request) -> Response {
                     "conditional PUT and custom metadata are not supported",
                 );
             }
-            for name in [
-                "x-amz-server-side-encryption",
-                "x-amz-acl",
-                "x-amz-checksum-crc32c",
-                "x-amz-checksum-crc64nvme",
-                "x-amz-checksum-sha1",
-            ] {
-                if headers.contains_key(name) {
-                    return err(
-                        StatusCode::NOT_IMPLEMENTED,
-                        "NotImplemented",
-                        "requested encryption, ACL or checksum is unsupported",
-                    );
-                }
+            if let Some(response) = verify_upload_checksums(&headers, &body) {
+                return response;
             }
-            for (name, value) in [
-                ("content-md5", super::iscsi::md5(&body).to_vec()),
-                (
-                    "x-amz-checksum-crc32",
-                    crc32fast::hash(&body).to_be_bytes().to_vec(),
-                ),
-                (
-                    "x-amz-checksum-sha256",
-                    ring::digest::digest(&ring::digest::SHA256, &body)
-                        .as_ref()
-                        .to_vec(),
-                ),
-            ] {
-                if let Some(got) = headers.get(name) {
-                    let expected = base64::engine::general_purpose::STANDARD.encode(value);
-                    if got.as_bytes() != expected.as_bytes() {
-                        return err(StatusCode::BAD_REQUEST, "BadDigest", "checksum mismatch");
-                    }
-                }
-            }
-            let response =
-                handle_s3_put(State(st.app.clone()), gateway_headers, Path(path), body).await;
+            let response = handle_s3_put(
+                State(st.app.clone()),
+                gateway_headers,
+                Path(path),
+                Query(S3WriteQuery::default()),
+                body,
+            )
+            .await;
             if response.status().is_success() {
                 let mut r = StatusCode::OK.into_response();
                 if let Some(v) = response.headers().get(header::ETAG) {
@@ -750,8 +730,13 @@ pub async fn handle(State(st): State<S3State>, request: Request) -> Response {
             response.body(axum::body::Body::from(bytes)).unwrap()
         }
         Method::DELETE => {
-            let response =
-                handle_s3_delete(State(st.app.clone()), gateway_headers, Path(path)).await;
+            let response = handle_s3_delete(
+                State(st.app.clone()),
+                gateway_headers,
+                Path(path),
+                Query(S3WriteQuery::default()),
+            )
+            .await;
             if response.status().is_success() {
                 StatusCode::NO_CONTENT.into_response()
             } else {
@@ -768,6 +753,345 @@ pub async fn handle(State(st): State<S3State>, request: Request) -> Response {
         }
     }
 }
+/// Escapes XML *text* (not attributes): a quoted ETag stays readable as `"`.
+fn esc_text(v: &str) -> String {
+    v.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// Renders a gateway multipart failure as the S3 XML error document.
+///
+/// The gateway answers JSON carrying the S3 error `code`, so the wire layer
+/// never has to guess a code from prose. A response without one (a control
+/// plane refusal, for instance) keeps the same status-based fallback `map_error`
+/// uses, and the explicit no-retry marker is preserved.
+async fn multipart_error(response: Response) -> Response {
+    let status = response.status();
+    let retry = response.headers().get("x-yadb-retry").cloned();
+    let body = axum::body::to_bytes(response.into_body(), 65536)
+        .await
+        .unwrap_or_default();
+    let parsed = serde_json::from_slice::<serde_json::Value>(&body).ok();
+    let message = parsed
+        .as_ref()
+        .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_owned))
+        .unwrap_or_else(|| String::from_utf8_lossy(&body).to_string());
+    let code = parsed
+        .as_ref()
+        .and_then(|v| v.get("code").and_then(|c| c.as_str()).map(str::to_owned))
+        .unwrap_or_else(|| match status {
+            StatusCode::NOT_FOUND => "NoSuchUpload".into(),
+            StatusCode::BAD_REQUEST => "InvalidRequest".into(),
+            StatusCode::FORBIDDEN => "AccessDenied".into(),
+            StatusCode::SERVICE_UNAVAILABLE => "ServiceUnavailable".into(),
+            _ => "InternalError".into(),
+        });
+    let mut mapped = err(status, &code, &message);
+    if let Some(value) = retry {
+        mapped.headers_mut().insert("x-yadb-retry", value);
+    }
+    mapped
+}
+
+/// Dispatches the multipart subresources of a keyed request.
+///
+/// Upload state and ETags belong to the engine; this function only selects the
+/// operation, bounds the part, and renders the S3 XML documents. Every write is
+/// executed by the same gateway handler a `/s3/...` request uses, so leader
+/// forwarding, authorization and error semantics are shared with single PUT.
+async fn multipart(
+    st: &S3State,
+    method: &Method,
+    headers: &HeaderMap,
+    gateway: HeaderMap,
+    path: (String, String, String, String),
+    params: &BTreeMap<&str, &str>,
+    body: axum::body::Bytes,
+) -> Response {
+    let (project, store, bucket, key) = path;
+    if key.is_empty() {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "InvalidRequest",
+            "multipart operations require an object key",
+        );
+    }
+    let upload_id = params.get("uploadId").map(|v| (*v).to_string());
+    let part_number = match params.get("partNumber") {
+        Some(v) => match v.parse::<u32>() {
+            Ok(v) => Some(v),
+            Err(_) => {
+                return err(
+                    StatusCode::BAD_REQUEST,
+                    "InvalidArgument",
+                    "partNumber must be an integer",
+                )
+            }
+        },
+        None => None,
+    };
+    let json = |response: Response| async move {
+        let bytes = axum::body::to_bytes(response.into_body(), 65536)
+            .await
+            .unwrap_or_default();
+        serde_json::from_slice::<serde_json::Value>(&bytes).unwrap_or_default()
+    };
+    match (method, params.contains_key("uploads"), upload_id) {
+        (&Method::POST, true, _) => {
+            let response = handle_s3_create_multipart(
+                st.app.clone(),
+                gateway,
+                project,
+                store,
+                bucket.clone(),
+                key.clone(),
+            )
+            .await;
+            if !response.status().is_success() {
+                return multipart_error(response).await;
+            }
+            let Some(upload_id) = json(response)
+                .await
+                .get("uploadId")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned)
+            else {
+                return err(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "ServiceUnavailable",
+                    "initiate did not return an upload id",
+                );
+            };
+            xml(
+                StatusCode::OK,
+                format!(
+                    "<InitiateMultipartUploadResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Bucket>{}</Bucket><Key>{}</Key><UploadId>{}</UploadId></InitiateMultipartUploadResult>",
+                    esc(&bucket),
+                    esc(&key),
+                    esc(&upload_id)
+                ),
+            )
+        }
+        (&Method::PUT, _, Some(upload_id)) => {
+            let Some(part_number) = part_number else {
+                return err(
+                    StatusCode::BAD_REQUEST,
+                    "InvalidArgument",
+                    "partNumber is required with uploadId",
+                );
+            };
+            // A part is verified exactly like a single PUT body: the client's
+            // `Content-MD5`/`x-amz-checksum-*` is checked before any fragment is
+            // written.
+            if let Some(response) = verify_upload_checksums(headers, &body) {
+                return response;
+            }
+            let response = handle_s3_upload_part(
+                st.app.clone(),
+                gateway,
+                project,
+                store,
+                bucket,
+                key,
+                upload_id,
+                part_number,
+                body,
+            )
+            .await;
+            if !response.status().is_success() {
+                return multipart_error(response).await;
+            }
+            let mut ok = StatusCode::OK.into_response();
+            if let Some(value) = response.headers().get(header::ETAG) {
+                ok.headers_mut().insert(header::ETAG, value.clone());
+            }
+            // S3 echoes the checksum it was asked to verify; a client that sent
+            // one expects it back on the part response.
+            for name in ["x-amz-checksum-crc32", "x-amz-checksum-sha256"] {
+                if let Some(value) = headers.get(name) {
+                    if let Ok(name) = axum::http::HeaderName::from_bytes(name.as_bytes()) {
+                        ok.headers_mut().insert(name, value.clone());
+                    }
+                }
+            }
+            ok
+        }
+        (&Method::POST, _, Some(upload_id)) => {
+            let response = handle_s3_complete_multipart(
+                st.app.clone(),
+                gateway,
+                project,
+                store,
+                bucket.clone(),
+                key.clone(),
+                upload_id.clone(),
+                body,
+            )
+            .await;
+            if !response.status().is_success() {
+                return multipart_error(response).await;
+            }
+            let Some(etag) = json(response)
+                .await
+                .get("etag")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned)
+            else {
+                return err(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "ServiceUnavailable",
+                    "completion did not return an object ETag",
+                );
+            };
+            let host = headers
+                .get(header::HOST)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("yadb");
+            xml(
+                StatusCode::OK,
+                format!(
+                    "<CompleteMultipartUploadResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Location>http://{}/{}/{}/{}</Location><Bucket>{}</Bucket><Key>{}</Key><ETag>{}</ETag></CompleteMultipartUploadResult>",
+                    esc(host),
+                    esc(&bucket),
+                    esc(&key),
+                    esc(&upload_id),
+                    esc(&bucket),
+                    esc(&key),
+                    esc_text(&etag)
+                ),
+            )
+        }
+        (&Method::DELETE, _, Some(upload_id)) => {
+            let response = handle_s3_abort_multipart(
+                st.app.clone(),
+                gateway,
+                project,
+                store,
+                bucket,
+                key,
+                upload_id,
+            )
+            .await;
+            if !response.status().is_success() {
+                return multipart_error(response).await;
+            }
+            StatusCode::NO_CONTENT.into_response()
+        }
+        (&Method::GET, _, Some(upload_id)) => {
+            let response = handle_s3_list_parts(
+                st.app.clone(),
+                gateway,
+                project,
+                store,
+                bucket.clone(),
+                key.clone(),
+                upload_id.clone(),
+            )
+            .await;
+            if !response.status().is_success() {
+                return multipart_error(response).await;
+            }
+            let listed = json(response).await;
+            let parts = listed
+                .get("parts")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let limit = 1000usize;
+            let truncated = parts.len() > limit;
+            let mut out = format!(
+                "<ListPartsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Bucket>{}</Bucket><Key>{}</Key><UploadId>{}</UploadId><PartNumberMarker>0</PartNumberMarker><MaxParts>{limit}</MaxParts><IsTruncated>{truncated}</IsTruncated>",
+                esc(&bucket),
+                esc(&key),
+                esc(&upload_id)
+            );
+            let shown = parts.iter().take(limit).collect::<Vec<_>>();
+            for part in &shown {
+                let number = part.get("partNumber").and_then(|v| v.as_u64()).unwrap_or(0);
+                let etag = part.get("etag").and_then(|v| v.as_str()).unwrap_or("");
+                let size = part.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
+                let modified = part
+                    .get("lastModified")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                out.push_str(&format!(
+                    "<Part><PartNumber>{number}</PartNumber><LastModified>{}</LastModified><ETag>{}</ETag><Size>{size}</Size></Part>",
+                    date(modified),
+                    esc_text(&format!("\"{}\"", etag.trim_matches('"')))
+                ));
+            }
+            if truncated {
+                let last = shown
+                    .last()
+                    .and_then(|p| p.get("partNumber"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                out.push_str(&format!(
+                    "<NextPartNumberMarker>{last}</NextPartNumberMarker>"
+                ));
+            }
+            out.push_str("</ListPartsResult>");
+            xml(StatusCode::OK, out)
+        }
+        _ => err(
+            StatusCode::NOT_IMPLEMENTED,
+            "NotImplemented",
+            "unsupported multipart operation",
+        ),
+    }
+}
+
+/// Verifies the integrity headers a client attached to an upload body.
+///
+/// A part is a whole object fragment as far as the wire is concerned, so the
+/// same rule applies to `PUT` and `UploadPart`: a declared digest that does not
+/// match the bytes the listener received is `BadDigest`, and an algorithm this
+/// build cannot verify is refused rather than silently ignored. `None` means the
+/// body may be stored.
+fn verify_upload_checksums(headers: &HeaderMap, body: &[u8]) -> Option<Response> {
+    for name in [
+        "x-amz-server-side-encryption",
+        "x-amz-acl",
+        "x-amz-checksum-crc32c",
+        "x-amz-checksum-crc64nvme",
+        "x-amz-checksum-sha1",
+    ] {
+        if headers.contains_key(name) {
+            return Some(err(
+                StatusCode::NOT_IMPLEMENTED,
+                "NotImplemented",
+                "requested encryption, ACL or checksum is unsupported",
+            ));
+        }
+    }
+    for (name, value) in [
+        ("content-md5", super::iscsi::md5(body).to_vec()),
+        (
+            "x-amz-checksum-crc32",
+            crc32fast::hash(body).to_be_bytes().to_vec(),
+        ),
+        (
+            "x-amz-checksum-sha256",
+            ring::digest::digest(&ring::digest::SHA256, body)
+                .as_ref()
+                .to_vec(),
+        ),
+    ] {
+        if let Some(got) = headers.get(name) {
+            let expected = base64::engine::general_purpose::STANDARD.encode(value);
+            if got.as_bytes() != expected.as_bytes() {
+                return Some(err(
+                    StatusCode::BAD_REQUEST,
+                    "BadDigest",
+                    "checksum mismatch",
+                ));
+            }
+        }
+    }
+    None
+}
+
 async fn map_error(response: Response) -> Response {
     let status = response.status();
     // Preserve the gateway's machine-readable mutation outcome. Dropping it
@@ -821,6 +1145,79 @@ mod tests {
     #[test]
     fn xml_escape() {
         assert_eq!(esc("<&\""), "&lt;&amp;&quot;");
+        // An ETag is text, not an attribute: its quotes stay literal so a
+        // client reading `<ETag>"abc-2"</ETag>` sees the same bytes S3 sends.
+        assert_eq!(esc_text("\"abc-2\" & <x>"), "\"abc-2\" &amp; &lt;x&gt;");
+    }
+
+    #[test]
+    fn upload_checksums_are_verified_for_a_whole_body_or_a_part() {
+        let body = b"part-bytes";
+        let md5 = base64::engine::general_purpose::STANDARD.encode(super::iscsi::md5(body));
+        let crc32 =
+            base64::engine::general_purpose::STANDARD.encode(crc32fast::hash(body).to_be_bytes());
+        let with = |name: &'static str, value: &str| {
+            let mut map = HeaderMap::new();
+            map.insert(name, value.parse().unwrap());
+            map
+        };
+        assert!(verify_upload_checksums(&HeaderMap::new(), body).is_none());
+        assert!(verify_upload_checksums(&with("content-md5", &md5), body).is_none());
+        assert!(verify_upload_checksums(&with("x-amz-checksum-crc32", &crc32), body).is_none());
+        // A digest for different bytes, and an algorithm this build cannot
+        // verify, are both refused before anything is stored.
+        let bad = with("content-md5", "AAAAAAAAAAAAAAAAAAAAAA==");
+        assert_eq!(
+            verify_upload_checksums(&bad, body).unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
+        let unsupported = with("x-amz-checksum-crc32c", "AAAAAA==");
+        assert_eq!(
+            verify_upload_checksums(&unsupported, body)
+                .unwrap()
+                .status(),
+            StatusCode::NOT_IMPLEMENTED
+        );
+    }
+
+    #[tokio::test]
+    async fn multipart_errors_render_s3_codes_from_the_gateway_envelope() {
+        // The gateway names the S3 code; the wire layer must not invent one.
+        let gateway = (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "part 2: ETag mismatch",
+                "code": "InvalidPart",
+            })),
+        )
+            .into_response();
+        let mapped = multipart_error(gateway).await;
+        assert_eq!(mapped.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(mapped.into_body(), 65536)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("<Code>InvalidPart</Code>"), "{body}");
+        assert!(
+            body.contains("<Message>part 2: ETag mismatch</Message>"),
+            "{body}"
+        );
+
+        // A refusal without a code keeps the status-based fallback, and the
+        // no-retry marker survives so a client does not replay a completion
+        // whose outcome is ambiguous.
+        let mut ambiguous = crate::api_err(StatusCode::SERVICE_UNAVAILABLE, "state changed");
+        ambiguous
+            .headers_mut()
+            .insert("x-yadb-retry", "do-not-retry".parse().unwrap());
+        let mapped = multipart_error(ambiguous).await;
+        assert_eq!(mapped.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(mapped.headers()["x-yadb-retry"], "do-not-retry");
+        let body = axum::body::to_bytes(mapped.into_body(), 65536)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("<Code>ServiceUnavailable</Code>"), "{body}");
     }
 
     #[tokio::test]
