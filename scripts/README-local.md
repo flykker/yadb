@@ -180,10 +180,14 @@ leaders 1/2/3. The admin allowlist subject is `local-operator`; the protocol use
 
 Boundaries, all deliberate: it never wipes a data directory, never re-applies a
 manifest to an existing root, never retries an ambiguous `/v1/apply`, and never
-converts a legacy root. Restarting a stopped root rewrites every group config to
-`mode: "open", initialize: false` before launch. A `start` on a `running`
-`state.json` whose PIDs are gone requires `--force`, because that is a crash, not
-a restart. Per-group garbage collection is refused on Multi-Raft (see below), so
+converts a legacy root. Every start sets each group's mode from the replica
+directories that actually exist: all three present → `mode: "open"` (never
+initialize again), none present → `mode: "create"`, partly present → an explicit
+refusal, because a partial bootstrap cannot be repaired by guessing. The
+recorded phase is deliberately not consulted for this: a start that failed
+before a replica was created still leaves a settled phase behind. A `start` on a
+`running` `state.json` whose PIDs are gone requires `--force`, because that is a
+crash, not a restart. Per-group garbage collection is refused on Multi-Raft (see below), so
 `scrub`/`gc` are evidence commands, not maintenance commands.
 
 ## Local smoke readback

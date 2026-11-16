@@ -1577,3 +1577,101 @@ returning 500 instead of the expected 501).
   documented; a preferred node does not reclaim leadership automatically.
 * A kernel iSCSI initiator was unavailable in this environment, so iSCSI was
   exercised with a hand-written initiator.
+
+## Multipart S3, consistent reads and the merged-tree run (2026-11-16)
+
+This run is on merged `main` after the pgwire/COPY block and the Multi-Raft
+block were integrated. Root `/data/data/com.foxdebug.acodefree/cache/opencode/yadb-or-merge`,
+base 23500, same layout as the run above; the cluster was stopped after each
+drill and its data kept.
+
+### Multipart uploads
+
+`POST /bucket/key?uploads` initiates, `PUT ...?partNumber=N&uploadId=...` uploads
+a part, `GET ...?uploadId=...` lists, `POST ...?uploadId=...` completes and
+`DELETE ...?uploadId=...` aborts. Parts are ordinary durable blob-pool
+allocations referenced by a `multipart: true` intent committed before any
+fragment is written, so the object is never buffered in memory. Completion is a
+single `RevisionTxn` that publishes the manifest, retires the previous one,
+deletes the upload record and deletes every part intent; a lost guard answers
+`503` with `x-yadb-retry: do-not-retry` rather than retrying a publication whose
+outcome is unknown. A wrong ETag (`InvalidPart`), a repeated or descending part
+number (`InvalidPartOrder`), a malformed document (`MalformedXML`) and an
+unknown upload (`NoSuchUpload`) are refused without consuming the upload.
+
+Live evidence with the real AWS CLI (2.22.10, `--only-show-errors`), a 40 MiB
+random file uploaded in five 8 MiB parts **through each of the three native S3
+listeners in turn** (two of them are followers, so the requests were forwarded):
+
+| Listener | Result |
+| --- | --- |
+| 23800 (node 1) | 41943040 bytes, ETag `"5da9de09…-5"`, download SHA-256 identical |
+| 23801 (node 2) | same size and ETag, download SHA-256 identical |
+| 23802 (node 3) | same size and ETag, download SHA-256 identical |
+
+The upload predates a full cluster stop/start; after the restart a
+`?consistent=true` range read of it returned the same bytes on all three nodes,
+so the completed object survived the restart and not only its metadata did.
+
+### Consistent reads through the native listener
+
+`?consistent=true` is the opt-in quorum-confirmed read; without it a read is the
+documented local applied-state read. The gateway route supported the parameter,
+but the native listener rejected it as an unsupported subresource and, worse,
+answered a plain read from local state — exactly the stale read the option
+exists to refuse. Observed: a PUT acknowledged through one node, then a
+`?consistent=true` GET on the node that had not applied it answered `404`.
+
+The listener now accepts the parameter and delegates to `handle_s3_get`, which
+takes the snapshot on the project-group leader; legacy metadata still refuses
+with `501 consistent reads require OpenRaft metadata` (asserted in
+`tests/protocols.py`). The delegation initially dropped `Range`,
+`If-Match` and `If-None-Match`, so a consistent read of a 40 MiB object answered
+`400 use Range for objects over 16 MiB` even though a range was supplied. One
+helper now builds the gateway header map for both the delegated read and the
+legacy leader forwarding, keeping every conditional field line; a unit test
+pins two `If-Match` lines surviving as two conditions.
+
+Live after the fix, on the 40 MiB object: `?consistent=true` with
+`Range: bytes=33554432-33558527` → `206` and 4096 identical bytes on all three
+nodes; the same read with a wrong `If-Match` → `412`; a full `?consistent=true`
+read of the object → `400` because of the documented 16 MiB cap.
+
+### Launcher: mode follows the replica directories
+
+A start that failed before the daemon created a replica (an argument error, or a
+binary built without `--features openraft-storage`) still recorded a settled
+phase. The next start then flipped every group config to `open`, and the daemon
+refused with `replica path conflicts with explicit create/open mode` forever.
+`sync_replica_modes` now decides from the replica directories on disk: all
+present → `open`; none present → `create`; partly present → explicit refusal,
+because a partial bootstrap cannot be repaired by guessing. The check runs on
+every start instead of only in the `stopped` branch.
+
+### Failure drills on the merged tree
+
+| Drill | Observed |
+| --- | --- |
+| `SIGKILL` of node 2 (g2 leader), then restart | g2 re-elected node 1 at **term 2**; the restarted node rejoined as a follower. Writes and consistent reads through every listener still returned 200. |
+| `stop-node 3` (one of three replicas) | Consistent reads returned 200 with identical bytes on nodes 1 and 2 (majority 2/3); every S3 PUT answered `503 "storage pool cannot reach full redundancy; the write was refused"` and a pgwire `INSERT` failed with a SQL error, so no write was acknowledged with fewer copies. |
+| `start-node 3` (recovery) | PUTs returned 200 through all three listeners again, and every object read back with one identical SHA-256 per object from every node. |
+
+### Gates on the merged tree
+
+`cargo fmt --all -- --check` clean; `cargo test -p yadbd --bins` 90/90;
+`cargo test -p yadb-s3 --lib` 37/37; `cargo test -p yadb-metakv --lib` 170/170;
+`cargo test -p yadb-db --lib` 46/46;
+`cargo test -p yadbd --features openraft-storage --test openraft_daemon` 4/4;
+`tests/protocols.py` 17/17 on consecutive runs and `--native-clients` 19/19.
+
+### Open items for multipart and consistent reads
+
+* A part is capped at 16 MiB (AWS allows 5 GiB); a larger part is refused, not
+  streamed.
+* There is no `ListMultipartUploads` and no `UploadPartCopy`/server-side copy.
+* Orphan collection stays disabled on Multi-Raft, so an aborted or expired
+  upload's fragments are not reclaimed there.
+* After an ambiguous `503` completion the client must `HEAD`/`GET` to learn the
+  outcome; the server does not resume an upload on its own.
+* A full `?consistent=true` read of an object above 16 MiB is refused; use
+  `Range`.

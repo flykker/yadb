@@ -368,6 +368,36 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   per read path. The group-scoped counter also means projects that share a group
   share one budget, which is intended but not yet exercised with a real second
   project on the same group.
+  - [x] Serve the S3 `?consistent=true` read through the gateway on the native
+    listener. The listener used to reject the parameter as an unsupported
+    subresource while a plain read answered from local applied state, so a
+    client asking for the quorum-confirmed read got `501` from its own listener
+    and a client that omitted it could get a `404` for an object just
+    acknowledged through another node. The listener now delegates to
+    `handle_s3_get` (legacy metadata still refuses with `501`), and the
+    delegated read keeps the client's `Range`/`If-Match`/`If-None-Match` lines.
+    Open: a full consistent read of an object above the 16 MiB cap is refused;
+    use `Range`.
+- [x] Multipart S3 uploads. `POST ?uploads`, `PUT ?partNumber&uploadId`,
+  `GET ?uploadId` (ListParts), `POST ?uploadId` (Complete) and
+  `DELETE ?uploadId` (Abort) are implemented. Upload state is a
+  `multipart: true` intent committed in MetaKV **before** any part fragment is
+  written; each part is an ordinary durable `v2-` allocation whose intent is
+  committed first, so parts survive a restart and a leader change and the whole
+  object is never buffered. Parts are verified with the same
+  `Content-MD5`/CRC32/SHA-256 rule as a single PUT, and completion is one
+  `RevisionTxn` guarded on the upload record, every part intent and the manifest
+  key: it publishes the new manifest, retires the previous one and deletes the
+  record and part intents, or answers `503` with `x-yadb-retry: do-not-retry`
+  when a guard is lost. `InvalidPart`, `InvalidPartOrder`, `MalformedXML` and
+  `NoSuchUpload` are refused without consuming the upload. Verified live on the
+  three-process cluster with the AWS CLI: a 40 MiB object in five 8 MiB parts
+  through each of the three listeners (two followers, so forwarded) produced the
+  same multipart ETag and byte-identical downloads, and a `?consistent=true`
+  range read after a full restart returned the same bytes. Open: a part is
+  capped at 16 MiB (not 5 GiB), there is no `ListMultipartUploads` and no
+  `UploadPartCopy`, and orphan collection stays disabled on Multi-Raft, so
+  aborted or expired upload fragments are not reclaimed there.
 - [x] Garbage collection on the legacy metadata runtime. `POST /v1/pools/gc`
   runs one bounded mark-and-sweep pass, and `POST /v1/pools/scrub` runs the same
   pass after its repair scan; the leader's periodic repair scan runs the sweep
