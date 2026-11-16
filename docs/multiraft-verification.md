@@ -942,12 +942,20 @@ failed precondition answers `412`, a matching `If-None-Match` answers a bodyless
 `304`, and a read over 16 MiB answers `400 InvalidRequest` before any fragment is
 fetched. `Last-Modified` and `Accept-Ranges` come from that manifest and the
 internal `x-yadb-leader-id` hop header is removed, so a follower response is the
-one a local read would have produced. Conditions follow RFC 9110 rather than a
-byte comparison of the header: `*` matches the representation (which exists,
-since a manifest was read), a list is split on commas outside the quotes, and
-`If-Match` uses strong comparison while `If-None-Match` uses weak comparison
-(so `W/"a"` matches `"a"`). A field value that cannot be parsed is ignored, as
-RFC 9110 permits, instead of being guessed at. The gateway `/s3/...` GET applies
+one a local read would have produced. Conditions are matched as RFC 9110
+`*` / `#entity-tag` rather than by comparing the whole header value: `*` matches
+the representation (which exists, since a manifest was read), a list is split on
+commas outside the quotes, empty list elements (a leading, doubled or trailing
+comma) are skipped as RFC 9110 requires of a recipient, and `If-Match` uses
+strong comparison while `If-None-Match` uses weak comparison (so `W/"a"` matches
+`"a"`). A conditional header sent as several field lines is evaluated over every
+line and forwarded as one joined list, so the leader sees the same condition the
+follower would have applied. A value that cannot be read is not guessed at:
+`If-Match` is true only on a match, so an unparsable `If-Match` answers `412`
+rather than becoming an unconditional read (a refusal stays an explicit error),
+while an unparsable `If-None-Match` names no version that can be confirmed and
+so does not suppress the bytes. A stored ETag that is not a well-formed
+entity-tag is never repaired into a match. The gateway `/s3/...` GET applies
 the same rule, including the 16 MiB cap, which it did not before: that is a
 deliberate change, because a follower's proxied read has to fit the forwarding
 wire cap. Native `HEAD` on a legacy follower is the one read that stays local —
@@ -999,7 +1007,8 @@ read path is covered by `proxy_response_preserves_allowlisted_entity_headers_and
 `map_error_frames_gateway_range_errors_as_s3_errors` and
 `map_error_frames_gateway_bad_requests_as_invalid_request`. Conditional and
 range semantics are covered by `conditional_reads_follow_rfc_9110_matching`,
-`a_forwarded_read_carries_its_range_and_conditions` and
+`a_forwarded_read_carries_its_range_and_conditions`,
+`a_forwarded_condition_keeps_every_field_line` and
 `gateway_read_enforces_the_16_mib_cap` (a real 16 MiB+1 object through the
 gateway handler: full read `400`, slice `206`, oversized slice `400`, small
 object `200`, and an empty object `200` / `416` with `Content-Range: bytes */0`
@@ -1075,9 +1084,15 @@ and `If-None-Match: "old", "630a9e70-11"` all answered a bodyless `304`, a
 non-matching `If-None-Match` answered `200` with the bytes, `If-Match: *` and
 `If-Match: "old", "630a9e70-11"` answered `200`, and `If-Match: W/"630a9e70-11"`
 (weak) and a non-matching `If-Match` answered `412`; the gateway `/s3/...` path
-agreed on all of them. A pass issued right after those reads refused with
+agreed on all of them. A fifth run checked the list and field-line edges on the
+leader, a follower (so the forwarding path) and the gateway: `If-Match: "other",`
+and `If-Match: , "other"` answered `412`, `If-None-Match: "<etag>",` and
+`If-None-Match: "other", , "<etag>"` answered a bodyless `304`, an unparsable
+`If-Match` answered `412` while an unparsable `If-None-Match` answered `200`,
+and two separate `If-Match`/`If-None-Match` field lines were honoured when either
+line matched (`200`/`304`). A pass issued right after those reads refused with
 `1 live lease(s) (1 reader, 0 writer)` and the next pass completed cleanly with
-the object and the 602 rows intact. Gates on this tree: `yadbd --bins` **74/74**,
+the object and the 602 rows intact. Gates on this tree: `yadbd --bins` **75/75**,
 `yadb-metakv` **169/169**, `yadb-block`
 **25/25**, `yadb-db` **46/46**, `yadb-s3` **26/26**, `cargo fmt --all --
 --check` clean, `tests/protocols.py` **16/16** and

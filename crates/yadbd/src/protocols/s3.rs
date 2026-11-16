@@ -587,9 +587,13 @@ pub async fn handle(State(st): State<S3State>, request: Request) -> Response {
                         }
                     }
                 }
+                // `Range` is single-valued; a conditional header may arrive as
+                // several field lines, and dropping one would give the leader a
+                // weaker condition than the caller sent. `gateway_headers` is
+                // fresh, so every line is appended once.
                 for name in [header::RANGE, header::IF_MATCH, header::IF_NONE_MATCH] {
-                    if let Some(value) = headers.get(&name) {
-                        forwarded.insert(name, value.clone());
+                    for value in headers.get_all(&name) {
+                        forwarded.append(name.clone(), value.clone());
                     }
                 }
                 let gateway_path = format!(

@@ -592,6 +592,15 @@ and carry no explicit size limit of their own; they are bounded by the HTTP
 parser's header limits, and a value that could add a header line is rejected
 before it reaches the proxy.
 
+Conditional reads are matched as RFC 9110 `*` / `#entity-tag`, not as a byte
+comparison of the whole header: `*`, a list of tags (commas inside the quotes
+belong to the tag, empty list elements are skipped) and weak comparison for
+`If-None-Match` all work, and `If-Match` uses strong comparison. A conditional
+header split over several field lines is evaluated over every line and forwarded
+as one joined list. A value that cannot be read never turns into an unconditional
+read: an unparsable `If-Match` answers `412`, while an unparsable
+`If-None-Match` names no confirmable version and does not suppress the bytes.
+
 The metadata Raft log is bounded: once `metakv/raft.wal` passes 8 MiB (or 4096
 applied entries above its base) each node writes an atomic
 `metakv/checkpoint.json` state image and rewrites the log, keeping everything

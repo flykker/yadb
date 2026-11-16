@@ -1174,6 +1174,31 @@ struct ProxyResponse {
     body: Vec<u8>,
 }
 
+/// All field lines of a list-valued conditional header, joined into one list
+/// value with `, ` so a forwarded request carries every condition.
+///
+/// The value is forwarded as text: a byte sequence that is not valid UTF-8
+/// becomes U+FFFD, which cannot match a stored ASCII entity-tag, so the leader
+/// reaches the same decision this node would.
+fn joined_condition(headers: &HeaderMap, name: &HeaderName) -> Option<String> {
+    let values: Vec<&[u8]> = headers
+        .get_all(name)
+        .iter()
+        .map(|value| value.as_bytes())
+        .collect();
+    if values.is_empty() {
+        return None;
+    }
+    let mut joined = Vec::new();
+    for (index, value) in values.iter().enumerate() {
+        if index > 0 {
+            joined.extend_from_slice(b", ");
+        }
+        joined.extend_from_slice(value);
+    }
+    Some(String::from_utf8_lossy(&joined).into_owned())
+}
+
 /// The read headers a proxied request must carry unchanged.
 ///
 /// Every value comes from an already-parsed `HeaderValue`, which cannot contain
@@ -1641,14 +1666,11 @@ async fn maybe_forward_write(
         .get(header::RANGE)
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
-    let if_match = headers
-        .get(header::IF_MATCH)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_owned);
-    let if_none_match = headers
-        .get(header::IF_NONE_MATCH)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_owned);
+    // A conditional header may be sent as several field lines, and the local
+    // evaluator reads all of them. Forwarding only the first would give the
+    // leader a different condition than the one this node would apply.
+    let if_match = joined_condition(headers, &header::IF_MATCH);
+    let if_none_match = joined_condition(headers, &header::IF_NONE_MATCH);
 
     let openraft = meta.is_openraft();
     let outcome = tokio::task::spawn_blocking(move || {
@@ -1887,31 +1909,55 @@ pub(crate) enum Conditional {
 /// weak marker.
 #[derive(Clone, Copy)]
 struct EntityTag<'a> {
-    opaque: &'a str,
+    opaque: &'a [u8],
     weak: bool,
+}
+
+/// Trims optional whitespace (SP / HTAB), the only whitespace RFC 9110 allows
+/// around list elements.
+fn trim_ows(mut value: &[u8]) -> &[u8] {
+    while let [first, rest @ ..] = value {
+        if *first == b' ' || *first == b'\t' {
+            value = rest;
+        } else {
+            break;
+        }
+    }
+    while let [rest @ .., last] = value {
+        if *last == b' ' || *last == b'\t' {
+            value = rest;
+        } else {
+            break;
+        }
+    }
+    value
 }
 
 /// Splits one `entity-tag` off the front of `value`, returning it and the
 /// remainder.
 ///
-/// `entity-tag = [ "W/" ] DQUOTE *etagc DQUOTE`, and `etagc` excludes `DQUOTE`.
-/// The first closing quote therefore ends the tag, so a comma inside the quotes
-/// is part of the opaque value and not a list separator.
-fn split_entity_tag(value: &str) -> Option<(EntityTag<'_>, &str)> {
-    let value = value.trim_start();
-    let (weak, value) = match value.strip_prefix("W/") {
+/// `entity-tag = [ "W/" ] DQUOTE *etagc DQUOTE`, and `etagc` excludes `DQUOTE`,
+/// space and control bytes. The first closing quote therefore ends the tag, so a
+/// comma inside the quotes is part of the opaque value and not a separator. The
+/// value is handled as bytes, not `str`: `etagc` includes `obs-text`, which is
+/// not valid UTF-8, and such a tag is still a tag that simply does not match a
+/// stored ASCII one.
+fn split_entity_tag(value: &[u8]) -> Option<(EntityTag<'_>, &[u8])> {
+    let value = trim_ows(value);
+    let (weak, value) = match value.strip_prefix(b"W/") {
         Some(rest) => (true, rest),
         None => (false, value),
     };
-    let value = value.strip_prefix('"')?;
-    let end = value.find('"')?;
-    Some((
-        EntityTag {
-            opaque: &value[..end],
-            weak,
-        },
-        &value[end + 1..],
-    ))
+    let value = value.strip_prefix(b"\"")?;
+    let end = value.iter().position(|b| *b == b'"')?;
+    let opaque = &value[..end];
+    if !opaque
+        .iter()
+        .all(|b| matches!(*b, 0x21 | 0x23..=0x7e | 0x80..=0xff))
+    {
+        return None;
+    }
+    Some((EntityTag { opaque, weak }, &value[end + 1..]))
 }
 
 /// A parsed `If-Match`/`If-None-Match` value: `*`, or a non-empty list of
@@ -1925,26 +1971,34 @@ enum ETagCondition<'a> {
 
 /// Parses a conditional value as RFC 9110 `*` / `#entity-tag`.
 ///
-/// `None` means the field is empty or syntactically invalid. Such a field is
-/// ignored (RFC 9110 permits ignoring a field value it cannot parse) rather
-/// than acted on, because neither reading of a value we cannot parse is
-/// defensible: guessing "match" would serve bytes the caller asked to be
-/// refused, and guessing "no match" would tell a client its cached copy is
-/// current.
-fn parse_etag_condition(value: &str) -> Option<ETagCondition<'_>> {
-    if value.trim() == "*" {
+/// Empty list elements are skipped, as RFC 9110 requires of a recipient: a
+/// trailing comma or `"a", , "b"` is a valid list, not a reason to drop the
+/// whole condition. `None` means the field is not a condition at all (not `*`,
+/// no parsable entity-tag). What that means is decided by the caller, because it
+/// differs per header: `If-Match` is true only on a match, `If-None-Match` is
+/// false only on a match.
+fn parse_etag_condition(value: &[u8]) -> Option<ETagCondition<'_>> {
+    if trim_ows(value) == b"*" {
         return Some(ETagCondition::Any);
     }
     let mut tags = Vec::new();
     let mut rest = value;
     loop {
-        let (tag, tail) = split_entity_tag(rest)?;
-        tags.push(tag);
-        rest = tail.trim_start();
+        rest = trim_ows(rest);
         if rest.is_empty() {
             break;
         }
-        rest = rest.strip_prefix(',')?;
+        if let Some(tail) = rest.strip_prefix(b",") {
+            rest = tail;
+            continue;
+        }
+        let (tag, tail) = split_entity_tag(rest)?;
+        tags.push(tag);
+        rest = trim_ows(tail);
+        if rest.is_empty() {
+            break;
+        }
+        rest = rest.strip_prefix(b",")?;
     }
     (!tags.is_empty()).then_some(ETagCondition::Tags(tags))
 }
@@ -1955,22 +2009,32 @@ fn etag_conditions<'a>(headers: &'a HeaderMap, name: &HeaderName) -> Vec<ETagCon
     headers
         .get_all(name)
         .iter()
-        .filter_map(|value| value.to_str().ok())
-        .filter_map(parse_etag_condition)
+        .filter_map(|value| parse_etag_condition(value.as_bytes()))
         .collect()
 }
 
-/// The manifest ETag as an entity-tag. A manifest writes it as a quoted tag; if
-/// a stored value is not well-formed, it is compared verbatim as a strong tag
-/// rather than silently dropping the precondition.
-fn manifest_tag(etag: &str) -> EntityTag<'_> {
-    match split_entity_tag(etag) {
-        Some((tag, rest)) if rest.trim().is_empty() => tag,
-        _ => EntityTag {
-            opaque: etag.trim().trim_matches('"'),
-            weak: false,
-        },
-    }
+/// The manifest ETag as an entity-tag, or `None` when the stored value is not a
+/// well-formed entity-tag.
+///
+/// A malformed stored validator is not repaired into a match: it never
+/// satisfies a condition, so `If-Match` refuses and `If-None-Match` serves the
+/// bytes. Nothing this engine writes produces such a value, and refusing to
+/// invent a match keeps a corrupted manifest from answering a conditional read
+/// as if it were the version the caller named.
+fn manifest_tag(etag: &str) -> Option<EntityTag<'_>> {
+    let (tag, rest) = split_entity_tag(etag.as_bytes())?;
+    trim_ows(rest).is_empty().then_some(tag)
+}
+
+/// RFC 9110 strong comparison: both tags must be strong and equal.
+fn strong_match(candidate: &EntityTag<'_>, current: &EntityTag<'_>) -> bool {
+    !candidate.weak && !current.weak && candidate.opaque == current.opaque
+}
+
+/// RFC 9110 weak comparison: the opaque values are equal, whatever either side's
+/// weak marker says.
+fn weak_match(candidate: &EntityTag<'_>, current: &EntityTag<'_>) -> bool {
+    candidate.opaque == current.opaque
 }
 
 /// Evaluates the conditional headers against the ETag a read actually
@@ -1979,32 +2043,35 @@ fn manifest_tag(etag: &str) -> EntityTag<'_> {
 /// bytes came from.
 ///
 /// `If-Match` uses RFC 9110's strong comparison and `If-None-Match` its weak
-/// comparison, both support `*` and a list of tags, and both are evaluated
-/// against the representation we hold (the manifest exists by construction, so
-/// `*` matches).
+/// comparison, and both support `*` and a list of tags. `*` matches because the
+/// representation exists by construction (a manifest was read). A field that is
+/// present but cannot be read fails `If-Match` — it never turns into an
+/// unconditional read — while for `If-None-Match` it names no version that can
+/// be confirmed, so it does not suppress the bytes.
 pub(crate) fn evaluate_conditions(headers: &HeaderMap, etag: &str) -> Conditional {
-    let tag = manifest_tag(etag);
-    let if_match = etag_conditions(headers, &header::IF_MATCH);
-    if !if_match.is_empty() {
-        let matched = if_match.iter().any(|condition| match condition {
-            ETagCondition::Any => true,
-            // Strong comparison: neither side may be weak.
-            ETagCondition::Tags(tags) => tags
-                .iter()
-                .any(|c| !c.weak && !tag.weak && c.opaque == tag.opaque),
-        });
+    let current = manifest_tag(etag);
+    if headers.contains_key(header::IF_MATCH) {
+        let matched = etag_conditions(headers, &header::IF_MATCH)
+            .iter()
+            .any(|condition| match condition {
+                ETagCondition::Any => true,
+                ETagCondition::Tags(tags) => tags
+                    .iter()
+                    .any(|candidate| current.is_some_and(|tag| strong_match(candidate, &tag))),
+            });
         if !matched {
             return Conditional::Failed;
         }
     }
-    let if_none_match = etag_conditions(headers, &header::IF_NONE_MATCH);
-    if !if_none_match.is_empty() {
-        let matched = if_none_match.iter().any(|condition| match condition {
-            ETagCondition::Any => true,
-            // Weak comparison: the opaque values are equivalent regardless of
-            // either side's weak marker.
-            ETagCondition::Tags(tags) => tags.iter().any(|c| c.opaque == tag.opaque),
-        });
+    if headers.contains_key(header::IF_NONE_MATCH) {
+        let matched = etag_conditions(headers, &header::IF_NONE_MATCH)
+            .iter()
+            .any(|condition| match condition {
+                ETagCondition::Any => true,
+                ETagCondition::Tags(tags) => tags
+                    .iter()
+                    .any(|candidate| current.is_some_and(|tag| weak_match(candidate, &tag))),
+            });
         if matched {
             return Conditional::NotModified;
         }
@@ -6551,6 +6618,36 @@ mod security_tests {
         assert!(HeaderValue::from_str("bytes=0-1\r\nX-Injected: 1").is_err());
     }
 
+    // A conditional header may arrive as several field lines. Forwarding only
+    // the first would give the leader a condition the caller did not send.
+    #[test]
+    fn a_forwarded_condition_keeps_every_field_line() {
+        let mut headers = headers_with(&[("if-none-match", "\"a\"")]);
+        headers.append(header::IF_NONE_MATCH, HeaderValue::from_static("\"b\""));
+        assert_eq!(
+            joined_condition(&headers, &header::IF_NONE_MATCH).as_deref(),
+            Some("\"a\", \"b\"")
+        );
+        // The other header is absent, so it is not forwarded at all.
+        assert!(joined_condition(&headers, &header::IF_MATCH).is_none());
+
+        let mut repeated = headers_with(&[("if-match", "\"other\"")]);
+        repeated.append(header::IF_MATCH, HeaderValue::from_static("\"abc-11\""));
+        // The joined value is exactly the list the local evaluator would read,
+        // so a forwarded read and a local read agree on it.
+        assert!(matches!(
+            evaluate_conditions(&repeated, "\"abc-11\""),
+            Conditional::Passed
+        ));
+        let joined = joined_condition(&repeated, &header::IF_MATCH).unwrap();
+        let mut forwarded = HeaderMap::new();
+        forwarded.insert(header::IF_MATCH, joined.parse().unwrap());
+        assert!(matches!(
+            evaluate_conditions(&forwarded, "\"abc-11\""),
+            Conditional::Passed
+        ));
+    }
+
     #[test]
     fn proxy_response_accepts_a_bodyless_304_without_content_length() {
         // A peer may omit Content-Length on a 304. It is not a close-delimited
@@ -7203,6 +7300,22 @@ mod security_tests {
     /// A legacy daemon state with one mirror pool, one project and one block
     /// volume: enough to exercise the request paths that read fragments.
     fn legacy_fragment_state(tag: &str) -> AppState {
+        legacy_fragment_state_with_dir(tag).0
+    }
+
+    /// Removes a fixture directory when the test ends, including when an
+    /// assertion panics mid-test.
+    struct TempDirGuard(std::path::PathBuf);
+
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// The same fixture, with its root directory so a test that writes real
+    /// payload can remove it afterwards.
+    fn legacy_fragment_state_with_dir(tag: &str) -> (AppState, std::path::PathBuf) {
         use yadb_control::{BlockVolumeSpec, MemberBinding, ProjectQuotas, ProjectSpec};
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -7251,7 +7364,7 @@ mod security_tests {
         );
         let block = BlockVolumeEngine::new(meta.clone(), DEFAULT_BLOCK_SIZE);
         block.register_pool("data", pool.clone());
-        AppState {
+        let state = AppState {
             #[cfg(feature = "openraft-storage")]
             openraft: None,
             listen_addr: "127.0.0.1:0".into(),
@@ -7270,7 +7383,8 @@ mod security_tests {
             s3: ObjectStoreEngine::new(meta.clone(), 4096),
             db: DatabaseEngine::new(meta.clone(), 100),
             block,
-        }
+        };
+        (state, dir)
     }
 
     async fn body_bytes(response: Response) -> Vec<u8> {
@@ -7353,7 +7467,11 @@ mod security_tests {
     // forwarding wire cap, and it is documented in the README.
     #[tokio::test]
     async fn gateway_read_enforces_the_16_mib_cap() {
-        let mut st = legacy_fragment_state("s3-read-cap");
+        let (state, dir) = legacy_fragment_state_with_dir("s3-read-cap");
+        // Declared before `st` so the directory is removed after the state (and
+        // its open handles) is dropped.
+        let _dir = TempDirGuard(dir);
+        let mut st = state;
         // Few large chunks keep this test to a handful of fragments; the blob
         // layer caps a single fragment at 10 MiB.
         st.s3 = ObjectStoreEngine::new(st.meta.clone(), 8 * 1024 * 1024);
@@ -7503,10 +7621,49 @@ mod security_tests {
         assert!(passed(&[("if-none-match", "\"other\"")]));
         assert!(passed(&[("if-none-match", "\"other\", \"third\"")]));
 
-        // A field value that cannot be parsed is ignored (RFC 9110 allows
-        // ignoring a field value it cannot parse) rather than guessed at.
-        assert!(passed(&[("if-match", "not a tag")]));
+        // Empty list elements are ignored, as RFC 9110 requires, so a trailing
+        // or doubled comma keeps the rest of the condition.
+        assert!(passed(&[("if-match", "\"abc-11\",")]));
+        assert!(failed(&[("if-match", "\"other\",")]));
+        assert!(failed(&[("if-match", ", \"other\"")]));
+        assert!(not_modified(&[("if-none-match", "\"abc-11\",")]));
+        assert!(not_modified(&[(
+            "if-none-match",
+            "\"other\", , \"abc-11\""
+        )]));
+
+        // A field value that cannot be read fails `If-Match` rather than
+        // turning into an unconditional read, because that condition is true
+        // only on a match. `If-None-Match` is false only on a match, so a value
+        // that names no readable version does not suppress the bytes.
+        assert!(failed(&[("if-match", "not a tag")]));
+        assert!(failed(&[("if-match", "\"unterminated")]));
+        assert!(failed(&[("if-match", ",")]));
+        assert!(passed(&[("if-none-match", "not a tag")]));
         assert!(passed(&[("if-none-match", "")]));
+
+        // A tag with `obs-text` is a valid entity-tag that simply does not
+        // match a stored ASCII one; it must not be dropped as unreadable.
+        let mut obs_text = HeaderMap::new();
+        obs_text.insert(
+            header::IF_MATCH,
+            HeaderValue::from_bytes(b"\"other\x80\"").unwrap(),
+        );
+        assert!(matches!(
+            evaluate_conditions(&obs_text, etag),
+            Conditional::Failed
+        ));
+
+        // A stored ETag that is not a well-formed entity-tag is never repaired
+        // into a match.
+        assert!(matches!(
+            evaluate_conditions(&headers_with(&[("if-match", "\"abc-11\"")]), "abc-11"),
+            Conditional::Failed
+        ));
+        assert!(matches!(
+            evaluate_conditions(&headers_with(&[("if-none-match", "\"abc-11\"")]), "abc-11"),
+            Conditional::Passed
+        ));
 
         // A list header may arrive as several field lines; a match on any of
         // them satisfies the condition.
