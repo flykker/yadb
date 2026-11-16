@@ -445,7 +445,10 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   `If-None-Match: "<etag>",` and `If-None-Match: "other", , "<etag>"` answered
   `304`), an unparsable `If-Match` answered `412` while an unparsable
   `If-None-Match` answered `200`, and two separate field lines were honoured when
-  either matched. Three `require_transaction`
+  either matched. A sixth run checked the combined-value policy the forwarding
+  hop shares: a well-formed line plus `junk` in one header answered `412` for
+  `If-Match` (including `*` plus `junk`) and `200` for `If-None-Match`, the same
+  on the leader, a follower and the gateway. Three `require_transaction`
   queries with an unknown session answered `409` and left `leases_live: 0`. Two block
   overwrites plus those reads left one
   live reader lease; the pass refused, and the next pass reclaimed 96 fragments /
@@ -467,8 +470,9 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   size or `Last-Modified`, because it reads no fragments and takes no lease; the
   forwarded `Range`/`If-Match`/`If-None-Match` values are bounded only by the
   HTTP parser's header limits (a value that could add a header line cannot be a
-  `HeaderValue`), and a conditional header sent as several field lines is
-  forwarded as one joined list so the leader sees the same condition; and no
+  `HeaderValue`), and repeated conditional field lines are combined into one
+  value that both the local evaluator and the forwarded request read, forwarded
+  byte for byte, so the leader cannot interpret the header differently; and no
   test runs a real multi-node pool,
   so remote enumeration, remote barriers and remote compaction are only exercised
   in-process. The admission fence, ownership-guarded renewal/release, the
@@ -486,6 +490,7 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   `conditional_reads_follow_rfc_9110_matching`,
   `a_forwarded_read_carries_its_range_and_conditions`,
   `a_forwarded_condition_keeps_every_field_line`,
+  `a_forwarded_condition_is_evaluated_like_the_local_one`,
   `gateway_read_enforces_the_16_mib_cap`,
   `map_error_frames_gateway_range_errors_as_s3_errors`,
   `map_error_frames_gateway_bad_requests_as_invalid_request`).

@@ -1174,29 +1174,26 @@ struct ProxyResponse {
     body: Vec<u8>,
 }
 
-/// All field lines of a list-valued conditional header, joined into one list
-/// value with `, ` so a forwarded request carries every condition.
+/// All field lines of a list-valued header combined into one value, or `None`
+/// when the header is absent.
 ///
-/// The value is forwarded as text: a byte sequence that is not valid UTF-8
-/// becomes U+FFFD, which cannot match a stored ASCII entity-tag, so the leader
-/// reaches the same decision this node would.
-fn joined_condition(headers: &HeaderMap, name: &HeaderName) -> Option<String> {
-    let values: Vec<&[u8]> = headers
-        .get_all(name)
-        .iter()
-        .map(|value| value.as_bytes())
-        .collect();
-    if values.is_empty() {
-        return None;
+/// RFC 9110 lets a recipient combine repeated field lines of a list field into
+/// one comma-separated value. The local evaluator and the forwarded request both
+/// read this combined value, so the leader cannot interpret the header
+/// differently from the follower that forwarded it.
+///
+/// The bytes are preserved verbatim: an `entity-tag` may contain `obs-text`,
+/// which is not valid UTF-8, and a lossy conversion could turn one opaque tag
+/// into another.
+fn joined_field_value(headers: &HeaderMap, name: &HeaderName) -> Option<Vec<u8>> {
+    let mut values = headers.get_all(name).iter();
+    let first = values.next()?;
+    let mut joined = first.as_bytes().to_vec();
+    for value in values {
+        joined.extend_from_slice(b", ");
+        joined.extend_from_slice(value.as_bytes());
     }
-    let mut joined = Vec::new();
-    for (index, value) in values.iter().enumerate() {
-        if index > 0 {
-            joined.extend_from_slice(b", ");
-        }
-        joined.extend_from_slice(value);
-    }
-    Some(String::from_utf8_lossy(&joined).into_owned())
+    Some(joined)
 }
 
 /// The read headers a proxied request must carry unchanged.
@@ -1207,8 +1204,17 @@ fn joined_condition(headers: &HeaderMap, name: &HeaderName) -> Option<String> {
 #[derive(Clone, Copy, Default)]
 struct ForwardedRead<'a> {
     range: Option<&'a str>,
-    if_match: Option<&'a str>,
-    if_none_match: Option<&'a str>,
+    if_match: Option<&'a [u8]>,
+    if_none_match: Option<&'a [u8]>,
+}
+
+/// Appends one `name: value` field line without copying `value` through a
+/// `str`, so an `obs-text` entity-tag keeps its bytes.
+fn push_header(request: &mut Vec<u8>, name: &str, value: &[u8]) {
+    request.extend_from_slice(name.as_bytes());
+    request.extend_from_slice(b": ");
+    request.extend_from_slice(value);
+    request.extend_from_slice(b"\r\n");
 }
 
 /// The internal HTTP/1.1 request `proxy_http_to_peer` writes. It is a separate
@@ -1223,35 +1229,46 @@ fn forwarded_request(
     body_len: usize,
     idempotency_key: Option<&str>,
     read: ForwardedRead<'_>,
-) -> String {
-    let signature_header = match subject_signature {
-        Some(signature) => format!("x-yadb-subject-signature: {signature}\r\n"),
-        None => String::new(),
-    };
-    let key_header = idempotency_key
-        .map(|key| format!("Idempotency-Key: {key}\r\n"))
-        .unwrap_or_default();
+) -> Vec<u8> {
+    let mut request = Vec::new();
+    request.extend_from_slice(
+        format!(
+            "{method} {path_and_query} HTTP/1.1\r\nHost: {host}\r\nx-yadb-subject: {subject}\r\n"
+        )
+        .as_bytes(),
+    );
+    if let Some(signature) = subject_signature {
+        push_header(
+            &mut request,
+            "x-yadb-subject-signature",
+            signature.as_bytes(),
+        );
+    }
+    if let Some(key) = idempotency_key {
+        push_header(&mut request, "Idempotency-Key", key.as_bytes());
+    }
     // A proxied read must ask the leader for the same byte range the caller
     // asked for: without this header the leader would answer 200 with the whole
     // object (or block) instead of the requested 206 slice.
-    let range_header = read
-        .range
-        .map(|range| format!("Range: {range}\r\n"))
-        .unwrap_or_default();
+    if let Some(range) = read.range {
+        push_header(&mut request, "Range", range.as_bytes());
+    }
     // Conditional reads are decided by the node that reads the manifest, so a
     // forwarded read carries the caller's conditions instead of evaluating them
     // against the follower's possibly lagging metadata.
-    let if_match_header = read
-        .if_match
-        .map(|value| format!("If-Match: {value}\r\n"))
-        .unwrap_or_default();
-    let if_none_match_header = read
-        .if_none_match
-        .map(|value| format!("If-None-Match: {value}\r\n"))
-        .unwrap_or_default();
-    format!(
-        "{method} {path_and_query} HTTP/1.1\r\nHost: {host}\r\nx-yadb-subject: {subject}\r\n{signature_header}{key_header}{range_header}{if_match_header}{if_none_match_header}x-yadb-forwarded: 1\r\nContent-Type: {content_type}\r\nContent-Length: {body_len}\r\nConnection: close\r\n\r\n"
-    )
+    if let Some(value) = read.if_match {
+        push_header(&mut request, "If-Match", value);
+    }
+    if let Some(value) = read.if_none_match {
+        push_header(&mut request, "If-None-Match", value);
+    }
+    request.extend_from_slice(
+        format!(
+            "x-yadb-forwarded: 1\r\nContent-Type: {content_type}\r\nContent-Length: {body_len}\r\nConnection: close\r\n\r\n"
+        )
+        .as_bytes(),
+    );
+    request
 }
 
 /// Raw HTTP/1.1 forwarding helper used by Followers to transparently proxy client writes to the Raft Leader.
@@ -1290,7 +1307,7 @@ fn proxy_http_to_peer(
         idempotency_key,
         read,
     );
-    stream.write_all(req.as_bytes())?;
+    stream.write_all(&req)?;
     if !body.is_empty() {
         stream.write_all(body)?;
     }
@@ -1666,11 +1683,11 @@ async fn maybe_forward_write(
         .get(header::RANGE)
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
-    // A conditional header may be sent as several field lines, and the local
-    // evaluator reads all of them. Forwarding only the first would give the
-    // leader a different condition than the one this node would apply.
-    let if_match = joined_condition(headers, &header::IF_MATCH);
-    let if_none_match = joined_condition(headers, &header::IF_NONE_MATCH);
+    // The local evaluator reads the combined value of every field line, so the
+    // forwarded request carries exactly that value (byte for byte) and the
+    // leader reaches the same decision.
+    let if_match = joined_field_value(headers, &header::IF_MATCH);
+    let if_none_match = joined_field_value(headers, &header::IF_NONE_MATCH);
 
     let openraft = meta.is_openraft();
     let outcome = tokio::task::spawn_blocking(move || {
@@ -2003,14 +2020,33 @@ fn parse_etag_condition(value: &[u8]) -> Option<ETagCondition<'_>> {
     (!tags.is_empty()).then_some(ETagCondition::Tags(tags))
 }
 
-/// Every well-formed condition carried by `name`. A list header may be sent as
-/// several field lines, and one unparsable line does not discard the others.
-fn etag_conditions<'a>(headers: &'a HeaderMap, name: &HeaderName) -> Vec<ETagCondition<'a>> {
-    headers
-        .get_all(name)
-        .iter()
-        .filter_map(|value| parse_etag_condition(value.as_bytes()))
-        .collect()
+/// Whether the combined value of `name` matches `current`.
+///
+/// `strong` selects RFC 9110 strong comparison (`If-Match`) or weak comparison
+/// (`If-None-Match`). A value that is not a readable condition matches nothing:
+/// what that means is decided by the caller.
+fn condition_matches(
+    headers: &HeaderMap,
+    name: &HeaderName,
+    current: Option<EntityTag<'_>>,
+    strong: bool,
+) -> bool {
+    let Some(value) = joined_field_value(headers, name) else {
+        return false;
+    };
+    match parse_etag_condition(&value) {
+        Some(ETagCondition::Any) => true,
+        Some(ETagCondition::Tags(tags)) => tags.iter().any(|candidate| {
+            current.is_some_and(|tag| {
+                if strong {
+                    strong_match(candidate, &tag)
+                } else {
+                    weak_match(candidate, &tag)
+                }
+            })
+        }),
+        None => false,
+    }
 }
 
 /// The manifest ETag as an entity-tag, or `None` when the stored value is not a
@@ -2050,31 +2086,15 @@ fn weak_match(candidate: &EntityTag<'_>, current: &EntityTag<'_>) -> bool {
 /// be confirmed, so it does not suppress the bytes.
 pub(crate) fn evaluate_conditions(headers: &HeaderMap, etag: &str) -> Conditional {
     let current = manifest_tag(etag);
-    if headers.contains_key(header::IF_MATCH) {
-        let matched = etag_conditions(headers, &header::IF_MATCH)
-            .iter()
-            .any(|condition| match condition {
-                ETagCondition::Any => true,
-                ETagCondition::Tags(tags) => tags
-                    .iter()
-                    .any(|candidate| current.is_some_and(|tag| strong_match(candidate, &tag))),
-            });
-        if !matched {
-            return Conditional::Failed;
-        }
+    if headers.contains_key(header::IF_MATCH)
+        && !condition_matches(headers, &header::IF_MATCH, current, true)
+    {
+        return Conditional::Failed;
     }
-    if headers.contains_key(header::IF_NONE_MATCH) {
-        let matched = etag_conditions(headers, &header::IF_NONE_MATCH)
-            .iter()
-            .any(|condition| match condition {
-                ETagCondition::Any => true,
-                ETagCondition::Tags(tags) => tags
-                    .iter()
-                    .any(|candidate| current.is_some_and(|tag| weak_match(candidate, &tag))),
-            });
-        if matched {
-            return Conditional::NotModified;
-        }
+    if headers.contains_key(header::IF_NONE_MATCH)
+        && condition_matches(headers, &header::IF_NONE_MATCH, current, false)
+    {
+        return Conditional::NotModified;
     }
     Conditional::Passed
 }
@@ -6578,23 +6598,50 @@ mod security_tests {
             None,
             ForwardedRead {
                 range: Some("bytes=7-999"),
-                if_match: Some("\"a\", \"b\""),
-                if_none_match: Some("W/\"c\""),
+                if_match: Some(b"\"a\", \"b\""),
+                if_none_match: Some(b"W/\"c\""),
             },
         );
         assert!(
-            request.starts_with("GET /s3/proj/store/bucket/key HTTP/1.1\r\n"),
-            "{request}"
+            request.starts_with(b"GET /s3/proj/store/bucket/key HTTP/1.1\r\n"),
+            "{request:?}"
         );
         for line in [
-            "Range: bytes=7-999\r\n",
-            "If-Match: \"a\", \"b\"\r\n",
-            "If-None-Match: W/\"c\"\r\n",
-            "x-yadb-forwarded: 1\r\n",
+            &b"Range: bytes=7-999\r\n"[..],
+            &b"If-Match: \"a\", \"b\"\r\n"[..],
+            &b"If-None-Match: W/\"c\"\r\n"[..],
+            &b"x-yadb-forwarded: 1\r\n"[..],
         ] {
-            assert!(request.contains(line), "missing {line:?} in {request}");
+            assert!(
+                request.windows(line.len()).any(|window| window == line),
+                "missing {line:?} in {request:?}"
+            );
         }
-        assert!(request.ends_with("\r\n\r\n"), "{request}");
+        assert!(request.ends_with(b"\r\n\r\n"), "{request:?}");
+
+        // An `obs-text` tag is forwarded with its exact bytes; a lossy text
+        // conversion could turn it into a tag that names another version.
+        let obs_text = forwarded_request(
+            "GET",
+            "/s3/x",
+            "127.0.0.1:1",
+            "sa:billing",
+            None,
+            "text/plain",
+            0,
+            None,
+            ForwardedRead {
+                range: None,
+                if_match: Some(b"\"\x80\""),
+                if_none_match: None,
+            },
+        );
+        assert!(
+            obs_text
+                .windows(b"If-Match: \"\x80\"\r\n".len())
+                .any(|window| window == b"If-Match: \"\x80\"\r\n"),
+            "{obs_text:?}"
+        );
 
         // A read with no conditions carries none of these headers, so a plain
         // read is unchanged by this path.
@@ -6609,8 +6656,11 @@ mod security_tests {
             None,
             ForwardedRead::default(),
         );
-        for line in ["Range:", "If-Match:", "If-None-Match:"] {
-            assert!(!plain.contains(line), "{line} must be absent from {plain}");
+        for line in [&b"Range:"[..], &b"If-Match:"[..], &b"If-None-Match:"[..]] {
+            assert!(
+                !plain.windows(line.len()).any(|window| window == line),
+                "{line:?} must be absent from {plain:?}"
+            );
         }
 
         // These values reach the request only as `HeaderValue`s, and one that
@@ -6618,30 +6668,89 @@ mod security_tests {
         assert!(HeaderValue::from_str("bytes=0-1\r\nX-Injected: 1").is_err());
     }
 
-    // A conditional header may arrive as several field lines. Forwarding only
-    // the first would give the leader a condition the caller did not send.
+    /// The header map a follower forwards: the combined value, byte-exact.
+    fn forwarded_condition_map(headers: &HeaderMap, name: &HeaderName) -> HeaderMap {
+        let mut forwarded = HeaderMap::new();
+        if let Some(value) = joined_field_value(headers, name) {
+            forwarded.insert(name.clone(), HeaderValue::from_bytes(&value).unwrap());
+        }
+        forwarded
+    }
+
+    // A conditional header may arrive as several field lines. The forwarded
+    // request carries the combined value the local evaluator reads, so the
+    // leader cannot interpret the header differently from this node.
     #[test]
     fn a_forwarded_condition_keeps_every_field_line() {
         let mut headers = headers_with(&[("if-none-match", "\"a\"")]);
         headers.append(header::IF_NONE_MATCH, HeaderValue::from_static("\"b\""));
         assert_eq!(
-            joined_condition(&headers, &header::IF_NONE_MATCH).as_deref(),
-            Some("\"a\", \"b\"")
+            joined_field_value(&headers, &header::IF_NONE_MATCH).as_deref(),
+            Some(&b"\"a\", \"b\""[..])
         );
         // The other header is absent, so it is not forwarded at all.
-        assert!(joined_condition(&headers, &header::IF_MATCH).is_none());
+        assert!(joined_field_value(&headers, &header::IF_MATCH).is_none());
 
-        let mut repeated = headers_with(&[("if-match", "\"other\"")]);
-        repeated.append(header::IF_MATCH, HeaderValue::from_static("\"abc-11\""));
-        // The joined value is exactly the list the local evaluator would read,
-        // so a forwarded read and a local read agree on it.
+        // Combining is lossless: an `obs-text` tag keeps its bytes, so a
+        // forwarded tag cannot start naming a different validator.
+        let mut obs_text = headers_with(&[("if-match", "\"other\"")]);
+        obs_text.append(
+            header::IF_MATCH,
+            HeaderValue::from_bytes(b"\"\x80\"").unwrap(),
+        );
+        assert_eq!(
+            joined_field_value(&obs_text, &header::IF_MATCH).as_deref(),
+            Some(&b"\"other\", \"\x80\""[..])
+        );
+    }
+
+    // The local evaluator and the forwarded request must read the same combined
+    // value, including when one field line is unreadable. Otherwise a follower
+    // and the leader would answer the same request differently.
+    #[test]
+    fn a_forwarded_condition_is_evaluated_like_the_local_one() {
+        let mut headers = headers_with(&[("if-match", "\"abc-11\"")]);
+        headers.append(header::IF_MATCH, HeaderValue::from_static("junk"));
         assert!(matches!(
-            evaluate_conditions(&repeated, "\"abc-11\""),
+            evaluate_conditions(&headers, "\"abc-11\""),
+            Conditional::Failed
+        ));
+        let forwarded = forwarded_condition_map(&headers, &header::IF_MATCH);
+        assert!(matches!(
+            evaluate_conditions(&forwarded, "\"abc-11\""),
+            Conditional::Failed
+        ));
+
+        // For `If-None-Match` an unreadable value names no confirmable version,
+        // so it does not suppress the bytes at either hop.
+        let mut headers = headers_with(&[("if-none-match", "\"abc-11\"")]);
+        headers.append(header::IF_NONE_MATCH, HeaderValue::from_static("junk"));
+        assert!(matches!(
+            evaluate_conditions(&headers, "\"abc-11\""),
             Conditional::Passed
         ));
-        let joined = joined_condition(&repeated, &header::IF_MATCH).unwrap();
-        let mut forwarded = HeaderMap::new();
-        forwarded.insert(header::IF_MATCH, joined.parse().unwrap());
+        let forwarded = forwarded_condition_map(&headers, &header::IF_NONE_MATCH);
+        assert!(matches!(
+            evaluate_conditions(&forwarded, "\"abc-11\""),
+            Conditional::Passed
+        ));
+
+        // A wildcard plus a malformed line is one unreadable value too.
+        let mut headers = headers_with(&[("if-match", "*")]);
+        headers.append(header::IF_MATCH, HeaderValue::from_static("junk"));
+        assert!(matches!(
+            evaluate_conditions(&headers, "\"abc-11\""),
+            Conditional::Failed
+        ));
+
+        // Well-formed lines still combine into a list that matches either way.
+        let mut headers = headers_with(&[("if-match", "\"other\"")]);
+        headers.append(header::IF_MATCH, HeaderValue::from_static("\"abc-11\""));
+        assert!(matches!(
+            evaluate_conditions(&headers, "\"abc-11\""),
+            Conditional::Passed
+        ));
+        let forwarded = forwarded_condition_map(&headers, &header::IF_MATCH);
         assert!(matches!(
             evaluate_conditions(&forwarded, "\"abc-11\""),
             Conditional::Passed

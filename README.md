@@ -595,9 +595,11 @@ before it reaches the proxy.
 Conditional reads are matched as RFC 9110 `*` / `#entity-tag`, not as a byte
 comparison of the whole header: `*`, a list of tags (commas inside the quotes
 belong to the tag, empty list elements are skipped) and weak comparison for
-`If-None-Match` all work, and `If-Match` uses strong comparison. A conditional
-header split over several field lines is evaluated over every line and forwarded
-as one joined list. A value that cannot be read never turns into an unconditional
+`If-None-Match` all work, and `If-Match` uses strong comparison. Repeated
+field lines are combined into one comma-separated value, as RFC 9110 permits,
+and a forwarded request carries the same bytes, so the leader reads the header
+exactly as the follower did (a tag's bytes are never converted through text). A
+combined value that cannot be read never turns into an unconditional
 read: an unparsable `If-Match` answers `412`, while an unparsable
 `If-None-Match` names no confirmable version and does not suppress the bytes.
 

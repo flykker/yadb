@@ -948,14 +948,19 @@ the representation (which exists, since a manifest was read), a list is split on
 commas outside the quotes, empty list elements (a leading, doubled or trailing
 comma) are skipped as RFC 9110 requires of a recipient, and `If-Match` uses
 strong comparison while `If-None-Match` uses weak comparison (so `W/"a"` matches
-`"a"`). A conditional header sent as several field lines is evaluated over every
-line and forwarded as one joined list, so the leader sees the same condition the
-follower would have applied. A value that cannot be read is not guessed at:
-`If-Match` is true only on a match, so an unparsable `If-Match` answers `412`
-rather than becoming an unconditional read (a refusal stays an explicit error),
-while an unparsable `If-None-Match` names no version that can be confirmed and
-so does not suppress the bytes. A stored ETag that is not a well-formed
-entity-tag is never repaired into a match. The gateway `/s3/...` GET applies
+`"a"`). Repeated field lines are combined into one comma-separated value, as
+RFC 9110 permits, and both the local evaluator and the forwarded request read
+that combined value, so the leader cannot interpret the header differently from
+the follower; the bytes are forwarded verbatim, because an `entity-tag` may
+contain `obs-text` and a lossy text conversion could name another tag. A value
+that cannot be read is not guessed at: `If-Match` is true only on a match, so a
+combined `If-Match` that cannot be read answers `412` rather than becoming an
+unconditional read (a refusal stays an explicit error, and a well-formed line
+does not rescue a malformed one, since the combined value is what both hops
+read), while a combined `If-None-Match` that cannot be read names no version
+that can be confirmed and so does not suppress the bytes. A stored ETag that is
+not a well-formed entity-tag is never repaired into a match. The gateway
+`/s3/...` GET applies
 the same rule, including the 16 MiB cap, which it did not before: that is a
 deliberate change, because a follower's proxied read has to fit the forwarding
 wire cap. Native `HEAD` on a legacy follower is the one read that stays local —
@@ -1008,7 +1013,8 @@ read path is covered by `proxy_response_preserves_allowlisted_entity_headers_and
 `map_error_frames_gateway_bad_requests_as_invalid_request`. Conditional and
 range semantics are covered by `conditional_reads_follow_rfc_9110_matching`,
 `a_forwarded_read_carries_its_range_and_conditions`,
-`a_forwarded_condition_keeps_every_field_line` and
+`a_forwarded_condition_keeps_every_field_line`,
+`a_forwarded_condition_is_evaluated_like_the_local_one` and
 `gateway_read_enforces_the_16_mib_cap` (a real 16 MiB+1 object through the
 gateway handler: full read `400`, slice `206`, oversized slice `400`, small
 object `200`, and an empty object `200` / `416` with `Content-Range: bytes */0`
@@ -1090,9 +1096,14 @@ and `If-Match: , "other"` answered `412`, `If-None-Match: "<etag>",` and
 `If-None-Match: "other", , "<etag>"` answered a bodyless `304`, an unparsable
 `If-Match` answered `412` while an unparsable `If-None-Match` answered `200`,
 and two separate `If-Match`/`If-None-Match` field lines were honoured when either
-line matched (`200`/`304`). A pass issued right after those reads refused with
+line matched (`200`/`304`). A sixth run checked the combined-value policy that
+the forwarding hop now shares: a well-formed line plus `junk` in the same header
+answered `412` for `If-Match` (including `If-Match: *` plus `junk`) and `200`
+for `If-None-Match`, identically on the leader, a follower and the gateway, and
+the trailing/doubled-comma cases still answered `412`/`304`. A pass issued right
+after those reads refused with
 `1 live lease(s) (1 reader, 0 writer)` and the next pass completed cleanly with
-the object and the 602 rows intact. Gates on this tree: `yadbd --bins` **75/75**,
+the object and the 602 rows intact. Gates on this tree: `yadbd --bins` **76/76**,
 `yadb-metakv` **169/169**, `yadb-block`
 **25/25**, `yadb-db` **46/46**, `yadb-s3` **26/26**, `cargo fmt --all --
 --check` clean, `tests/protocols.py` **16/16** and
