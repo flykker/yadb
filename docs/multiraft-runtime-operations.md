@@ -209,6 +209,20 @@ Two rules keep a handoff placement honest:
 * a spare on the node whose nominal slot failed is skipped — that node is the
   one that did not answer.
 
+A slot that *answers* with a refusal is not a slot that did not answer. An
+`ImmutableConflict` (the id already holds different bytes), a `FencedByBarrier`
+or a `Tombstoned` refusal, and a `StorageUnavailable` volume, are all permanent:
+the write is refused with that exact error, nothing is retried on a spare, and
+nothing is acknowledged, because a handoff copy would describe bytes that reads
+never return — or resurrect a fenced blob from a copy the fence did not cover.
+Only an I/O failure is handoff-eligible: a connection failure or an unexpected
+HTTP status on a remote slot, or an I/O failure on a local volume.
+
+The handoff search ends only when no unplaced part has an untried eligible spare
+left, never merely because a round made no progress: one unreachable spare must
+not end the search while a healthy spare beside it is still untried. Every round
+consumes at least one spare, so the search is bounded by `handoffSlots`.
+
 A handoff ack keeps the *erasure* layout whole (all `total_parts()` fragments
 exist), but it does not keep the nominal spread across `failureDomains` until the
 parts are assimilated back: a scrub pass moves a handoff part to its nominal slot
