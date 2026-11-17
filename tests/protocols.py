@@ -174,11 +174,13 @@ class TransportProxy(socketserver.ThreadingTCPServer):
 class TransportHandler(socketserver.BaseRequestHandler):
     def handle(self):
         server = self.server
-        if server.blocked.is_set():
-            server.record("refused while blocked")
-            return
         server.enter()
         try:
+            # Account for a handler before checking the cut: settle() must not
+            # miss a relay that passed the check but has not yet been counted.
+            if server.blocked.is_set():
+                server.record("refused while blocked")
+                return
             try:
                 upstream = socket.create_connection(
                     ("127.0.0.1", raft_port(server.group, server.target)), timeout=5)
@@ -659,6 +661,14 @@ def skip(scenario, reason):
     """Record a capability this runtime does not expose; never a failure."""
     SKIPS.append((scenario, reason))
     print(f"SKIP {scenario}: {reason}")
+
+
+def assert_sql_no_ack(result):
+    """A worker exception is a test failure, not a SQL refusal."""
+    if isinstance(result, BaseException):
+        raise result
+    assert any(kind == b"E" for kind, _ in result), result
+    assert not any(kind == b"C" for kind, _ in result), result
 
 
 def eventually(read, check, label, timeout=15):
@@ -1344,11 +1354,12 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
             status, hs, body = signed(s3_port(3), "GET", mp_key, extra={"range": "bytes=4096-9095"})
             assert status == 206 and body == joined[4096:9096], (status, body)
             # The consumed upload cannot be completed twice.
-            _, _, body = eventually(
-                lambda: signed(s3_port(2), "POST", f"{mp_key}?uploadId={upload_id}",
-                               complete_multipart_xml(mp_etags)),
-                lambda r: r[0] == 404 and b"<Code>NoSuchUpload</Code>" in r[2],
-                "S3 consumed upload is gone")
+            eventually(lambda: signed(s3_port(2), "GET", f"{mp_key}?uploadId={upload_id}"),
+                       lambda r: r[0] == 404 and b"<Code>NoSuchUpload</Code>" in r[2],
+                       "S3 consumed upload is gone")
+            result = signed(s3_port(2), "POST", f"{mp_key}?uploadId={upload_id}",
+                            complete_multipart_xml(mp_etags))
+            assert result[0] == 404 and b"<Code>NoSuchUpload</Code>" in result[2], result
             # Abort removes the upload, and its parts are no longer usable.
             status, _, body = signed(s3_port(2), "POST", "/invoices-2026/multipart/aborted?uploads")
             assert status == 200, (status, body)
@@ -1357,10 +1368,11 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
             assert signed(
                 s3_port(2), "PUT", f"{aborted}?partNumber=1&uploadId={abort_id}", b"x")[0] == 200
             assert signed(s3_port(2), "DELETE", f"{aborted}?uploadId={abort_id}")[0] == 204
-            eventually(
-                lambda: signed(s3_port(2), "PUT", f"{aborted}?partNumber=2&uploadId={abort_id}", b"y"),
-                lambda r: r[0] == 404,
-                "S3 aborted upload rejects a later part")
+            eventually(lambda: signed(s3_port(2), "GET", f"{aborted}?uploadId={abort_id}"),
+                       lambda r: r[0] == 404 and b"<Code>NoSuchUpload</Code>" in r[2],
+                       "S3 aborted upload is gone")
+            result = signed(s3_port(2), "PUT", f"{aborted}?partNumber=2&uploadId={abort_id}", b"y")
+            assert result[0] == 404 and b"<Code>NoSuchUpload</Code>" in result[2], result
             assert signed(s3_port(3), "GET", aborted)[0] == 404
             # The same flow through the other node. Each statement is forwarded
             # to whichever node leads the billing group, so the follower that
@@ -1558,20 +1570,23 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
             assert signed(s3_port(2), "GET", blocked_s3_key)[0] == 404
 
             def cut_billing_leader():
-                """Cut the billing group's outbound links from its leader.
+                """Isolate the billing-group leader in both Raft directions.
 
-                The leader keeps its client listener and still believes it is
-                leader, so the next request is proposed locally. With no link to
-                either peer the proposal can never reach a quorum. Peer-to-peer
-                links stay intact, so the other two nodes elect a new leader in
-                a higher term while the proposal is still uncommitted.
+                Peer-to-peer links stay intact. The isolated node cannot learn
+                their new leader via Raft; if it demotes itself, it cannot
+                forward to that leader over the separate public HTTP links.
+                It may instead refuse before proposing anything.
                 """
                 leader = wait_group_leader(BILLING_GROUP)
                 peers = [i for i in NODES if i != leader]
                 for peer in peers:
                     proxies[BILLING_GROUP, leader, peer].blocked.set()
+                    proxies[BILLING_GROUP, peer, leader].blocked.set()
                 for peer in peers:
                     proxies[BILLING_GROUP, leader, peer].settle()
+                    proxies[BILLING_GROUP, peer, leader].settle()
+                observation = group_observation(leader, BILLING_GROUP)
+                assert observation["leader_id"] in (None, leader), observation
                 return leader
 
             def heal_billing_leader(leader):
@@ -1587,6 +1602,7 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
                 assert new != leader, (new, leader)
                 for peer in peers:
                     proxies[BILLING_GROUP, leader, peer].blocked.clear()
+                    proxies[BILLING_GROUP, peer, leader].blocked.clear()
                 return wait_group_leader(BILLING_GROUP)
 
             # (a) May have committed. A proxy in front of the billing group
@@ -1630,19 +1646,20 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
                   f"complete new value ({len(body)} bytes)")
 
             # (b) Cannot have committed. The cut is in place before the mutation
-            # is proposed, so the entry exists only in the old leader's log. It
-            # never reaches a quorum, the peers elect a leader in a higher term,
-            # and that leader's log truncates the stale entry. The client is
-            # told the write failed, and the old value must remain.
+            # is attempted. It is either refused before proposal or cannot
+            # reach a quorum; it cannot be forwarded to the new leader. The
+            # peers elect a higher-term leader before healing. No retry is made.
             leader = cut_billing_leader()
             try:
                 blocked = signed(s3_port(leader), "PUT", blocked_s3_key,
                                  b"cannot-commit")
                 assert not 200 <= blocked[0] < 300, blocked
+                observation = group_observation(leader, BILLING_GROUP)
+                assert observation["leader_id"] in (None, leader), observation
             finally:
                 heal_billing_leader(leader)
-            # An entry that never left one log cannot be resurrected by the
-            # deposed leader, so the old value (absent) is the only outcome.
+            # A refused request or an entry that never reached a quorum must
+            # leave the old value (absent) after the higher-term leader wins.
             for node in NODES:
                 s3_absent(s3_port(node), blocked_s3_key)
             print(f"PASS ambiguous S3 write refused without a quorum: HTTP "
@@ -1656,6 +1673,8 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
                 sql_fault.s.settimeout(60)
                 try:
                     sql_fault.query("INSERT INTO wire VALUES (96,996);", fail=True)
+                    observation = group_observation(leader, BILLING_GROUP)
+                    assert observation["leader_id"] in (None, leader), observation
                 finally:
                     sql_fault.close()
             finally:
@@ -1765,10 +1784,9 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
             for peer in majority:
                 proxies[BILLING_GROUP, old, peer].settle()
                 proxies[BILLING_GROUP, peer, old].settle()
-            # Both mutations are proposed while `old` still believes it is the
-            # billing-group leader. The cut is bidirectional, so it never learns
-            # of the higher term and never forwards: each proposal dies in its
-            # own log. Neither is retried.
+            # The bidirectional cut prevents `old` from learning the majority's
+            # new leader. If it demotes itself it may refuse before proposing;
+            # it cannot forward to that new leader. Neither mutation is retried.
             outcome = {}
             def attempt(name, call):
                 try:
@@ -1783,9 +1801,12 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
                     "sql", lambda: stale_pg.query("INSERT INTO wire VALUES (98,998);", fail=True))),
             ]
             for thread in writers:
+                thread.daemon = True
+            for thread in writers:
                 thread.start()
             for thread in writers:
                 thread.join(120)
+            assert all(not thread.is_alive() for thread in writers), "partition writers did not finish"
             stale_pg.close()
             # A definitive answer must not be a success; a transport error is
             # also a non-acknowledgement and is recorded rather than retried.
@@ -1793,6 +1814,11 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
                 assert not 200 <= outcome["s3"][0] < 300, outcome["s3"]
             else:
                 assert isinstance(outcome["s3"], OSError), outcome["s3"]
+            # Pg.query(fail=True) raises if there is an acknowledgement or any
+            # other unexpected failure. Do not turn that exception into a pass.
+            assert_sql_no_ack(outcome["sql"])
+            observation = group_observation(old, BILLING_GROUP)
+            assert observation["leader_id"] in (None, old), observation
             new = wait_group_leader_other(BILLING_GROUP, majority, old)
             # A Raft majority exists, so metadata commits. The third failure
             # domain is unreachable across the partition, but its parts move to
