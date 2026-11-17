@@ -616,16 +616,21 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   SQL rows live in pool fragments, not in the metadata image); compaction runs
   under the Raft mutex, so one pass briefly stalls proposals; and a single-node
   cluster compacts on its own applied index without a peer bound.
-- [ ] Garbage collection on Multi-Raft. `POST /v1/pools/gc` and the sweep inside
-  `POST /v1/pools/scrub` both refuse with `garbage collection disabled for
-  Multi-Raft: no single atomic cross-group metadata snapshot` and delete
-  nothing. The live set is group-scoped while deletion is pool-scoped, and one
-  node cannot enumerate every group's manifests, so a Multi-Raft collector needs
-  a per-group fence, a per-group barrier it can prove, and a rule for a fragment
-  referenced by another group's manifest. None of that exists; a Multi-Raft
-  deployment still reclaims nothing.
+- [x] Garbage collection on Multi-Raft. `POST /v1/pools/gc` and the sweep inside
+  `POST /v1/pools/scrub` now run one leader-only, quorum-confirmed pass per
+  metadata group instead of refusing with `garbage collection disabled for
+  Multi-Raft: no single atomic cross-group metadata snapshot`. Each group has its
+  own collector lease (`/gc/g<group>/collector`) and writer leases
+  (`/gc/g<group>/writer/<id>`), so passes on different groups neither block each
+  other nor share a fence. A group this node does not lead, whose linearizable
+  snapshot fails, whose fence cannot be read, or that has a live lease is
+  refused with its reason in `gc_groups_refused` and deletes nothing; the
+  endpoint answers `409`. Only the repair (orphan) scan is still refused,
+  because it needs one whole-deployment view. Open: no live-cluster drill of the
+  per-group path, and readers on Multi-Raft take no reader lease, so only the
+  per-group writer lease and an S3 `Prepared` intent fence in-flight writes.
 
-  Implementation plan from the read-only analysis of the current primitives:
+  The plan that was implemented, from the read-only analysis of the primitives:
 
   * **Cross-group references are impossible, so the mark can stay group-scoped.**
     Every fragment id carries its `project_id`, and a manifest only names
@@ -643,15 +648,15 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
     (`try_linearizable_snapshot` / `ensure_linearizable`) before marking G's
     manifests; a follower's applied state can lag a committed manifest and
     would delete a fragment that manifest still references. The collector lease
-    (`/gc/collector`) is currently one control-group key and must become
+    (`/gc-lease/collector`) was one control-group key and had to become
     per-group.
   * **In-flight writes need a fence the legacy path gets from a lease.**
-    `acquire_writer_if_legacy` returns `None` on OpenRaft, so SQL tablet
-    writes and S3 puts currently have no writer fence there. S3 is covered by
-    the `Prepared` intent committed before its fragments plus the intent
-    lease, and the collector must treat an unexpired intent as live. SQL has no
-    equivalent intent record, so a per-group writer lease (or an intent
-    committed before the fragment) is a prerequisite, not an optimization.
+    `acquire_writer_if_legacy` returned `None` on OpenRaft, so SQL tablet writes
+    and S3 puts had no writer fence there. S3 is covered by the `Prepared`
+    intent committed before its fragments plus the intent lease, and the
+    collector must treat an unexpired intent as live. SQL has no equivalent
+    intent record, so a per-group writer lease (or an intent committed before
+    the fragment) is a prerequisite, not an optimization.
   * **Order of work:** per-group collector lease and writer fence → leader-only
     per-group sweep with the intent grace → a drill that kills the group leader
     between fragment write and manifest commit and proves nothing is reclaimed.

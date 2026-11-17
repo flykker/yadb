@@ -11,9 +11,10 @@
 //!    atomically: a lease published before it is visible to the check in step 2,
 //!    and one attempted after it loses its CAS. That is what makes the fence hold
 //!    for the whole pass, not just at one instant.
-//! 2. **Fence.** Refuse on OpenRaft (no single atomic cross-group view). Read
-//!    every live reader/writer lease and reap expired ones; any live lease means
-//!    a read or write is in flight, so the pass refuses and deletes nothing.
+//! 2. **Fence.** On legacy metadata, read every live reader/writer lease and reap
+//!    expired ones; any live lease means a read or write is in flight, so the
+//!    pass refuses and deletes nothing. On Multi-Raft the same fence is applied
+//!    per group (see below).
 //! 3. **Collector lease.** Publish a durable collector record so a second pass
 //!    cannot interleave its mark and sweep phases with this one, and so no new
 //!    reader or writer can be admitted until the pass is done. The record is
@@ -35,6 +36,20 @@
 //!    channel)`; exact per-fragment tombstones everywhere else.
 //! 7. **Compact.** Seal a wasteful active segment and compact sealed ones, so the
 //!    bytes the barrier/tombstone freed are actually returned to the filesystem.
+//!
+//! **Multi-Raft.** There is one metadata group per project and no atomic
+//! cross-group snapshot, so the pass runs once per group instead of once for the
+//! whole deployment. Cross-group references are impossible (a fragment id
+//! carries its project id, a manifest only names fragments of its own project,
+//! and a project maps to exactly one group), so a pass that marks one group
+//! cannot orphan another group's fragments. For each group the pass must be that
+//! group's leader, take a quorum-confirmed (`ensure_linearizable`) snapshot of
+//! it, and hold its own collector lease (`/gc/g<group>/collector`); otherwise it
+//! refuses that group and deletes nothing for it. Writer leases live in the same
+//! group (`/gc/g<group>/writer/<id>`), and an unexpired S3 `Prepared` intent is
+//! part of the mark. A group that is not led by this node, whose snapshot fails,
+//! or whose fence cannot be read is refused with an explicit reason; other groups
+//! are unaffected.
 //!
 //! Crash safety comes from the order, not from atomicity: the fence and the
 //! barrier/tombstone records are durable before any byte is freed, and every step
@@ -88,12 +103,17 @@ pub struct SweepOutcome {
     pub leases_live: usize,
     /// Durable barriers written.
     pub barriers_applied: usize,
-    /// Set when the pass deleted nothing. Always an explicit reason.
+    /// Set when at least one group or pool deleted nothing. Always an explicit
+    /// reason.
     #[serde(rename = "gc_refusal")]
     pub refusal: Option<String>,
     /// Pools that were mounted but not swept, with the reason.
     #[serde(rename = "gc_pools_refused")]
     pub pools_refused: Vec<String>,
+    /// Multi-Raft metadata groups that were refused, with the reason. Empty on
+    /// legacy metadata, which has one namespace rather than per-group passes.
+    #[serde(rename = "gc_groups_refused", default)]
+    pub groups_refused: Vec<String>,
     /// Per-operation failures that happened after the refusal point. A barrier or
     /// compaction failure is reported here, never swallowed.
     #[serde(rename = "gc_errors")]
@@ -118,15 +138,18 @@ pub fn sweep(
     control: &ControlPlaneState,
 ) -> SweepOutcome {
     if meta.is_openraft() {
-        // A Multi-Raft deployment has one metadata group per project. There is no
-        // single atomic snapshot that covers every group's manifests, so a
-        // fragment that is unreferenced in the groups this node can read may be
-        // referenced by one it cannot. Refuse instead of guessing.
-        return SweepOutcome::refuse(
-            "garbage collection disabled for Multi-Raft: no single atomic cross-group metadata snapshot",
-        );
+        return sweep_groups(meta, pools, control);
     }
+    sweep_legacy(meta, pools, control)
+}
 
+/// The single-namespace pass used by legacy metadata. Its behaviour, keys and
+/// ordering are unchanged; Multi-Raft uses [`sweep_groups`].
+fn sweep_legacy(
+    meta: &LocalMetaKv<OsFs>,
+    pools: &BTreeMap<String, std::sync::Arc<PoolStriper<OsFs>>>,
+    control: &ControlPlaneState,
+) -> SweepOutcome {
     // Step 1: fence. Only the metadata leader may collect. A follower's applied
     // state can lag the committed state, and a fragment that looks unreferenced
     // in that lagging view can be referenced by a manifest the leader has already
@@ -185,33 +208,7 @@ pub fn sweep(
 
     // Step 3: enumerate what every slot actually holds. A pool that cannot
     // answer is unprovable: it is recorded as refused and never touched.
-    let mut present: BTreeMap<String, BTreeSet<BlobId>> = BTreeMap::new();
-    for (pool_name, striper) in pools {
-        let mut pool_ids = BTreeSet::new();
-        let mut failed = None;
-        for slot in striper.slots() {
-            match slot.scan_live() {
-                Ok(ids) => {
-                    for id in &ids {
-                        pool_ids.insert(id.with_part(0));
-                    }
-                }
-                Err(error) => {
-                    failed = Some(format!(
-                        "pool `{pool_name}` refused: slot {} cannot be enumerated: {error}",
-                        slot.slot_index()
-                    ));
-                    break;
-                }
-            }
-        }
-        match failed {
-            Some(reason) => outcome.pools_refused.push(reason),
-            None => {
-                present.insert(pool_name.clone(), pool_ids);
-            }
-        }
-    }
+    let present = enumerate_present(pools, &mut outcome);
 
     // Step 4: raise the durable watermark before re-checking the fence. A reader
     // that is still behind this revision can no longer prove its manifests are
@@ -321,6 +318,279 @@ pub fn sweep(
     // even if the lease is lost here; it is renewed anyway so a long compaction
     // does not hand the next pass a record that expires mid-way.
     let _ = collector.renew(COLLECTOR_LEASE_MS);
+    compact_pools(pools, &present, &mut outcome);
+
+    if let Err(error) = collector.release() {
+        // The pass already deleted what it proved dead; the stale collector lease
+        // only blocks the next pass until it expires. Report it.
+        outcome
+            .errors
+            .push(format!("collector lease release failed: {error}"));
+    }
+    outcome
+}
+
+/// The Multi-Raft pass: one leader-only, quorum-confirmed sweep per data group.
+///
+/// Enumeration is physical and therefore shared: every slot is asked once which
+/// fragments it holds, and a pool that cannot answer is refused for every group.
+/// The mark and the deletion are per group, and each group's fragments are the
+/// ones whose project id that group owns.
+fn sweep_groups(
+    meta: &LocalMetaKv<OsFs>,
+    pools: &BTreeMap<String, std::sync::Arc<PoolStriper<OsFs>>>,
+    control: &ControlPlaneState,
+) -> SweepOutcome {
+    let scopes = match meta.gc_group_scopes() {
+        Ok(scopes) => scopes,
+        Err(error) => {
+            return SweepOutcome::refuse(format!(
+                "garbage collection refused: metadata groups cannot be enumerated: {error}"
+            ))
+        }
+    };
+    if scopes.is_empty() {
+        return SweepOutcome::refuse(
+            "garbage collection refused: no data group is configured, so no manifest can be marked",
+        );
+    }
+
+    let mut outcome = SweepOutcome::default();
+    let present = enumerate_present(pools, &mut outcome);
+
+    let mut refusals = Vec::new();
+    let mut swept = 0usize;
+    for scope in &scopes {
+        match sweep_group(meta, pools, control, scope, &present, &mut outcome) {
+            Ok(()) => swept += 1,
+            Err(reason) => refusals.push(format!("group {} refused: {reason}", scope.group_id)),
+        }
+    }
+
+    if !refusals.is_empty() {
+        outcome.refusal = Some(format!(
+            "garbage collection refused for {} of {} metadata group(s): {}",
+            refusals.len(),
+            scopes.len(),
+            refusals.join("; ")
+        ));
+    }
+    outcome.groups_refused = refusals;
+
+    // Compaction is physical and only reclaims space a durable barrier or
+    // tombstone already fenced, so it is safe across groups. A pass in which
+    // every group refused must not touch the volumes at all.
+    if swept > 0 {
+        compact_pools(pools, &present, &mut outcome);
+    }
+    outcome
+}
+
+/// One group's pass. Every step either succeeds under a provable fence or
+/// returns the reason the group is refused; it never deletes on a guess.
+fn sweep_group(
+    meta: &LocalMetaKv<OsFs>,
+    pools: &BTreeMap<String, std::sync::Arc<PoolStriper<OsFs>>>,
+    control: &ControlPlaneState,
+    scope: &yadb_metakv::GcGroupScope,
+    present: &BTreeMap<String, BTreeSet<BlobId>>,
+    outcome: &mut SweepOutcome,
+) -> Result<(), String> {
+    let group = scope.group_id;
+
+    // 1. Leader-only. A follower's applied state can lag a committed manifest,
+    // and deleting from that view loses a fragment the manifest references.
+    let (node_id, role, _, leader, _) = meta
+        .role_info_for_group(group)
+        .map_err(|error| format!("role is unreadable: {error}"))?;
+    if role != yadb_metakv::RoleState::Leader {
+        return Err(format!(
+            "node {node_id} is not the leader of metadata group {group} (leader is {leader:?}); a lagging view could delete a fragment the committed state still references"
+        ));
+    }
+
+    // 2. Writer fence. SQL tablet writes and block writes have no intent record,
+    // so an in-flight writer is only visible through its per-group writer lease.
+    // This is checked before admission closes, so a lease published earlier is
+    // seen and one attempted later loses its CAS on the collector record.
+    let live = yadb_metakv::gc::live_leases_in(meta, group)
+        .map_err(|error| format!("writer fence is unreadable: {error}"))?;
+    if !live.is_empty() {
+        outcome.leases_live += live.len();
+        return Err(format!(
+            "{} live lease(s) ({} reader, {} writer) in metadata group {group}; no fragment of that group was deleted",
+            live.len(),
+            live.iter()
+                .filter(|lease| lease.kind == gc::LeaseKind::Reader)
+                .count(),
+            live.iter()
+                .filter(|lease| lease.kind == gc::LeaseKind::Writer)
+                .count()
+        ));
+    }
+
+    // 3. Collector lease of this group. It closes admission for the group, so
+    // the mark taken below cannot be invalidated by a writer that starts later.
+    let expected = match yadb_metakv::gc::live_collector_in(meta, group) {
+        Ok(Some(lease)) => {
+            return Err(format!(
+                "another pass holds the collector lease of group {group} until {}",
+                lease.expires_at_ms
+            ))
+        }
+        Ok(None) => mod_revision(meta, &gc::group_collector_key(group))?,
+        Err(error) => return Err(format!("collector lease is unreadable: {error}")),
+    };
+    let mut collector =
+        yadb_metakv::gc::acquire_collector_in(meta, group, expected, COLLECTOR_LEASE_MS)
+            .map_err(|error| format!("collector lease unavailable: {error}"))?;
+
+    // 3b. Re-check the fence now that admission is closed. A writer that
+    // published its lease between the check in step 2 and this acquisition is
+    // visible here; one that tries after it loses its CAS, because publication
+    // guards on this group's collector record being absent. Without this check
+    // a writer could publish in that window, be absent from the mark, and have
+    // its fragments deleted.
+    let live = match yadb_metakv::gc::live_leases_in(meta, group) {
+        Ok(live) => live,
+        Err(error) => {
+            let _ = collector.release();
+            return Err(format!(
+                "writer fence is unreadable during the pass: {error}; no fragment of group {group} was deleted"
+            ));
+        }
+    };
+    if !live.is_empty() {
+        outcome.leases_live += live.len();
+        let _ = collector.release();
+        return Err(format!(
+            "{} lease(s) appeared during the pass ({} reader, {} writer) in metadata group {group}; no fragment of that group was deleted",
+            live.len(),
+            live.iter()
+                .filter(|lease| lease.kind == gc::LeaseKind::Reader)
+                .count(),
+            live.iter()
+                .filter(|lease| lease.kind == gc::LeaseKind::Writer)
+                .count()
+        ));
+    }
+
+    // 4. Quorum-confirmed snapshot of this group, taken after admission closed.
+    // A local applied view is not enough: it may lag a committed manifest.
+    let prefixes: Vec<String> = LIVE_PREFIXES.iter().map(|p| (*p).to_string()).collect();
+    let snapshot = match meta.try_linearizable_group_snapshot(group, &[], &prefixes) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            let _ = collector.release();
+            return Err(format!("linearizable snapshot failed: {error}"));
+        }
+    };
+
+    // 5. Mark from that snapshot. An unreadable manifest, intent or extent map
+    // makes the live set unprovable, so the group is refused.
+    let mark = match mark_snapshot(&snapshot, control) {
+        Ok(mark) => mark,
+        Err(reason) => {
+            let _ = collector.release();
+            return Err(format!("live set is not provable: {reason}"));
+        }
+    };
+    outcome.blobs_live += mark.len();
+
+    // 6. Delete only this group's fragments. A fragment whose project this group
+    // does not own belongs to another group's pass and is never considered here.
+    if let Err(error) = collector.renew(COLLECTOR_LEASE_MS) {
+        // Release before refusing: a pass that cannot prove it still holds the
+        // record must not leave admission closed for this group until its TTL.
+        let _ = collector.release();
+        return Err(format!("{error}; no fragment of group {group} was deleted"));
+    }
+    let live_by_pool = group_by_pool(&mark);
+    for (pool_name, pool_present) in present {
+        let Some(striper) = pools.get(pool_name) else {
+            outcome.pools_refused.push(format!(
+                "pool `{pool_name}` refused: no mounted striper to sweep"
+            ));
+            continue;
+        };
+        if let Err(error) = collector.renew(COLLECTOR_LEASE_MS) {
+            outcome.errors.push(format!(
+                "sweep of group {group} stopped before pool `{pool_name}`: {error}"
+            ));
+            break;
+        }
+        let empty = BTreeSet::new();
+        let live = live_by_pool.get(pool_name).unwrap_or(&empty);
+        let dead: BTreeSet<BlobId> = pool_present
+            .iter()
+            .filter(|id| scope.covers(id.project_id()) && !live.contains(*id))
+            .copied()
+            .collect();
+        if dead.is_empty() {
+            continue;
+        }
+        sweep_pool(striper, pool_name, &dead, live, outcome);
+    }
+
+    if let Err(error) = collector.release() {
+        outcome.errors.push(format!(
+            "collector lease release failed for group {group}: {error}"
+        ));
+    }
+    Ok(())
+}
+
+/// `mod_revision` of a key, or `0` when it is absent. Errors are reported, never
+/// flattened into "absent": a fence that cannot be read must refuse the group.
+fn mod_revision(meta: &LocalMetaKv<OsFs>, key: &str) -> Result<u64, String> {
+    meta.try_snapshot(&[key.to_string()], &[])
+        .map(|snapshot| snapshot.get(key).map_or(0, |kv| kv.mod_revision))
+        .map_err(|error| format!("`{key}` cannot be read: {error}"))
+}
+
+/// Asks every slot of every mounted pool which physical fragment ids it holds.
+/// A pool that cannot answer is recorded as refused and left out entirely.
+fn enumerate_present(
+    pools: &BTreeMap<String, std::sync::Arc<PoolStriper<OsFs>>>,
+    outcome: &mut SweepOutcome,
+) -> BTreeMap<String, BTreeSet<BlobId>> {
+    let mut present: BTreeMap<String, BTreeSet<BlobId>> = BTreeMap::new();
+    for (pool_name, striper) in pools {
+        let mut pool_ids = BTreeSet::new();
+        let mut failed = None;
+        for slot in striper.slots() {
+            match slot.scan_live() {
+                Ok(ids) => {
+                    for id in &ids {
+                        pool_ids.insert(id.with_part(0));
+                    }
+                }
+                Err(error) => {
+                    failed = Some(format!(
+                        "pool `{pool_name}` refused: slot {} cannot be enumerated: {error}",
+                        slot.slot_index()
+                    ));
+                    break;
+                }
+            }
+        }
+        match failed {
+            Some(reason) => outcome.pools_refused.push(reason),
+            None => {
+                present.insert(pool_name.clone(), pool_ids);
+            }
+        }
+    }
+    present
+}
+
+/// Seals and compacts every enumerated pool. A pool that was refused during
+/// enumeration is not in `present` and is never touched.
+fn compact_pools(
+    pools: &BTreeMap<String, std::sync::Arc<PoolStriper<OsFs>>>,
+    present: &BTreeMap<String, BTreeSet<BlobId>>,
+    outcome: &mut SweepOutcome,
+) {
     for (pool_name, striper) in pools {
         if !present.contains_key(pool_name) {
             continue;
@@ -337,15 +607,6 @@ pub fn sweep(
             }
         }
     }
-
-    if let Err(error) = collector.release() {
-        // The pass already deleted what it proved dead; the stale collector lease
-        // only blocks the next pass until it expires. Report it.
-        outcome
-            .errors
-            .push(format!("collector lease release failed: {error}"));
-    }
-    outcome
 }
 
 fn group_by_pool(mark: &MarkSet) -> BTreeMap<String, BTreeSet<BlobId>> {
@@ -452,7 +713,16 @@ fn mark(meta: &LocalMetaKv<OsFs>, control: &ControlPlaneState) -> Result<MarkSet
     let snapshot = meta
         .try_snapshot(&[], &prefixes)
         .map_err(|error: MetaError| error.to_string())?;
+    mark_snapshot(&snapshot, control)
+}
 
+/// The live set named by one metadata snapshot. Used by the legacy pass (one
+/// whole-namespace snapshot) and by each Multi-Raft group pass (one
+/// quorum-confirmed group snapshot).
+fn mark_snapshot(
+    snapshot: &yadb_metakv::MetaSnapshot,
+    control: &ControlPlaneState,
+) -> Result<MarkSet, String> {
     let mut mark: MarkSet = BTreeSet::new();
 
     for (key, value) in snapshot.scan_prefix("/db/") {
@@ -1012,5 +1282,645 @@ mod tests {
             .read_at(1, "disk", POOL, 1 << 20, 0, b"first-block".len())
             .unwrap();
         assert_eq!(read, b"first-block");
+    }
+
+    /// Multi-Raft passes: one leader-only, quorum-confirmed sweep per data
+    /// group. These tests need the OpenRaft adapters, so they are gated on the
+    /// daemon feature that enables them.
+    #[cfg(feature = "openraft-storage")]
+    mod openraft_tests {
+        use super::*;
+        use std::collections::{BTreeMap, BTreeSet};
+        use std::path::{Path, PathBuf};
+        use std::sync::Mutex;
+        use std::time::Duration;
+
+        use openraft::error::{
+            Fatal, RPCError, RaftError, RemoteError, ReplicationClosed, StreamingError, Unreachable,
+        };
+        use openraft::network::RPCOption;
+        use openraft::raft::{
+            AppendEntriesRequest, AppendEntriesResponse, SnapshotResponse, VoteRequest,
+            VoteResponse,
+        };
+        use openraft::{BasicNode, RaftNetwork, RaftNetworkFactory, Snapshot, Vote};
+        use yadb_metakv::multiraft::{GroupIdentity, ReplicaIdentity};
+        use yadb_metakv::openraft_runtime::{YadbRaft, YadbRaftTypeConfig as C};
+        use yadb_metakv::openraft_state_machine::DurableMetaStateMachine;
+        use yadb_metakv::openraft_storage::DurableOpenRaftLog;
+        use yadb_s3::S3Error;
+
+        const CLUSTER: [u8; 16] = [71; 16];
+
+        /// A single-node group never calls its network. Refusing every call is
+        /// enough and keeps the fixture honest about having no peers.
+        struct NoNetwork;
+        impl RaftNetworkFactory<C> for NoNetwork {
+            type Network = NoNetwork;
+            async fn new_client(&mut self, _: u32, _: &BasicNode) -> NoNetwork {
+                NoNetwork
+            }
+        }
+        impl RaftNetwork<C> for NoNetwork {
+            async fn append_entries(
+                &mut self,
+                _: AppendEntriesRequest<C>,
+                _: RPCOption,
+            ) -> Result<AppendEntriesResponse<u32>, RPCError<u32, BasicNode, RaftError<u32>>>
+            {
+                Err(Unreachable::new(&std::io::Error::other("singleton")).into())
+            }
+            async fn vote(
+                &mut self,
+                _: VoteRequest<u32>,
+                _: RPCOption,
+            ) -> Result<VoteResponse<u32>, RPCError<u32, BasicNode, RaftError<u32>>> {
+                Err(Unreachable::new(&std::io::Error::other("singleton")).into())
+            }
+            async fn full_snapshot(
+                &mut self,
+                _: Vote<u32>,
+                _: Snapshot<C>,
+                _: impl std::future::Future<Output = ReplicationClosed> + Send + 'static,
+                _: RPCOption,
+            ) -> Result<SnapshotResponse<u32>, StreamingError<C, Fatal<u32>>> {
+                Err(Unreachable::new(&std::io::Error::other("singleton")).into())
+            }
+        }
+
+        /// In-process transport between the two nodes of the follower fixture.
+        #[derive(Clone)]
+        struct TestNetwork {
+            nodes: Arc<Mutex<BTreeMap<u32, YadbRaft>>>,
+            target: u32,
+        }
+
+        impl TestNetwork {
+            fn peer(&self) -> Result<YadbRaft, Unreachable> {
+                self.nodes
+                    .lock()
+                    .unwrap()
+                    .get(&self.target)
+                    .cloned()
+                    .ok_or_else(|| {
+                        Unreachable::new(&std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            "unknown node",
+                        ))
+                    })
+            }
+        }
+
+        impl RaftNetworkFactory<C> for TestNetwork {
+            type Network = Self;
+            async fn new_client(&mut self, target: u32, _: &BasicNode) -> Self {
+                Self {
+                    target,
+                    ..self.clone()
+                }
+            }
+        }
+
+        impl RaftNetwork<C> for TestNetwork {
+            async fn append_entries(
+                &mut self,
+                rpc: AppendEntriesRequest<C>,
+                _: RPCOption,
+            ) -> Result<AppendEntriesResponse<u32>, RPCError<u32, BasicNode, RaftError<u32>>>
+            {
+                let peer = self.peer()?;
+                peer.append_entries(rpc)
+                    .await
+                    .map_err(|e| RPCError::RemoteError(RemoteError::new(self.target, e)))
+            }
+            async fn vote(
+                &mut self,
+                rpc: VoteRequest<u32>,
+                _: RPCOption,
+            ) -> Result<VoteResponse<u32>, RPCError<u32, BasicNode, RaftError<u32>>> {
+                let peer = self.peer()?;
+                peer.vote(rpc)
+                    .await
+                    .map_err(|e| RPCError::RemoteError(RemoteError::new(self.target, e)))
+            }
+            async fn full_snapshot(
+                &mut self,
+                vote: Vote<u32>,
+                snapshot: Snapshot<C>,
+                cancel: impl std::future::Future<Output = ReplicationClosed> + Send + 'static,
+                _: RPCOption,
+            ) -> Result<SnapshotResponse<u32>, StreamingError<C, Fatal<u32>>> {
+                let peer = self.peer().map_err(StreamingError::from)?;
+                tokio::select! {
+                    result = peer.install_full_snapshot(vote, snapshot) => result
+                        .map_err(|e| StreamingError::RemoteError(RemoteError::new(self.target, e))),
+                    closed = cancel => Err(StreamingError::Closed(closed)),
+                }
+            }
+        }
+
+        struct GroupFixture {
+            meta: LocalMetaKv<OsFs>,
+            pool: Arc<PoolStriper<OsFs>>,
+            pools: BTreeMap<String, Arc<PoolStriper<OsFs>>>,
+            control: ControlPlaneState,
+            rafts: Vec<YadbRaft>,
+        }
+
+        impl GroupFixture {
+            fn new(dir: PathBuf, meta: LocalMetaKv<OsFs>, rafts: Vec<YadbRaft>) -> Self {
+                let fs = OsFs::new(&dir).unwrap();
+                let stores: Vec<VolumeStore<OsFs>> = (0..3)
+                    .map(|i| {
+                        VolumeStore::open(
+                            fs.clone(),
+                            format!("pool/data-{i}"),
+                            VolumeConfig::default(),
+                        )
+                        .unwrap()
+                    })
+                    .collect();
+                let pool = Arc::new(
+                    PoolStriper::new(ErasureScheme::Mirror { replicas: 3 }, stores).unwrap(),
+                );
+                let mut control = ControlPlaneState::new();
+                for (name, id) in [("p1", 1u32), ("p2", 2u32)] {
+                    control.projects.insert(
+                        name.into(),
+                        (
+                            id,
+                            ProjectSpec {
+                                quotas: ProjectQuotas::default(),
+                                members: Vec::new(),
+                            },
+                        ),
+                    );
+                    control.block_volumes.insert(
+                        format!("{name}/disk"),
+                        BlockVolumeSpec {
+                            pool: POOL.into(),
+                            size_bytes: 1 << 20,
+                        },
+                    );
+                }
+                let pools = BTreeMap::from([(POOL.to_string(), pool.clone())]);
+                Self {
+                    meta,
+                    pool,
+                    pools,
+                    control,
+                    rafts,
+                }
+            }
+
+            fn engine(&self) -> BlockVolumeEngine<OsFs> {
+                let engine = BlockVolumeEngine::new(self.meta.clone(), BLOCK_SIZE);
+                engine.register_pool(POOL, self.pool.clone());
+                engine
+            }
+
+            fn s3(&self) -> ObjectStoreEngine<OsFs> {
+                let s3 = ObjectStoreEngine::new(self.meta.clone(), 8 * 1024);
+                s3.register_pool(POOL, self.pool.clone());
+                s3
+            }
+
+            fn sweep(&self) -> SweepOutcome {
+                sweep(&self.meta, &self.pools, &self.control)
+            }
+
+            fn live_ids(&self) -> Vec<BlobId> {
+                self.pool
+                    .slots()
+                    .iter()
+                    .flat_map(|slot| slot.local_store().unwrap().live_ids())
+                    .collect()
+            }
+
+            fn distinct_ids(&self) -> BTreeSet<BlobId> {
+                self.live_ids()
+                    .into_iter()
+                    .map(|id| id.with_part(0))
+                    .collect()
+            }
+        }
+
+        async fn shutdown(f: GroupFixture) {
+            let GroupFixture { meta, rafts, .. } = f;
+            drop(meta);
+            for raft in rafts {
+                let _ = raft.shutdown().await;
+            }
+        }
+
+        fn temp_dir(tag: &str) -> PathBuf {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let dir = std::env::temp_dir()
+                .join(format!("yadb-gc-raft-{tag}-{}-{nanos}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            dir
+        }
+
+        async fn single_group(dir: &Path, group: u64) -> (YadbRaft, DurableMetaStateMachine) {
+            let identity = ReplicaIdentity::new(
+                GroupIdentity {
+                    cluster: CLUSTER,
+                    group,
+                    incarnation: 1,
+                },
+                1,
+                vec![1],
+            )
+            .unwrap();
+            let log =
+                DurableOpenRaftLog::create(dir.join(format!("g{group}-log")), &identity).unwrap();
+            let state =
+                DurableMetaStateMachine::create(dir.join(format!("g{group}-state")), &identity)
+                    .unwrap();
+            let config = Arc::new(openraft::Config::default().validate().unwrap());
+            let raft = YadbRaft::new(1, config, NoNetwork, log, state.clone())
+                .await
+                .unwrap();
+            raft.initialize(BTreeMap::from([(1, BasicNode::new("one"))]))
+                .await
+                .unwrap();
+            raft.wait(Some(Duration::from_secs(5)))
+                .current_leader(1, "leader")
+                .await
+                .unwrap();
+            (raft, state)
+        }
+
+        /// Two groups (2 and 3) over projects 1 and 2, with group 1 as the
+        /// control group. Every group is a single-node cluster on node 1, which
+        /// is what a one-node deployment looks like.
+        async fn multigroup(tag: &str) -> GroupFixture {
+            let dir = temp_dir(tag);
+            let (control, control_state) = single_group(&dir, 1).await;
+            let (group2, group2_state) = single_group(&dir, 2).await;
+            let (group3, group3_state) = single_group(&dir, 3).await;
+            let meta = LocalMetaKv::from_openraft_groups(
+                1,
+                BTreeMap::from([
+                    (1, (control.clone(), control_state)),
+                    (2, (group2.clone(), group2_state)),
+                    (3, (group3.clone(), group3_state)),
+                ]),
+                BTreeMap::from([(1, 2), (2, 3)]),
+                BTreeMap::new(),
+                tokio::runtime::Handle::current(),
+            )
+            .unwrap();
+            GroupFixture::new(dir, meta, vec![control, group2, group3])
+        }
+
+        /// Group 2 is a two-node cluster whose local node (1) is kept a follower
+        /// by a long election timeout; node 2 is the leader. Groups 1 and 3 are
+        /// single-node leaders on node 1.
+        async fn follower_multigroup(tag: &str) -> (GroupFixture, LocalMetaKv<OsFs>) {
+            let dir = temp_dir(tag);
+            let (control, control_state) = single_group(&dir, 1).await;
+            let (group3, group3_state) = single_group(&dir, 3).await;
+
+            let shared = Arc::new(Mutex::new(BTreeMap::new()));
+            let follower_config = Arc::new(
+                openraft::Config {
+                    election_timeout_min: 2_000,
+                    election_timeout_max: 3_000,
+                    ..Default::default()
+                }
+                .validate()
+                .unwrap(),
+            );
+            let leader_config = Arc::new(openraft::Config::default().validate().unwrap());
+            let node1 = ReplicaIdentity::new(
+                GroupIdentity {
+                    cluster: CLUSTER,
+                    group: 2,
+                    incarnation: 1,
+                },
+                1,
+                vec![1, 2],
+            )
+            .unwrap();
+            let node2 = ReplicaIdentity::new(
+                GroupIdentity {
+                    cluster: CLUSTER,
+                    group: 2,
+                    incarnation: 1,
+                },
+                2,
+                vec![1, 2],
+            )
+            .unwrap();
+            let log1 = DurableOpenRaftLog::create(dir.join("g2-n1-log"), &node1).unwrap();
+            let state1 = DurableMetaStateMachine::create(dir.join("g2-n1-state"), &node1).unwrap();
+            let raft1 = YadbRaft::new(
+                1,
+                follower_config,
+                TestNetwork {
+                    nodes: shared.clone(),
+                    target: 0,
+                },
+                log1,
+                state1.clone(),
+            )
+            .await
+            .unwrap();
+            let log2 = DurableOpenRaftLog::create(dir.join("g2-n2-log"), &node2).unwrap();
+            let state2 = DurableMetaStateMachine::create(dir.join("g2-n2-state"), &node2).unwrap();
+            let raft2 = YadbRaft::new(
+                2,
+                leader_config,
+                TestNetwork {
+                    nodes: shared.clone(),
+                    target: 0,
+                },
+                log2,
+                state2.clone(),
+            )
+            .await
+            .unwrap();
+            shared.lock().unwrap().insert(1, raft1.clone());
+            shared.lock().unwrap().insert(2, raft2.clone());
+            raft2
+                .initialize(BTreeMap::from([
+                    (1, BasicNode::new("one")),
+                    (2, BasicNode::new("two")),
+                ]))
+                .await
+                .unwrap();
+            raft2
+                .wait(Some(Duration::from_secs(5)))
+                .current_leader(2, "leader")
+                .await
+                .unwrap();
+
+            let meta = LocalMetaKv::from_openraft_groups(
+                1,
+                BTreeMap::from([
+                    (1, (control.clone(), control_state)),
+                    (2, (raft1.clone(), state1)),
+                    (3, (group3.clone(), group3_state)),
+                ]),
+                BTreeMap::from([(1, 2), (2, 3)]),
+                BTreeMap::new(),
+                tokio::runtime::Handle::current(),
+            )
+            .unwrap();
+            let leader_meta = LocalMetaKv::from_openraft(
+                raft2.clone(),
+                state2,
+                BTreeMap::new(),
+                tokio::runtime::Handle::current(),
+            );
+            (
+                GroupFixture::new(dir, meta, vec![control, raft1, raft2, group3]),
+                leader_meta,
+            )
+        }
+
+        fn write_generations(engine: &BlockVolumeEngine<OsFs>, project: u32, base: u8) {
+            for i in 0..6u8 {
+                engine
+                    .write_at(
+                        project,
+                        "disk",
+                        POOL,
+                        1 << 20,
+                        0,
+                        &vec![base.wrapping_add(i); 16 * BLOCK_SIZE as usize],
+                    )
+                    .unwrap();
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_multigroup_pass_reclaims_each_groups_dead_fragments() {
+            tokio::time::timeout(Duration::from_secs(30), async {
+                let f = multigroup("reclaim").await;
+                let project1 = f.engine();
+                let project2 = f.engine();
+                write_generations(&project1, 1, 10);
+                write_generations(&project2, 2, 20);
+
+                let before = f.distinct_ids();
+                assert!(
+                    before.iter().filter(|id| id.project_id() == 1).count() > 16,
+                    "the fixture must leave superseded fragments: {before:?}"
+                );
+                assert!(before.iter().filter(|id| id.project_id() == 2).count() > 16);
+
+                let outcome = f.sweep();
+                assert!(outcome.refusal.is_none(), "{outcome:?}");
+                assert!(outcome.groups_refused.is_empty(), "{outcome:?}");
+                assert!(outcome.fragments_deleted > 0, "{outcome:?}");
+                assert!(outcome.errors.is_empty(), "{outcome:?}");
+
+                // Exactly the newest generation of each project survives.
+                let after = f.distinct_ids();
+                assert_eq!(
+                    after.iter().filter(|id| id.project_id() == 1).count(),
+                    16,
+                    "{outcome:?}"
+                );
+                assert_eq!(
+                    after.iter().filter(|id| id.project_id() == 2).count(),
+                    16,
+                    "{outcome:?}"
+                );
+
+                // Both groups still serve their newest bytes.
+                let read1 = project1
+                    .read_at(1, "disk", POOL, 1 << 20, 0, 16 * BLOCK_SIZE as usize)
+                    .unwrap();
+                assert_eq!(read1, vec![15u8; 16 * BLOCK_SIZE as usize]);
+                let read2 = project2
+                    .read_at(2, "disk", POOL, 1 << 20, 0, 16 * BLOCK_SIZE as usize)
+                    .unwrap();
+                assert_eq!(read2, vec![25u8; 16 * BLOCK_SIZE as usize]);
+
+                drop(project1);
+                drop(project2);
+                shutdown(f).await;
+            })
+            .await
+            .expect("multigroup sweep timed out");
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_follower_group_refuses_and_deletes_nothing() {
+            tokio::time::timeout(Duration::from_secs(30), async {
+                let (f, leader_meta) = follower_multigroup("follower").await;
+                let leader = BlockVolumeEngine::new(leader_meta.clone(), BLOCK_SIZE);
+                leader.register_pool(POOL, f.pool.clone());
+                write_generations(&leader, 1, 0);
+
+                let before = f.distinct_ids();
+                assert!(before.iter().filter(|id| id.project_id() == 1).count() > 16);
+
+                let outcome = f.sweep();
+                assert_eq!(outcome.fragments_deleted, 0, "{outcome:?}");
+                assert_eq!(outcome.groups_refused.len(), 1, "{outcome:?}");
+                let refusal = &outcome.groups_refused[0];
+                assert!(refusal.starts_with("group 2 refused:"), "{refusal}");
+                assert!(refusal.contains("is not the leader"), "{refusal}");
+                assert_eq!(
+                    f.distinct_ids(),
+                    before,
+                    "a follower's pass must delete nothing"
+                );
+
+                // The same fragments are provably dead: group 2's leader
+                // reclaims them, so the refusal (not the data) kept them alive.
+                let leader_outcome = sweep(&leader_meta, &f.pools, &f.control);
+                assert!(leader_outcome.refusal.is_none(), "{leader_outcome:?}");
+                assert!(leader_outcome.fragments_deleted > 0, "{leader_outcome:?}");
+                let read = leader
+                    .read_at(1, "disk", POOL, 1 << 20, 0, 16 * BLOCK_SIZE as usize)
+                    .unwrap();
+                assert_eq!(read, vec![5u8; 16 * BLOCK_SIZE as usize]);
+
+                drop(leader);
+                drop(leader_meta);
+                shutdown(f).await;
+            })
+            .await
+            .expect("follower refusal test timed out");
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_group_writer_lease_protects_an_unpublished_fragment() {
+            tokio::time::timeout(Duration::from_secs(30), async {
+                let f = multigroup("writer-lease").await;
+                let project1 = f.engine();
+                let project2 = f.engine();
+                write_generations(&project1, 1, 0);
+                write_generations(&project2, 2, 10);
+
+                // A fragment appended by a writer that has not published the
+                // manifest naming it. Nothing in the mark set refers to it.
+                let orphan = BlobId::new(1, 0x00FF_FFFF, 1, 0, yadb_block::BLOCK_CHANNEL, 0);
+                f.pool
+                    .put_blob(orphan, &vec![0xABu8; BLOCK_SIZE as usize])
+                    .unwrap();
+                let before = f.distinct_ids();
+                assert!(before.contains(&orphan));
+
+                // The lease is published in group 2, so only group 2 refuses;
+                // group 3 still reclaims its own dead fragments.
+                let writer = yadb_metakv::gc::acquire_writer(&f.meta, 1, 0, 60_000).unwrap();
+                let outcome = f.sweep();
+                assert_eq!(outcome.groups_refused.len(), 1, "{outcome:?}");
+                let refusal = &outcome.groups_refused[0];
+                assert!(refusal.starts_with("group 2 refused:"), "{refusal}");
+                assert!(refusal.contains("live lease"), "{refusal}");
+
+                let held = f.distinct_ids();
+                assert!(
+                    held.contains(&orphan),
+                    "an unexpired writer lease must protect its fragment: {outcome:?}"
+                );
+                assert_eq!(
+                    held.iter().filter(|id| id.project_id() == 1).count(),
+                    before.iter().filter(|id| id.project_id() == 1).count(),
+                    "group 2 must delete nothing while its writer lease is live"
+                );
+                assert_eq!(
+                    held.iter().filter(|id| id.project_id() == 2).count(),
+                    16,
+                    "group 3 is not blocked by group 2's lease: {outcome:?}"
+                );
+
+                writer.release().unwrap();
+                let outcome = f.sweep();
+                assert!(outcome.refusal.is_none(), "{outcome:?}");
+                assert!(outcome.fragments_deleted > 0, "{outcome:?}");
+                let after = f.distinct_ids();
+                assert!(
+                    !after.contains(&orphan),
+                    "without the lease the orphan is provably dead"
+                );
+                assert_eq!(after.iter().filter(|id| id.project_id() == 1).count(), 16);
+
+                drop(project1);
+                drop(project2);
+                shutdown(f).await;
+            })
+            .await
+            .expect("writer-lease test timed out");
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_prepared_s3_intent_protects_its_chunks() {
+            tokio::time::timeout(Duration::from_secs(30), async {
+                let f = multigroup("s3-intent").await;
+                let s3 = f.s3();
+                let payload = vec![0x5Au8; 32 * 1024];
+                let failed = s3.put_object_with(
+                    1,
+                    "store",
+                    POOL,
+                    "bucket",
+                    "inflight",
+                    "text/plain",
+                    &payload,
+                    |_| Err(S3Error::ConcurrentModification),
+                );
+                assert!(
+                    matches!(failed, Err(S3Error::ConcurrentModification)),
+                    "{failed:?}"
+                );
+
+                let intents = f.meta.scan_prefix("/s3-intent/1/");
+                assert_eq!(intents.len(), 1, "{intents:?}");
+                let (intent_key, intent_value) = &intents[0];
+                let chunks: BTreeSet<BlobId> = yadb_s3::intent_chunk_ids(&intent_value.value)
+                    .unwrap()
+                    .into_iter()
+                    .map(|(_, id)| id.with_part(0))
+                    .collect();
+                assert!(!chunks.is_empty(), "{intents:?}");
+                let present = f.distinct_ids();
+                assert!(
+                    chunks.iter().all(|id| present.contains(id)),
+                    "the chunks must be on disk: {chunks:?}"
+                );
+
+                // The prepared intent is part of the mark, so the pass succeeds
+                // and keeps the chunks it names.
+                let outcome = f.sweep();
+                assert!(outcome.refusal.is_none(), "{outcome:?}");
+                assert_eq!(outcome.fragments_deleted, 0, "{outcome:?}");
+                let after = f.distinct_ids();
+                assert!(
+                    chunks.iter().all(|id| after.contains(id)),
+                    "a prepared intent must keep its chunks: {outcome:?}"
+                );
+
+                // With the intent gone the same chunks are provably dead.
+                f.meta
+                    .execute(KvCommand::Delete {
+                        key: intent_key.clone(),
+                    })
+                    .unwrap();
+                let outcome = f.sweep();
+                assert!(outcome.refusal.is_none(), "{outcome:?}");
+                assert!(outcome.fragments_deleted > 0, "{outcome:?}");
+                let after = f.distinct_ids();
+                assert!(
+                    chunks.iter().all(|id| !after.contains(id)),
+                    "without the intent the chunks are dead: {outcome:?}"
+                );
+
+                drop(s3);
+                shutdown(f).await;
+            })
+            .await
+            .expect("s3-intent test timed out");
+        }
     }
 }

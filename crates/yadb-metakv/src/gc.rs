@@ -21,6 +21,13 @@
 //! any lease of either kind is live, and record their own collector lease so
 //! two passes cannot interleave their mark and sweep phases.
 //!
+//! On Multi-Raft there is one metadata group per project, so every record is
+//! scoped to the group that owns the project: `/gc/g<group>/collector`,
+//! `/gc/g<group>/reader/<id>` and `/gc/g<group>/writer/<id>`. A pass over one
+//! group then fences exactly that group, and a pass over another group neither
+//! blocks it nor is blocked by it. The single legacy namespace keeps its
+//! original keys (`/gc-lease/...`), unchanged.
+//!
 //! This is deliberately a fence, not a grace period: there is no window in which
 //! the collector deletes something "recent enough" to be safe.
 
@@ -32,11 +39,30 @@ use serde::{Deserialize, Serialize};
 use crate::{KvCommand, KvResult, LocalMetaKv, MetaError, RevisionGuard, TxnOp};
 use yadb_io::StorageFs;
 
-/// Prefix of every lease record. Nothing else in the metadata namespace may use it.
+/// Prefix of every legacy lease record. Nothing else in the metadata namespace
+/// may use it. Multi-Raft uses [`GROUP_GC_NAMESPACE`] instead, because a lease
+/// has to live in the group whose manifests it fences.
 pub const LEASE_PREFIX: &str = "/gc-lease/";
 pub const READER_PREFIX: &str = "/gc-lease/reader/";
 pub const WRITER_PREFIX: &str = "/gc-lease/writer/";
 pub const COLLECTOR_KEY: &str = "/gc-lease/collector";
+/// Namespace of the per-group GC records on Multi-Raft: `/gc/g<group>/`.
+///
+/// The router treats the segment after `g` as a canonical group id, exactly
+/// like `/idempotency/g<group>/`, so one key family names one group and cannot
+/// be confused with a project namespace.
+pub const GROUP_GC_NAMESPACE: &str = "/gc/g";
+
+/// Collector record of one metadata group. The key is what makes the fence
+/// per-group: admission for a project guards on its own group's record only.
+pub fn group_collector_key(group: u64) -> String {
+    format!("{GROUP_GC_NAMESPACE}{group}/collector")
+}
+
+/// Prefix of one group's reader or writer lease records.
+pub fn group_lease_prefix(group: u64) -> String {
+    format!("{GROUP_GC_NAMESPACE}{group}/")
+}
 /// Highest revision whose dead fragments a completed pass may already have
 /// deleted. A reader whose applied view is older than this cannot prove that the
 /// manifests it sees are still complete, so it must refuse instead of reading.
@@ -54,6 +80,76 @@ pub const DEFAULT_TTL_MS: u64 = 30_000;
 /// up to this long, which is the safe direction.
 pub const WRITER_TTL_MS: u64 = 300_000;
 
+/// The metadata namespace a lease lives in.
+///
+/// Legacy metadata has exactly one namespace, addressed by the original
+/// `/gc-lease/` keys. Multi-Raft has one namespace per data group, and a lease
+/// must live in the group whose manifests it protects: a writer lease published
+/// in another group would not be visible to that group's collector, and the
+/// collector's admission guard would not exclude it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LeaseScope {
+    Legacy,
+    Group(u64),
+}
+
+impl LeaseScope {
+    fn collector_key(self) -> String {
+        match self {
+            Self::Legacy => COLLECTOR_KEY.to_string(),
+            Self::Group(group) => group_collector_key(group),
+        }
+    }
+
+    fn lease_prefix(self) -> String {
+        match self {
+            Self::Legacy => LEASE_PREFIX.to_string(),
+            Self::Group(group) => group_lease_prefix(group),
+        }
+    }
+
+    fn reader_prefix(self) -> String {
+        match self {
+            Self::Legacy => READER_PREFIX.to_string(),
+            Self::Group(group) => format!("{}{}", group_lease_prefix(group), "reader/"),
+        }
+    }
+
+    fn writer_prefix(self) -> String {
+        match self {
+            Self::Legacy => WRITER_PREFIX.to_string(),
+            Self::Group(group) => format!("{}{}", group_lease_prefix(group), "writer/"),
+        }
+    }
+
+    fn of(lease: &GcLease) -> Self {
+        lease.group.map_or(Self::Legacy, Self::Group)
+    }
+}
+
+/// One metadata group a collection pass can run over, with the projects whose
+/// fragments its manifests may name.
+///
+/// A fragment id carries its project id and a manifest only names fragments of
+/// its own project, so a pass that marks one group cannot orphan another
+/// group's fragments. That is what makes a per-group sweep safe without a
+/// cross-group snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GcGroupScope {
+    pub group_id: u64,
+    /// `None` when the deployment has a single group and no explicit project
+    /// routing, so every project's fragments belong to it.
+    pub project_ids: Option<std::collections::BTreeSet<u32>>,
+}
+
+impl GcGroupScope {
+    pub fn covers(&self, project_id: u32) -> bool {
+        self.project_ids
+            .as_ref()
+            .is_none_or(|ids| ids.contains(&project_id))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LeaseKind {
@@ -63,6 +159,9 @@ pub enum LeaseKind {
 }
 
 impl LeaseKind {
+    /// Legacy key prefix. Group-scoped records are addressed through
+    /// [`LeaseScope`] instead.
+    #[allow(dead_code)]
     fn prefix(self) -> &'static str {
         match self {
             Self::Reader => READER_PREFIX,
@@ -77,6 +176,10 @@ pub struct GcLease {
     pub id: String,
     pub kind: LeaseKind,
     pub project_id: u32,
+    /// Metadata group whose namespace holds this record. `None` is the single
+    /// legacy namespace; a legacy record never carries this field.
+    #[serde(default)]
+    pub group: Option<u64>,
     /// The metadata revision the holder is reading (readers) or the revision it
     /// observed before writing (writers). Informational: the collector refuses on
     /// any live lease and does not try to reason about this value.
@@ -350,6 +453,23 @@ fn put_lease<FS: StorageFs>(
     revision: u64,
     ttl_ms: u64,
 ) -> Result<(String, GcLease), MetaError> {
+    // The lease must land in the group that owns the project's manifests. On
+    // legacy metadata that is the single namespace, so the keys are unchanged.
+    let scope = match meta.gc_group_for_project(project_id)? {
+        Some(group) => LeaseScope::Group(group),
+        None => LeaseScope::Legacy,
+    };
+    put_lease_in(meta, scope, kind, project_id, revision, ttl_ms)
+}
+
+fn put_lease_in<FS: StorageFs>(
+    meta: &LocalMetaKv<FS>,
+    scope: LeaseScope,
+    kind: LeaseKind,
+    project_id: u32,
+    revision: u64,
+    ttl_ms: u64,
+) -> Result<(String, GcLease), MetaError> {
     if kind == LeaseKind::Collector {
         // The collector lease is a single fixed key with CAS semantics; it must
         // not be created through the reader/writer id-keyed path.
@@ -357,13 +477,23 @@ fn put_lease<FS: StorageFs>(
             "the collector lease must be acquired with acquire_collector".into(),
         ));
     }
+    let collector_key = scope.collector_key();
+    let prefix = match kind {
+        LeaseKind::Reader => scope.reader_prefix(),
+        LeaseKind::Writer => scope.writer_prefix(),
+        LeaseKind::Collector => unreachable!(),
+    };
     for _ in 0..2 {
         let id = new_lease_id();
-        let key = format!("{}{}", kind.prefix(), id);
+        let key = format!("{prefix}{id}");
         let mut lease = GcLease {
             id: id.clone(),
             kind,
             project_id,
+            group: match scope {
+                LeaseScope::Legacy => None,
+                LeaseScope::Group(group) => Some(group),
+            },
             revision,
             expires_at_ms: now_ms().saturating_add(ttl_ms.max(1)),
             mod_revision: 0,
@@ -379,7 +509,7 @@ fn put_lease<FS: StorageFs>(
                     expected_mod_revision: 0,
                 },
                 RevisionGuard {
-                    key: COLLECTOR_KEY.into(),
+                    key: collector_key.clone(),
                     expected_mod_revision: 0,
                 },
             ],
@@ -399,14 +529,14 @@ fn put_lease<FS: StorageFs>(
                 // collection pass holds the collector record. Reap an expired
                 // collector record and retry once; otherwise refuse, because
                 // publishing now would race the pass.
-                if live_collector(meta).is_some() {
+                if live_collector_in_scope(meta, scope)?.is_some() {
                     return Err(MetaError::Routing(
                         "garbage collection is running; the read or write was refused rather than \
                          admitted while fragments are being reclaimed"
                             .into(),
                     ));
                 }
-                reap_expired(meta, now_ms());
+                reap_expired(meta, &scope.lease_prefix(), now_ms());
             }
             other => {
                 return Err(MetaError::Routing(format!(
@@ -423,10 +553,16 @@ fn put_lease<FS: StorageFs>(
 /// Key of a lease record. Collector leases are addressed by their fixed key, so
 /// this maps them there rather than to an id-keyed slot.
 pub fn lease_key(lease: &GcLease) -> String {
+    let scope = LeaseScope::of(lease);
     if lease.kind == LeaseKind::Collector {
-        return COLLECTOR_KEY.to_string();
+        return scope.collector_key();
     }
-    format!("{}{}", lease.kind.prefix(), lease.id)
+    let prefix = match lease.kind {
+        LeaseKind::Reader => scope.reader_prefix(),
+        LeaseKind::Writer => scope.writer_prefix(),
+        LeaseKind::Collector => unreachable!(),
+    };
+    format!("{prefix}{}", lease.id)
 }
 
 /// Publishes a lease and returns the owned record. Use this when the holder
@@ -537,22 +673,22 @@ pub fn acquire_writer<FS: StorageFs>(
     Ok(GcLeaseGuard { meta, key, lease })
 }
 
-/// A writer lease on the legacy runtime, or `None` on Multi-Raft.
+/// A writer lease for a project, in whichever metadata runtime is active.
 ///
-/// Collection refuses on Multi-Raft (`sweep` has no cross-group snapshot), so
-/// there is nothing for a lease to fence there, and `/gc-lease/` is not a routed
-/// namespace: publishing one would fail with an unknown-namespace routing error
-/// and break every write. The legacy runtime, where collection does run, still
-/// gets a real lease.
+/// On legacy metadata the lease lives in `/gc-lease/`. On Multi-Raft it is
+/// published in the group that owns the project (`/gc/g<group>/writer/`), so
+/// that group's collector sees it and refuses, and a collector of another group
+/// is unaffected. SQL tablet writes and block writes have no intent record of
+/// their own, so this lease is their only fence against a collector reclaiming
+/// fragments they appended but have not published yet.
+///
+/// The name is kept for its call sites; it no longer means "legacy only".
 pub fn acquire_writer_if_legacy<FS: StorageFs>(
     meta: &LocalMetaKv<FS>,
     project_id: u32,
     revision: u64,
     ttl_ms: u64,
 ) -> Result<Option<GcLeaseGuard<'_, FS>>, MetaError> {
-    if meta.is_openraft() {
-        return Ok(None);
-    }
     acquire_writer(meta, project_id, revision, ttl_ms).map(Some)
 }
 
@@ -661,6 +797,7 @@ fn read_lease(key: &str, value: &[u8]) -> GcLease {
                 id: key.trim_start_matches(LEASE_PREFIX).to_string(),
                 kind: LeaseKind::Collector,
                 project_id: 0,
+                group: None,
                 revision: 0,
                 expires_at_ms: u64::MAX,
                 mod_revision: 0,
@@ -671,9 +808,9 @@ fn read_lease(key: &str, value: &[u8]) -> GcLease {
 
 /// Removes expired lease records. Best effort: a record that cannot be removed
 /// stays live (it is still counted) and the next pass tries again.
-fn reap_expired<FS: StorageFs>(meta: &LocalMetaKv<FS>, now: u64) -> usize {
+fn reap_expired<FS: StorageFs>(meta: &LocalMetaKv<FS>, prefix: &str, now: u64) -> usize {
     let mut reaped = 0usize;
-    for (key, value) in meta.scan_prefix(LEASE_PREFIX) {
+    for (key, value) in meta.scan_prefix(prefix) {
         let lease = read_lease(&key, &value.value);
         if lease.is_live_at(now) {
             continue;
@@ -694,16 +831,16 @@ fn reap_expired<FS: StorageFs>(meta: &LocalMetaKv<FS>, now: u64) -> usize {
     reaped
 }
 
-/// Every live reader or writer lease in the namespace, after reaping expired
-/// records. The collector lease is reported separately by [`live_collector`].
-///
-/// A malformed record is reported as live: refusing to collect is always safer
-/// than collecting on a namespace whose fence cannot be read.
-pub fn live_leases<FS: StorageFs>(meta: &LocalMetaKv<FS>) -> Result<Vec<GcLease>, MetaError> {
+fn live_leases_in_scope<FS: StorageFs>(
+    meta: &LocalMetaKv<FS>,
+    scope: LeaseScope,
+) -> Result<Vec<GcLease>, MetaError> {
     let now = now_ms();
-    reap_expired(meta, now);
+    reap_expired(meta, &scope.lease_prefix(), now);
     let mut live = Vec::new();
-    for prefix in [READER_PREFIX, WRITER_PREFIX] {
+    let reader_prefix = scope.reader_prefix();
+    let writer_prefix = scope.writer_prefix();
+    for prefix in [&reader_prefix, &writer_prefix] {
         for (key, value) in meta.scan_prefix(prefix) {
             let lease = read_lease(&key, &value.value);
             if lease.is_live_at(now) {
@@ -713,8 +850,11 @@ pub fn live_leases<FS: StorageFs>(meta: &LocalMetaKv<FS>) -> Result<Vec<GcLease>
     }
     // Any record under the lease prefix that is neither a reader, a writer nor
     // the collector is unparseable or foreign; refuse rather than ignore it.
-    for (key, value) in meta.scan_prefix(LEASE_PREFIX) {
-        if key == COLLECTOR_KEY || key.starts_with(READER_PREFIX) || key.starts_with(WRITER_PREFIX)
+    let collector_key = scope.collector_key();
+    for (key, value) in meta.scan_prefix(&scope.lease_prefix()) {
+        if key == collector_key
+            || key.starts_with(&reader_prefix)
+            || key.starts_with(&writer_prefix)
         {
             continue;
         }
@@ -726,6 +866,28 @@ pub fn live_leases<FS: StorageFs>(meta: &LocalMetaKv<FS>) -> Result<Vec<GcLease>
     Ok(live)
 }
 
+/// Every live reader or writer lease in the namespace, after reaping expired
+/// records. The collector lease is reported separately by [`live_collector`].
+///
+/// A malformed record is reported as live: refusing to collect is always safer
+/// than collecting on a namespace whose fence cannot be read.
+pub fn live_leases<FS: StorageFs>(meta: &LocalMetaKv<FS>) -> Result<Vec<GcLease>, MetaError> {
+    live_leases_in_scope(meta, LeaseScope::Legacy)
+}
+
+/// Every live reader or writer lease of one metadata group, after reaping
+/// expired records in that group.
+///
+/// This is the per-group fence: a pass over group `group` refuses on a live
+/// lease here, and ignores leases held in other groups, because a write to
+/// another group cannot reference this group's fragments.
+pub fn live_leases_in<FS: StorageFs>(
+    meta: &LocalMetaKv<FS>,
+    group: u64,
+) -> Result<Vec<GcLease>, MetaError> {
+    live_leases_in_scope(meta, LeaseScope::Group(group))
+}
+
 /// The current collector lease, if one is live. An expired record is reaped and
 /// reported as absent so a crashed pass cannot block collection forever.
 ///
@@ -733,21 +895,50 @@ pub fn live_leases<FS: StorageFs>(meta: &LocalMetaKv<FS>) -> Result<Vec<GcLease>
 /// leases are only published while this key is absent, so an expired record left
 /// in place would refuse every read and write until somebody removed it.
 pub fn live_collector<FS: StorageFs>(meta: &LocalMetaKv<FS>) -> Option<GcLease> {
-    let value = meta.get(COLLECTOR_KEY)?;
-    let lease = read_lease(COLLECTOR_KEY, &value.value);
+    live_collector_in_scope(meta, LeaseScope::Legacy)
+        .ok()
+        .flatten()
+}
+
+/// The collector lease of one metadata group, if one is live.
+///
+/// Returns `Err` when the record cannot be read: an unreadable fence must
+/// refuse the group, not be treated as "no pass is running".
+pub fn live_collector_in<FS: StorageFs>(
+    meta: &LocalMetaKv<FS>,
+    group: u64,
+) -> Result<Option<GcLease>, MetaError> {
+    live_collector_in_scope(meta, LeaseScope::Group(group))
+}
+
+fn live_collector_in_scope<FS: StorageFs>(
+    meta: &LocalMetaKv<FS>,
+    scope: LeaseScope,
+) -> Result<Option<GcLease>, MetaError> {
+    let key = scope.collector_key();
+    let Some(value) = read_key(meta, &key)? else {
+        return Ok(None);
+    };
+    let lease = read_lease(&key, &value.value);
     if lease.is_live_at(now_ms()) {
-        return Some(lease);
+        return Ok(Some(lease));
     }
     let _ = meta.execute(KvCommand::RevisionTxn {
         guards: vec![RevisionGuard {
-            key: COLLECTOR_KEY.into(),
+            key: key.clone(),
             expected_mod_revision: value.mod_revision,
         }],
-        ops: vec![TxnOp::Delete {
-            key: COLLECTOR_KEY.into(),
-        }],
+        ops: vec![TxnOp::Delete { key }],
     });
-    None
+    Ok(None)
+}
+
+/// Reads one key without panicking on an unavailable or unroutable namespace.
+fn read_key<FS: StorageFs>(
+    meta: &LocalMetaKv<FS>,
+    key: &str,
+) -> Result<Option<crate::KvValue>, MetaError> {
+    Ok(meta.try_snapshot(&[key.to_owned()], &[])?.get(key))
 }
 
 /// Acquires the collector lease, refusing when another pass already holds it.
@@ -758,33 +949,63 @@ pub fn acquire_collector<FS: StorageFs>(
     expected_mod_revision: u64,
     ttl_ms: u64,
 ) -> Result<CollectorGuard<'_, FS>, MetaError> {
+    acquire_collector_in_scope(meta, LeaseScope::Legacy, expected_mod_revision, ttl_ms)
+}
+
+/// Acquires one group's collector lease, refusing when another pass already
+/// holds that group's record.
+///
+/// The record is written into the group itself, so two passes over the same
+/// group cannot interleave their mark and sweep, while a pass over another
+/// group neither blocks this one nor is blocked by it.
+pub fn acquire_collector_in<FS: StorageFs>(
+    meta: &LocalMetaKv<FS>,
+    group: u64,
+    expected_mod_revision: u64,
+    ttl_ms: u64,
+) -> Result<CollectorGuard<'_, FS>, MetaError> {
+    acquire_collector_in_scope(
+        meta,
+        LeaseScope::Group(group),
+        expected_mod_revision,
+        ttl_ms,
+    )
+}
+
+fn acquire_collector_in_scope<FS: StorageFs>(
+    meta: &LocalMetaKv<FS>,
+    scope: LeaseScope,
+    expected_mod_revision: u64,
+    ttl_ms: u64,
+) -> Result<CollectorGuard<'_, FS>, MetaError> {
+    let key = scope.collector_key();
     let id = new_lease_id();
     let mut lease = GcLease {
         id,
         kind: LeaseKind::Collector,
         project_id: 0,
-        revision: meta.revision(),
+        group: match scope {
+            LeaseScope::Legacy => None,
+            LeaseScope::Group(group) => Some(group),
+        },
+        revision: meta.legacy_revision(),
         expires_at_ms: now_ms().saturating_add(ttl_ms.max(1)),
         mod_revision: 0,
     };
     let value = serde_json::to_vec(&lease)?;
     match meta.execute(KvCommand::RevisionTxn {
         guards: vec![RevisionGuard {
-            key: COLLECTOR_KEY.into(),
+            key: key.clone(),
             expected_mod_revision,
         }],
         ops: vec![TxnOp::Put {
-            key: COLLECTOR_KEY.into(),
+            key: key.clone(),
             value,
         }],
     })? {
         KvResult::TxnOk { revision, .. } => {
             lease.mod_revision = revision;
-            Ok(CollectorGuard {
-                meta,
-                key: COLLECTOR_KEY.into(),
-                lease,
-            })
+            Ok(CollectorGuard { meta, key, lease })
         }
         KvResult::CasConflict { .. } => Err(MetaError::Routing(
             "another garbage collection pass holds the collector lease".into(),
@@ -1018,6 +1239,98 @@ mod tests {
         assert!(meta.get(COLLECTOR_KEY).is_none());
         let third = acquire_collector(&meta, 0, DEFAULT_TTL_MS).unwrap();
         third.release().unwrap();
+    }
+
+    #[test]
+    fn group_leases_are_scoped_to_their_group() {
+        let meta = meta();
+        // A group-scoped writer record lands in that group's namespace, not in
+        // the legacy one and not in another group's.
+        let (key, writer) = put_lease_in(
+            &meta,
+            LeaseScope::Group(2),
+            LeaseKind::Writer,
+            1,
+            0,
+            DEFAULT_TTL_MS,
+        )
+        .unwrap();
+        assert!(key.starts_with("/gc/g2/writer/"), "{key}");
+        assert_eq!(writer.group, Some(2));
+        assert_eq!(lease_key(&writer), key);
+
+        assert_eq!(live_leases_in(&meta, 2).unwrap().len(), 1);
+        assert!(
+            live_leases_in(&meta, 3).unwrap().is_empty(),
+            "a lease of group 2 must not fence group 3"
+        );
+        assert!(
+            live_leases(&meta).unwrap().is_empty(),
+            "a group-scoped lease must not appear in the legacy namespace"
+        );
+
+        release(&meta, &writer).unwrap();
+        assert!(live_leases_in(&meta, 2).unwrap().is_empty());
+        assert!(meta.get(&key).is_none());
+    }
+
+    #[test]
+    fn group_collectors_are_independent_and_close_admission_per_group() {
+        let meta = meta();
+        let group2 = acquire_collector_in(&meta, 2, 0, DEFAULT_TTL_MS).unwrap();
+        let group3 = acquire_collector_in(&meta, 3, 0, DEFAULT_TTL_MS).unwrap();
+        assert!(live_collector_in(&meta, 2).unwrap().is_some());
+        assert!(live_collector_in(&meta, 3).unwrap().is_some());
+        assert!(live_collector(&meta).is_none());
+
+        // Admission in group 2 is closed while its own collector record is held.
+        let refused = put_lease_in(
+            &meta,
+            LeaseScope::Group(2),
+            LeaseKind::Reader,
+            1,
+            0,
+            DEFAULT_TTL_MS,
+        )
+        .unwrap_err();
+        assert!(
+            refused
+                .to_string()
+                .contains("garbage collection is running"),
+            "{refused}"
+        );
+
+        // Releasing group 2's collector neither removes group 3's record nor
+        // reopens admission for group 3.
+        group2.release().unwrap();
+        assert!(live_collector_in(&meta, 2).unwrap().is_none());
+        assert!(live_collector_in(&meta, 3).unwrap().is_some());
+        let refused = put_lease_in(
+            &meta,
+            LeaseScope::Group(3),
+            LeaseKind::Writer,
+            2,
+            0,
+            DEFAULT_TTL_MS,
+        )
+        .unwrap_err();
+        assert!(refused
+            .to_string()
+            .contains("garbage collection is running"));
+
+        // Once group 3's pass is gone its admission reopens, independently.
+        group3.release().unwrap();
+        let (key, writer) = put_lease_in(
+            &meta,
+            LeaseScope::Group(3),
+            LeaseKind::Writer,
+            2,
+            0,
+            DEFAULT_TTL_MS,
+        )
+        .unwrap();
+        assert!(key.starts_with("/gc/g3/writer/"), "{key}");
+        release(&meta, &writer).unwrap();
     }
 
     #[test]

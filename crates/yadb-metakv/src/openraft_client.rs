@@ -139,6 +139,8 @@ impl GroupRouter {
             "/s3-upload-sequence/",
             "/block/",
             "/block-write-sequence/",
+            // Per-group garbage-collection records: `/gc/g<group>/...`.
+            crate::gc::GROUP_GC_NAMESPACE,
             // Must precede `/idempotency/`, or a group namespace would match the
             // project entry and its `g` segment would be parsed as a project id,
             // failing as noncanonical instead of routing to the named group.
@@ -159,6 +161,14 @@ impl GroupRouter {
         if key.starts_with(GROUP_IDEMPOTENCY_NAMESPACE) {
             // Same separator rule as a project prefix: a bare `/idempotency/g2`
             // must not be able to match `/idempotency/g20/...` in another group.
+            if !rest.contains('/') {
+                return Err(MetaError::Routing(format!("invalid group key: {key}")));
+            }
+            return self.configured_group(canonical_group(part, key)?);
+        }
+        if key.starts_with(crate::gc::GROUP_GC_NAMESPACE) {
+            // `/gc/g<group>/...` names one data group. The same separator rule
+            // keeps `/gc/g2` from matching `/gc/g20/...` in another group.
             if !rest.contains('/') {
                 return Err(MetaError::Routing(format!("invalid group key: {key}")));
             }
@@ -400,6 +410,60 @@ impl GroupRouter {
             .state
             .try_snapshot(&[], &[])?
             .revision())
+    }
+    /// One scope per data group a per-group collection pass may run over.
+    ///
+    /// A single-group deployment has no explicit project routing, so its one
+    /// scope covers every project: every fragment belongs to that group.
+    pub(crate) fn gc_scopes(&self) -> Vec<crate::gc::GcGroupScope> {
+        if self.singleton {
+            return vec![crate::gc::GcGroupScope {
+                group_id: self.control,
+                project_ids: None,
+            }];
+        }
+        let mut by_group: BTreeMap<u64, std::collections::BTreeSet<u32>> = BTreeMap::new();
+        for (project, group) in &self.projects {
+            by_group.entry(*group).or_default().insert(*project);
+        }
+        by_group
+            .into_iter()
+            .map(|(group_id, project_ids)| crate::gc::GcGroupScope {
+                group_id,
+                project_ids: Some(project_ids),
+            })
+            .collect()
+    }
+    /// The data group that owns `project`, failing closed for an unmapped one.
+    pub(crate) fn group_for_project_id(&self, project: u32) -> Result<u64, MetaError> {
+        if self.singleton {
+            return Ok(self.control);
+        }
+        self.projects
+            .get(&project)
+            .copied()
+            .ok_or_else(|| MetaError::Routing(format!("unmapped project: {project}")))
+    }
+    pub(crate) fn role_for_group(
+        &self,
+        group: u64,
+    ) -> Result<(u32, RoleState, u64, Option<u32>, u64), MetaError> {
+        self.groups
+            .get(&group)
+            .map(|client| client.role_info())
+            .ok_or_else(|| MetaError::Routing(format!("unconfigured group: {group}")))
+    }
+    /// Quorum-confirmed snapshot of exactly one group, named directly.
+    pub(crate) fn linearizable_group_snapshot(
+        &self,
+        group: u64,
+        keys: &[String],
+        prefixes: &[String],
+    ) -> Result<MetaSnapshot, MetaError> {
+        self.groups
+            .get(&group)
+            .ok_or_else(|| MetaError::Routing(format!("unconfigured group: {group}")))?
+            .linearizable_snapshot(keys, prefixes)
     }
     pub(crate) fn watch_prefix(&self, prefix: String) -> mpsc::Receiver<WatchEvent> {
         self.try_snapshot(&[], &[prefix.clone()])

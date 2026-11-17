@@ -1001,6 +1001,73 @@ impl<FS: StorageFs> LocalMetaKv<FS> {
         })
     }
 
+    /// One scope per data group for a per-group collection pass.
+    ///
+    /// A single-group deployment has no explicit project routing, so its one
+    /// scope covers every project. Legacy metadata has no groups; collection
+    /// there is a single-namespace pass and must not call this.
+    pub fn gc_group_scopes(&self) -> Result<Vec<crate::gc::GcGroupScope>, MetaError> {
+        #[cfg(any(test, feature = "openraft-storage"))]
+        if let Some(router) = &self.openraft {
+            return Ok(router.gc_scopes());
+        }
+        Err(MetaError::Routing(
+            "per-group garbage collection requires OpenRaft".into(),
+        ))
+    }
+
+    /// The data group that owns `project_id`, or `None` on legacy metadata.
+    ///
+    /// This is what routes a writer lease into the group whose manifests it
+    /// fences, and what lets a per-group pass decide which fragments it owns.
+    pub fn gc_group_for_project(&self, project_id: u32) -> Result<Option<u64>, MetaError> {
+        #[cfg(any(test, feature = "openraft-storage"))]
+        if let Some(router) = &self.openraft {
+            return router.group_for_project_id(project_id).map(Some);
+        }
+        let _ = project_id;
+        Ok(None)
+    }
+
+    /// Locally observed role of one named metadata group. Like
+    /// [`Self::role_info_for_key`] this is not proof that the leader has quorum;
+    /// the linearizable snapshot is.
+    pub fn role_info_for_group(
+        &self,
+        group: u64,
+    ) -> Result<(u32, RoleState, u64, Option<u32>, u64), MetaError> {
+        #[cfg(any(test, feature = "openraft-storage"))]
+        if let Some(router) = &self.openraft {
+            return router.role_for_group(group);
+        }
+        let _ = group;
+        Err(MetaError::Routing(
+            "per-group role information requires OpenRaft".into(),
+        ))
+    }
+
+    /// Quorum-confirmed snapshot of exactly one metadata group.
+    ///
+    /// The group is named directly instead of being routed from a key, because
+    /// a collection pass marks every manifest prefix of the group and no single
+    /// project key names that scope. Followers and unavailable quorums return
+    /// an error; there is no fallback to local applied state.
+    pub fn try_linearizable_group_snapshot(
+        &self,
+        group: u64,
+        keys: &[String],
+        prefixes: &[String],
+    ) -> Result<MetaSnapshot, MetaError> {
+        #[cfg(any(test, feature = "openraft-storage"))]
+        if let Some(router) = &self.openraft {
+            return router.linearizable_group_snapshot(group, keys, prefixes);
+        }
+        let _ = (group, keys, prefixes);
+        Err(MetaError::Routing(
+            "per-group linearizable snapshot requires OpenRaft".into(),
+        ))
+    }
+
     pub fn revision_for_key(&self, key: &str) -> Result<u64, MetaError> {
         #[cfg(any(test, feature = "openraft-storage"))]
         if let Some(router) = &self.openraft {
@@ -1526,13 +1593,14 @@ impl<FS: StorageFs> LocalMetaKv<FS> {
         self.legacy().lock().unwrap().revision()
     }
 
-    /// Revision to stamp a *legacy-only* GC lease with, or `0` on OpenRaft.
+    /// Revision to stamp a legacy-only GC lease with, or `0` on OpenRaft.
     ///
     /// Multi-Raft metadata has no global revision (`revision()` asserts that),
-    /// and collection is disabled there, so no lease is ever published and the
-    /// value is unused. Callers that pass a revision to
-    /// `gc::acquire_writer_if_legacy` must use this: evaluating `revision()`
-    /// eagerly as an argument panics before the legacy check can run.
+    /// and a group-scoped lease does not use the value for anything: the
+    /// collector refuses on any live lease instead of reasoning about revisions.
+    /// Callers that pass a revision to `gc::acquire_writer_if_legacy` must use
+    /// this: evaluating `revision()` eagerly as an argument panics before the
+    /// per-group path can run.
     pub fn legacy_revision(&self) -> u64 {
         if self.is_openraft() {
             return 0;

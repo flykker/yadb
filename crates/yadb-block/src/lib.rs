@@ -304,10 +304,10 @@ impl<FS: StorageFs> BlockVolumeEngine<FS> {
             // no fragment) and before the first fragment append. The collector
             // refuses while any lease is live, so fragments that are not
             // referenced yet cannot be swept between the append and the
-            // publication that names them. A release that fails leaves the record
-            // until its TTL, which blocks collection but never unblocks a
-            // deletion. On Multi-Raft there is no collector to fence and no
-            // routed lease namespace, so no lease is published.
+            // publication that names them. On Multi-Raft the lease lives in the
+            // group that owns the project, and that group's collector refuses on
+            // it. A release that fails leaves the record until its TTL, which
+            // blocks collection but never unblocks a deletion.
             let mut writer_lease = yadb_metakv::gc::acquire_writer_if_legacy(
                 &self.meta,
                 project_id,
