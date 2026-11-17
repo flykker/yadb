@@ -9637,7 +9637,7 @@ mod security_tests {
 mod raft_status_tests {
     use super::*;
     use ::openraft::error::{
-        Fatal, RPCError, RaftError, RemoteError, ReplicationClosed, StreamingError, Unreachable,
+        Fatal, RPCError, RaftError, ReplicationClosed, StreamingError, Unreachable,
     };
     use ::openraft::network::RPCOption;
     use ::openraft::raft::{

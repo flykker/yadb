@@ -157,43 +157,6 @@ fn spawn_cluster(
         .unwrap();
     Daemon(child)
 }
-/// Spawns a single legacy-runtime daemon with optional subject verification and
-/// an admin allowlist. Used to exercise `/v1/apply` authorization without the
-/// cost of a full Raft cluster.
-fn spawn_auth(
-    data: &Path,
-    public: SocketAddr,
-    log: &Path,
-    secret: Option<&str>,
-    admins: &[&str],
-) -> Daemon {
-    let stderr = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log)
-        .unwrap();
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_yadbd"));
-    cmd.args([
-        "--listen",
-        &public.to_string(),
-        "--data-dir",
-        data.to_str().unwrap(),
-    ])
-    .env_remove("YADB_SUBJECT_SECRET")
-    .env_remove("YADB_RAFT_TOKEN");
-    if let Some(secret) = secret {
-        cmd.args(["--subject-secret", secret]);
-    }
-    if !admins.is_empty() {
-        cmd.args(["--admin-subject", &admins.join(",")]);
-    }
-    Daemon(
-        cmd.stdout(Stdio::from(stderr.try_clone().unwrap()))
-            .stderr(Stdio::from(stderr))
-            .spawn()
-            .unwrap(),
-    )
-}
 fn request(
     addr: SocketAddr,
     method: &str,
@@ -508,6 +471,27 @@ spec: {pool: data, sizeBytes: 8192}
         );
         assert_eq!(status, expected);
     }
+    // A forged signature must not be accepted even for an allowlisted subject:
+    // the signature, not the claimed name, is what proves the subject.
+    let forged = format!(
+        "x-yadb-subject: admin\r\nx-yadb-subject-signature: {}\r\n",
+        "00".repeat(32)
+    );
+    let (status, _, body) = request_with_identity(
+        public,
+        "POST",
+        "/v1/apply",
+        &keyed_body,
+        "application/json",
+        &forged,
+        "Idempotency-Key: auth\r\n",
+    );
+    assert_eq!(
+        status,
+        401,
+        "forged signature: {}",
+        String::from_utf8_lossy(&body)
+    );
     assert_eq!(generation(), before);
     let (status, _, recorded_body) = request_extra(
         public,
@@ -1611,11 +1595,14 @@ spec: {quotas: {maxStorageBytes: 100000000, maxIops: 1000}, members: []}
     );
 }
 
-/// `/v1/apply` mutates the control plane, so it accepts only a proven subject
-/// that appears on the admin allowlist. Every other case must be refused
-/// before any state is written.
+/// A deployment whose admin allowlist can never be satisfied must refuse to
+/// start, and each refusal has to name the specific missing value instead of
+/// failing later for a less informative reason. `/v1/apply` authorization
+/// against a live cluster is covered by
+/// `daemon_multigroup_http_shutdown_reopen_and_root_guards`; this test owns only
+/// the startup contract, so it needs no cluster and no manifest.
 #[test]
-fn apply_requires_a_signed_allowlisted_subject() {
+fn startup_refuses_an_admin_allowlist_it_cannot_verify() {
     let base = std::env::var_os("YADB_TEST_TMPDIR")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
@@ -1632,198 +1619,121 @@ fn apply_requires_a_signed_allowlisted_subject() {
     let reservation = TcpListener::bind("127.0.0.1:0").unwrap();
     let public = reservation.local_addr().unwrap();
     drop(reservation);
-    let log = dir.0.join("daemon.log");
     let data = dir.0.join("data");
 
-    // An allowlist without a secret can never verify a subject, so the daemon
-    // must refuse to start instead of running an unusable deployment.
-    let mut unverifiable = spawn_auth(&data, public, &log, None, &["admin"]);
-    assert!(
-        !unverifiable.wait(Duration::from_secs(10)).success(),
-        "allowlist without --subject-secret must refuse to start"
-    );
-    drop(unverifiable);
-    let text = std::fs::read_to_string(&log).unwrap();
+    // The manifest path is a placeholder: every check below runs before the
+    // manifest is read, so reaching one of them proves the omitted value is what
+    // the daemon refuses on.
+    let manifest = dir.0.join("missing-manifest.json");
+    let refused = |tag: &str, omit: &str| -> String {
+        let log = dir.0.join(format!("{tag}.log"));
+        let stderr = std::fs::File::create(&log).unwrap();
+        let mut args: Vec<String> = vec![
+            "--listen".into(),
+            public.to_string(),
+            "--data-dir".into(),
+            data.to_str().unwrap().into(),
+            "--openraft-config".into(),
+            manifest.to_str().unwrap().into(),
+            "--peers".into(),
+            format!("1={public}"),
+            "--raft-token".into(),
+            "integration-test-token".into(),
+            "--subject-secret".into(),
+            SUBJECT_SECRET.into(),
+            "--admin-subject".into(),
+            "admin".into(),
+        ];
+        let index = args
+            .iter()
+            .position(|a| a == omit)
+            .unwrap_or_else(|| panic!("{tag}: {omit} is not in the argument list"));
+        args.drain(index..=index + 1);
+        let child = Command::new(env!("CARGO_BIN_EXE_yadbd"))
+            .args(&args)
+            .env_remove("YADB_SUBJECT_SECRET")
+            .env_remove("YADB_RAFT_TOKEN")
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(stderr))
+            .spawn()
+            .unwrap();
+        let mut daemon = Daemon(child);
+        assert!(
+            !daemon.wait(Duration::from_secs(10)).success(),
+            "{tag}: a daemon missing {omit} must refuse to start"
+        );
+        drop(daemon);
+        std::fs::read_to_string(&log).unwrap()
+    };
+
+    // An allowlist without a secret can never verify a subject.
+    let text = refused("no-secret", "--subject-secret");
     assert!(
         text.contains("--subject-secret"),
         "unexpected startup error: {text}"
     );
+    // An empty allowlist would refuse every control-plane mutation.
+    let text = refused("no-admin", "--admin-subject");
+    assert!(
+        text.contains("--admin-subject"),
+        "unexpected startup error: {text}"
+    );
+    // The internal endpoints are unauthenticated without a shared secret.
+    let text = refused("no-token", "--raft-token");
+    assert!(
+        text.contains("--raft-token"),
+        "unexpected startup error: {text}"
+    );
+    // OpenRaft needs an explicit new root, never an implicit one.
+    let text = refused("no-data-dir", "--data-dir");
+    assert!(
+        text.contains("--data-dir"),
+        "unexpected startup error: {text}"
+    );
+    // And an explicit multi-group manifest, never a default configuration.
+    let text = refused("no-config", "--openraft-config");
+    assert!(
+        text.contains("--openraft-config"),
+        "unexpected startup error: {text}"
+    );
 
-    // OpenRaft mode additionally requires a non-empty allowlist. The check runs
-    // before the manifest is read, so a placeholder path is enough.
-    let openraft_log = dir.0.join("openraft.log");
-    let openraft_stderr = std::fs::File::create(&openraft_log).unwrap();
-    let openraft = Command::new(env!("CARGO_BIN_EXE_yadbd"))
+    // Every value present but the manifest absent: the daemon must refuse rather
+    // than invent a configuration or bootstrap itself.
+    let log = dir.0.join("missing-manifest.log");
+    let stderr = std::fs::File::create(&log).unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_yadbd"))
         .args([
             "--listen",
             &public.to_string(),
             "--data-dir",
-            dir.0.join("openraft-data").to_str().unwrap(),
-            "--metadata-runtime",
-            "openraft",
+            data.to_str().unwrap(),
             "--openraft-config",
-            dir.0.join("missing-manifest.json").to_str().unwrap(),
+            manifest.to_str().unwrap(),
             "--peers",
             &format!("1={public}"),
             "--raft-token",
             "integration-test-token",
             "--subject-secret",
             SUBJECT_SECRET,
+            "--admin-subject",
+            "admin",
         ])
         .env_remove("YADB_SUBJECT_SECRET")
         .env_remove("YADB_RAFT_TOKEN")
         .stdout(Stdio::null())
-        .stderr(Stdio::from(openraft_stderr))
+        .stderr(Stdio::from(stderr))
         .spawn()
         .unwrap();
-    let mut openraft = Daemon(openraft);
+    let mut daemon = Daemon(child);
     assert!(
-        !openraft.wait(Duration::from_secs(10)).success(),
-        "openraft mode without --admin-subject must refuse to start"
+        !daemon.wait(Duration::from_secs(10)).success(),
+        "a missing manifest must refuse to start, not fall back to a default"
     );
-    drop(openraft);
-    let text = std::fs::read_to_string(&openraft_log).unwrap();
+    drop(daemon);
     assert!(
-        text.contains("--admin-subject"),
-        "unexpected startup error: {text}"
+        !std::fs::read_to_string(&log).unwrap().is_empty(),
+        "a refused start must say why"
     );
-
-    let mut daemon = spawn_auth(&data, public, &log, Some(SUBJECT_SECRET), &["admin"]);
-    let deadline = Instant::now() + Duration::from_secs(20);
-    loop {
-        assert!(
-            daemon.0.try_wait().unwrap().is_none(),
-            "daemon exited during startup: {}",
-            std::fs::read_to_string(&log).unwrap_or_default()
-        );
-        if TcpStream::connect_timeout(&public, Duration::from_millis(100)).is_ok() {
-            break;
-        }
-        assert!(Instant::now() < deadline, "daemon did not listen");
-        std::thread::sleep(Duration::from_millis(50));
-    }
-
-    let yaml = r#"apiVersion: yadb.io/v1alpha1
-kind: StoragePool
-metadata: {name: data}
-spec: {erasure: {scheme: mirror, replicas: 3}, failureDomains: 3}
----
-apiVersion: yadb.io/v1alpha1
-kind: Project
-metadata: {name: alpha}
-spec: {quotas: {maxStorageBytes: 100000000, maxIops: 1000}, members: [{subject: tester, role: readWrite}]}
-"#;
-    let body = serde_json::to_vec(&json!({"yaml": yaml})).unwrap();
-    let signed = |subject: &str| {
-        format!(
-            "x-yadb-subject: {subject}\r\nx-yadb-subject-signature: {}\r\n",
-            subject_signature(subject)
-        )
-    };
-
-    // No identity at all, and an unsigned subject header, are both unverified.
-    for identity in ["", "x-yadb-subject: admin\r\n"] {
-        let (status, _, response) = request_with_identity(
-            public,
-            "POST",
-            "/v1/apply",
-            &body,
-            "application/json",
-            identity,
-            "",
-        );
-        assert_eq!(
-            status,
-            401,
-            "unsigned apply: {}",
-            String::from_utf8_lossy(&response)
-        );
-    }
-    // A forged signature must not be accepted.
-    let forged = format!(
-        "x-yadb-subject: admin\r\nx-yadb-subject-signature: {}\r\n",
-        "00".repeat(32)
-    );
-    let (status, _, response) = request_with_identity(
-        public,
-        "POST",
-        "/v1/apply",
-        &body,
-        "application/json",
-        &forged,
-        "",
-    );
-    assert_eq!(
-        status,
-        401,
-        "forged signature: {}",
-        String::from_utf8_lossy(&response)
-    );
-    // A proven subject that is not on the allowlist is forbidden.
-    let (status, _, response) = request_with_identity(
-        public,
-        "POST",
-        "/v1/apply",
-        &body,
-        "application/json",
-        &signed("operator"),
-        "",
-    );
-    assert_eq!(
-        status,
-        403,
-        "non-admin apply: {}",
-        String::from_utf8_lossy(&response)
-    );
-
-    // Nothing above may have written control state.
-    let state: Value =
-        serde_json::from_slice(&ok(public, "GET", "/v1/status", b"", "application/json")).unwrap();
-    assert_eq!(state["generation"], 0);
-    assert!(state["projects"]["alpha"].is_null());
-
-    // The allowlisted subject is accepted and the generation advances.
-    let (status, _, response) = request_with_identity(
-        public,
-        "POST",
-        "/v1/apply",
-        &body,
-        "application/json",
-        &signed("admin"),
-        "",
-    );
-    assert_eq!(
-        status,
-        200,
-        "admin apply: {}",
-        String::from_utf8_lossy(&response)
-    );
-    let state: Value =
-        serde_json::from_slice(&ok(public, "GET", "/v1/status", b"", "application/json")).unwrap();
-    assert_eq!(state["generation"], 1);
-    assert!(!state["projects"]["alpha"].is_null());
-
-    // The legacy runtime has no record store, so a keyed mutation is refused
-    // rather than silently running unkeyed. This must hold even though the
-    // request is otherwise well-formed: the refusal is about the runtime, not
-    // the payload.
-    let (status, _, response) = request_with_identity(
-        public,
-        "POST",
-        "/block/alpha/disk/unmap",
-        br#"{"offset":0,"len":4096}"#,
-        "application/json",
-        &signed("admin"),
-        "Idempotency-Key: legacy\r\n",
-    );
-    assert_eq!(
-        status,
-        501,
-        "keyed unmap on legacy: {}",
-        String::from_utf8_lossy(&response)
-    );
-
-    daemon.interrupt();
 }
 
 /// `/openraft/status` names every local group, so a deployment that configured
