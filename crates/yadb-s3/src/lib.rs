@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -328,6 +328,16 @@ pub struct ObjectStoreEngine<FS: StorageFs> {
     meta: LocalMetaKv<FS>,
     pools: Arc<RwLock<BTreeMap<String, Arc<PoolStriper<FS>>>>>,
     chunk_size: usize,
+    /// Allocation ids already reserved from the durable counter but not yet
+    /// handed out, per project, as `[next, end)`.
+    ///
+    /// One Raft CAS per upload would make N simultaneous writers contend N
+    /// times each on the single sequence key. A writer takes a whole block per
+    /// successful CAS and serves the rest of that block locally. The unused
+    /// tail is never returned to the counter: an id only has to be unique and
+    /// increasing, so skipping is safe, while reuse would alias two uploads
+    /// after a restart.
+    allocation_cache: Arc<Mutex<BTreeMap<u32, (u64, u64)>>>,
 }
 
 impl<FS: StorageFs> Clone for ObjectStoreEngine<FS> {
@@ -336,6 +346,7 @@ impl<FS: StorageFs> Clone for ObjectStoreEngine<FS> {
             meta: self.meta.clone(),
             pools: self.pools.clone(),
             chunk_size: self.chunk_size,
+            allocation_cache: self.allocation_cache.clone(),
         }
     }
 }
@@ -346,6 +357,7 @@ impl<FS: StorageFs> ObjectStoreEngine<FS> {
             meta,
             pools: Arc::new(RwLock::new(BTreeMap::new())),
             chunk_size: chunk_size.max(4096),
+            allocation_cache: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -388,7 +400,22 @@ impl<FS: StorageFs> ObjectStoreEngine<FS> {
 
     /// One non-deleting allocator per project, shared by every writer/key/pool.
     /// Failed/ambiguous allocations are skipped rather than reused.
+    ///
+    /// The counter is a single key, so handing out one id per CAS makes N
+    /// simultaneous uploads contend N times each: 24 concurrent writers issued
+    /// 596 sequence transactions for 48 uploads, and the queue behind that hot
+    /// key pushed individual transactions past the metadata bridge's deadline.
+    /// A writer therefore takes a whole block per successful CAS and serves the
+    /// rest of it locally, so the storm costs one round trip per block per
+    /// process instead of one per upload. The unused tail is deliberately not
+    /// returned: an allocation id only has to be unique and increasing, so
+    /// skipping ids is safe, while reusing one would alias two uploads.
+    const ALLOCATION_BLOCK: u64 = 32;
+
     fn reserve_upload(&self, project_id: u32) -> Result<u64, S3Error> {
+        if let Some(id) = self.take_cached_allocation(project_id) {
+            return Ok(id);
+        }
         let key = format!("/s3-upload-sequence/{project_id}");
         for _ in 0..128 {
             let current = self.meta.get(&key);
@@ -397,7 +424,7 @@ impl<FS: StorageFs> ObjectStoreEngine<FS> {
                 None => 0,
             };
             let next = previous
-                .checked_add(1)
+                .checked_add(Self::ALLOCATION_BLOCK)
                 .filter(|v| *v <= MAX_ALLOCATION)
                 .ok_or(S3Error::GenerationExhausted)?;
             if matches!(
@@ -413,10 +440,29 @@ impl<FS: StorageFs> ObjectStoreEngine<FS> {
                 })?,
                 KvResult::TxnOk { .. }
             ) {
-                return Ok(next);
+                // [previous+2, next] is the rest of the block; the durable
+                // counter already sits at `next`, so a crash loses these ids
+                // instead of handing one out twice.
+                self.allocation_cache
+                    .lock()
+                    .unwrap()
+                    .insert(project_id, (previous + 2, next + 1));
+                return Ok(previous + 1);
             }
         }
         Err(S3Error::GenerationExhausted)
+    }
+
+    fn take_cached_allocation(&self, project_id: u32) -> Option<u64> {
+        let mut cache = self.allocation_cache.lock().unwrap();
+        let (next, end) = cache.get_mut(&project_id)?;
+        if *next >= *end {
+            cache.remove(&project_id);
+            return None;
+        }
+        let id = *next;
+        *next += 1;
+        Some(id)
     }
 
     /// Persists allocation + complete intent before any fragment write, then
@@ -1853,6 +1899,67 @@ mod tests {
     }
 
     #[test]
+    fn allocator_reserves_a_block_so_concurrent_writers_do_not_alias_or_reuse_ids() {
+        let meta_fs = SimFs::new(6260);
+        let disks = [SimFs::new(6261), SimFs::new(6262), SimFs::new(6263)];
+        let s3 = engine(&meta_fs, &disks);
+        let ids = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..16)
+                .map(|_| {
+                    let writer = ObjectStoreEngine::new(s3.meta.clone(), 4096);
+                    scope.spawn(move || writer.reserve_upload(1).unwrap())
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        let mut distinct = ids.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert_eq!(
+            distinct.len(),
+            ids.len(),
+            "two writers shared an id: {ids:?}"
+        );
+        // Every success advanced the durable counter by a whole block, so the
+        // first id after a restart lies beyond every id handed out *and* beyond
+        // the unused tails: reusing a tail would alias an upload that may still
+        // exist, which is why the tail is skipped rather than reclaimed.
+        let stored = s3.meta.get("/s3-upload-sequence/1").unwrap();
+        let counter: u64 = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(counter, 16 * ObjectStoreEngine::<SimFs>::ALLOCATION_BLOCK);
+        drop(s3);
+        meta_fs.simulate_power_cut();
+        for disk in &disks {
+            disk.simulate_power_cut();
+        }
+        let recovered = engine(&meta_fs, &disks);
+        let first = recovered.reserve_upload(1).unwrap();
+        assert!(
+            first > *ids.iter().max().unwrap(),
+            "{first} <= {:?}",
+            ids.iter().max()
+        );
+        assert!(first > counter);
+        // One process serves a whole block locally: sixteen reservations cost a
+        // single extra CAS, and every id is still distinct and beyond the
+        // durable counter.
+        let mut block = vec![first];
+        block.extend((0..15).map(|_| recovered.reserve_upload(1).unwrap()));
+        block.sort_unstable();
+        block.dedup();
+        assert_eq!(block.len(), 16, "{block:?}");
+        let stored = recovered.meta.get("/s3-upload-sequence/1").unwrap();
+        let advanced: u64 = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            advanced,
+            counter + ObjectStoreEngine::<SimFs>::ALLOCATION_BLOCK
+        );
+    }
+
+    #[test]
     fn allocator_crosses_generation_boundary_and_stops_before_id_wraparound() {
         let meta_fs = SimFs::new(6245);
         let disks = [SimFs::new(6246), SimFs::new(6247), SimFs::new(6248)];
@@ -1884,8 +1991,11 @@ mod tests {
                 value: serde_json::to_vec(&MAX_ALLOCATION).unwrap(),
             })
             .unwrap();
+        // A process-local block would still be serving ids; a restart drops it,
+        // so the exhaustion check uses a fresh engine over the same metadata.
+        let restarted = ObjectStoreEngine::new(s3.meta.clone(), 4096);
         assert!(matches!(
-            s3.reserve_upload(1),
+            restarted.reserve_upload(1),
             Err(S3Error::GenerationExhausted)
         ));
     }
