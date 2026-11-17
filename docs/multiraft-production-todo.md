@@ -108,8 +108,10 @@ Status: implementation in progress; the new nonproduction cluster is running but
 is no longer empty (see current status above), and no existing cluster has been
 switched. See `docs/multiraft-verification.md`.
 
-- [ ] Add explicit daemon metadata-runtime selection, preserving legacy default
-  and requiring the OpenRaft feature and mandatory-mTLS group configuration.
+- [x] Add explicit daemon metadata-runtime selection. **Superseded:** the legacy
+  runtime was removed instead of kept as the default; `--metadata-runtime`
+  accepts only `openraft`, and `--openraft-config` with a version-2 multi-group
+  manifest is mandatory.
 - [ ] Route existing SQL, S3, block and iSCSI metadata through actual OpenRaft
   client writes across several active groups. Use a dedicated control group and
   an explicit immutable project-ID-to-data-group map with at least two distinct

@@ -447,7 +447,6 @@
   </div>
   <div style="display:flex;gap:8px;align-items:center">
     <button class="btn btn-secondary btn-sm" onclick="refreshAll()">↻ Refresh</button>
-    <button class="btn btn-secondary btn-sm" id="elect-leader" onclick="electLeader()" disabled title="Waiting for metadata runtime">⚡ Elect Leader</button>
   </div>
 </div>
 
@@ -750,10 +749,6 @@ async function refreshAll() {
   if (s?.ok && s.json) state = s.json;
   if (ph?.ok && ph.json) poolHealth = ph.json;
   const isOpenraft = raft.metadata_runtime === "openraft";
-  const elect = document.getElementById("elect-leader");
-  elect.disabled = !h?.ok || !h.json || isOpenraft;
-  elect.title = isOpenraft ? "Leader election is unsupported for OpenRaft" :
-    (elect.disabled ? "Metadata runtime unavailable" : "Trigger Raft Leader Election on this node");
   document.getElementById("ov-raft-title").textContent = isOpenraft ? "Raft MetaKV · CONTROL" : "Raft MetaKV";
   document.getElementById("ov-openraft-card").classList.toggle("hidden", !isOpenraft);
   if (isOpenraft) {
@@ -940,12 +935,6 @@ async function runYamlApply() {
     return;
   }
   box.innerHTML = renderDiffOps("Manifests Reconciled & Committed", r.json.ops, r.json.generation);
-  await refreshAll();
-}
-
-async function electLeader() {
-  if (document.getElementById("elect-leader").disabled || raft.metadata_runtime === "openraft") return;
-  await api("/raft/elect", { method: "POST" });
   await refreshAll();
 }
 

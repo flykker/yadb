@@ -22,11 +22,10 @@ use yadb_block::{BlockError, BlockVolumeEngine, VolumeExtentMap, DEFAULT_BLOCK_S
 use yadb_control::{parse_manifests, ControlError, ControlPlaneState, DiffOp, Role};
 use yadb_db::{parse_sql_script, script_has_writes, DatabaseEngine, DbError, TabletManifest};
 use yadb_io::OsFs;
-use yadb_metakv::{KvCommand, LocalMetaKv, MetaError, RaftRpc, RoleState, WatchEvent};
+use yadb_metakv::{KvCommand, LocalMetaKv, MetaError, RoleState, WatchEvent};
 use yadb_s3::{ObjectManifest, ObjectStoreEngine, S3Error};
 
 mod gc;
-#[cfg(feature = "openraft-storage")]
 mod openraft;
 mod protocols;
 
@@ -54,27 +53,29 @@ struct Args {
     #[arg(long, default_value = "127.0.0.1:8420")]
     listen: String,
 
-    /// Metadata backend; openraft is opt-in and requires a freshly created root.
-    #[arg(long, default_value = "legacy", value_parser = ["legacy", "openraft"])]
+    /// Metadata runtime. OpenRaft is the only clustered metadata runtime and
+    /// is always used; the flag is kept so an unsupported value fails loudly.
+    #[arg(long, default_value = "openraft", value_parser = ["openraft"])]
     metadata_runtime: String,
 
     #[arg(long, default_value_t = 1)]
     node_id: u32,
 
-    /// Optional comma-separated Raft peer map: `1=127.0.0.1:8421,2=127.0.0.1:8422,3=127.0.0.1:8423`
+    /// Optional comma-separated public peer map: `1=127.0.0.1:8421,2=127.0.0.1:8422,3=127.0.0.1:8423`
     #[arg(long)]
     peers: Option<String>,
 
-    /// Shared secret required by the internal Raft endpoints (`/raft/rpc`,
-    /// `/raft/elect`). Required when `--peers` is set: an unauthenticated
-    /// Raft endpoint lets any client inject Raft messages.
+    /// Shared secret required by the token-authenticated internal endpoints
+    /// (`/internal/control/snapshot`, `/internal/vdisk/...`). Required and must
+    /// be non-empty: an unauthenticated internal endpoint lets any client
+    /// mutate storage behind the metadata runtime's back.
     #[arg(long, env = "YADB_RAFT_TOKEN", hide_env_values = true)]
     raft_token: Option<String>,
 
     #[arg(long)]
     data_dir: Option<PathBuf>,
 
-    /// OpenRaft group configuration path; requires the openraft-storage feature.
+    /// OpenRaft group configuration path; required.
     #[arg(long)]
     openraft_config: Option<PathBuf>,
 
@@ -131,16 +132,6 @@ struct Args {
     /// must be non-empty, otherwise the daemon refuses to start.
     #[arg(long, value_delimiter = ',')]
     admin_subject: Vec<String>,
-}
-
-fn check_openraft_config(path: Option<&std::path::Path>) -> Result<(), &'static str> {
-    if path.is_none() {
-        return Ok(());
-    }
-    if !cfg!(feature = "openraft-storage") {
-        return Err("--openraft-config requires the openraft-storage feature");
-    }
-    Ok(())
 }
 
 /// Bounded lease for the locally cached control snapshot. A fresh lease means
@@ -319,12 +310,11 @@ fn require_admin(
 
 #[derive(Clone)]
 struct AppState {
-    #[cfg(feature = "openraft-storage")]
     openraft: Option<openraft::Status>,
     listen_addr: String,
     fs: OsFs,
     meta: LocalMetaKv<OsFs>,
-    /// Shared secret required by the internal Raft endpoints.
+    /// Shared secret required by the token-authenticated internal endpoints.
     raft_token: Option<String>,
     /// Optional secret for signed client subjects.
     subject_secret: Option<String>,
@@ -1938,8 +1928,8 @@ async fn maybe_forward_write(
             let target_id = match leader_opt {
                 Some(id) if id != my_id => id,
                 _ => {
-                    // No known leader yet: trigger election or wait briefly for peer election
-                    let _ = meta.trigger_election();
+                    // No known leader yet. OpenRaft runs its own election, so
+                    // wait briefly and re-read the control group's leader.
                     let (_, new_role, _, new_leader, _) = meta.role_info();
                     if new_role == RoleState::Leader {
                         return Ok(None);
@@ -1976,7 +1966,8 @@ async fn maybe_forward_write(
                     if response.code == 409
                         && String::from_utf8_lossy(&response.body).contains("not Raft leader") =>
                 {
-                    let _ = meta.trigger_election();
+                    // The control group's leader moved. OpenRaft elects on its
+                    // own; retry against the leader reported by the next read.
                     continue;
                 }
                 Ok(ok_tuple) => return Ok(Some((target_id, ok_tuple))),
@@ -1986,7 +1977,6 @@ async fn maybe_forward_write(
                     // reads and mutations, and a mutation that still cannot be
                     // forwarded is reported as not sent rather than unknown.
                     unsent = Some(e);
-                    let _ = meta.trigger_election();
                     let (_, new_role, _, _, _) = meta.role_info();
                     if new_role == RoleState::Leader {
                         return Ok(None);
@@ -2004,8 +1994,8 @@ async fn maybe_forward_write(
                             Some("unknown"),
                         ));
                     }
-                    // Read-only requests can safely trigger failover and retry.
-                    let _ = meta.trigger_election();
+                    // Read-only requests can safely retry against the leader
+                    // the control group reports next.
                     let (_, new_role, _, _, _) = meta.role_info();
                     if new_role == RoleState::Leader {
                         return Ok(None);
@@ -2347,8 +2337,8 @@ async fn handle_health(State(st): State<AppState>) -> impl IntoResponse {
     let (node_id, role, term, leader_id, commit_index) = st.meta.role_info();
     Json(serde_json::json!({
         "status": "ok",
-        "metadata_runtime": if st.meta.is_openraft() { "openraft" } else { "legacy" },
-        "role_scope": if st.meta.is_openraft() { "control_group; see /openraft/status for all groups" } else { "legacy" },
+        "metadata_runtime": if st.meta.is_openraft() { "openraft" } else { "single-node" },
+        "role_scope": if st.meta.is_openraft() { "control_group; see /openraft/status for all groups" } else { "single" },
         "production_ready": false,
         "node_id": node_id,
         "role": format!("{role:?}"),
@@ -2361,22 +2351,19 @@ async fn handle_health(State(st): State<AppState>) -> impl IntoResponse {
 }
 
 async fn handle_raft_status(State(st): State<AppState>) -> impl IntoResponse {
+    // `term` and `commit_index` are the control group's: every deployment has
+    // one, and a data group's term says nothing about the control plane. A
+    // single-node store has no term at all, so it reports `null` rather than a
+    // made-up number.
     let (node_id, role, term, leader_id, commit_index) = st.meta.role_info();
-    let (base_index, compaction_floor, wal_bytes) = st.meta.compaction_info().unwrap_or((0, 0, 0));
     Json(serde_json::json!({
-        "metadata_runtime": if st.meta.is_openraft() { "openraft" } else { "legacy" },
-        "role_scope": if st.meta.is_openraft() { "control_group; see /openraft/status for all groups" } else { "legacy" },
+        "metadata_runtime": if st.meta.is_openraft() { "openraft" } else { "single-node" },
         "production_ready": false,
         "node_id": node_id,
         "role": format!("{role:?}"),
-        "term": term,
+        "term": if st.meta.is_openraft() { Some(term) } else { None },
         "leader_id": leader_id,
         "commit_index": commit_index,
-        "revision": if st.meta.is_openraft() { None } else { Some(st.meta.revision()) },
-        "base_index": base_index,
-        "compaction_floor": compaction_floor,
-        "wal_bytes": wal_bytes,
-        "compaction_error": st.meta.compaction_error(),
     }))
 }
 
@@ -2385,7 +2372,6 @@ async fn handle_raft_status(State(st): State<AppState>) -> impl IntoResponse {
 /// The body names every local group, so a deployment that configured
 /// `--subject-secret` requires a verified signed subject. Without the secret no
 /// subject can be verified and the legacy open route is kept.
-#[cfg(feature = "openraft-storage")]
 async fn handle_openraft_status(State(st): State<AppState>, headers: HeaderMap) -> Response {
     if let Some(secret) = st.subject_secret.as_deref() {
         if verified_subject(&headers, Some(secret)).is_none() {
@@ -2404,7 +2390,6 @@ async fn handle_openraft_status(State(st): State<AppState>, headers: HeaderMap) 
     .into_response()
 }
 
-#[cfg(feature = "openraft-storage")]
 #[derive(Serialize)]
 struct FreshControlResponse {
     revision: u64,
@@ -2414,7 +2399,6 @@ struct FreshControlResponse {
 
 /// Internal, token-authenticated control snapshot. Only the control-group
 /// leader can answer because the read performs a quorum-confirmed barrier.
-#[cfg(feature = "openraft-storage")]
 async fn handle_internal_control_snapshot(
     State(st): State<AppState>,
     headers: HeaderMap,
@@ -2499,61 +2483,6 @@ fn raft_token_matches(headers: &axum::http::HeaderMap, expected: Option<&str>) -
         diff |= a ^ b;
     }
     diff == 0
-}
-
-async fn handle_raft_elect(State(st): State<AppState>, headers: axum::http::HeaderMap) -> Response {
-    if st.meta.is_openraft() {
-        return api_err(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "legacy Raft endpoint disabled in OpenRaft mode",
-        );
-    }
-    if !raft_token_matches(&headers, st.raft_token.as_deref()) {
-        return api_err(
-            StatusCode::UNAUTHORIZED,
-            "invalid or missing internal Raft token",
-        );
-    }
-    let meta = st.meta.clone();
-    let res = tokio::task::spawn_blocking(move || meta.trigger_election()).await;
-    match res {
-        Ok(Ok(role)) => {
-            let (node_id, _, term, leader_id, commit_index) = st.meta.role_info();
-            Json(serde_json::json!({
-                "node_id": node_id,
-                "role": format!("{role:?}"),
-                "term": term,
-                "leader_id": leader_id,
-                "commit_index": commit_index,
-            }))
-            .into_response()
-        }
-        Ok(Err(e)) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-        Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-    }
-}
-
-async fn handle_raft_rpc(
-    State(st): State<AppState>,
-    headers: axum::http::HeaderMap,
-    Json(rpc): Json<RaftRpc>,
-) -> Response {
-    if st.meta.is_openraft() {
-        return api_err(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "legacy Raft endpoint disabled in OpenRaft mode",
-        );
-    }
-    if !raft_token_matches(&headers, st.raft_token.as_deref()) {
-        return api_err(
-            StatusCode::UNAUTHORIZED,
-            "invalid or missing internal Raft token",
-        );
-    }
-    match st.meta.step_rpc(rpc) {
-        Ok(reply) => Json(reply).into_response(),
-        Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-    }
 }
 
 async fn handle_status(State(st): State<AppState>) -> impl IntoResponse {
@@ -7372,37 +7301,37 @@ async fn handle_pools_gc(State(st): State<AppState>, headers: HeaderMap) -> Resp
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
-    check_openraft_config(args.openraft_config.as_deref())
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-    let client_openraft = args.metadata_runtime == "openraft";
-    if client_openraft && args.openraft_config.is_none() {
-        return Err("--metadata-runtime openraft requires --openraft-config".into());
+    // `--metadata-runtime` is parsed and pinned to `openraft`; read it so the
+    // value is not silently ignored.
+    debug_assert_eq!(args.metadata_runtime, "openraft");
+    // Every requirement below is fail-closed: there is no default config, no
+    // fallback runtime, no auto-bootstrap and no retry.
+    if args.openraft_config.is_none() {
+        return Err("--openraft-config is required: OpenRaft is the metadata runtime".into());
     }
-    if client_openraft && !cfg!(feature = "openraft-storage") {
-        return Err("--metadata-runtime openraft requires openraft-storage feature".into());
+    if args.data_dir.is_none() {
+        return Err("--data-dir is required: OpenRaft needs an explicit new root".into());
     }
-    if client_openraft && args.data_dir.is_none() {
-        return Err("--metadata-runtime openraft requires an explicit new --data-dir".into());
-    }
-    if client_openraft && args.raft_token.as_deref().is_none_or(str::is_empty) {
+    if args.raft_token.as_deref().is_none_or(str::is_empty) {
         return Err(
-            "--metadata-runtime openraft requires a non-empty --raft-token (or YADB_RAFT_TOKEN)"
+            "--raft-token (or YADB_RAFT_TOKEN) is required and must be non-empty; the internal \
+             endpoints are unauthenticated without it"
                 .into(),
         );
     }
     // A control-plane mutation needs a proven subject and an allowlist. Fail
     // closed at startup instead of refusing every `/v1/apply` at runtime.
-    if client_openraft && args.admin_subject.is_empty() {
+    if args.admin_subject.is_empty() {
         return Err(
-            "--metadata-runtime openraft requires at least one --admin-subject; an empty \
-             allowlist would refuse every control-plane mutation"
+            "--admin-subject is required: an empty allowlist would refuse every control-plane \
+             mutation"
                 .into(),
         );
     }
     if args.admin_subject.iter().any(|s| s.trim().is_empty()) {
         return Err("--admin-subject must not contain empty entries".into());
     }
-    if !args.admin_subject.is_empty() && args.subject_secret.as_deref().is_none_or(str::is_empty) {
+    if args.subject_secret.as_deref().is_none_or(str::is_empty) {
         return Err(
             "--admin-subject requires a non-empty --subject-secret (or YADB_SUBJECT_SECRET) to \
              verify signed subjects"
@@ -7412,29 +7341,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let data_dir = args.data_dir.clone().unwrap_or_else(|| {
         PathBuf::from("/data/data/com.foxdebug.acodefree/cache/opencode/yadbd-data")
     });
-    if !client_openraft
-        && (data_dir.join(".yadb-openraft-runtime.json").exists()
-            || data_dir.join(".yadb-openraft-runtime.pending").exists())
-    {
-        return Err("legacy metadata runtime refuses an OpenRaft-marked data directory".into());
-    }
-    #[cfg(feature = "openraft-storage")]
-    let prepared = if client_openraft {
-        None
-    } else {
-        args.openraft_config
-            .as_deref()
-            .map(openraft::prepare)
-            .transpose()?
-    };
-    #[cfg(feature = "openraft-storage")]
-    let prepared_multi = if client_openraft {
-        Some(openraft::prepare_multi(
-            args.openraft_config.as_deref().unwrap(),
-        )?)
-    } else {
-        None
-    };
+    let prepared_multi = openraft::prepare_multi(args.openraft_config.as_deref().unwrap())?;
     let enabled =
         args.pg_listen.is_some() || args.iscsi_listen.is_some() || args.s3_listen.is_some();
     let credentials = if enabled {
@@ -7446,77 +7353,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         protocols::Credentials::default()
     };
-    #[cfg(feature = "openraft-storage")]
-    let public_peers = if client_openraft {
-        Some(
-            parse_peer_map(
-                args.peers
-                    .as_deref()
-                    .ok_or("--peers public HTTP map required for OpenRaft")?,
-            )
-            .map_err(std::io::Error::other)?,
-        )
-    } else {
-        None
-    };
-    #[cfg(feature = "openraft-storage")]
-    if let Some(peers) = &public_peers {
-        prepared_multi.as_ref().unwrap().validate_client_root(
-            &data_dir,
-            args.node_id,
-            peers,
-            &args.listen,
-        )?;
-    }
+    let public_peers = parse_peer_map(
+        args.peers
+            .as_deref()
+            .ok_or("--peers public HTTP map required for OpenRaft")?,
+    )
+    .map_err(std::io::Error::other)?;
+    prepared_multi.validate_client_root(&data_dir, args.node_id, &public_peers, &args.listen)?;
     let listener = tokio::net::TcpListener::bind(&args.listen).await?;
-    #[cfg(feature = "openraft-storage")]
-    let _client_root_owner = if client_openraft {
-        Some(
-            prepared_multi
-                .as_ref()
-                .unwrap()
-                .provision_client_root(&data_dir, public_peers.as_ref().unwrap())?,
-        )
-    } else {
-        None
-    };
-    #[cfg(feature = "openraft-storage")]
-    let mut raft_owner = if let Some(prepared) = prepared_multi {
-        Some(openraft::Owner::Multi(prepared.start().await?))
-    } else if let Some(prepared) = prepared {
-        Some(openraft::Owner::Single(prepared.start().await?))
-    } else {
-        None
-    };
+    let _client_root_owner = prepared_multi.provision_client_root(&data_dir, &public_peers)?;
+    let mut raft_owner = openraft::Owner::Multi(prepared_multi.start().await?);
     let result: Result<(), Box<dyn std::error::Error>> = async {
     let fs = OsFs::new(&data_dir)?;
 
-    #[cfg(feature = "openraft-storage")]
-    let meta = if client_openraft {
-        raft_owner.as_ref().unwrap().metadata(public_peers.clone().unwrap())?
-    } else if let Some(peers_raw) = &args.peers {
-        let peer_map = parse_peer_map(peers_raw).map_err(std::io::Error::other)?;
-        let token = args.raft_token.clone().filter(|t| !t.is_empty()).ok_or(
-            "--raft-token (or YADB_RAFT_TOKEN) is required and must be non-empty with --peers",
-        )?;
-        LocalMetaKv::open_clustered_with_token(&fs, "metakv", args.node_id, peer_map, token)?
-    } else { LocalMetaKv::open_single_node(&fs, "metakv", args.node_id)? };
-    #[cfg(not(feature = "openraft-storage"))]
-    let meta = if let Some(peers_raw) = &args.peers {
-        let peer_map = parse_peer_map(peers_raw)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-        // Fail closed: a clustered node without the internal token would
-        // expose an unauthenticated Raft endpoint to every client.
-        let token = args.raft_token.clone().filter(|t| !t.is_empty()).ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "--raft-token (or YADB_RAFT_TOKEN) is required and must be non-empty with --peers",
-            )
-        })?;
-        LocalMetaKv::open_clustered_with_token(&fs, "metakv", args.node_id, peer_map, token)?
-    } else {
-        LocalMetaKv::open_single_node(&fs, "metakv", args.node_id)?
-    };
+    let meta = raft_owner.metadata(public_peers.clone())?;
 
     // Subscribe first so an apply concurrent with the initial read is queued.
     let watch_rx = meta.watch_prefix(CONTROL_STATE_KEY);
@@ -7531,8 +7381,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let block = BlockVolumeEngine::new(meta.clone(), DEFAULT_BLOCK_SIZE);
 
     let state = AppState {
-        #[cfg(feature = "openraft-storage")]
-        openraft: raft_owner.as_ref().map(|group| group.status()),
+        openraft: Some(raft_owner.status()),
         listen_addr: args.listen.clone(),
         fs,
         meta: meta.clone(),
@@ -7578,34 +7427,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // Periodic Raft leader heartbeat, automatic follower election timeout & Self-Healing VDisk Scrubber
-    if args.peers.is_some() && !client_openraft {
-        let hb_meta = meta.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_millis(200));
-            loop {
-                interval.tick().await;
-                let m = hb_meta.clone();
-                let _ = tokio::task::spawn_blocking(move || m.broadcast_heartbeat()).await;
-            }
-        });
-
-        let elect_meta = meta.clone();
-        let node_id = args.node_id;
-        tokio::spawn(async move {
-            let mut tick_no: u64 = 0;
-            let mut interval = tokio::time::interval(Duration::from_millis(150));
-            loop {
-                interval.tick().await;
-                tick_no = tick_no.wrapping_add(1);
-                let jitter_ms = ((node_id as u64).wrapping_mul(193).wrapping_add(tick_no * 37)) % 450;
-                let timeout = Duration::from_millis(850 + jitter_ms);
-                let m = elect_meta.clone();
-                let _ = tokio::task::spawn_blocking(move || m.check_election_timeout(timeout)).await;
-            }
-        });
-
-    }
+    // Self-Healing VDisk scrubber. OpenRaft owns elections and heartbeats; a
+    // node only sweeps while its control group believes it is the leader.
     if args.peers.is_some() {
         let scrub_state = state.clone();
         tokio::spawn(async move {
@@ -7683,8 +7506,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/ui", get(handle_ui))
         .route("/healthz", get(handle_health))
         .route("/raft/status", get(handle_raft_status))
-        .route("/raft/elect", post(handle_raft_elect))
-        .route("/raft/rpc", post(handle_raft_rpc))
         .route("/v1/sample-yaml", get(handle_sample_yaml))
         .route("/v1/status", get(handle_status))
         .route("/v1/plan", post(handle_plan))
@@ -7729,7 +7550,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .layer(axum::extract::DefaultBodyLimit::max(16 * 1024 * 1024))
         ;
-    #[cfg(feature = "openraft-storage")]
     let app = app
         .route(
             "/openraft/status",
@@ -7745,37 +7565,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "yadbd node {} listening on http://{} (data={:?}, generation={})",
         args.node_id, args.listen, data_dir, recovered_cp.generation
     );
-    #[cfg(feature = "openraft-storage")]
     {
-        let result = if let Some(group) = raft_owner.as_mut() {
-            tokio::select! {
-                result = axum::serve(listener, app) => result,
-                result = tokio::signal::ctrl_c() => result,
-                result = group.listener_finished() => Err(std::io::Error::other(format!("OpenRaft listener stopped: {result}"))),
-            }
-        } else {
-            tokio::select! {
-                result = axum::serve(listener, app) => result,
-                result = tokio::signal::ctrl_c() => result,
-            }
+        let result = tokio::select! {
+            result = axum::serve(listener, app) => result,
+            result = tokio::signal::ctrl_c() => result,
+            result = raft_owner.listener_finished() => Err(std::io::Error::other(format!("OpenRaft listener stopped: {result}"))),
         };
-        let _ = watch_stop.send(());
-        let _ = watch_thread.join();
-        result?;
-    }
-    #[cfg(not(feature = "openraft-storage"))]
-    {
-        let result = axum::serve(listener, app).await;
         let _ = watch_stop.send(());
         let _ = watch_thread.join();
         result?;
     }
     Ok(())
     }.await;
-    #[cfg(feature = "openraft-storage")]
-    if let Some(group) = raft_owner.as_mut() {
-        group.shutdown().await?;
-    }
+    raft_owner.shutdown().await?;
     result
 }
 
@@ -8344,18 +8146,6 @@ mod security_tests {
     }
 
     #[test]
-    fn openraft_config_fails_closed() {
-        assert!(check_openraft_config(None).is_ok());
-        if cfg!(feature = "openraft-storage") {
-            assert!(check_openraft_config(Some(std::path::Path::new("config.json"))).is_ok());
-        } else {
-            let error =
-                check_openraft_config(Some(std::path::Path::new("config.json"))).unwrap_err();
-            assert!(error.contains("requires the openraft-storage feature"));
-        }
-    }
-
-    #[test]
     fn resolve_refuses_capacity_as_unknown_not_as_a_quota_status() {
         // `resolve` must never answer with something a client cannot classify:
         // the three documented shapes are committed / not_committed / unknown,
@@ -8455,7 +8245,6 @@ mod security_tests {
         let fs = OsFs::new(&dir).unwrap();
         let meta = LocalMetaKv::open_single_node(&fs, "meta", 1).unwrap();
         let mut st = AppState {
-            #[cfg(feature = "openraft-storage")]
             openraft: None,
             listen_addr: "127.0.0.1:0".into(),
             fs,
@@ -8978,7 +8767,6 @@ mod security_tests {
         let block = BlockVolumeEngine::new(meta.clone(), DEFAULT_BLOCK_SIZE);
         block.register_pool("data", pool.clone());
         let state = AppState {
-            #[cfg(feature = "openraft-storage")]
             openraft: None,
             listen_addr: "127.0.0.1:0".into(),
             fs,
@@ -9839,5 +9627,158 @@ mod security_tests {
 
         // No conditional headers at all.
         assert!(passed(&[]));
+    }
+}
+
+/// `/raft/status` must answer from the control group in OpenRaft mode. This
+/// runs a real single-node OpenRaft group so the response is the same one the
+/// daemon serves, not a hand-built fixture.
+#[cfg(test)]
+mod raft_status_tests {
+    use super::*;
+    use ::openraft::error::{
+        Fatal, RPCError, RaftError, ReplicationClosed, StreamingError, Unreachable,
+    };
+    use ::openraft::network::RPCOption;
+    use ::openraft::raft::{
+        AppendEntriesRequest, AppendEntriesResponse, SnapshotResponse, VoteRequest, VoteResponse,
+    };
+    use ::openraft::{BasicNode, RaftNetwork, RaftNetworkFactory, Snapshot, Vote};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use yadb_metakv::multiraft::{GroupIdentity, ReplicaIdentity};
+    use yadb_metakv::openraft_runtime::{YadbRaft, YadbRaftTypeConfig as C};
+    use yadb_metakv::openraft_state_machine::DurableMetaStateMachine;
+    use yadb_metakv::openraft_storage::DurableOpenRaftLog;
+
+    /// A single-node group never calls its network.
+    struct NoNetwork;
+    impl RaftNetworkFactory<C> for NoNetwork {
+        type Network = NoNetwork;
+        async fn new_client(&mut self, _: u32, _: &BasicNode) -> NoNetwork {
+            NoNetwork
+        }
+    }
+    impl RaftNetwork<C> for NoNetwork {
+        async fn append_entries(
+            &mut self,
+            _: AppendEntriesRequest<C>,
+            _: RPCOption,
+        ) -> Result<AppendEntriesResponse<u32>, RPCError<u32, BasicNode, RaftError<u32>>> {
+            Err(Unreachable::new(&std::io::Error::other("singleton")).into())
+        }
+        async fn vote(
+            &mut self,
+            _: VoteRequest<u32>,
+            _: RPCOption,
+        ) -> Result<VoteResponse<u32>, RPCError<u32, BasicNode, RaftError<u32>>> {
+            Err(Unreachable::new(&std::io::Error::other("singleton")).into())
+        }
+        async fn full_snapshot(
+            &mut self,
+            _: Vote<u32>,
+            _: Snapshot<C>,
+            _: impl std::future::Future<Output = ReplicationClosed> + Send + 'static,
+            _: RPCOption,
+        ) -> Result<SnapshotResponse<u32>, StreamingError<C, Fatal<u32>>> {
+            Err(Unreachable::new(&std::io::Error::other("singleton")).into())
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn raft_status_reports_the_control_group_in_openraft_mode() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("yadb-raft-status-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let identity = ReplicaIdentity::new(
+            GroupIdentity {
+                cluster: [91; 16],
+                group: 1,
+                incarnation: 1,
+            },
+            1,
+            vec![1],
+        )
+        .unwrap();
+        let log = DurableOpenRaftLog::create(dir.join("log"), &identity).unwrap();
+        let state = DurableMetaStateMachine::create(dir.join("state"), &identity).unwrap();
+        let config = Arc::new(::openraft::Config::default().validate().unwrap());
+        let raft = YadbRaft::new(1, config, NoNetwork, log, state.clone())
+            .await
+            .unwrap();
+        raft.initialize(BTreeMap::from([(1, BasicNode::new("one"))]))
+            .await
+            .unwrap();
+        raft.wait(Some(Duration::from_secs(5)))
+            .current_leader(1, "leader")
+            .await
+            .unwrap();
+        let meta = LocalMetaKv::from_openraft(
+            raft.clone(),
+            state,
+            BTreeMap::from([(1, "127.0.0.1:1".to_string())]),
+            tokio::runtime::Handle::current(),
+        );
+        let fs = OsFs::new(&dir).unwrap();
+        let st = AppState {
+            openraft: None,
+            listen_addr: "127.0.0.1:0".into(),
+            fs,
+            meta: meta.clone(),
+            raft_token: Some("secret".into()),
+            subject_secret: None,
+            admin_subjects: vec![],
+            control: Arc::new(RwLock::new(ControlPlaneState::new())),
+            control_refresh: Arc::new(std::sync::Mutex::new(())),
+            control_freshness: Arc::new(std::sync::Mutex::new(ControlFreshness::default())),
+            pools: Arc::new(RwLock::new(BTreeMap::new())),
+            local_vdisks: Arc::new(RwLock::new(BTreeMap::new())),
+            last_scrub: Arc::new(RwLock::new(None)),
+            reader_lease: Arc::new(std::sync::Mutex::new(None)),
+            s3: ObjectStoreEngine::new(meta.clone(), 4096),
+            db: DatabaseEngine::new(meta.clone(), 100),
+            block: BlockVolumeEngine::new(meta.clone(), DEFAULT_BLOCK_SIZE),
+        };
+
+        let response = handle_raft_status(State(st)).await.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        println!("{}", String::from_utf8_lossy(&body));
+
+        assert_eq!(json["metadata_runtime"], "openraft");
+        assert_eq!(json["production_ready"], false);
+        assert_eq!(json["node_id"], 1);
+        assert!(json["role"].is_string());
+        assert!(json["term"].is_u64());
+        assert!(json["leader_id"].is_u64());
+        assert!(json["commit_index"].is_u64());
+        // Exactly the documented keys: no compaction or WAL bookkeeping that
+        // this runtime cannot answer honestly.
+        assert_eq!(
+            json.as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![
+                "commit_index",
+                "leader_id",
+                "metadata_runtime",
+                "node_id",
+                "production_ready",
+                "role",
+                "term"
+            ]
+        );
+
+        raft.shutdown().await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

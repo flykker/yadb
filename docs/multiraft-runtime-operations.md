@@ -87,17 +87,16 @@ current status). The
 version-1 standalone interface below remains observational, not a client-routing
 configuration.
 
-The daemon's `openraft-storage` build feature forwards the MetaKV
-`openraft-storage` feature. `--openraft-config <path>` is rejected before
-data initialization when the feature is absent. These names previously carried an
+The daemon's `openraft-storage` build feature is a retained no-op: the OpenRaft
+adapters are always compiled in and there is no other metadata runtime, so an
+invocation that still passes `--features openraft-storage` keeps working and one
+that omits it is not weaker. `--openraft-config <path>` is mandatory and must
+name a version-2 multi-group manifest. These names previously carried an
 `experimental` prefix; the old spellings (`--experimental-openraft-config`, the
 `experimental-openraft-storage` feature and `/experimental/openraft/status`) are no
-longer accepted, so an existing invocation must be updated before it can start a
-daemon. In legacy mode the version-1
-configuration starts one isolated observational group on a dedicated mandatory-mTLS
-listener while legacy MetaKV serves clients. The in-progress v2 client mode instead
-uses one dedicated listener per group and does not create a legacy MetaKV WAL or
-fall back to legacy on failure.
+longer accepted. There is no version-1 single-group daemon mode and no fallback:
+the daemon creates one dedicated mTLS listener per group and never creates a
+single-node metadata WAL.
 
 OpenRaft `consistent=true` block reads are supported: the extent map is read
 through a quorum-confirmed snapshot on the project-group leader and the blobs it
@@ -146,13 +145,13 @@ group uses `initialize: true`; restart every group with `mode: "open", initializ
 readiness/cutover authority. When the daemon runs with `--subject-secret` the
 route requires a verified signed subject (`x-yadb-subject` together with a valid
 `x-yadb-subject-signature`) and returns `401` otherwise; without a configured
-secret no subject can be verified, so the route stays open like the other legacy
-fallbacks. It reports
-`production_ready: false`; client traffic is labeled legacy for observational v1
-and multiraft for v2 client mode. Group node/state/term/leader are cached local
-observations. Metrics, authenticated operator controls and daemon integration
-validation remain incomplete. Protect the public diagnostics listener according to
-the deployment's existing access policy.
+secret no subject can be verified, so the route stays open. `--subject-secret` is
+mandatory, so in a supported deployment the route is always authenticated. It
+reports `production_ready: false`; `client_traffic` is `multiraft` for the
+multi-group owner and `single-group` for a single-group one. Group node/state/term/
+leader are cached local observations. Metrics, authenticated operator controls and
+daemon integration validation remain incomplete. Protect the public diagnostics
+listener according to the deployment's existing access policy.
 
 ## Provision storage before starting
 
@@ -165,13 +164,13 @@ the current ownership contract.
 `scripts/yadb-openraft-dev.py` does this provisioning for a disposable
 three-process cluster: `prepare` writes credentials, per-node group configs and
 the version-2 manifests, and `start` refuses to reuse a root that holds node data
-without a matching `state.json`. Use it instead of hand-writing a root when you
+without a matching `state.json`. Use it when you
 need the PostgreSQL, S3 and iSCSI frontends as well; `scripts/yadb-local.py`
-remains the legacy/default launcher.
+provisions a Multi-Raft cluster without the client protocol listeners.
 
-Reads on Multi-Raft do **not** take the legacy GC reader lease. Collection is
+Reads on Multi-Raft do **not** take the single-namespace GC reader lease. Collection is
 refused there, so there is no pass to fence against, and the lease record's
-`revision` is a legacy-only value that multi-group metadata cannot supply
+`revision` is a single-namespace value that multi-group metadata cannot supply
 (`LocalMetaKv::revision()` asserts). The SQL, block and S3 read paths therefore
 skip the lease when `meta.is_openraft()`, and a plain (non-`consistent=true`)
 read is served from the locally applied view.
@@ -300,7 +299,7 @@ file/directory sync errors poison the store until validated reopen. These limits
 can stop an overloaded group and are not a substitute for capacity planning,
 backpressure, multi-group isolation or supported-host durability tests.
 
-The legacy metadata WAL distinguishes a torn tail from damage. A frame is
+The single-node metadata WAL distinguishes a torn tail from damage. A frame is
 truncated only when it provably runs past the end of the file: fewer bytes remain
 than a header needs, a short read at EOF, or a declared length past EOF. A
 complete frame with a bad magic, a bad header or payload checksum, or a payload
@@ -365,7 +364,7 @@ cannot span groups; projects sharing a group therefore share one budget. Resolve
 takes `{"scope":"control","key":…}` or
 `{"scope":"project","project":…,"key":…}`; a control resolve needs an admin
 subject, a project resolve needs `readWrite` on that project. SQL, S3 and block PUT
-reject a key with 501, as does every keyed write on the legacy runtime.
+reject a key with 501, as does every keyed write on a single-node metadata store.
 Admission for control is bounded by a replicated counter
 (`/sys/idempotency/_usage`, `10_000` records or `8 MiB`, committed in the same
 `RevisionTxn`), which refuses with `429` before planning; the project counter has

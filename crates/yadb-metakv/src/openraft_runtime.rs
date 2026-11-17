@@ -4,10 +4,11 @@
 //! commit, membership and snapshot protocol. YADB owns the group identity,
 //! storage implementation, state machine and transport routing around it.
 //!
-//! The legacy `RaftCore` and the
+//! The removed legacy `RaftCore` and the
 //! `DeterministicGroupCore` prototype are not silently adapted to OpenRaft: their WAL and
-//! RPC formats are incompatible with OpenRaft's storage contracts. Durable
-//! owners, a registry and authenticated transport remain opt-in.
+//! RPC formats are incompatible with OpenRaft's storage contracts. OpenRaft is
+//! the only clustered metadata runtime; its durable owners, registry and
+//! authenticated transport are always compiled in.
 
 use std::io::Cursor;
 
@@ -30,7 +31,6 @@ pub type YadbRaft = openraft::Raft<YadbRaftTypeConfig>;
 
 /// Owner for one persistent replica. Network configuration and
 /// migration remain separate responsibilities; daemon integration is opt-in.
-#[cfg(any(test, feature = "openraft-storage"))]
 pub mod persistent {
     use super::{ReplicaIdentity, YadbRaft, YadbRaftTypeConfig};
     use crate::{
@@ -211,7 +211,6 @@ pub mod persistent {
 
 /// In-process group ownership. This does not route network
 /// traffic, enforce per-group memory/disk limits, or provide daemon lifecycle.
-#[cfg(any(test, feature = "openraft-storage"))]
 pub mod registry {
     use super::{
         persistent::{PersistentGroup, StartError},

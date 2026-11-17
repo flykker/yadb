@@ -576,52 +576,63 @@ block writes (501), and the record set has no quota yet.
 
 ## Local dev cluster
 
-`scripts/yadb-dev.py` starts a persistent three-node **legacy-runtime** cluster on
-loopback with the PostgreSQL, S3 and iSCSI listeners enabled, so real clients can be
-used against it. It is separate from `scripts/yadb-local.py`, which provisions an
-OpenRaft-only cluster with no client protocols. Build the daemon once, then:
+`scripts/yadb-openraft-dev.py` starts a persistent three-node OpenRaft Multi-Raft
+cluster on loopback — one control group plus two data groups, three replicas each,
+with mandatory mutual TLS between replicas — and enables the PostgreSQL, S3 and
+iSCSI listeners so real clients can be used against it. It is the only cluster
+launcher, because the daemon has no other metadata runtime. It never wipes a data
+directory, never changes daemon defaults, never retries an ambiguous mutation and
+never switches an existing root.
+
+Build the daemon once (`cargo build -p yadbd --offline --locked -j 2`; the
+`openraft-storage` feature is a no-op, so it is neither needed nor harmful), then:
 
 ```bash
-cargo build -p yadbd --offline --locked -j 2
+# optional: provision a fresh root without starting it
+python3 scripts/yadb-openraft-dev.py prepare
 
-# First start also applies examples/platform.yaml and prints every endpoint,
+# First start also applies examples/platform.yaml (signed) and prints every endpoint,
 # the credentials path and the generated password.
-python3 scripts/yadb-dev.py start
-python3 scripts/yadb-dev.py status      # compares state.json with live PIDs and ports
-python3 scripts/yadb-dev.py logs --lines 50
+python3 scripts/yadb-openraft-dev.py start
+python3 scripts/yadb-openraft-dev.py status   # compares state.json with live PIDs and ports
+python3 scripts/yadb-openraft-dev.py logs --lines 50
 
-# stop and start again: same data dirs, peers and Raft token; manifests are not re-applied
-python3 scripts/yadb-dev.py stop
-python3 scripts/yadb-dev.py start
+# stop and start again: same data dirs; manifests are not re-applied
+python3 scripts/yadb-openraft-dev.py stop
+python3 scripts/yadb-openraft-dev.py start
+
+# A control-plane change must be signed, so use apply rather than an unsigned curl.
+python3 scripts/yadb-openraft-dev.py apply examples/platform.yaml
 ```
 
-Ports derive from one `--port-base` (default `18000`): HTTP `base+0..2`, PostgreSQL
-`base+100..102`, S3 `base+200..202`, iSCSI `base+300..302`. The base is recorded in
+Ports derive from one `--port-base` (default `23500`): HTTP `base+0..2`, PostgreSQL
+`base+200..202`, S3 `base+300..302`, iSCSI `base+400..402`. The base is recorded in
 `state.json` on first start and must be reused for that root; use a new `--root` for a
 second cluster. The default root is
-`/data/data/com.foxdebug.acodefree/cache/opencode/yadb-dev`. Start refuses if any
-derived port is bound, if state says running and the PIDs are alive, or if a recorded
-process is missing; the last case needs an explicit `--force`. It never wipes data,
-never re-initialises an existing directory and never retries an `apply` whose outcome
-is unknown. Credentials live in `<root>/credentials.json` (mode 0600, user `backend`,
-database `billing/ledger`); the legacy runtime needs no `--admin-subject`, so
-`/v1/apply` keeps its historical loopback behaviour.
+`/data/data/com.foxdebug.acodefree/cache/opencode/yadb-openraft-dev`. Start refuses if
+any derived port is bound, if state says running and the PIDs are alive, or if a
+recorded process is missing; the last case needs an explicit `--force`. It never
+wipes data, never re-initialises an existing directory and never retries an `apply`
+whose outcome is unknown. Credentials live in `<root>/credentials.json` (mode 0600,
+user `backend`, database `billing/ledger`); `--admin-subject` and `--subject-secret`
+are mandatory, so `/v1/apply` has to be signed and the launcher's `apply` subcommand
+is the supported way to do it.
 
 ```bash
 # psql, including the extended protocol (\bind)
 PGPASSWORD=<printed password> PGSSLMODE=disable \
-  psql -h 127.0.0.1 -p 18100 -U backend -d billing/ledger -c 'SELECT 1;'
+  psql -h 127.0.0.1 -p 23700 -U backend -d billing/ledger -c 'SELECT 1;'
 printf 'SELECT id FROM t WHERE id = $1 \\bind 1 \\g\n' | \
   PGPASSWORD=<printed password> PGSSLMODE=disable \
-  psql -h 127.0.0.1 -p 18100 -U backend -d billing/ledger
+  psql -h 127.0.0.1 -p 23700 -U backend -d billing/ledger
 
 # AWS CLI (path-style addressing is required)
 AWS_ACCESS_KEY_ID=backend AWS_SECRET_ACCESS_KEY=<printed password> \
 AWS_DEFAULT_REGION=us-east-1 AWS_EC2_METADATA_DISABLED=true \
-  aws --endpoint-url http://127.0.0.1:18200 s3 cp ./file s3://invoices-2026/dev/file
+  aws --endpoint-url http://127.0.0.1:23800 s3 cp ./file s3://invoices-2026/dev/file
 ```
 
-The iSCSI target is `iqn.2026-11.io.yadb:billing:vm-root` on `base+300..302` with
+The iSCSI target is `iqn.2026-11.io.yadb:billing:vm-root` on `base+400..402` with
 CHAP user `backend`; discovery advertises all three portals. These listeners are
 cleartext on loopback: keep them local and treat the whole root as secret.
 
@@ -643,7 +654,7 @@ runs one collection pass and returns `blobs_live`, `fragments_deleted`,
 while any node is reading, so wait about 30 s after the last query:
 
 ```bash
-curl -s -X POST http://127.0.0.1:18000/v1/pools/gc
+curl -s -X POST http://127.0.0.1:23500/v1/pools/gc
 ```
 
 While a pass runs, reads and writes are refused with `503` instead of being

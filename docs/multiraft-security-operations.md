@@ -137,8 +137,9 @@ reload or a dual-key epoch. Therefore **no safe rolling rotation is promised**.
    copies of the previous configuration under secret-management policy.
 2. Quiesce clients of any separately authorized new-empty-test Multi-Raft cluster,
    then stop its listeners and await all handler and Raft shutdowns on every peer.
-   Existing production deployments remain on legacy Raft. Do not redirect test
-   clients to legacy as a rollback after OpenRaft writes: legacy lacks those writes.
+   There is no legacy Raft runtime any more, so a rollback to it is not merely
+   discouraged: it does not exist. The previous configuration must therefore be
+   kept recoverable for its own sake, not as a fallback path.
 3. Provision all new CA chains, leaf pins, names, envelope public keys and local
    secrets consistently. Do not change replica identity, voters or data paths.
 4. Validate every peer's configuration offline, including local certificate/key

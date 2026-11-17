@@ -194,7 +194,8 @@ with a different range or a byte-different JSON body of the same range returns
 `committed` from the project group; a fenced key returns `not_committed` and a
 later keyed UNMAP with it returns 409 `idempotency_key_fenced`; a control payload
 carrying `project`, a project payload without it, and an unknown scope all return
-400. The legacy runtime refuses a keyed UNMAP with 501.
+400. A keyed write on the single-node metadata store is refused with 501,
+because that store keeps no record namespace; the daemon never runs on it.
 
 Block write and S3 PUT/DELETE share the same contract and the same record
 namespace and counter, but their evidence is in-process only. Block write
@@ -2043,6 +2044,11 @@ leader->follower direction once the proposal has been relayed, which is what
 survives exactly or is absent — never a different value.
 
 ### Live three-node drill (legacy runtime, ports 18000-18300)
+
+Historical record. The legacy runtime and `scripts/yadb-dev.py` no longer exist:
+OpenRaft is the only metadata runtime and `scripts/yadb-openraft-dev.py` is the
+only cluster launcher. The drill below documents what that runtime did, and is
+not a procedure that can be repeated today.
 
 `scripts/yadb-dev.py start` on a fresh root with `examples/platform.yaml`
 (three mounts per node, `handoffSlots: 3`), then:
