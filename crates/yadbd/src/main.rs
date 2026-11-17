@@ -820,9 +820,7 @@ impl AppState {
     /// fence rules as [`Self::scrub_all_pools`]; a refusal is returned to the
     /// caller as an error response, not hidden in a 200 body.
     ///
-    /// On Multi-Raft this is a per-group pass: each group is swept by its own
-    /// leader under its own collector lease, and a group that cannot prove its
-    /// fence is refused with its reason in the outcome.
+    /// Multi-Raft collection is temporarily refused until its fencing is safe.
     fn gc_all_pools(&self) -> gc::SweepOutcome {
         let control = self.control.read().unwrap().clone();
         let pools = self.pools.read().unwrap().clone();
@@ -844,9 +842,8 @@ impl AppState {
         // scan to know which blobs should exist.
         if self.meta.is_openraft() {
             // The global repair scan needs one whole-deployment view, which
-            // Multi-Raft does not have. The collection pass does not: it runs
-            // per group under that group's leader and collector lease, so it
-            // still reclaims garbage. Only the repair half is refused here.
+            // Multi-Raft does not have. Collection also refuses until its
+            // lease fencing is safe.
             let sweep_outcome = if sweep {
                 let control = self.control.read().unwrap().clone();
                 let pools = self.pools.read().unwrap().clone();
@@ -7265,7 +7262,16 @@ async fn handle_pools_scrub(State(st): State<AppState>, headers: HeaderMap) -> R
     let st_clone = st.clone();
     let res = tokio::task::spawn_blocking(move || st_clone.scrub_all_pools(true)).await;
     match res {
-        Ok(summary) => Json(summary).into_response(),
+        Ok(summary) => {
+            // Preserve legacy scrub responses; Multi-Raft cannot perform either
+            // repair or collection, so do not report a successful manual run.
+            let status = if st.meta.is_openraft() {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::OK
+            };
+            (status, Json(summary)).into_response()
+        }
         Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }
@@ -7447,8 +7453,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         last_sweep = std::time::Instant::now();
                     }
                     let st = scrub_state.clone();
-                    let _ =
-                        tokio::task::spawn_blocking(move || st.scrub_all_pools(due)).await;
+                    match tokio::task::spawn_blocking(move || st.scrub_all_pools(due)).await {
+                        Ok(summary) if due => {
+                            if let Some(reason) = summary.gc_refusal {
+                                eprintln!("background garbage collection: {reason}");
+                            }
+                        }
+                        Err(error) => eprintln!("background scrub failed: {error}"),
+                        _ => {}
+                    }
                 }
             }
         });

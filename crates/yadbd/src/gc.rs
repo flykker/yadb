@@ -13,8 +13,7 @@
 //!    for the whole pass, not just at one instant.
 //! 2. **Fence.** On legacy metadata, read every live reader/writer lease and reap
 //!    expired ones; any live lease means a read or write is in flight, so the
-//!    pass refuses and deletes nothing. On Multi-Raft the same fence is applied
-//!    per group (see below).
+//!    pass refuses and deletes nothing.
 //! 3. **Collector lease.** Publish a durable collector record so a second pass
 //!    cannot interleave its mark and sweep phases with this one, and so no new
 //!    reader or writer can be admitted until the pass is done. The record is
@@ -37,19 +36,9 @@
 //! 7. **Compact.** Seal a wasteful active segment and compact sealed ones, so the
 //!    bytes the barrier/tombstone freed are actually returned to the filesystem.
 //!
-//! **Multi-Raft.** There is one metadata group per project and no atomic
-//! cross-group snapshot, so the pass runs once per group instead of once for the
-//! whole deployment. Cross-group references are impossible (a fragment id
-//! carries its project id, a manifest only names fragments of its own project,
-//! and a project maps to exactly one group), so a pass that marks one group
-//! cannot orphan another group's fragments. For each group the pass must be that
-//! group's leader, take a quorum-confirmed (`ensure_linearizable`) snapshot of
-//! it, and hold its own collector lease (`/gc/g<group>/collector`); otherwise it
-//! refuses that group and deletes nothing for it. Writer leases live in the same
-//! group (`/gc/g<group>/writer/<id>`), and an unexpired S3 `Prepared` intent is
-//! part of the mark. A group that is not led by this node, whose snapshot fails,
-//! or whose fence cannot be read is refused with an explicit reason; other groups
-//! are unaffected.
+//! **Multi-Raft.** Collection is disabled: a writer can renew an expired lease
+//! during a pass, and a collector RPC can continue after the collector lease
+//! expires. Per-group snapshots and lease checks do not close those races.
 //!
 //! Crash safety comes from the order, not from atomicity: the fence and the
 //! barrier/tombstone records are durable before any byte is freed, and every step
@@ -132,19 +121,21 @@ impl SweepOutcome {
 /// A mark set plus the pool each reference names.
 type MarkSet = BTreeSet<(String, BlobId)>;
 
+pub const MULTIRAFT_GC_REFUSAL: &str = "garbage collection refused: mark-and-sweep disabled for Multi-Raft; writer leases can renew after expiry and collector RPCs can outlive their lease";
+
 pub fn sweep(
     meta: &LocalMetaKv<OsFs>,
     pools: &BTreeMap<String, std::sync::Arc<PoolStriper<OsFs>>>,
     control: &ControlPlaneState,
 ) -> SweepOutcome {
     if meta.is_openraft() {
-        return sweep_groups(meta, pools, control);
+        return SweepOutcome::refuse(MULTIRAFT_GC_REFUSAL);
     }
     sweep_legacy(meta, pools, control)
 }
 
 /// The single-namespace pass used by legacy metadata. Its behaviour, keys and
-/// ordering are unchanged; Multi-Raft uses [`sweep_groups`].
+/// ordering are unchanged; Multi-Raft collection is temporarily disabled.
 fn sweep_legacy(
     meta: &LocalMetaKv<OsFs>,
     pools: &BTreeMap<String, std::sync::Arc<PoolStriper<OsFs>>>,
@@ -336,6 +327,7 @@ fn sweep_legacy(
 /// fragments it holds, and a pool that cannot answer is refused for every group.
 /// The mark and the deletion are per group, and each group's fragments are the
 /// ones whose project id that group owns.
+#[allow(dead_code)] // Retained temporarily, unreachable while Multi-Raft GC is disabled.
 fn sweep_groups(
     meta: &LocalMetaKv<OsFs>,
     pools: &BTreeMap<String, std::sync::Arc<PoolStriper<OsFs>>>,
@@ -1307,6 +1299,7 @@ mod tests {
         use yadb_metakv::openraft_runtime::{YadbRaft, YadbRaftTypeConfig as C};
         use yadb_metakv::openraft_state_machine::DurableMetaStateMachine;
         use yadb_metakv::openraft_storage::DurableOpenRaftLog;
+
         use yadb_s3::S3Error;
 
         const CLUSTER: [u8; 16] = [71; 16];
@@ -1697,6 +1690,103 @@ mod tests {
             }
         }
 
+        fn assert_refused_without_mutation(f: &GroupFixture) {
+            let before = f.distinct_ids();
+            let outcome = f.sweep();
+            assert_eq!(outcome.refusal.as_deref(), Some(MULTIRAFT_GC_REFUSAL));
+            assert_eq!(outcome.fragments_deleted, 0);
+            assert_eq!(outcome.barriers_applied, 0);
+            assert_eq!(outcome.bytes_reclaimed, 0);
+            assert_eq!(f.distinct_ids(), before);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn multigroup_leader_refuses_before_collection() {
+            let f = multigroup("refuse-leader").await;
+            let engine = f.engine();
+            write_generations(&engine, 1, 10);
+            write_generations(&engine, 2, 20);
+            assert!(f.distinct_ids().len() > 32);
+            assert_refused_without_mutation(&f);
+            let writer = yadb_metakv::gc::acquire_writer(&f.meta, 1, 0, 60_000).unwrap();
+            assert_refused_without_mutation(&f);
+            writer.release().unwrap();
+            drop(engine);
+            shutdown(f).await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn multigroup_follower_and_leader_refuse_before_collection() {
+            let (f, leader_meta) = follower_multigroup("refuse-follower").await;
+            let engine = BlockVolumeEngine::new(leader_meta.clone(), BLOCK_SIZE);
+            engine.register_pool(POOL, f.pool.clone());
+            write_generations(&engine, 1, 0);
+            assert_refused_without_mutation(&f);
+            let before = f.distinct_ids();
+            let outcome = sweep(&leader_meta, &f.pools, &f.control);
+            assert_eq!(outcome.refusal.as_deref(), Some(MULTIRAFT_GC_REFUSAL));
+            assert_eq!(outcome.fragments_deleted, 0);
+            assert_eq!(outcome.barriers_applied, 0);
+            assert_eq!(outcome.bytes_reclaimed, 0);
+            assert_eq!(f.distinct_ids(), before);
+            drop(engine);
+            drop(leader_meta);
+            shutdown(f).await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn manual_routes_and_periodic_scrub_refuse_without_collection() {
+            let f = multigroup("refuse-routes").await;
+            let engine = f.engine();
+            write_generations(&engine, 1, 0);
+            let before = f.live_ids();
+            let meta = f.meta.clone();
+            let st = crate::AppState {
+                openraft: None,
+                listen_addr: "127.0.0.1:0".into(),
+                fs: OsFs::new(temp_dir("route-app")).unwrap(),
+                meta: meta.clone(),
+                raft_token: None,
+                subject_secret: Some("secret".into()),
+                admin_subjects: vec!["operator".into()],
+                control: Arc::new(std::sync::RwLock::new(f.control.clone())),
+                control_refresh: Arc::new(Mutex::new(())),
+                control_freshness: Arc::new(Mutex::new(crate::ControlFreshness::default())),
+                pools: Arc::new(std::sync::RwLock::new(f.pools.clone())),
+                local_vdisks: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
+                last_scrub: Arc::new(std::sync::RwLock::new(None)),
+                reader_lease: Arc::new(Mutex::new(None)),
+                s3: ObjectStoreEngine::new(meta.clone(), 4096),
+                db: yadb_db::DatabaseEngine::new(meta.clone(), 100),
+                block: BlockVolumeEngine::new(meta, BLOCK_SIZE),
+            };
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert("x-yadb-subject", "operator".parse().unwrap());
+            headers.insert(
+                "x-yadb-subject-signature",
+                crate::subject_signature("secret", "operator")
+                    .parse()
+                    .unwrap(),
+            );
+            for response in [
+                crate::handle_pools_gc(axum::extract::State(st.clone()), headers.clone()).await,
+                crate::handle_pools_scrub(axum::extract::State(st.clone()), headers).await,
+            ] {
+                assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                assert!(String::from_utf8_lossy(&body).contains(MULTIRAFT_GC_REFUSAL));
+            }
+            let summary = st.scrub_all_pools(true);
+            assert_eq!(summary.gc_refusal.as_deref(), Some(MULTIRAFT_GC_REFUSAL));
+            assert_eq!(summary.fragments_deleted, 0);
+            assert_eq!(f.live_ids(), before);
+            drop(st);
+            drop(engine);
+            shutdown(f).await;
+        }
+        #[ignore = "Multi-Raft GC is temporarily disabled"]
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn a_multigroup_pass_reclaims_each_groups_dead_fragments() {
             tokio::time::timeout(Duration::from_secs(30), async {
@@ -1750,6 +1840,7 @@ mod tests {
             .expect("multigroup sweep timed out");
         }
 
+        #[ignore = "Multi-Raft GC is temporarily disabled"]
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn a_follower_group_refuses_and_deletes_nothing() {
             tokio::time::timeout(Duration::from_secs(30), async {
@@ -1791,6 +1882,7 @@ mod tests {
             .expect("follower refusal test timed out");
         }
 
+        #[ignore = "Multi-Raft GC is temporarily disabled"]
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn a_group_writer_lease_protects_an_unpublished_fragment() {
             tokio::time::timeout(Duration::from_secs(30), async {
@@ -1853,6 +1945,7 @@ mod tests {
             .expect("writer-lease test timed out");
         }
 
+        #[ignore = "Multi-Raft GC is temporarily disabled"]
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn a_prepared_s3_intent_protects_its_chunks() {
             tokio::time::timeout(Duration::from_secs(30), async {
