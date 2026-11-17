@@ -15,6 +15,7 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle};
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -685,6 +686,14 @@ pub fn prepare(path: &Path) -> io::Result<Prepared> {
         raft_config.election_timeout_max = timing.election_max_ms;
     }
     let raft_config = Arc::new(raft_config.validate().map_err(|e| invalid(e.to_string()))?);
+    // Every Raft RPC opens a fresh connection and pays a pinned mTLS handshake,
+    // which is slower than OpenRaft's heartbeat-derived append deadline. That
+    // deadline is therefore floored at one election timeout: an append that
+    // takes longer than an election timeout is stale, and abandoning one that
+    // would have succeeded turns into a retry backoff that stalls the commit
+    // for seconds.
+    let mut transport = transport;
+    transport.rpc_ttl_floor = Some(Duration::from_millis(raft_config.election_timeout_min));
     Ok(Prepared {
         identity,
         path,

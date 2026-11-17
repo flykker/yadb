@@ -185,6 +185,20 @@ pub struct TransportConfig {
     pub require_known_address: bool,
     pub connect_timeout: Duration,
     pub request_timeout: Duration,
+    /// Optional floor for every RPC's hard TTL.
+    ///
+    /// This transport opens a fresh TCP connection and performs a pinned mTLS
+    /// handshake for every RPC: measured on loopback that is ~120 ms at p50 and
+    /// ~960 ms at the tail. OpenRaft derives an append's deadline from
+    /// `heartbeat_interval` (250 ms in the dev timing), so a deadline shorter
+    /// than the transport's own round trip abandons appends that the follower
+    /// did apply; each abandoned append is retried after a backoff and the
+    /// commit stalls for seconds while nothing is wrong with the cluster. A
+    /// caller that knows its election timeout sets it here as the floor, since
+    /// an append older than one election timeout is stale anyway. `None` keeps
+    /// OpenRaft's own deadline, which is what the in-process test transports
+    /// rely on.
+    pub rpc_ttl_floor: Option<Duration>,
     pub tls: Option<Arc<MutualTls>>,
 }
 
@@ -203,6 +217,7 @@ impl TransportConfig {
             require_known_address: false,
             connect_timeout: Duration::from_secs(3),
             request_timeout: Duration::from_secs(5),
+            rpc_ttl_floor: None,
             tls: None,
         }
     }
@@ -458,16 +473,17 @@ impl RaftNetwork<C> for AuthenticatedTcpNetwork {
         option: RPCOption,
     ) -> Result<AppendEntriesResponse<u32>, RPCError<u32, BasicNode, openraft::error::RaftError<u32>>>
     {
+        let ttl = rpc_deadline(self.config.rpc_ttl_floor, option.hard_ttl());
         let response = self
-            .call(WireRequest::AppendEntries(Box::new(rpc)), option.hard_ttl())
+            .call(WireRequest::AppendEntries(Box::new(rpc)), ttl)
             .await
-            .map_err(|error| rpc_error(self.target, error, option.hard_ttl()))?;
+            .map_err(|error| rpc_error(self.target, error, ttl))?;
         match response {
             WireResponse::AppendEntries(response) => Ok(*response),
             _ => Err(rpc_error(
                 self.target,
                 TransportError::AuthenticationFailed,
-                option.hard_ttl(),
+                ttl,
             )),
         }
     }
@@ -477,16 +493,17 @@ impl RaftNetwork<C> for AuthenticatedTcpNetwork {
         rpc: VoteRequest<u32>,
         option: RPCOption,
     ) -> Result<VoteResponse<u32>, RPCError<u32, BasicNode, openraft::error::RaftError<u32>>> {
+        let ttl = rpc_deadline(self.config.rpc_ttl_floor, option.hard_ttl());
         let response = self
-            .call(WireRequest::Vote(Box::new(rpc)), option.hard_ttl())
+            .call(WireRequest::Vote(Box::new(rpc)), ttl)
             .await
-            .map_err(|error| rpc_error(self.target, error, option.hard_ttl()))?;
+            .map_err(|error| rpc_error(self.target, error, ttl))?;
         match response {
             WireResponse::Vote(response) => Ok(*response),
             _ => Err(rpc_error(
                 self.target,
                 TransportError::AuthenticationFailed,
-                option.hard_ttl(),
+                ttl,
             )),
         }
     }
@@ -504,8 +521,9 @@ impl RaftNetwork<C> for AuthenticatedTcpNetwork {
             meta: snapshot.meta,
             data,
         };
+        let ttl = rpc_deadline(self.config.rpc_ttl_floor, option.hard_ttl());
         let result = tokio::select! {
-            result = self.call(request, option.hard_ttl()) => result,
+            result = self.call(request, ttl) => result,
             _ = cancel => return Err(StreamingError::Closed(ReplicationClosed::new("snapshot cancelled"))),
         };
         match result {
@@ -525,6 +543,15 @@ fn transport_io(error: io::Error) -> TransportError {
         io::ErrorKind::TimedOut => "request timeout",
         _ => "transport failure",
     })
+}
+
+/// The deadline for one RPC: OpenRaft's own hard TTL, raised to the configured
+/// floor when there is one. See [`TransportConfig::rpc_ttl_floor`].
+fn rpc_deadline(floor: Option<Duration>, hard_ttl: Duration) -> Duration {
+    match floor {
+        Some(floor) => hard_ttl.max(floor),
+        None => hard_ttl,
+    }
 }
 
 fn rpc_error(
@@ -1510,5 +1537,24 @@ mod reply_tests {
         );
         assert_eq!(count.load(Ordering::SeqCst), 1);
         task.abort();
+    }
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+
+    /// OpenRaft asks for a heartbeat-derived deadline; the transport may need
+    /// longer than that just to complete its handshake. The floor must win
+    /// there, and must stay out of the way when no floor is configured.
+    #[test]
+    fn rpc_deadline_raises_the_heartbeat_derived_ttl_to_the_configured_floor() {
+        let heartbeat = Duration::from_millis(250);
+        let election = Duration::from_millis(1_500);
+        assert_eq!(rpc_deadline(None, heartbeat), heartbeat);
+        assert_eq!(rpc_deadline(Some(election), heartbeat), election);
+        // A deadline OpenRaft already considers generous is never shortened.
+        let snapshot = Duration::from_secs(30);
+        assert_eq!(rpc_deadline(Some(election), snapshot), snapshot);
     }
 }

@@ -937,9 +937,14 @@ impl OpenRaftClient {
                     if worker_stopping.load(Ordering::Acquire) {
                         break;
                     }
-                    let (result_tx, result_rx) = mpsc::sync_channel(1);
+                    // Dispatch without waiting. `client_write` is safe to call
+                    // concurrently and that is the only way the runtime can
+                    // batch entries: a bridge that waits for one write before
+                    // dequeuing the next turns N concurrent writers into N
+                    // serial round trips, and the state machine then persists
+                    // one entry at a time instead of one committed batch.
                     let raft = worker_raft.clone();
-                    let task = worker_handle.spawn(async move {
+                    worker_handle.spawn(async move {
                         let result = match raft.client_write(cmd).await {
                             Ok(response) => Ok(response.data),
                             Err(RaftError::APIError(ClientWriteError::ForwardToLeader(f))) => {
@@ -949,17 +954,8 @@ impl OpenRaftClient {
                             }
                             Err(error) => Err(MetaError::OpenRaftWriteUnknown(error.to_string())),
                         };
-                        let _ = result_tx.send(result);
+                        let _ = reply.send(result);
                     });
-                    let result = result_rx
-                        .recv_timeout(Duration::from_secs(5))
-                        .unwrap_or_else(|_| {
-                            task.abort();
-                            Err(MetaError::OpenRaftWriteUnknown(
-                                "client write timed out".into(),
-                            ))
-                        });
-                    let _ = reply.send(result);
                 }
             })
             .expect("could not start OpenRaft metadata bridge");
@@ -995,11 +991,13 @@ impl OpenRaftClient {
         // A caller timeout never causes a retry. The queued request may still
         // execute; response loss is an unknown outcome.
         let wait = || {
-            rx.recv_timeout(Duration::from_secs(6)).map_err(|_| {
-                MetaError::OpenRaftWriteUnknown(
-                    "metadata bridge response timed out or stopped".into(),
-                )
-            })?
+            rx.recv_timeout(Duration::from_secs(6))
+                .map_err(|_| {
+                    MetaError::OpenRaftWriteUnknown(
+                        "metadata bridge response timed out or stopped".into(),
+                    )
+                })
+                .and_then(|inner| inner)
         };
         if runtime.is_some() {
             tokio::task::block_in_place(wait)
