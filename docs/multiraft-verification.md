@@ -1780,7 +1780,9 @@ if it ever fails again.
 * `ListParts` and a plain GET on a follower answer from that node's applied
   state, so a part or object acknowledged a moment earlier through another node
   can be missing until it applies; `?consistent=true` is the opt-in read.
-* Per-group GC on Multi-Raft, and `InstallSnapshot`, remain unimplemented.
+* Per-group GC on Multi-Raft and `InstallSnapshot` were unimplemented at this
+  point; both landed later (see the per-group GC section below and the
+  compaction section above).
 
 ## Second review round: XML framing, pagination and the stop path (2026-11-16)
 
@@ -1976,3 +1978,100 @@ passes when run alone (pre-existing timing sensitivity, not touched here).
   fence in-flight writes there.
 * A pass over a group whose project set is empty still takes and releases its
   collector record; the cost is one round trip, not a correctness issue.
+
+## Handoff slots, a commit wait that reads silence correctly, and the live drill (2026-11-17)
+
+### Placement
+
+A pool now has `total_parts()` nominal slots plus `handoffSlots` spares, and the
+placement rule is documented in `multiraft-runtime-operations.md`. A part whose
+nominal slot refuses is written to a spare, in parallel rounds, and the
+acknowledgement still means every part of the blob has a durable copy — a
+handoff write is not a degraded write and does not appear in `degraded_puts`.
+The write quorum itself is unchanged by default (`total_parts()`); `minWriteQuorum`
+is an explicit per-pool opt-in bounded by `min_parts_for_read()` and
+`total_parts()`.
+
+Tests (`cargo test -p yadb-blob --lib`, 33 tests) add
+`a_failed_nominal_slot_is_handed_off_and_the_ack_stays_fully_redundant`,
+`without_handoff_a_failed_nominal_slot_refuses_the_write`,
+`one_handoff_slot_never_takes_two_parts_of_the_same_blob`,
+`delete_tombstones_the_handoff_copy_too`,
+`repair_moves_a_handoff_part_back_to_its_nominal_slot`,
+`a_spare_that_refuses_once_is_skipped_by_the_next_round` and
+`appending_handoff_slots_does_not_move_existing_parts`.
+
+### The 24-way burst: a self-inflicted silence
+
+`tests/protocols.py`'s concurrent S3 burst failed intermittently with fourteen
+of twenty-four writes answered `UncommittedIndex` for indices 557-570 while the
+leader's `commit_index` was already 588 and every node stayed in term 1. Two
+defects in the commit wait, not in replication:
+
+* A waiter counted *rounds* without a peer reply and refused after three. During
+  an apply stall those three rounds take tens of milliseconds, so it refused
+  entries that committed a moment later.
+* Every waiter re-broadcast on each 2 ms poll. Twenty-four waiters produced
+  thousands of RPCs per second against the two peers they were waiting for; the
+  peers then answered slower than the 500 ms Raft RPC read timeout, and those
+  timeouts were counted as a missing quorum. The burst manufactured the silence
+  it then refused on.
+
+The wait now re-broadcasts at most once per `COMMIT_WAIT_NUDGE_INTERVAL` (50 ms)
+and treats silence as evidence only after it has held for
+`COMMIT_WAIT_NO_QUORUM` (1500 ms), which is longer than one round's own timeout.
+`drive_round` returns `(replies, attempted)` so a round that had nothing to send
+— another proposer already shipped the entry — is never counted as silence.
+Regressions: `execute_keeps_waiting_through_silence_shorter_than_the_no_quorum_window`
+(five silent rounds then a reply, must commit) and
+`execute_refuses_after_sustained_silence_and_before_the_commit_budget` (silence
+that holds, refused at or after 1500 ms and before the 3000 ms budget).
+
+### The ambiguous-write drill had stopped being ambiguous
+
+With the wait fixed, the S3 ambiguity scenario returned `200`: the predicate
+dropped only the reply to the publication `AppendEntries`, but the next
+heartbeat carries no entries, so it was not matched, and its reply reports the
+follower's `match_index` — which already includes the entry. That reply confirms
+the write as well as the lost one did. The proxy now cuts the whole
+leader->follower direction once the proposal has been relayed, which is what
+"the follower holding the proposal became unreachable" means. The client sees
+`503`/`x-yadb-write-outcome: unknown`, and after the heal the manifest either
+survives exactly or is absent — never a different value.
+
+### Live three-node drill (legacy runtime, ports 18000-18300)
+
+`scripts/yadb-dev.py start` on a fresh root with `examples/platform.yaml`
+(three mounts per node, `handoffSlots: 3`), then:
+
+| Step | Observed |
+| --- | --- |
+| `SIGKILL` node 3, leader stays node 1 | `S3 PUT` -> `200`, etag `"1968494e-15"`; `GET` returns the exact 15 bytes; `INSERT`/`SELECT` through pgwire returns `alpha` |
+| Pool scrub on the leader | `degraded_puts: 0` |
+| `SIGKILL` node 2 | `S3 PUT` -> `503`, `x-yadb-write-outcome: unknown`; `GET` -> `503 reader lease unavailable`; `INSERT` fails explicitly |
+| `stop`, `start`, three nodes converged | the refused object is `404`, the handed-off object is `200` with the same bytes, `drill_live` holds only `('1','alpha')` |
+
+So a two-of-three write is acknowledged with full redundancy through a handoff
+slot, a one-of-three write is refused with an explicit unknown outcome, and the
+refused mutation left nothing behind. The cluster was stopped immediately after
+the run; its data directory is kept.
+
+### Gates on the merged tree
+
+`cargo fmt --all -- --check` clean; `cargo test -p yadb-metakv --lib` 181/181;
+`cargo test -p yadbd --bins` 96/96; `cargo test -p yadbd --bins --features
+openraft-storage` 109/109; `cargo test -p yadb-blob --lib` 33/33;
+`cargo test -p yadb-s3 --lib` 39/39; `python3 -m unittest
+scripts/test_yadb_openraft_dev.py` 3/3; `tests/protocols.py` 18/18 on two
+consecutive runs and 18/18 on four more before the merges;
+`tests/protocols.py --native-clients` 20/20.
+
+### Open
+
+* No live drill of the per-group GC path or of an actual `InstallSnapshot`
+  transfer between processes; both are proven with in-process fixtures.
+* A pool with spares tolerates the loss of a whole node only while a spare slot
+  lives on a surviving node and takes at most one part of the blob; a second
+  simultaneous failure can still refuse the write with `RedundancyNotMet`.
+* The commit wait bounds its own RPC rate but does not share one round between
+  waiters: twenty-four waiters still issue twenty-four rounds per 50 ms.
