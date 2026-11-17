@@ -179,7 +179,9 @@ Multi-Raft mark-and-sweep is temporarily refused, both manually and by the
 periodic task. A writer lease can be renewed while a collector pass is in
 flight, and collector RPCs can continue past lease expiry, so a reader lease
 alone is not a sufficient fence. Storage-side fencing (an epoch on every target
-and a versioned RPC) is designed only conceptually and is not implemented.
+and a versioned RPC) is designed only conceptually and is not implemented; the
+plan, including the invariant it has to establish and the drill that would prove
+it, is in `multiraft-gc-fencing-plan.md`.
 Manual GC and scrub return `409`, report zero deletions and zero reclaimed
 bytes, and leave fragments intact; the periodic task logs the refusal. Garbage
 therefore accumulates and can exhaust disk space. This change does not cancel
