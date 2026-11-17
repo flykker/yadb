@@ -311,7 +311,12 @@ def signed(port, method, path, body=b"", extra=None, secret=None, timeout=30):
     date = now[:8]
     headers = {"host": f"127.0.0.1:{port}", "x-amz-date": now,
                "x-amz-content-sha256": hashlib.sha256(body).hexdigest()}
-    headers.update(extra or {})
+    # SigV4 signs lowercased header names, and the daemon rejects a
+    # `SignedHeaders` entry that is not lowercase with "invalid header name"
+    # rather than a signature mismatch. Normalise here so a caller may spell a
+    # header the way the wire does (`Idempotency-Key`) without having to know
+    # that rule.
+    headers.update({name.lower(): value for name, value in (extra or {}).items()})
     names = ";".join(sorted(headers))
     uri, _, query = path.partition("?")
     encode = lambda s: urllib.parse.quote(s, safe="-_.~")
@@ -1387,10 +1392,13 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
             concurrent_lock = threading.Lock()
             def concurrent_put(i):
                 try:
-                    # Keyed S3 writes are serialized behind the billing group's
-                    # metadata log, so 24 proposals queue. The per-request
-                    # timeout is a client-side budget, not part of the contract
-                    # under test: give the queue room instead of racing it.
+                    # Every S3 write commits through the billing group's metadata
+                    # log, and 24 simultaneous proposals contend for it: measured
+                    # 0.27 s for one write, 0.33 s each at 2 in flight, but 38 s
+                    # for all 24. The per-request timeout is a client-side
+                    # budget, not part of the contract under test (the contract
+                    # is that every proposal is acknowledged and readable), so it
+                    # is raised here instead of racing a queue that is real.
                     result = signed(s3_port(2), "PUT", f"/invoices-2026/concurrent/{i}",
                                     f"value-{i}".encode(), timeout=180)
                 except Exception as e:
