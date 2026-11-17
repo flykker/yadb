@@ -1,4 +1,3 @@
-#![cfg(feature = "openraft-storage")]
 //! Real daemon, new nonproduction root and three local singleton groups.
 use ring::{
     rand::SystemRandom,

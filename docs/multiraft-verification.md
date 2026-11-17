@@ -2041,6 +2041,11 @@ survives exactly or is absent — never a different value.
 
 ### Live three-node drill (legacy runtime, ports 18000-18300)
 
+Historical record. The legacy runtime and `scripts/yadb-dev.py` no longer exist:
+OpenRaft is the only metadata runtime and `scripts/yadb-openraft-dev.py` is the
+only cluster launcher. The drill below documents what that runtime did, and is
+not a procedure that can be repeated today.
+
 `scripts/yadb-dev.py start` on a fresh root with `examples/platform.yaml`
 (three mounts per node, `handoffSlots: 3`), then:
 

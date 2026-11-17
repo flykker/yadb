@@ -2337,8 +2337,8 @@ async fn handle_health(State(st): State<AppState>) -> impl IntoResponse {
     let (node_id, role, term, leader_id, commit_index) = st.meta.role_info();
     Json(serde_json::json!({
         "status": "ok",
-        "metadata_runtime": if st.meta.is_openraft() { "openraft" } else { "legacy" },
-        "role_scope": if st.meta.is_openraft() { "control_group; see /openraft/status for all groups" } else { "legacy" },
+        "metadata_runtime": if st.meta.is_openraft() { "openraft" } else { "single-node" },
+        "role_scope": if st.meta.is_openraft() { "control_group; see /openraft/status for all groups" } else { "single" },
         "production_ready": false,
         "node_id": node_id,
         "role": format!("{role:?}"),
@@ -2357,7 +2357,7 @@ async fn handle_raft_status(State(st): State<AppState>) -> impl IntoResponse {
     // made-up number.
     let (node_id, role, term, leader_id, commit_index) = st.meta.role_info();
     Json(serde_json::json!({
-        "metadata_runtime": if st.meta.is_openraft() { "openraft" } else { "legacy" },
+        "metadata_runtime": if st.meta.is_openraft() { "openraft" } else { "single-node" },
         "production_ready": false,
         "node_id": node_id,
         "role": format!("{role:?}"),

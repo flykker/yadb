@@ -395,6 +395,13 @@ impl<FS: StorageFs> LocalMetaKv<FS> {
     /// Opens a single-node, non-replicated store. Used where no cluster exists
     /// at all: unit tests on [`yadb_io::SimFs`], which the OpenRaft storage
     /// adapters cannot serve because they require `std::fs`.
+    ///
+    /// **Not a deployment mode.** A write through this handle is acknowledged
+    /// after it reaches one local WAL; there is no replica, no quorum and no
+    /// failover, so losing this node loses the data. The daemon never opens it —
+    /// `--metadata-runtime` accepts only `openraft`. It also never compacts, so
+    /// its WAL grows for as long as the store is open; that is acceptable for a
+    /// test fixture and unacceptable for anything long-lived.
     pub fn open_single_node(fs: &FS, dir: &str, node_id: u32) -> Result<Self, MetaError> {
         let core = LocalKv::open(fs, dir, node_id)?;
         Ok(Self {

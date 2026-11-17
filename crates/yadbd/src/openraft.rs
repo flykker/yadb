@@ -708,7 +708,7 @@ pub struct Status {
 impl Status {
     pub fn snapshot(&self) -> serde_json::Value {
         let groups = self.groups.iter().map(|(id, (raft, preferred))| { let m = raft.metrics().borrow().clone(); serde_json::json!({"group": id, "node_id": m.id, "state": format!("{:?}", m.state), "term": m.current_term, "leader_id": m.current_leader, "preferred_leader": preferred, "preference_met": preferred.zip(m.current_leader).map(|(want, actual)| want == actual), "last_applied": format!("{:?}", m.last_applied), "running_state": format!("{:?}", m.running_state)}) }).collect::<Vec<_>>();
-        serde_json::json!({"enabled": true, "client_traffic": if self.client_mode { "multiraft" } else { "legacy" }, "production_ready": false, "limitation": "dedicated listener per group; reads are local-applied", "local_observations": groups})
+        serde_json::json!({"enabled": true, "client_traffic": if self.client_mode { "multiraft" } else { "single-group" }, "production_ready": false, "limitation": "dedicated listener per group; reads are local-applied", "local_observations": groups})
     }
 }
 
@@ -1108,7 +1108,7 @@ mod tests {
         let mut running = prepare(&path).unwrap().start().await.unwrap();
         let status = running.status(false).snapshot();
         assert_eq!(status["production_ready"], false);
-        assert_eq!(status["client_traffic"], "legacy");
+        assert_eq!(status["client_traffic"], "single-group");
         running.shutdown().await.unwrap();
         drop(running);
         config["mode"] = json!("open");

@@ -1,4 +1,3 @@
-#![cfg(feature = "openraft-storage")]
 //! Engine-level integration only: no daemon protocol or multi-node claims.
 use openraft::{
     error::{Fatal, RPCError, RaftError, ReplicationClosed, StreamingError, Unreachable},

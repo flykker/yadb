@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Start, stop and inspect a disposable three-node Multi-Raft OpenRaft cluster.
 
-This launcher is the explicit-OpenRaft sibling of `scripts/yadb-dev.py` (which
-keeps legacy as the default). It provisions a *fresh* root containing three
-daemons, each running three mandatory-mTLS Raft groups: one control group plus
-two data groups. The project route map is `{"1": 2, "2": 3}`, so project IDs 1
-and 2 are served by different data groups.
+This launcher is the only cluster launcher: OpenRaft is the only metadata
+runtime, so there is no alternative runtime to select. It provisions a *fresh*
+root containing three daemons, each running three mandatory-mTLS Raft groups:
+one control group plus two data groups. The project route map is `{"1": 2,
+"2": 3}`, so project IDs 1 and 2 are served by different data groups.
 
 Configuration, manifests, TLS/signing material and the on-disk layout reuse the
 exact version-1 group config / version-2 manifest format and certificate
