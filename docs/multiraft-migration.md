@@ -2,8 +2,10 @@
 
 Status: **specification only; migration is not implemented or authorized**.
 No command currently exports/imports this format, enforces its writer fence or
-performs cutover. For existing deployments, keep all SQL, S3, block, iSCSI and
-legacy Raft traffic on the legacy runtime. The separately authorized fresh,
+performs cutover. The built-in ("legacy") Raft runtime has since been removed, so
+there is no runtime left to keep existing deployments on and no rollback target:
+OpenRaft is the only metadata runtime, and it requires a fresh root. The
+separately authorized fresh,
 empty test cluster is outside that restriction; it does not authorize importing
 or reusing existing legacy data. An OpenRaft
 group is not a migration destination
