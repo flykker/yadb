@@ -2015,11 +2015,12 @@ to reuse the ids of failed or ambiguous allocations and still returns
 `GenerationExhausted` when the counter would pass `MAX_ALLOCATION`
 (`(1<<56)-1`).
 
-`generation` in a BlobId is the low 24 bits of the allocation id (`MAX_U24`), so
-blocks of 32 make generation values advance in steps of 32 rather than by 1.
-Generation exhaustion still happens after the same total number of allocations,
-but it is consumed 32 ids at a time, so a project that runs out of generations may
-do so up to 31 ids earlier than a per-upload allocator would.
+`generation` in a BlobId is the low 24 bits of the allocation id (`MAX_U24`) and is
+masked, not checked, so blocks of 32 make generation values advance in steps of 32
+and wrap at the 24-bit boundary. Uniqueness does not rest on `generation` alone:
+two allocations 2^24 apart share a generation but differ in `owner_id` (the high
+32 bits), and the allocator only stops at `MAX_ALLOCATION`, not at the generation
+boundary. There is no generation-exhaustion error to reach 31 ids early.
 
 ## Handoff slots, a commit wait that reads silence correctly, and the live drill (2026-11-17)
 
@@ -2129,3 +2130,57 @@ consecutive runs and 18/18 on four more before the merges;
   simultaneous failure can still refuse the write with `RedundancyNotMet`.
 * The commit wait bounds its own RPC rate but does not share one round between
   waiters: twenty-four waiters still issue twenty-four rounds per 50 ms.
+
+## Transport deadline floor and concurrent write dispatch (2026-11-17)
+
+A 24-writer S3 burst on a three-process Multi-Raft cluster (ports 19500-19900,
+transport proxies in front of every peer link) took 31.8 s, 57.6 s and 71.2 s per
+round and produced `503 ... metadata bridge response timed out or stopped`. Two
+independent causes were measured, not inferred.
+
+**The transport abandons appends it could have completed.** Every Raft RPC opens a
+fresh TCP connection and performs the pinned mTLS handshake. Measured on loopback
+under suite load that round trip is about 120 ms at p50, 285 ms at p90 and 960 ms
+at the tail. OpenRaft derives an `AppendEntries` deadline from `heartbeat_interval`
+(250 ms with the dev timing), so roughly a fifth of appends were abandoned after
+the follower had already applied them; each abandoned append is retried after a
+backoff, so a healthy cluster stalled for seconds. `TransportConfig::rpc_ttl_floor`
+raises the deadline to one `election_timeout_min` (1500 ms here), on the grounds
+that an append older than one election timeout is stale anyway. Snapshot transfers
+keep their own, longer deadline.
+
+**The bridge serialised concurrent writers.** `OpenRaftClient::execute` awaited one
+`client_write` before dequeuing the next, so N concurrent writers became N serial
+round trips and the state machine persisted one entry at a time instead of one
+committed batch. It now dispatches each write and lets the runtime coalesce them.
+`client_write` is documented as safe to call concurrently, and the response still
+arrives only after the entry is applied (`handle_apply_result`), so the outcome
+classification is unchanged.
+
+After both changes the same burst completed 24/24 in 8.6-8.9 s for the first round
+and about 2.3 s for the second, with zero RPC timeouts in the daemon logs. The
+first round is slower because every writer reserves an allocation block; the
+second round serves from the per-process cache. This is an improvement, not a
+target: per-peer connection reuse remains the real fix for the handshake cost.
+
+### Residual defect
+
+The protocol suite still fails one scenario, reproducibly, immediately after a
+full-cluster `SIGKILL`/restart:
+
+```
+BRIDGE TIMEOUT /s3-upload-sequence/1 after=6000ms
+  state=Leader leader=Some(2) term=1 last_log=Some(281) applied=Some(280)
+```
+
+The leader had appended entry 281 and `running_state` was `Ok(())`, while
+`last_applied` stayed at 280 for the whole deadline and `AppendEntries` to both
+peers kept succeeding at 60-250 ms. Because OpenRaft answers `client_write` from
+`handle_apply_result`, this isolates the stall to the apply path, not replication
+or commit. Ruled out by inspection: no `inner.lock()` guard in the state machine is
+held across an `await`, and watch notifications use an unbounded
+`std::sync::mpsc::channel()`, so `Watcher::tx.send` cannot block the apply loop.
+The remaining candidates are starvation of the state-machine task (the log store
+performs a synchronous `sync_data` plus directory `sync_all` inside an `async fn`,
+i.e. on a runtime worker thread) and the cost of rewriting the whole `state.json`
+per apply batch. This is open; the suite is not green until it is explained.
