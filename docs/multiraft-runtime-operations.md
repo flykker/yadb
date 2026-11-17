@@ -366,10 +366,13 @@ S3 upload allocation ids are handed out in blocks of 32. A writer's first upload
 after its cache empties advances `/s3-upload-sequence/{project_id}` by 32 in one
 guarded write and serves the rest of the block locally, so a burst performs one
 sequence transaction per process per round instead of one per upload. A process
-that exits with ids unused loses that tail; the ids are never reused. A BlobId
-takes `owner_id` from the high 32 bits of the allocation id and `generation` from
-the low 24, so generation values advance in steps of 32 and wrap at the 24-bit
-boundary; uniqueness comes from the pair, not from `generation` alone.
+that exits with ids unused loses that tail; the ids are never reused. The ids
+handed out are consecutive within a block (`previous+1`, `previous+2`, ...), so
+the durable counter advances by 32 per block while `generation` advances by 1 per
+upload. A BlobId takes `owner_id` from the high 32 bits of the allocation id and
+`generation` from the low 24, so `generation` wraps at the 24-bit boundary while
+`owner_id` increments; uniqueness comes from the pair, not from `generation`
+alone. `MAX_ALLOCATION` is `2^56-1`, so `owner_id` still fits 32 bits.
 
 ## Fail-closed recovery matrix
 

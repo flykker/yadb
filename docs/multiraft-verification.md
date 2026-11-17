@@ -2216,3 +2216,49 @@ call is not offloaded to a blocking pool. It is bounded to one sync per apply
 batch (not per entry) and no longer includes a directory sync. It has not starved
 the runtime on this 7-core host; a dedicated blocking pool is the change to make
 if apply latency ever shows up under a real fsync-heavy disk.
+
+### Open finding: the connection cap drops peers silently
+
+`RaftPeerServer::serve_until` admits at most `MAX_CONNECTIONS` (64) handlers and
+drops the accepted socket when the semaphore is exhausted:
+
+```rust
+let Ok(permit) = connections.clone().try_acquire_owned() else {
+    continue;
+};
+```
+
+The peer then sees a connection closed during the TLS handshake, which
+`transport_io` maps to `InvalidInput("transport failure")` and `rpc_error` maps to
+`RPCError::Network`. OpenRaft treats that as a progress error, not a retry, so
+replication to that peer pauses until the next event. Because every RPC opens a
+fresh TCP + mTLS connection, a burst of N concurrent writers asks for roughly
+`N x 2` connections per node, and 64 is reachable on a three-node cluster.
+
+This is not corruption, and it did not produce the observed stalls, but it is
+invisible: the drop emits no frame, no counter and no log line. The server only
+logs snapshot failures (`snapshot_failure` is called when `phase > 0`), so every
+ordinary `AppendEntries`/`Vote` connection failure — cap drop, bad signature,
+replayed envelope, identity mismatch — leaves no trace. That silence is what made
+the instrumented investigation expensive: 16 019 `TLS CONNECT FAIL ... tls
+handshake eof` client-side events in one run had no server-side counterpart.
+
+Recommended, in order: count and log cap rejections (rate-limited) so an operator
+can tell "cap reached" from "peer down"; then reuse one connection per peer
+instead of dialling per RPC, which removes the pressure rather than raising the
+limit.
+
+### Open finding: a failed checkpoint fold is swallowed
+
+```rust
+if inner.delta_entries >= COMPACT_AFTER_ENTRIES || inner.delta_bytes >= COMPACT_AFTER_BYTES {
+    let _ = compact_locked(&mut inner);
+}
+```
+
+The entries are already durable in the delta, so this is not data loss, and
+`persist_locked` poisons the handle so the next operation fails closed. But the
+apply that triggered the failed fold still returns `Ok`, and if no further
+operation arrives the node keeps answering applies from a state machine whose
+checkpoint is unreadable, with nothing reported. The failure should surface on a
+channel an operator can see, not only through the next call's error.
