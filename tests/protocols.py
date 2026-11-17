@@ -20,12 +20,12 @@ state ("reads are local-applied" in `/openraft/status`). A read on a node other
 than the project-group leader can therefore lag a commit; assertions that need
 read-your-writes poll with `eventually` instead of racing the apply loop.
 
-Every scenario that `main` exercised is still exercised. Three capabilities the
-Multi-Raft runtime does not expose are reported as `SKIP <scenario>: <reason>`
-instead of being deleted or turned into a pass: reader leases are legacy-gated,
-the repair/orphan scan is refused, and per-group GC collection and a
-cross-process `InstallSnapshot` have no live run here. A skipped scenario is
-still a non-zero exit if anything else fails.
+Unavailable capabilities are reported as `SKIP <scenario>: <reason>` instead
+of being turned into a pass: reader leases are legacy-gated, Multi-Raft repair
+and collection are disabled, and cross-process `InstallSnapshot` has no live
+run here. The disabled GC and scrub routes are tested for refusal and fragment
+preservation, not collection. A skipped scenario is still a non-zero exit if
+anything else fails.
 """
 import argparse
 import datetime
@@ -305,6 +305,23 @@ def request(port, method, path, body=b"", headers=None, timeout=30):
     status, hs, data = r.status, dict(r.getheaders()), r.read()
     c.close()
     return status, hs, data
+
+
+def assert_multiraft_gc_refusal(port, path, fragments):
+    """Check the HTTP refusal and verify each seeded fragment remains readable."""
+    status, _, body = request(port, "POST", path, headers=admin_headers())
+    assert status == 409, (path, status, body)
+    summary = json.loads(body)
+    reason = summary.get("gc_refusal")
+    assert isinstance(reason, str) and "mark-and-sweep disabled for Multi-Raft" in reason, summary
+    assert summary["fragments_deleted"] == 0 and summary["bytes_reclaimed"] == 0, summary
+    if path == "/v1/pools/scrub":
+        assert summary["orphan_collection_error"] == "scrub disabled for Multi-Raft", summary
+        assert summary["orphan_blobs_collected"] == 0, summary
+    for fragment_port, fragment_path, expected in fragments:
+        result = request(fragment_port, "GET", fragment_path,
+                         headers={"x-yadb-raft-token": RAFT_TOKEN})
+        assert result[0] == 200 and result[2] == expected, (fragment_path, result)
 
 
 def signed(port, method, path, body=b"", extra=None, secret=None, timeout=30):
@@ -974,6 +991,7 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
             # Exercise the internal DELETE route on every actual VDisk host,
             # using a reserved test project/channel unrelated to engine IDs.
             vdisk_tombstones = []
+            gc_fragments = []
             health = json.loads(request(http_port(2), "GET", "/v1/pools/health")[2])
             for pool in health["pools"]:
                 for slot in pool["slots"]:
@@ -989,31 +1007,25 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
                     assert request(port, "DELETE", path, headers=internal)[2] == b"absent"
                     assert request(port, "PUT", path, b"late-fragment", internal)[0] == 412
                     vdisk_tombstones.append((port, path))
-            # The repair/orphan scan needs one whole-deployment view, which
-            # Multi-Raft does not have. The daemon must say so instead of
-            # pretending it collected nothing, so the refusal itself is
-            # asserted; the collection half is a documented gap.
+                    # A different reserved channel gives GC an unreferenced
+                    # fragment to preserve, not the tombstoned DELETE fixture.
+                    gc_blob = ((0xFFFFFFFE << 96) | (1 << 64) | (1 << 40)
+                               | ((slot["slot_index"]+1) << 16) | (249 << 8) | 1)
+                    gc_path = f'/internal/vdisk/{pool["pool_name"]}/{slot["slot_index"]}/blob/{gc_blob:032x}'
+                    payload = b"gc-refusal-fragment"
+                    assert request(port, "PUT", gc_path, payload, internal)[0] == 200
+                    before = request(port, "GET", gc_path, headers=internal)
+                    assert before[0] == 200 and before[2] == payload, before
+                    gc_fragments.append((port, gc_path, payload))
+            assert gc_fragments, "no VDisk fragments seeded for GC refusal"
             control_leader = wait_group_leader(CONTROL_GROUP)
-            scrub = json.loads(request(http_port(control_leader), "POST", "/v1/pools/scrub",
-                                       headers=admin_headers())[2])
-            assert scrub["orphan_collection_error"] == "scrub disabled for Multi-Raft", scrub
-            assert "orphan_blobs_collected" in scrub
-            assert "gc_groups_refused" in scrub, scrub
+            for path in ("/v1/pools/gc", "/v1/pools/scrub"):
+                assert_multiraft_gc_refusal(http_port(control_leader), path, gc_fragments)
+            print("PASS Multi-Raft GC and scrub explicitly refuse without deleting fragments")
             skip("VDisk orphan collection",
-                 "scrub's repair/orphan scan is refused on Multi-Raft "
-                 "(crates/yadbd/src/main.rs:884, orphan_collection_error), so no orphan "
-                 "fragment can be collected or asserted; per-group GC has no live run")
-            # The GC route is exercised for its admin gate and its structured
-            # refusal, but a per-group sweep under its own collector lease has
-            # no live run in this harness.
-            gc_status, _, gc_body = request(http_port(control_leader), "POST",
-                                            "/v1/pools/gc", headers=admin_headers())
-            assert gc_status in (200, 409), (gc_status, gc_body)
-            gc = json.loads(gc_body)
-            assert "gc_refusal" in gc and "gc_groups_refused" in gc, gc
+                 "scrub's repair/orphan scan is disabled on Multi-Raft")
             skip("per-group GC collection",
-                 "POST /v1/pools/gc returns a per-group outcome, but no scenario drives a "
-                 "live multi-group sweep and asserts reclaimed bytes")
+                 "mark-and-sweep is disabled for Multi-Raft")
             print("PASS VDisk exact DELETE, idempotent tombstone and delayed PUT fencing")
             a, b = Pg(pg_port(2)), Pg(pg_port(3))
             a.query("CREATE TABLE wire (id INT PRIMARY KEY, balance INT);")
