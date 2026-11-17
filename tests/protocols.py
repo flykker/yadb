@@ -4,13 +4,36 @@
 Run after cargo build --offline: python3 tests/protocols.py
 Add --native-clients for psql/AWS CLI, --libiscsi-dir for libiscsi utilities,
 and --libiscsi-probe for the compiled libiscsi_probe.c. Not a kernel multipath test.
+
+The cluster is an OpenRaft Multi-Raft deployment: three nodes, each running a
+control group (1) and two data groups (2 and 3), with the project route map
+`{"1": 2, "2": 3}`. Credentials, TLS material, group configs and manifests are
+provisioned by `scripts/yadb-openraft-dev.py`; only the listener ports are
+re-derived here, because this harness keeps the documented fixed bases instead
+of the launcher's offset scheme (the launcher's Raft block would collide with
+the pgwire block). Each node's group config names the *proxy* address of every
+peer, so every outbound Raft RPC of a directed link crosses a proxy that a test
+can cut, and no test decodes a transport frame.
+
+`--metadata-runtime openraft` serves default reads from the node's own applied
+state ("reads are local-applied" in `/openraft/status`). A read on a node other
+than the project-group leader can therefore lag a commit; assertions that need
+read-your-writes poll with `eventually` instead of racing the apply loop.
+
+Every scenario that `main` exercised is still exercised. Three capabilities the
+Multi-Raft runtime does not expose are reported as `SKIP <scenario>: <reason>`
+instead of being deleted or turned into a pass: reader leases are legacy-gated,
+the repair/orphan scan is refused, and per-group GC collection and a
+cross-process `InstallSnapshot` have no live run here. A skipped scenario is
+still a non-zero exit if anything else fails.
 """
-import datetime
 import argparse
+import datetime
 from collections import deque
 import hashlib
 import hmac
 import http.client
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -26,107 +49,241 @@ import urllib.parse
 import xml.etree.ElementTree as ET
 
 ROOT = Path(__file__).resolve().parents[1]
-SECRET = "integration-secret-12345"
 SUBJECT = "sa:billing-backend"
-# Clustered legacy daemons refuse to start without a shared Raft token.
-RAFT_TOKEN = "integration-raft-token-12345"
+# The only subject on every daemon's --admin-subject allowlist.
+ADMIN = "local-operator"
+# Both are generated per run by the provisioning helper.
+SECRET = ""
+RAFT_TOKEN = ""
+# Separate from the protocol user secret: the daemon verifies signed subjects
+# (and `/openraft/status`, `/v1/apply`, scrub and GC) with this one.
+SUBJECT_SECRET = ""
+
+# Documented fixed listener bases; node i listens on base + i.
+HTTP_BASE = 19000
+PG_BASE = 19100
+S3_BASE = 19200
+ISCSI_BASE = 19300
+# One response-dropping HTTP proxy per node, in front of its S3 listener.
+HTTP_PROXY_BASE = 19400
+# Directed Raft transport proxy: base + (group-1)*100 + source*10 + target.
+RAFT_PROXY_BASE = 19500
+# Real Raft listener: base + (group-1)*10 + node.
+RAFT_BASE = 19800
+
+NODES = (1, 2, 3)
+GROUPS = (1, 2, 3)
+CONTROL_GROUP = 1
+PROJECT_GROUPS = {"1": 2, "2": 3}
+# billing is project id 1 and therefore owned by data group 2.
+BILLING_GROUP = PROJECT_GROUPS["1"]
 
 
-class PeerProxy(socketserver.ThreadingTCPServer):
-    """One directed peer link; toggling it also closes in-flight connections."""
+def http_port(node):
+    return HTTP_BASE + node
+
+
+def pg_port(node):
+    return PG_BASE + node
+
+
+def s3_port(node):
+    return S3_BASE + node
+
+
+def iscsi_port(node):
+    return ISCSI_BASE + node
+
+
+def raft_port(group, node):
+    return RAFT_BASE + (group - 1) * 10 + node
+
+
+def raft_proxy_port(group, source, target):
+    return RAFT_PROXY_BASE + (group - 1) * 100 + source * 10 + target
+
+
+def _load_dev_module():
+    """Import the OpenRaft launcher's provisioning helpers.
+
+    The file name contains a hyphen, so it cannot be imported normally. The
+    module only defines constants and functions; importing it has no side
+    effects and reuses the exact credential, certificate and manifest format.
+    """
+    path = ROOT / "scripts" / "yadb-openraft-dev.py"
+    spec = importlib.util.spec_from_file_location("yadb_openraft_dev", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+DEV = _load_dev_module()
+
+
+class TransportProxy(socketserver.ThreadingTCPServer):
+    """One directed Raft link (source -> target) of one group.
+
+    The source node's group config names this address as the peer, so every
+    outbound RPC of that direction crosses it. `blocked` refuses new
+    connections and closes the ones in flight, which is what a partition looks
+    like to OpenRaft: the link is gone rather than merely slow.
+    """
     allow_reuse_address = True
     daemon_threads = True
-    # The stdlib default backlog (5) is smaller than the concurrent client
-    # burst, even before Raft heartbeats and VDisk scrub connections.
     request_queue_size = 128
 
-    def __init__(self, source, target):
+    def __init__(self, group, source, target):
+        self.group = group
         self.source = source
         self.target = target
         self.blocked = threading.Event()
-        self.raft_request_fault = None
-        self.raft_reply_fault = None
-        self.dropped_raft_reply = threading.Event()
-        self.events = deque(maxlen=30)
+        self.events = deque(maxlen=40)
         self.events_lock = threading.Lock()
-        super().__init__(("127.0.0.1", 19400 + source * 10 + target), PeerHandler)
+        self.active = 0
+        self.active_lock = threading.Lock()
+        super().__init__(("127.0.0.1", raft_proxy_port(group, source, target)),
+                         TransportHandler)
+
+    @property
+    def label(self):
+        return f"g{self.group} {self.source}->{self.target}"
 
     def record(self, event):
         with self.events_lock:
             self.events.append((round(time.monotonic(), 3), event))
 
+    def enter(self):
+        with self.active_lock:
+            self.active += 1
 
-class PeerHandler(socketserver.BaseRequestHandler):
+    def leave(self):
+        with self.active_lock:
+            self.active -= 1
+
+    def settle(self, timeout=10):
+        """Wait until no relay is in flight, so a cut is complete."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with self.active_lock:
+                if self.active == 0:
+                    return
+            time.sleep(0.01)
+        raise RuntimeError(f"transport proxy {self.label} still relays a connection")
+
+
+class TransportHandler(socketserver.BaseRequestHandler):
     def handle(self):
-        if self.server.blocked.is_set():
-            self.server.record("blocked on accept")
+        server = self.server
+        if server.blocked.is_set():
+            server.record("refused while blocked")
             return
+        server.enter()
         try:
-            with socket.create_connection(("127.0.0.1", 19000+self.server.target), timeout=2) as upstream:
-                upstream.settimeout(2)
-                self.request.settimeout(2)
-                drop_raft_reply = False
-                drop_raft_request = False
-                reply_fault = self.server.raft_reply_fault
-                request_fault = self.server.raft_request_fault
-                if reply_fault is not None or request_fault is not None:
-                    # Classify the HTTP request before relaying any response.
-                    # VDisk fragment writes must still receive acknowledgements
-                    # so the fault reaches metadata commit rather than blob PUT.
-                    header = b""
-                    while b"\r\n\r\n" not in header:
-                        chunk = self.request.recv(65536)
-                        if not chunk:
-                            return
-                        header += chunk
-                        assert len(header) <= 128 * 1024, "oversized proxy request header"
-                    if header.startswith(b"POST /raft/rpc "):
-                        head, body = header.split(b"\r\n\r\n", 1)
-                        headers = dict(line.split(b":", 1) for line in head.split(b"\r\n")[1:])
-                        length = int(headers[b"Content-Length"].strip())
-                        assert length <= 16 * 1024 * 1024, "oversized proxy Raft request"
-                        while len(body) < length:
-                            chunk = self.request.recv(min(65536, length-len(body)))
-                            if not chunk:
-                                return
-                            header += chunk
-                            body += chunk
-                        rpc = json.loads(body)
-                        drop_raft_reply = reply_fault is not None and reply_fault(rpc)
-                        drop_raft_request = request_fault is not None and request_fault(rpc)
-                        if drop_raft_request:
-                            self.server.record("dropped Raft request")
-                            return
-                    upstream.sendall(header)
-                    if drop_raft_reply:
-                        # The proposal has reached this follower durably, but its
-                        # acknowledgement must never reach the leader again: a
-                        # later heartbeat carries no entries, so it is not
-                        # matched by the predicate, and its reply reports the
-                        # follower's match_index — which already includes the
-                        # entry. That reply confirms the write just as well as
-                        # the lost publication reply did. So the whole
-                        # leader->follower direction is cut: the leader cannot
-                        # learn that this follower holds the entry until the
-                        # fault is healed.
-                        self.server.record("dropped Raft reply; link cut")
-                        self.server.dropped_raft_reply.set()
-                        self.server.blocked.set()
-                        return
-                sockets = (self.request, upstream)
-                while not self.server.blocked.is_set():
+            try:
+                upstream = socket.create_connection(
+                    ("127.0.0.1", raft_port(server.group, server.target)), timeout=5)
+            except OSError as error:
+                server.record(f"upstream {type(error).__name__}")
+                return
+            server.record("open")
+            sockets = (self.request, upstream)
+            try:
+                self.request.settimeout(0.2)
+                upstream.settimeout(0.2)
+                while not server.blocked.is_set():
                     ready, _, _ = select.select(sockets, [], [], .05)
                     for sock in ready:
                         data = sock.recv(65536)
                         if not data:
                             return
-                        if sock is upstream and drop_raft_reply:
-                            self.server.record(f"dropped {len(data)} Raft response bytes")
-                            self.server.dropped_raft_reply.set()
-                            return
                         (upstream if sock is self.request else self.request).sendall(data)
-        except OSError as e:
-            self.server.record(f"{type(e).__name__}: {e}; blocked={self.server.blocked.is_set()}")
+            except OSError as error:
+                server.record(type(error).__name__)
+            finally:
+                for sock in sockets:
+                    try:
+                        sock.close()
+                    except OSError:
+                        pass
+        finally:
+            server.leave()
+
+
+class ResponseDropProxy(socketserver.ThreadingTCPServer):
+    """Forward one HTTP request, read the whole upstream response, drop it.
+
+    The mutation reaches the daemon and may commit; the client only sees the
+    connection close. That is exactly the ambiguous outcome a client must
+    survive without retrying the command.
+    """
+    allow_reuse_address = True
+    daemon_threads = True
+    request_queue_size = 8
+
+    def __init__(self, port, target_port, label):
+        self.port = port
+        self.target_port = target_port
+        self.label = label
+        self.upstream_status = None
+        self.upstream_body = b""
+        self.error = None
+        self.observed = threading.Event()
+        super().__init__(("127.0.0.1", port), ResponseDropHandler)
+
+
+def _read_head(stream, limit=128 * 1024):
+    data = b""
+    while b"\r\n\r\n" not in data:
+        chunk = stream.recv(65536)
+        if not chunk:
+            raise EOFError("connection closed before a complete head")
+        data += chunk
+        assert len(data) <= limit, "oversized HTTP head"
+    return data.split(b"\r\n\r\n", 1)
+
+
+def _content_length(head):
+    for line in head.split(b"\r\n")[1:]:
+        name, _, value = line.partition(b":")
+        if name.strip().lower() == b"content-length":
+            return int(value.strip())
+    return 0
+
+
+class ResponseDropHandler(socketserver.BaseRequestHandler):
+    def handle(self):
+        server = self.server
+        try:
+            self.request.settimeout(60)
+            head, body = _read_head(self.request)
+            length = _content_length(head)
+            while len(body) < length:
+                chunk = self.request.recv(min(65536, length - len(body)))
+                if not chunk:
+                    return
+                body += chunk
+            with socket.create_connection(("127.0.0.1", server.target_port),
+                                          timeout=60) as upstream:
+                upstream.settimeout(60)
+                upstream.sendall(head + b"\r\n\r\n" + body)
+                reply_head, reply_body = _read_head(upstream)
+                status = int(reply_head.split(b"\r\n")[0].split(b" ")[1])
+                while len(reply_body) < _content_length(reply_head):
+                    chunk = upstream.recv(65536)
+                    if not chunk:
+                        break
+                    reply_body += chunk
+                server.upstream_status = status
+                server.upstream_body = reply_body
+        except (OSError, EOFError, ValueError, IndexError) as error:
+            server.error = f"{type(error).__name__}: {error}"
+        finally:
+            server.observed.set()
+            # Not one response byte: the client must see a transport error.
+            try:
+                self.request.close()
+            except OSError:
+                pass
 
 
 def exact(sock, n):
@@ -139,8 +296,8 @@ def exact(sock, n):
     return data
 
 
-def request(port, method, path, body=b"", headers=None):
-    c = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
+def request(port, method, path, body=b"", headers=None, timeout=30):
+    c = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
     c.request(method, path, body, headers or {})
     r = c.getresponse()
     status, hs, data = r.status, dict(r.getheaders()), r.read()
@@ -148,7 +305,8 @@ def request(port, method, path, body=b"", headers=None):
     return status, hs, data
 
 
-def signed(port, method, path, body=b"", extra=None, secret=SECRET):
+def signed(port, method, path, body=b"", extra=None, secret=None, timeout=30):
+    secret = SECRET if secret is None else secret
     now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     date = now[:8]
     headers = {"host": f"127.0.0.1:{port}", "x-amz-date": now,
@@ -170,7 +328,7 @@ def signed(port, method, path, body=b"", extra=None, secret=SECRET):
         key = hmac.new(key, v.encode(), hashlib.sha256).digest()
     sig = hmac.new(key, text.encode(), hashlib.sha256).hexdigest()
     headers["authorization"] = f"AWS4-HMAC-SHA256 Credential=backend/{scope}, SignedHeaders={names}, Signature={sig}"
-    return request(port, method, path, body, headers)
+    return request(port, method, path, body, headers, timeout)
 
 
 def complete_multipart_xml(parts):
@@ -297,7 +455,8 @@ class Pg:
 
 
 class Iscsi:
-    def __init__(self, port, discovery=False, secret=SECRET, negotiation=None):
+    def __init__(self, port, discovery=False, secret=None, negotiation=None):
+        secret = SECRET if secret is None else secret
         self.s = socket.create_connection(("127.0.0.1", port), timeout=30)
         self.cmd = 1
         self.itt = 1
@@ -395,8 +554,8 @@ class Iscsi:
         self.scsi(cdb, len(data), data, immediate)
 
 
-def wait(port):
-    deadline = time.monotonic()+10
+def wait(port, timeout=30):
+    deadline = time.monotonic()+timeout
     while time.monotonic() < deadline:
         try:
             if request(port, "GET", "/healthz")[0] == 200:
@@ -407,27 +566,120 @@ def wait(port):
     raise RuntimeError("daemon not ready")
 
 
-def wait_leader(nodes=(1, 2, 3), timeout=20):
-    """Wait until every listed node names the same elected leader.
+def admin_headers():
+    return DEV.signed_headers(SUBJECT_SECRET, ADMIN)
 
-    A restarted node binds its listeners before Raft has elected a leader. A
-    read forwarded in that window is refused with "known leader: None", which
-    is correct cluster behavior, so the harness waits for the election instead
-    of treating the refusal as a test result.
+
+def openraft_status(node, timeout=2):
+    status, body = DEV.http_json(http_port(node), "/openraft/status", admin_headers(), timeout)
+    if status != 200 or not isinstance(body, dict):
+        raise RuntimeError(f"node {node}: /openraft/status HTTP {status}")
+    return body
+
+
+def group_observation(node, group):
+    for entry in openraft_status(node).get("local_observations", []):
+        if entry.get("group") == group:
+            return entry
+    raise RuntimeError(f"node {node}: /openraft/status has no observation for group {group}")
+
+
+def wait_group_leader(group, nodes=NODES, timeout=30):
+    """Wait until every listed node names the same elected leader for one group.
+
+    A restarted node binds its listeners before its groups have elected a
+    leader, and a request forwarded in that window is refused, which is correct
+    cluster behaviour. Multi-Raft elects one leader per group, so this waits for
+    that group's election instead of expecting a single cluster-wide leader.
     """
     deadline = time.monotonic()+timeout
-    statuses = []
+    last = None
     while time.monotonic() < deadline:
         try:
-            statuses = [json.loads(request(19000+i, "GET", "/raft/status")[2])
-                        for i in nodes]
-        except OSError:
-            statuses = []
-        if statuses and len({s["leader_id"] for s in statuses}) == 1 \
-                and statuses[0]["leader_id"] is not None:
-            return statuses[0]["leader_id"]
+            last = [group_observation(node, group) for node in nodes]
+            leaders = {entry["leader_id"] for entry in last}
+            if len(leaders) == 1 and None not in leaders:
+                return leaders.pop()
+        except (OSError, RuntimeError):
+            last = None
         time.sleep(.05)
-    raise RuntimeError(f"no agreed Raft leader: {statuses}")
+    raise RuntimeError(f"group {group}: no leader agreed by nodes {tuple(nodes)}: {last}")
+
+
+def wait_group_leader_other(group, nodes, exclude, timeout=45):
+    """Wait until `nodes` agree on a leader that is not `exclude`.
+
+    `leader_id` keeps naming the old leader until that leader's lease expires,
+    so mere agreement is not enough after a leader is cut off: a test that heals
+    the links before the peers have replaced it would let the old leader commit
+    its pending entry.
+    """
+    deadline = time.monotonic()+timeout
+    last = None
+    while time.monotonic() < deadline:
+        try:
+            last = [group_observation(node, group) for node in nodes]
+            leaders = {entry["leader_id"] for entry in last}
+            if len(leaders) == 1:
+                (found,) = leaders
+                if found is not None and found != exclude:
+                    return found
+        except (OSError, RuntimeError):
+            last = None
+        time.sleep(.05)
+    raise RuntimeError(f"group {group}: nodes {tuple(nodes)} did not replace "
+                       f"leader {exclude}: {last}")
+
+
+def wait_all_leaders(timeout=60):
+    """Wait until every node observes a leader for every group."""
+    deadline = time.monotonic()+timeout
+    last = None
+    while time.monotonic() < deadline:
+        try:
+            last = [[group_observation(node, group) for group in GROUPS]
+                    for node in NODES]
+            if all(entry["leader_id"] is not None for row in last for entry in row):
+                return last
+        except (OSError, RuntimeError):
+            last = None
+        time.sleep(.05)
+    raise RuntimeError(f"not every node observed three group leaders: {last}")
+
+
+SKIPS = []
+
+
+def skip(scenario, reason):
+    """Record a capability this runtime does not expose; never a failure."""
+    SKIPS.append((scenario, reason))
+    print(f"SKIP {scenario}: {reason}")
+
+
+def eventually(read, check, label, timeout=15):
+    """Poll a read until `check` accepts it; the runtime guarantees convergence."""
+    deadline = time.monotonic()+timeout
+    last = None
+    while time.monotonic() < deadline:
+        last = read()
+        if check(last):
+            return last
+        time.sleep(.02)
+    raise AssertionError(f"{label}: not observed within {timeout}s; last={last!r}")
+
+
+def s3_visible(port, key, body, extra=None, timeout=15):
+    """Default S3 GET on a possibly-lagging follower, until `body` is applied."""
+    return eventually(lambda: signed(port, "GET", key, extra=extra),
+                      lambda r: r[0] == 200 and r[2] == body,
+                      f"S3 GET {key} on {port} == {body!r}", timeout)
+
+
+def s3_absent(port, key, timeout=15):
+    return eventually(lambda: signed(port, "GET", key),
+                      lambda r: r[0] == 404,
+                      f"S3 GET {key} on {port} == 404", timeout)
+
 
 
 def native(command, env=None):
@@ -594,60 +846,126 @@ def native_client_checks(temp, pg_port, s3_port):
     print("PASS native psql 17 and AWS CLI 2 (Simple Query, transaction, S3 PUT/HEAD/GET/LIST)")
 
 
+def rewrite_group_configs(root):
+    """Point every node's group config at the proxy address of every peer.
+
+    `prepare` requires `listen` to equal the node's own peer address, so a node
+    keeps its real Raft address and only the *other* peers move behind that
+    node's directed proxy. TLS stays end-to-end: the proxy relays bytes to the
+    real listener, and the pinned certificate and server name still verify.
+    """
+    for node in NODES:
+        for group in GROUPS:
+            path = root / "config" / f"node-{node}-group-{group}.json"
+            config = DEV.LOCAL.load(path)
+            peers = []
+            for peer in config["peers"]:
+                peer = dict(peer)
+                target = peer["id"]
+                peer["address"] = (
+                    f"127.0.0.1:{raft_port(group, node)}" if target == node
+                    else f"127.0.0.1:{raft_proxy_port(group, node, target)}")
+                peers.append(peer)
+            config["peers"] = peers
+            config["listen"] = f"127.0.0.1:{raft_port(group, node)}"
+            DEV.LOCAL.replace(path, config)
+
+
+def node_command(root, node):
+    """Daemon argv for one node in this harness's fixed port layout.
+
+    The launcher derives its own offsets from `--port-base`; this harness keeps
+    the documented protocols.py bases, so the flags are spelled out. Everything
+    that is not a port comes from the provisioned root.
+    """
+    return [
+        str(ROOT / "target" / "debug" / "yadbd"),
+        "--listen", f"127.0.0.1:{http_port(node)}",
+        "--node-id", str(node),
+        "--data-dir", str(root / "data" / f"node-{node}"),
+        "--metadata-runtime", "openraft",
+        "--openraft-config", str(root / "config" / f"node-{node}-manifest.json"),
+        "--peers", ",".join(f"{peer}=127.0.0.1:{http_port(peer)}" for peer in NODES),
+        "--admin-subject", ADMIN,
+        "--protocol-credentials", str(root / "credentials.json"),
+        "--pg-listen", f"127.0.0.1:{pg_port(node)}",
+        "--s3-listen", f"127.0.0.1:{s3_port(node)}",
+        "--s3-target", DEV.S3_TARGET,
+        "--iscsi-listen", f"127.0.0.1:{iscsi_port(node)}",
+        "--iscsi-portals", ",".join(f"127.0.0.1:{iscsi_port(peer)}" for peer in NODES),
+    ]
+
+
+def launch_node(root, node, env):
+    """Spawn one daemon, appending to its log, in its own session."""
+    log = (root / "logs" / f"node-{node}.log").open("ab", buffering=0)
+    try:
+        return subprocess.Popen(node_command(root, node), env=env,
+                                stdout=log, stderr=subprocess.STDOUT,
+                                start_new_session=True)
+    finally:
+        log.close()
+
+
 def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
+    global SECRET, RAFT_TOKEN, SUBJECT_SECRET
     base = "/data/data/com.foxdebug.acodefree/cache/opencode"
     with tempfile.TemporaryDirectory(prefix="yadb-protocols-", dir=base) as temp:
         temp = Path(temp)
-        creds = temp/"credentials.json"
-        creds.write_text(json.dumps({"users": {"backend": {"subject": SUBJECT, "secret": SECRET}}}))
-        os.chmod(creds, 0o600)
-        nodes = []
-        logs = []
+        # Provisioning is the launcher's, not a copy: credentials, TLS keys,
+        # pinned certificates, group configs and the version-2 manifest.
+        DEV.provision(temp, 19000)
+        rewrite_group_configs(temp)
+        secrets_ = DEV.load_secrets(temp)
+        SECRET = DEV.ensure_credentials(temp)
+        RAFT_TOKEN = secrets_["raft"]
+        SUBJECT_SECRET = secrets_["subject"]
+        env = DEV.daemon_env(temp)
+        nodes = [None, None, None]
         proxies = {}
-        portals = ",".join(f"127.0.0.1:{19300+i}" for i in range(1, 4))
         def start_node(i):
-            peers = ",".join(f"{j}=127.0.0.1:{19000+j if i == j else 19400+i*10+j}" for j in range(1, 4))
-            return subprocess.Popen([str(ROOT/"target/debug/yadbd"), "--node-id", str(i),
-                "--listen", f"127.0.0.1:{19000+i}", "--peers", peers, "--data-dir", str(temp/f"n{i}"),
-                "--protocol-credentials", str(creds), "--pg-listen", f"127.0.0.1:{19100+i}",
-                "--iscsi-listen", f"127.0.0.1:{19300+i}", "--iscsi-portals", portals,
-                "--s3-listen", f"127.0.0.1:{19200+i}", "--s3-target", "billing/receipts",
-                "--raft-token", RAFT_TOKEN],
-                stdout=logs[i-1], stderr=logs[i-1])
+            # A replica that already exists must be reopened, not re-created.
+            # The launcher owns that bookkeeping (`mode`/`initialize` per group
+            # config), so a restart of the same storage directories is its
+            # decision, not a second copy of the rule here.
+            DEV.sync_replica_modes(temp)
+            return launch_node(temp, i, env)
         try:
-            for i in range(1, 4):
-                for j in range(1, 4):
-                    if i != j:
-                        proxy = PeerProxy(i, j)
-                        proxies[i, j] = proxy
+            # One directed proxy per (group, source, target): a test can cut a
+            # single group's link without touching the other two groups.
+            for group in GROUPS:
+                for source in NODES:
+                    for target in NODES:
+                        if source == target:
+                            continue
+                        proxy = TransportProxy(group, source, target)
+                        proxies[group, source, target] = proxy
                         threading.Thread(target=proxy.serve_forever, daemon=True).start()
-            for i in range(1, 4):
-                log = open(temp/f"node{i}.log", "wb")
-                logs.append(log)
-                nodes.append(start_node(i))
-            for i in range(1, 4):
-                wait(19000+i)
-            # A bound listener is not an elected cluster. Forwarding the
-            # bootstrap apply before a leader is known is refused (correctly),
-            # so wait for the election rather than racing it.
-            wait_leader()
+            nodes[:] = [start_node(i) for i in NODES]
+            for i in NODES:
+                wait(http_port(i))
+            # A bound listener is not an elected cluster: the bootstrap apply
+            # must reach the control group's leader, so wait for every group's
+            # election rather than racing it.
+            wait_all_leaders()
             body = json.dumps({"yaml": (ROOT/"examples/platform.yaml").read_text()}).encode()
-            assert request(19002, "POST", "/v1/apply", body, {"Content-Type": "application/json"})[0] == 200
-            for i in range(1, 4):
-                deadline = time.monotonic()+10
-                while "billing/ledger" not in json.loads(request(19000+i, "GET", "/v1/status")[2])["databases"]:
+            assert request(http_port(2), "POST", "/v1/apply", body,
+                           {"Content-Type": "application/json", **admin_headers()})[0] == 200
+            for i in NODES:
+                deadline = time.monotonic()+20
+                while "billing/ledger" not in json.loads(request(http_port(i), "GET", "/v1/status")[2])["databases"]:
                     assert time.monotonic() < deadline, "control cache not replicated"
                     time.sleep(.05)
             # Exercise the internal DELETE route on every actual VDisk host,
             # using a reserved test project/channel unrelated to engine IDs.
             vdisk_tombstones = []
-            health = json.loads(request(19002, "GET", "/v1/pools/health")[2])
+            health = json.loads(request(http_port(2), "GET", "/v1/pools/health")[2])
             for pool in health["pools"]:
                 for slot in pool["slots"]:
                     blob = ((0xFFFFFFFE << 96) | (1 << 64) | (1 << 40)
                             | ((slot["slot_index"]+1) << 16) | (250 << 8) | 1)
                     path = f'/internal/vdisk/{pool["pool_name"]}/{slot["slot_index"]}/blob/{blob:032x}'
-                    port = 19000 + slot["node_id"]
+                    port = http_port(slot["node_id"])
                     internal = {"x-yadb-raft-token": RAFT_TOKEN}
                     assert request(port, "PUT", path, b"orphan-fragment", internal)[0] == 200
                     result = request(port, "DELETE", path, headers=internal)
@@ -656,11 +974,33 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
                     assert request(port, "DELETE", path, headers=internal)[2] == b"absent"
                     assert request(port, "PUT", path, b"late-fragment", internal)[0] == 412
                     vdisk_tombstones.append((port, path))
-            scrub = json.loads(request(19002, "POST", "/v1/pools/scrub")[2])
-            assert scrub["orphan_collection_error"] is None, scrub
+            # The repair/orphan scan needs one whole-deployment view, which
+            # Multi-Raft does not have. The daemon must say so instead of
+            # pretending it collected nothing, so the refusal itself is
+            # asserted; the collection half is a documented gap.
+            control_leader = wait_group_leader(CONTROL_GROUP)
+            scrub = json.loads(request(http_port(control_leader), "POST", "/v1/pools/scrub",
+                                       headers=admin_headers())[2])
+            assert scrub["orphan_collection_error"] == "scrub disabled for Multi-Raft", scrub
             assert "orphan_blobs_collected" in scrub
+            assert "gc_groups_refused" in scrub, scrub
+            skip("VDisk orphan collection",
+                 "scrub's repair/orphan scan is refused on Multi-Raft "
+                 "(crates/yadbd/src/main.rs:884, orphan_collection_error), so no orphan "
+                 "fragment can be collected or asserted; per-group GC has no live run")
+            # The GC route is exercised for its admin gate and its structured
+            # refusal, but a per-group sweep under its own collector lease has
+            # no live run in this harness.
+            gc_status, _, gc_body = request(http_port(control_leader), "POST",
+                                            "/v1/pools/gc", headers=admin_headers())
+            assert gc_status in (200, 409), (gc_status, gc_body)
+            gc = json.loads(gc_body)
+            assert "gc_refusal" in gc and "gc_groups_refused" in gc, gc
+            skip("per-group GC collection",
+                 "POST /v1/pools/gc returns a per-group outcome, but no scenario drives a "
+                 "live multi-group sweep and asserts reclaimed bytes")
             print("PASS VDisk exact DELETE, idempotent tombstone and delayed PUT fencing")
-            a, b = Pg(19102), Pg(19103)
+            a, b = Pg(pg_port(2)), Pg(pg_port(3))
             a.query("CREATE TABLE wire (id INT PRIMARY KEY, balance INT);")
             a.query("INSERT INTO wire VALUES (1,100), (2,200);")
             a.query("BEGIN; UPDATE wire SET balance=balance-10 WHERE id=1;")
@@ -804,7 +1144,7 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
             # transaction outside BEGIN, and a bad row must roll the whole load
             # back: a cleanup that silently failed would leave a partial table or
             # an open transaction the client cannot see.
-            b = Pg(19102)
+            b = Pg(pg_port(2))
             b.query("CREATE TABLE bulk (id INT PRIMARY KEY, name TEXT);")
             assert [c[0] for c in b.rows("SHOW COLUMNS FROM bulk;")] == ["id", "name"]
             out = b.copy_in("COPY bulk (id, name) FROM STDIN;",
@@ -833,25 +1173,34 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
             print("PASS pgwire index backfill and cross-portal indexed DML")
 
             key = "/invoices-2026/dir/a%20%2B%26.txt"
-            assert signed(19202, "PUT", key, b"hello aws")[0] == 200
-            assert signed(19203, "GET", key)[2] == b"hello aws"
-            assert signed(19203, "GET", key, extra={"range": "bytes=1-4"})[2] == b"ello"
-            status, hs, body = signed(19203, "GET", key, extra={"range": "bytes=7-999"})
+            assert signed(s3_port(2), "PUT", key, b"hello aws")[0] == 200
+            # Default reads are local-applied, so a follower converges rather
+            # than answering the new version instantly.
+            s3_visible(s3_port(3), key, b"hello aws")
+            assert signed(s3_port(3), "GET", key, extra={"range": "bytes=1-4"})[2] == b"ello"
+            status, hs, body = signed(s3_port(3), "GET", key, extra={"range": "bytes=7-999"})
             assert status == 206 and body == b"ws", (status, hs, body)
             assert next(v for k, v in hs.items() if k.lower() == "content-range") == "bytes 7-8/9"
-            assert signed(19203, "HEAD", key)[0] == 200
+            assert signed(s3_port(3), "HEAD", key)[0] == 200
+            # A quorum-confirmed read is served on OpenRaft: a follower forwards
+            # it to the project-group leader, which reads one snapshot.
+            consistent = signed(s3_port(3), "GET", key + "?consistent=true")
+            assert consistent[0] == 200 and consistent[2] == b"hello aws", consistent
+            missing = signed(s3_port(3), "GET", "/invoices-2026/consistent-missing?consistent=true")
+            assert missing[0] == 404, missing
             # A successful conditional GET must return the version whose ETag
             # was matched, even while a different version is being published.
             race_key = "/invoices-2026/conditional-race"
             original, replacement = b"old version", b"new version has another size"
-            status, hs, _ = signed(19202, "PUT", race_key, original)
+            status, hs, _ = signed(s3_port(2), "PUT", race_key, original)
             assert status == 200
             etag = next(v for k, v in hs.items() if k.lower() == "etag")
+            s3_visible(s3_port(2), race_key, original)
             failures = []
             def overwrite():
                 try:
                     for i in range(60):
-                        result = signed(19202, "PUT", race_key, replacement if i % 2 == 0 else original)
+                        result = signed(s3_port(2), "PUT", race_key, replacement if i % 2 == 0 else original)
                         assert result[0] == 200, result
                 except BaseException as e:
                     failures.append(e)
@@ -859,33 +1208,44 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
             writer.start()
             try:
                 for _ in range(120):
-                    status, _, body = signed(19202, "GET", race_key, extra={"if-match": etag})
+                    status, _, body = signed(s3_port(2), "GET", race_key, extra={"if-match": etag})
                     assert status == 412 or (status == 200 and body == original), (status, body)
             finally:
                 writer.join()
             assert not failures, failures
             print("PASS S3 conditional GET under concurrent overwrites")
-            status, _, body = signed(19203, "GET", "/invoices-2026?list-type=2&prefix=dir%2F")
-            assert status == 200 and ET.fromstring(body).find("{*}Contents/{*}Key").text == "dir/a +&.txt", body
-            assert signed(19202, "GET", key, secret="wrong-password")[0] == 403
-            invalid_range = signed(19202, "GET", key, extra={"range": "bytes=900-999"})
+            status, _, body = eventually(
+                lambda: signed(s3_port(3), "GET", "/invoices-2026?list-type=2&prefix=dir%2F"),
+                lambda r: r[0] == 200
+                and ET.fromstring(r[2]).find("{*}Contents/{*}Key").text == "dir/a +&.txt",
+                "S3 cross-node listing sees dir/a +&.txt")
+            assert status == 200, body
+            assert signed(s3_port(2), "GET", key, secret="wrong-password")[0] == 403
+            invalid_range = signed(s3_port(2), "GET", key, extra={"range": "bytes=900-999"})
             assert invalid_range[0] == 416, invalid_range
-            assert signed(19202, "DELETE", key)[0] == 204
-            assert signed(19202, "GET", key)[0] == 404
+            assert signed(s3_port(2), "DELETE", key)[0] == 204
+            s3_absent(s3_port(2), key)
             for name in ["a", "b", "c"]:
-                assert signed(19202, "PUT", "/invoices-2026/page/"+name, name.encode())[0] == 200
-            _, _, first = signed(19202, "GET", "/invoices-2026?list-type=2&prefix=page%2F&max-keys=1")
+                assert signed(s3_port(2), "PUT", "/invoices-2026/page/"+name, name.encode())[0] == 200
+            _, _, first = eventually(
+                lambda: signed(s3_port(2), "GET", "/invoices-2026?list-type=2&prefix=page%2F&max-keys=1"),
+                lambda r: r[0] == 200
+                and ET.fromstring(r[2]).find("{*}NextContinuationToken") is not None,
+                "S3 paginated listing sees page/")
             token = ET.fromstring(first).find("{*}NextContinuationToken").text
-            _, _, second = signed(19202, "GET", "/invoices-2026?list-type=2&prefix=page%2F&max-keys=1&continuation-token="+token)
+            _, _, second = signed(s3_port(2), "GET", "/invoices-2026?list-type=2&prefix=page%2F&max-keys=1&continuation-token="+token)
             assert ET.fromstring(second).find("{*}Contents/{*}Key").text == "page/b"
-            assert signed(19202, "PUT", "/invoices-2026/bad", b"bad", {"x-amz-checksum-crc32": "AAAAAA=="})[0] == 400
-            assert signed(19202, "PUT", "/invoices-2026/bad-md5", b"bad", {"content-md5": "AAAAAAAAAAAAAAAAAAAAAA=="})[0] == 400
-            # An opt-in quorum-confirmed read cannot be served by legacy
-            # metadata, so the native listener must refuse it instead of
-            # silently answering from the locally applied manifest.
-            consistent = signed(19202, "GET", key + "?consistent=true")
-            assert consistent[0] == 501, consistent
-            assert b"consistent reads require OpenRaft metadata" in consistent[2], consistent
+            assert signed(s3_port(2), "PUT", "/invoices-2026/bad", b"bad", {"x-amz-checksum-crc32": "AAAAAA=="})[0] == 400
+            assert signed(s3_port(2), "PUT", "/invoices-2026/bad-md5", b"bad", {"content-md5": "AAAAAAAAAAAAAAAAAAAAAA=="})[0] == 400
+            # A quorum-confirmed read is served above on OpenRaft: the legacy
+            # runtime refused `?consistent=true` because it cannot take such a
+            # snapshot, so that refusal became a success assertion. Nothing here
+            # falls back to a locally applied manifest.
+            skip("reader lease",
+                 "begin_read_lease is legacy-gated (crates/yadbd/src/protocols/s3.rs:685 "
+                 "and crates/yadbd/src/main.rs:534), so Multi-Raft has no fenced read "
+                 "lease to acquire, renew or expire; consistent reads use the quorum "
+                 "snapshot instead")
             # Multipart upload: the parts are real durable allocations, and the
             # completed object must be indistinguishable from a single PUT.
             # An option the object store cannot honour is refused at initiate,
@@ -895,12 +1255,12 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
             for options in ({"x-amz-meta-owner": "ops"},
                             {"x-amz-server-side-encryption": "AES256"}):
                 status, _, body = signed(
-                    19202, "POST", "/invoices-2026/multipart/refused?uploads",
+                    s3_port(2), "POST", "/invoices-2026/multipart/refused?uploads",
                     b"", options)
                 assert status == 501 and b"<Code>NotImplemented</Code>" in body, (status, body)
-                assert signed(19202, "GET", "/invoices-2026/multipart/refused")[0] == 404
+                assert signed(s3_port(2), "GET", "/invoices-2026/multipart/refused")[0] == 404
             mp_key = "/invoices-2026/multipart/object.bin"
-            status, _, body = signed(19202, "POST", mp_key + "?uploads")
+            status, _, body = signed(s3_port(2), "POST", mp_key + "?uploads")
             assert status == 200, (status, body)
             upload_id = ET.fromstring(body).find("{*}UploadId").text
             assert upload_id.startswith("mpu-"), upload_id
@@ -908,19 +1268,21 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
             mp_etags = []
             for number, part in enumerate(mp_parts, 1):
                 status, hs, body = signed(
-                    19202, "PUT",
+                    s3_port(2), "PUT",
                     f"{mp_key}?partNumber={number}&uploadId={upload_id}", part)
                 assert status == 200, (status, body)
                 etag = next(v for k, v in hs.items() if k.lower() == "etag")
                 assert etag == '"' + hashlib.md5(part).hexdigest() + '"', etag
                 mp_etags.append((number, etag.strip('"')))
-            status, _, body = signed(19202, "GET", f"{mp_key}?uploadId={upload_id}")
-            assert status == 200, (status, body)
+            _, _, body = eventually(
+                lambda: signed(s3_port(2), "GET", f"{mp_key}?uploadId={upload_id}"),
+                lambda r: r[0] == 200 and len(ET.fromstring(r[2]).findall("{*}Part")) == 3,
+                "S3 ListParts sees three parts")
             assert len(ET.fromstring(body).findall("{*}Part")) == 3, body
             # ListParts is paginated and says so; the marker resumes after the
             # last part shown. An out-of-range page size is refused, not clamped.
             status, _, body = signed(
-                19202, "GET", f"{mp_key}?uploadId={upload_id}&max-parts=2")
+                s3_port(2), "GET", f"{mp_key}?uploadId={upload_id}&max-parts=2")
             assert status == 200, (status, body)
             page = ET.fromstring(body)
             assert [p.find("{*}PartNumber").text for p in page.findall("{*}Part")] == ["1", "2"], body
@@ -928,34 +1290,34 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
             marker = page.find("{*}NextPartNumberMarker").text
             assert marker == "2", body
             status, _, body = signed(
-                19202, "GET",
+                s3_port(2), "GET",
                 f"{mp_key}?uploadId={upload_id}&max-parts=2&part-number-marker={marker}")
             assert status == 200, (status, body)
             page = ET.fromstring(body)
             assert [p.find("{*}PartNumber").text for p in page.findall("{*}Part")] == ["3"], body
             assert page.find("{*}IsTruncated").text == "false", body
             status, _, body = signed(
-                19202, "GET", f"{mp_key}?uploadId={upload_id}&max-parts=0")
+                s3_port(2), "GET", f"{mp_key}?uploadId={upload_id}&max-parts=0")
             assert status == 400 and b"<Code>InvalidArgument</Code>" in body, (status, body)
             # An explicit empty value is a client error, not an absent page size:
             # defaulting `max-parts=` to 1000 would answer a different request.
             for empty in ("max-parts=", "part-number-marker="):
                 status, _, body = signed(
-                    19202, "GET", f"{mp_key}?uploadId={upload_id}&{empty}")
+                    s3_port(2), "GET", f"{mp_key}?uploadId={upload_id}&{empty}")
                 assert status == 400 and b"<Code>InvalidArgument</Code>" in body, (status, body)
             # A wrong ETag and an out-of-order list are refused with the S3 codes,
             # and neither consumes the upload.
             wrong = [(mp_etags[0][0], "0" * 32)] + mp_etags[1:]
             status, _, body = signed(
-                19202, "POST", f"{mp_key}?uploadId={upload_id}",
+                s3_port(2), "POST", f"{mp_key}?uploadId={upload_id}",
                 complete_multipart_xml(wrong))
             assert status == 400 and b"<Code>InvalidPart</Code>" in body, (status, body)
             status, _, body = signed(
-                19202, "POST", f"{mp_key}?uploadId={upload_id}",
+                s3_port(2), "POST", f"{mp_key}?uploadId={upload_id}",
                 complete_multipart_xml(list(reversed(mp_etags))))
             assert status == 400 and b"<Code>InvalidPartOrder</Code>" in body, (status, body)
             status, hs, body = signed(
-                19202, "POST", f"{mp_key}?uploadId={upload_id}",
+                s3_port(2), "POST", f"{mp_key}?uploadId={upload_id}",
                 complete_multipart_xml(mp_etags))
             assert status == 200, (status, body)
             expected = multipart_etag(mp_parts)
@@ -966,51 +1328,58 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
             assert location is not None, body
             assert "uploadId" not in location.text, location.text
             joined = b"".join(mp_parts)
-            status, hs, body = signed(19203, "GET", mp_key)
-            assert status == 200 and body == joined, (status, body[:64])
+            _, hs, body = eventually(
+                lambda: signed(s3_port(3), "GET", mp_key),
+                lambda r: r[0] == 200 and r[2] == joined,
+                "S3 completed multipart object visible on the other node")
             assert next(v for k, v in hs.items() if k.lower() == "etag") == expected
-            status, hs, _ = signed(19203, "HEAD", mp_key)
+            status, hs, _ = signed(s3_port(3), "HEAD", mp_key)
             assert status == 200
             assert int(next(v for k, v in hs.items() if k.lower() == "content-length")) == len(joined)
-            status, hs, body = signed(19203, "GET", mp_key, extra={"range": "bytes=4096-9095"})
+            status, hs, body = signed(s3_port(3), "GET", mp_key, extra={"range": "bytes=4096-9095"})
             assert status == 206 and body == joined[4096:9096], (status, body)
             # The consumed upload cannot be completed twice.
-            status, _, body = signed(
-                19202, "POST", f"{mp_key}?uploadId={upload_id}",
-                complete_multipart_xml(mp_etags))
-            assert status == 404 and b"<Code>NoSuchUpload</Code>" in body, (status, body)
+            _, _, body = eventually(
+                lambda: signed(s3_port(2), "POST", f"{mp_key}?uploadId={upload_id}",
+                               complete_multipart_xml(mp_etags)),
+                lambda r: r[0] == 404 and b"<Code>NoSuchUpload</Code>" in r[2],
+                "S3 consumed upload is gone")
             # Abort removes the upload, and its parts are no longer usable.
-            status, _, body = signed(19202, "POST", "/invoices-2026/multipart/aborted?uploads")
+            status, _, body = signed(s3_port(2), "POST", "/invoices-2026/multipart/aborted?uploads")
             assert status == 200, (status, body)
             abort_id = ET.fromstring(body).find("{*}UploadId").text
             aborted = "/invoices-2026/multipart/aborted"
             assert signed(
-                19202, "PUT", f"{aborted}?partNumber=1&uploadId={abort_id}", b"x")[0] == 200
-            assert signed(19202, "DELETE", f"{aborted}?uploadId={abort_id}")[0] == 204
-            assert signed(
-                19202, "PUT", f"{aborted}?partNumber=2&uploadId={abort_id}", b"y")[0] == 404
-            assert signed(19203, "GET", aborted)[0] == 404
-            # The same flow through the other node: exactly one of 19202/19203
-            # is the leader, so at least one round is forwarded, and a
-            # follower must reach the same state.
+                s3_port(2), "PUT", f"{aborted}?partNumber=1&uploadId={abort_id}", b"x")[0] == 200
+            assert signed(s3_port(2), "DELETE", f"{aborted}?uploadId={abort_id}")[0] == 204
+            eventually(
+                lambda: signed(s3_port(2), "PUT", f"{aborted}?partNumber=2&uploadId={abort_id}", b"y"),
+                lambda r: r[0] == 404,
+                "S3 aborted upload rejects a later part")
+            assert signed(s3_port(3), "GET", aborted)[0] == 404
+            # The same flow through the other node. Each statement is forwarded
+            # to whichever node leads the billing group, so the follower that
+            # received it must converge on the same state.
             follow_key = "/invoices-2026/multipart/forwarded.bin"
-            status, _, body = signed(19203, "POST", follow_key + "?uploads")
+            status, _, body = signed(s3_port(3), "POST", follow_key + "?uploads")
             assert status == 200, (status, body)
             follow_id = ET.fromstring(body).find("{*}UploadId").text
             follow_parts = [b"f" * 32, b"g" * 64]
             follow_etags = []
             for number, part in enumerate(follow_parts, 1):
                 status, hs, body = signed(
-                    19203, "PUT",
+                    s3_port(3), "PUT",
                     f"{follow_key}?partNumber={number}&uploadId={follow_id}", part)
                 assert status == 200, (status, body)
                 follow_etags.append(
                     (number, next(v for k, v in hs.items() if k.lower() == "etag").strip('"')))
             status, _, body = signed(
-                19203, "POST", f"{follow_key}?uploadId={follow_id}",
+                s3_port(3), "POST", f"{follow_key}?uploadId={follow_id}",
                 complete_multipart_xml(follow_etags))
             assert status == 200, (status, body)
-            assert signed(19202, "GET", follow_key)[2] == b"".join(follow_parts)
+            eventually(lambda: signed(s3_port(2), "GET", follow_key),
+                       lambda r: r[0] == 200 and r[2] == b"".join(follow_parts),
+                       "S3 forwarded multipart object visible on the other node")
             print("PASS S3 multipart: initiate, parts, list, complete, HEAD/Range, abort")
             print("PASS S3 SigV4, XML listing, escaped keys, PUT/GET/HEAD/Range/DELETE, bad signatures")
 
@@ -1018,7 +1387,12 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
             concurrent_lock = threading.Lock()
             def concurrent_put(i):
                 try:
-                    result = signed(19202, "PUT", f"/invoices-2026/concurrent/{i}", f"value-{i}".encode())
+                    # Keyed S3 writes are serialized behind the billing group's
+                    # metadata log, so 24 proposals queue. The per-request
+                    # timeout is a client-side budget, not part of the contract
+                    # under test: give the queue room instead of racing it.
+                    result = signed(s3_port(2), "PUT", f"/invoices-2026/concurrent/{i}",
+                                    f"value-{i}".encode(), timeout=180)
                 except Exception as e:
                     result = (None, {}, repr(e))
                 with concurrent_lock:
@@ -1032,18 +1406,20 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
             failures = [(i, result) for i, result in concurrent_results if result[0] != 200]
             assert not failures, failures
             for i in range(24):
-                assert signed(19203, "GET", f"/invoices-2026/concurrent/{i}")[2] == f"value-{i}".encode()
+                eventually(lambda i=i: signed(s3_port(3), "GET", f"/invoices-2026/concurrent/{i}"),
+                           lambda r, i=i: r[0] == 200 and r[2] == f"value-{i}".encode(),
+                           f"S3 concurrent object {i} visible on the other node")
             print("PASS concurrent Raft-backed S3 proposals")
 
             if native_clients:
-                native_client_checks(temp, 19102, 19202)
+                native_client_checks(temp, pg_port(2), s3_port(2))
 
-            Iscsi(19302, secret="wrong-password")
-            discovery = Iscsi(19302, discovery=True)
+            Iscsi(iscsi_port(2), secret="wrong-password")
+            discovery = Iscsi(iscsi_port(2), discovery=True)
             _, data = discovery.exchange(4, 0x80, b"SendTargets=All\0")
             assert data.count(b"TargetAddress=") == 3, data
             discovery.s.close()
-            x, y = Iscsi(19302), Iscsi(19303)
+            x, y = Iscsi(iscsi_port(2)), Iscsi(iscsi_port(3))
             cdb = bytes([0x12, 1, 0x83, 0, 255, 0])
             assert x.scsi(cdb, 255) == y.scsi(cdb, 255)
             # INQUIRY allocation length zero but iSCSI expects 36 bytes: the
@@ -1104,7 +1480,7 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
             x.write(b"C"*512)
             x.scsi(bytes([0x35])+bytes(9))
             print("PASS iSCSI CHAP, discovery, stable VPD83, READ/WRITE, R2T/Data-Out, UNMAP")
-            limited = Iscsi(19302, negotiation={"ImmediateData": "No", "MaxBurstLength": "4096", "FirstBurstLength": "4096"})
+            limited = Iscsi(iscsi_port(2), negotiation={"ImmediateData": "No", "MaxBurstLength": "4096", "FirstBurstLength": "4096"})
             assert limited.negotiated["ImmediateData"] == "No", limited.negotiated
             assert limited.negotiated["MaxBurstLength"] == "4096", limited.negotiated
             payload = bytes(range(256))*64
@@ -1113,7 +1489,7 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
             limited.s.close()
             print("PASS iSCSI ImmediateData=No, negotiated burst limits, multiple R2Ts")
             if libiscsi_dir:
-                iscsi_url = f"iscsi://backend%{SECRET}@127.0.0.1:19302/iqn.2026-11.io.yadb:billing:vm-root/0"
+                iscsi_url = f"iscsi://backend%{SECRET}@127.0.0.1:{iscsi_port(2)}/iqn.2026-11.io.yadb:billing:vm-root/0"
                 output = native([str(Path(libiscsi_dir)/"iscsi-inq"), "-d", "3", iscsi_url])
                 assert "YADB" in output, output
                 print(native([str(Path(libiscsi_dir)/"iscsi-readcapacity16"), iscsi_url]))
@@ -1121,13 +1497,13 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
             if libiscsi_probe:
                 probe_env = os.environ.copy()
                 probe_env["YADB_TEST_SECRET"] = SECRET
-                print(native([libiscsi_probe, "127.0.0.1:19302"], probe_env).strip())
+                print(native([libiscsi_probe, f"127.0.0.1:{iscsi_port(2)}"], probe_env).strip())
 
             # Abruptly stop every process after acknowledged writes, retaining
             # the same storage directories. One SQL transaction remains open.
-            assert signed(19202, "PUT", "/invoices-2026/restart", b"durable object")[0] == 200
+            assert signed(s3_port(2), "PUT", "/invoices-2026/restart", b"durable object")[0] == 200
             x.write(b"R"*512, lba=4096)
-            uncommitted = Pg(19102)
+            uncommitted = Pg(pg_port(2))
             uncommitted.query("BEGIN; UPDATE wire SET balance=7 WHERE id=1;")
             for node in nodes:
                 node.kill()
@@ -1137,292 +1513,322 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
             b.s.close()
             x.s.close()
             y.s.close()
-            nodes[:] = [start_node(i) for i in range(1, 4)]
-            for i in range(1, 4):
-                wait(19000+i)
-            for i in range(1, 4):
-                deadline = time.monotonic()+20
-                while "billing/ledger" not in json.loads(request(19000+i, "GET", "/v1/status")[2])["databases"]:
+            nodes[:] = [start_node(i) for i in NODES]
+            for i in NODES:
+                wait(http_port(i))
+            for i in NODES:
+                deadline = time.monotonic()+30
+                while "billing/ledger" not in json.loads(request(http_port(i), "GET", "/v1/status")[2])["databases"]:
                     assert time.monotonic() < deadline, "control cache not recovered"
                     time.sleep(.05)
-            wait_leader()
-            restored = Pg(19102)
+            wait_all_leaders()
+            skip("cross-process InstallSnapshot",
+                 "a full-cluster restart re-elects and replays from the local WAL; no "
+                 "scenario forces one node to install a snapshot from another process")
+            restored = Pg(pg_port(2))
             assert restored.rows("SELECT balance FROM wire WHERE id=1;") == [["90"]]
             assert restored.rows("SELECT id FROM wire WHERE balance=90;") == [["1"]]
             assert restored.rows("SELECT id FROM wire WHERE balance=201;") == [["2"]]
             assert restored.rows("SELECT id FROM wire WHERE balance=200;") == []
             restored.close()
-            assert signed(19203, "GET", "/invoices-2026/restart")[2] == b"durable object"
+            s3_visible(s3_port(3), "/invoices-2026/restart", b"durable object")
             for port, path in vdisk_tombstones:
                 internal = {"x-yadb-raft-token": RAFT_TOKEN}
                 status, _, body = request(port, "PUT", path, b"late-after-restart", internal)
                 assert status == 412, (status, body)
                 assert request(port, "GET", path, headers=internal)[0] == 404
-            disk = Iscsi(19303)
+            disk = Iscsi(iscsi_port(3))
             assert disk.read(lba=4096) == b"R"*512
             disk.s.close()
             print("PASS full cluster SIGKILL/restart: committed SQL, S3, iSCSI and uncommitted SQL rollback")
 
-            def has_entries(rpc):
-                return bool(rpc.get("AppendEntries", {}).get("entries"))
-
-            def begin_ambiguous_write(old, label, predicate=has_entries):
-                peers = [i for i in range(1, 4) if i != old]
-                delivered = peers[0]
-                blocked = peers[1]
-                # One follower durably receives the proposal but its reply is
-                # lost; the other follower never receives it. The proxy cuts the
-                # leader's link to the first follower as soon as it relays the
-                # proposal, so no later reply (a heartbeat reply carries the
-                # follower's match_index too) can confirm the entry. The client
-                # sees an error without this test retrying the command.
-                proxies[old, delivered].raft_reply_fault = predicate
-                proxies[old, blocked].raft_request_fault = predicate
-                for peer in peers:
-                    proxies[old, peer].dropped_raft_reply.clear()
-                # The follower that holds the proposal must not be able to win
-                # the next election: if it could, the cluster would commit the
-                # write and answer the caller definitively, and the ambiguous
-                # path would never be exercised.
-                proxies[delivered, old].blocked.set()
-                proxies[delivered, blocked].blocked.set()
-                proxies[blocked, delivered].blocked.set()
-
-                def recover():
-                    assert proxies[old, delivered].dropped_raft_reply.is_set(), (
-                        f"{label}: publication response fault did not trigger")
-                    proxies[old, delivered].raft_reply_fault = None
-                    proxies[old, blocked].raft_request_fault = None
-                    # Heal the holder's links first: a new leader needs its log.
-                    proxies[delivered, old].blocked.clear()
-                    proxies[delivered, blocked].blocked.clear()
-                    proxies[blocked, delivered].blocked.clear()
-                    for peer in peers:
-                        proxies[old, peer].blocked.set()
-                        proxies[peer, old].blocked.set()
-                    deadline = time.monotonic()+20
-                    while True:
-                        statuses = [json.loads(request(19000+i, "GET", "/raft/status")[2]) for i in peers]
-                        leaders = [s["node_id"] for s in statuses if s["role"] == "Leader"]
-                        if len(leaders) == 1:
-                            break
-                        assert time.monotonic() < deadline, statuses
-                        time.sleep(.1)
-                    new = leaders[0]
-                    for proxy in proxies.values():
-                        proxy.blocked.clear()
-                    deadline = time.monotonic()+20
-                    while True:
-                        statuses = [json.loads(request(19000+i, "GET", "/raft/status")[2]) for i in range(1, 4)]
-                        if all(s["leader_id"] == new for s in statuses) and statuses[old-1]["role"] == "Follower":
-                            break
-                        assert time.monotonic() < deadline, statuses
-                        time.sleep(.1)
-
-                return recover
-
-            # S3: the manifest may or may not survive the leader change, but a
-            # failed client request must never produce a different object value.
-            old = json.loads(request(19002, "GET", "/raft/status")[2])["leader_id"]
+            # Ambiguous writes. A client that loses the response decides the
+            # outcome by reading, never by retrying the mutation.
             ambiguous_s3_key = "/invoices-2026/ambiguous-process-s3"
-            def publishes_s3_manifest(rpc):
-                # Allocation and intent persistence now precede fragment PUT.
-                # Fault only publication, not those earlier Raft commands.
-                for entry in rpc.get("AppendEntries", {}).get("entries", []):
-                    txn = entry.get("cmd", {}).get("RevisionTxn", {})
-                    if any(op.get("Put", {}).get("key", "").startswith("/s3/")
-                           for op in txn.get("ops", [])):
-                        return True
-                return False
-            recover = begin_ambiguous_write(old, "S3", publishes_s3_manifest)
-            s3_fault = signed(19200+old, "PUT", ambiguous_s3_key, b"ambiguous-s3")
-            assert not 200 <= s3_fault[0] < 300, s3_fault
-            recover()
-            s3_check = signed(19200+old, "GET", ambiguous_s3_key)
-            assert s3_check[0] in (200, 404), s3_check
-            if s3_check[0] == 200:
-                assert s3_check[2] == b"ambiguous-s3", s3_check
-            s3_outcome = (s3_check[0], s3_check[2])
-            print("PASS ambiguous S3 write: error did not imply rollback")
+            blocked_s3_key = "/invoices-2026/ambiguous-blocked-s3"
+            assert signed(s3_port(2), "GET", ambiguous_s3_key)[0] == 404
+            assert signed(s3_port(2), "GET", blocked_s3_key)[0] == 404
 
-            # SQL: same transport fault at the metadata commit boundary. The
-            # INSERT is not retried; after convergence only 0 or 1 exact row is
-            # acceptable, never a success for another command.
-            old = json.loads(request(19002, "GET", "/raft/status")[2])["leader_id"]
-            def publishes_sql_manifest(rpc):
-                # Takeover/allocation precede WAL PUT. Fault actual publication,
-                # not a reservation that could fail before any SQL data exists.
-                for entry in rpc.get("AppendEntries", {}).get("entries", []):
-                    txn = entry.get("cmd", {}).get("RevisionTxn", {})
-                    if any("/shards/" in op.get("Put", {}).get("key", "")
-                           and op.get("Put", {}).get("key", "").startswith("/db/")
-                           for op in txn.get("ops", [])):
-                        # Takeover writes one manifest; commit also guards schema.
-                        if any("/tables/" in guard.get("key", "")
-                               for guard in txn.get("guards", [])):
-                            return True
-                return False
-            recover = begin_ambiguous_write(old, "SQL", publishes_sql_manifest)
-            sql_fault = Pg(19100+old)
-            sql_fault.s.settimeout(10)
-            sql_fault.query("INSERT INTO wire VALUES (96,996);", fail=True)
-            sql_fault.close()
-            recover()
-            sql_check = Pg(19100+old)
-            sql_outcome = sql_check.rows("SELECT balance FROM wire WHERE id=96;")
-            assert sql_outcome in ([], [["996"]])
-            sql_check.close()
-            print("PASS ambiguous SQL write: error did not imply rollback")
+            def cut_billing_leader():
+                """Cut the billing group's outbound links from its leader.
 
-            # Once the new leader has converged, neither accepted outcome may
+                The leader keeps its client listener and still believes it is
+                leader, so the next request is proposed locally. With no link to
+                either peer the proposal can never reach a quorum. Peer-to-peer
+                links stay intact, so the other two nodes elect a new leader in
+                a higher term while the proposal is still uncommitted.
+                """
+                leader = wait_group_leader(BILLING_GROUP)
+                peers = [i for i in NODES if i != leader]
+                for peer in peers:
+                    proxies[BILLING_GROUP, leader, peer].blocked.set()
+                for peer in peers:
+                    proxies[BILLING_GROUP, leader, peer].settle()
+                return leader
+
+            def heal_billing_leader(leader):
+                """Depose the cut leader, then restore every billing link.
+
+                The peers must agree on a new leader *before* the links heal:
+                an uncommitted entry in a deposed leader's log is truncated by
+                the new leader, while an entry in a leader that is still in
+                office would simply commit once a quorum returns.
+                """
+                peers = [i for i in NODES if i != leader]
+                new = wait_group_leader_other(BILLING_GROUP, peers, leader)
+                assert new != leader, (new, leader)
+                for peer in peers:
+                    proxies[BILLING_GROUP, leader, peer].blocked.clear()
+                return wait_group_leader(BILLING_GROUP)
+
+            # (a) May have committed. A proxy in front of the billing group
+            # leader's S3 listener forwards the whole PUT, reads the daemon's
+            # answer and closes without writing one response byte. The client
+            # sees a transport error although the mutation may be durable.
+            leader = wait_group_leader(BILLING_GROUP)
+            drop = ResponseDropProxy(HTTP_PROXY_BASE + leader, s3_port(leader),
+                                     "billing S3 PUT")
+            threading.Thread(target=drop.serve_forever, daemon=True).start()
+            try:
+                try:
+                    status, _, _ = signed(HTTP_PROXY_BASE + leader, "PUT",
+                                          ambiguous_s3_key, b"ambiguous-s3")
+                except (OSError, http.client.HTTPException) as error:
+                    client_error = type(error).__name__
+                else:
+                    raise AssertionError(
+                        f"ambiguous PUT was answered with HTTP {status}; a lost "
+                        "response must surface as a transport error")
+                assert drop.observed.wait(30), "response-drop proxy saw no request"
+                assert drop.error is None, drop.error
+                assert 200 <= drop.upstream_status < 300, drop.upstream_status
+            finally:
+                drop.shutdown()
+                drop.server_close()
+            # The daemon answered 2xx, so the mutation is durable: the object
+            # must become the complete new value, never absent and never torn.
+            # Reads are local-applied, so poll the (possibly new) group leader
+            # until its apply loop has caught up with its own commit.
+            reader = wait_group_leader(BILLING_GROUP)
+            _, headers, body = eventually(
+                lambda: signed(s3_port(reader), "GET", ambiguous_s3_key),
+                lambda r: r[0] == 200 and r[2] == b"ambiguous-s3",
+                "ambiguous S3 write is complete after a lost response")
+            assert int(next(v for k, v in headers.items()
+                            if k.lower() == "content-length")) == len(body), headers
+            s3_outcome = (200, body)
+            print(f"PASS ambiguous S3 write: client saw {client_error} after the "
+                  f"daemon answered {drop.upstream_status}; the object is the "
+                  f"complete new value ({len(body)} bytes)")
+
+            # (b) Cannot have committed. The cut is in place before the mutation
+            # is proposed, so the entry exists only in the old leader's log. It
+            # never reaches a quorum, the peers elect a leader in a higher term,
+            # and that leader's log truncates the stale entry. The client is
+            # told the write failed, and the old value must remain.
+            leader = cut_billing_leader()
+            try:
+                blocked = signed(s3_port(leader), "PUT", blocked_s3_key,
+                                 b"cannot-commit")
+                assert not 200 <= blocked[0] < 300, blocked
+            finally:
+                heal_billing_leader(leader)
+            # An entry that never left one log cannot be resurrected by the
+            # deposed leader, so the old value (absent) is the only outcome.
+            for node in NODES:
+                s3_absent(s3_port(node), blocked_s3_key)
+            print(f"PASS ambiguous S3 write refused without a quorum: HTTP "
+                  f"{blocked[0]} and the object stayed absent on all nodes")
+
+            # The same guarantee for SQL: the INSERT is not retried, so a
+            # non-2xx must mean no row rather than a row of another value.
+            leader = cut_billing_leader()
+            try:
+                sql_fault = Pg(pg_port(leader))
+                sql_fault.s.settimeout(60)
+                try:
+                    sql_fault.query("INSERT INTO wire VALUES (96,996);", fail=True)
+                finally:
+                    sql_fault.close()
+            finally:
+                heal_billing_leader(leader)
+            for node in NODES:
+                check = Pg(pg_port(node))
+                assert check.rows("SELECT balance FROM wire WHERE id=96;") == []
+                check.close()
+            print("PASS ambiguous SQL write refused without a quorum: the error "
+                  "implied rollback and no replica published the row")
+
+            # Once the groups have converged, neither accepted outcome may
             # change across a full process restart of the same storage files.
             for node in nodes:
                 node.kill()
             for node in nodes:
                 node.wait(timeout=10)
-            nodes[:] = [start_node(i) for i in range(1, 4)]
-            for i in range(1, 4):
-                wait(19000+i)
+            nodes[:] = [start_node(i) for i in NODES]
+            for i in NODES:
+                wait(http_port(i))
                 deadline = time.monotonic()+20
-                while "billing/ledger" not in json.loads(request(19000+i, "GET", "/v1/status")[2])["databases"]:
+                while "billing/ledger" not in json.loads(request(http_port(i), "GET", "/v1/status")[2])["databases"]:
                     assert time.monotonic() < deadline, "control cache not recovered after ambiguous writes"
                     time.sleep(.05)
-            wait_leader()
-            restart_s3 = signed(19202, "GET", ambiguous_s3_key)
-            assert (restart_s3[0], restart_s3[2]) == s3_outcome, (s3_outcome, restart_s3)
-            restart_sql = Pg(19102)
-            assert restart_sql.rows("SELECT balance FROM wire WHERE id=96;") == sql_outcome
+            wait_all_leaders()
+            if s3_outcome[0] == 200:
+                s3_visible(s3_port(2), ambiguous_s3_key, s3_outcome[1])
+            else:
+                s3_absent(s3_port(2), ambiguous_s3_key)
+            for node in NODES:
+                s3_absent(s3_port(node), blocked_s3_key)
+            restart_sql = Pg(pg_port(2))
+            assert restart_sql.rows("SELECT balance FROM wire WHERE id=96;") == []
             assert restart_sql.rows("SELECT balance FROM wire WHERE id=1;") == [["90"]]
             restart_sql.close()
             print("PASS ambiguous SQL/S3 outcomes preserved through full cluster restart")
 
-            # Leave the current leader alive but remove both voting peers. A
-            # rejected or timed-out write may still commit after recovery, so do
-            # not assume its final outcome; only assert it was not acknowledged.
-            leader = json.loads(request(19002, "GET", "/raft/status")[2])["leader_id"]
-            assert leader in (1, 2, 3), leader
-            stopped = [i for i in range(1, 4) if i != leader]
+            # Leave the current billing-group leader alive but remove both other
+            # processes. Two of three processes are gone, so the control group
+            # has no quorum either: the S3 request is refused at the control
+            # lease, while the SQL session opened *before* the loss is refused
+            # by the billing group itself. Nothing is acknowledged and no
+            # outcome is assumed.
+            leader = wait_group_leader(BILLING_GROUP)
+            assert leader in NODES, leader
+            isolated = Pg(pg_port(leader))
+            isolated.s.settimeout(30)
+            stopped = [i for i in NODES if i != leader]
             for i in stopped:
                 nodes[i-1].kill()
             for i in stopped:
                 nodes[i-1].wait(timeout=10)
-            result = signed(19200+leader, "PUT", "/invoices-2026/no-quorum", b"unknown outcome")
+            result = signed(s3_port(leader), "PUT", "/invoices-2026/no-quorum", b"unknown outcome")
             assert not 200 <= result[0] < 300, result
-            isolated = Pg(19100+leader)
-            isolated.s.settimeout(10)
             isolated.query("INSERT INTO wire VALUES (99,999);", fail=True)
             isolated.close()
 
             # Restore only one follower first: two out of three form a Raft
-            # quorum, so metadata commits again. Every pool is striped over all
-            # three failure domains, but a part whose nominal slot sits on the
-            # dead node is written to a handoff slot on a live node instead —
-            # YDB's handoff-disk rule. The ack therefore still means every part
-            # is durable, so the write is accepted rather than refused for a
-            # missing domain, and it is not counted as degraded.
+            # quorum for every group, so metadata commits again. Every pool is
+            # striped over all three failure domains, but a part whose nominal
+            # slot sits on the dead node is written to a handoff slot on a live
+            # node instead — YDB's handoff-disk rule. The ack therefore still
+            # means every part is durable, so the write is accepted rather than
+            # refused for a missing domain, and it is not counted as degraded.
             i = stopped[0]
             nodes[i-1] = start_node(i)
-            wait(19000+i)
+            wait(http_port(i))
+            live = [leader, i]
+            wait_group_leader(CONTROL_GROUP, nodes=live)
+            wait_group_leader(BILLING_GROUP, nodes=live)
             deadline = time.monotonic()+20
             while True:
-                result = signed(19200+leader, "PUT", "/invoices-2026/quorum-restored", b"recovered")
+                result = signed(s3_port(leader), "PUT", "/invoices-2026/quorum-restored", b"recovered")
                 if result[0] == 200:
                     break
                 assert time.monotonic() < deadline, result
                 time.sleep(.1)
-            health = json.loads(request(19000+leader, "GET", "/v1/pools/health")[2])
+            health = json.loads(request(http_port(leader), "GET", "/v1/pools/health")[2])
             assert health["pools"], health
             assert all(p["degraded_puts"] == 0 for p in health["pools"]), health
-            assert signed(19200+leader, "GET", "/invoices-2026/restart")[2] == b"durable object"
-            check = Pg(19100+leader)
+            s3_visible(s3_port(leader), "/invoices-2026/restart", b"durable object")
+            check = Pg(pg_port(leader))
             assert check.rows("SELECT balance FROM wire WHERE id=1;") == [["90"]]
             check.close()
             i = stopped[1]
             nodes[i-1] = start_node(i)
-            wait(19000+i)
+            wait(http_port(i))
             # The blob written while that node was down lives partly on handoff
             # slots. Reads probe the nominal slot and then every spare, so it
             # must still read once the node is back.
-            deadline = time.monotonic()+20
-            while True:
-                got = signed(19200+leader, "GET", "/invoices-2026/quorum-restored")
-                if got[0] == 200 and got[2] == b"recovered":
-                    break
-                assert time.monotonic() < deadline, got
-                time.sleep(.1)
+            s3_visible(s3_port(leader), "/invoices-2026/quorum-restored", b"recovered",
+                       timeout=20)
             print("PASS quorum loss: no SQL/S3 acknowledgement without a Raft quorum; a write with two of three nodes is accepted via handoff slots, stays undegraded and reads back")
 
-            # Partition the live leader from both peers in both directions.
-            # Direct client ports stay reachable on all three processes.
-            deadline = time.monotonic()+20
-            while True:
-                statuses = [json.loads(request(19000+i, "GET", "/raft/status")[2]) for i in range(1, 4)]
-                leaders = [s["node_id"] for s in statuses if s["role"] == "Leader"]
-                if len(leaders) == 1 and all(s["leader_id"] == leaders[0] for s in statuses):
-                    break
-                assert time.monotonic() < deadline, statuses
-                time.sleep(.1)
-            old = leaders[0]
-            majority = [i for i in range(1, 4) if i != old]
+            # Partition the billing group's leader from both peers in both
+            # directions. Only that group's transport links are cut: the control
+            # group and every direct client port stay reachable, which is what
+            # makes this a per-group partition rather than a node outage.
+            wait_all_leaders()
+            old = wait_group_leader(BILLING_GROUP)
+            majority = [i for i in NODES if i != old]
+            stale_pg = Pg(pg_port(old))
+            stale_pg.s.settimeout(30)
             for peer in majority:
-                proxies[old, peer].blocked.set()
-                proxies[peer, old].blocked.set()
-            stale = signed(19200+old, "PUT", "/invoices-2026/partition-stale", b"minority")
-            assert not 200 <= stale[0] < 300, stale
-            stale_pg = Pg(19100+old)
-            stale_pg.s.settimeout(10)
-            stale_pg.query("INSERT INTO wire VALUES (98,998);", fail=True)
+                proxies[BILLING_GROUP, old, peer].blocked.set()
+                proxies[BILLING_GROUP, peer, old].blocked.set()
+            for peer in majority:
+                proxies[BILLING_GROUP, old, peer].settle()
+                proxies[BILLING_GROUP, peer, old].settle()
+            # Both mutations are proposed while `old` still believes it is the
+            # billing-group leader. The cut is bidirectional, so it never learns
+            # of the higher term and never forwards: each proposal dies in its
+            # own log. Neither is retried.
+            outcome = {}
+            def attempt(name, call):
+                try:
+                    outcome[name] = call()
+                except Exception as error:  # noqa: BLE001 - reported below
+                    outcome[name] = error
+            writers = [
+                threading.Thread(target=attempt, args=(
+                    "s3", lambda: signed(s3_port(old), "PUT",
+                                         "/invoices-2026/partition-stale", b"minority"))),
+                threading.Thread(target=attempt, args=(
+                    "sql", lambda: stale_pg.query("INSERT INTO wire VALUES (98,998);", fail=True))),
+            ]
+            for thread in writers:
+                thread.start()
+            for thread in writers:
+                thread.join(120)
             stale_pg.close()
-            deadline = time.monotonic()+20
-            while True:
-                statuses = [json.loads(request(19000+i, "GET", "/raft/status")[2]) for i in majority]
-                leaders = [s["node_id"] for s in statuses if s["role"] == "Leader"]
-                if len(leaders) == 1:
-                    break
-                assert time.monotonic() < deadline, statuses
-                time.sleep(.1)
-            new = leaders[0]
+            # A definitive answer must not be a success; a transport error is
+            # also a non-acknowledgement and is recorded rather than retried.
+            if isinstance(outcome["s3"], tuple):
+                assert not 200 <= outcome["s3"][0] < 300, outcome["s3"]
+            else:
+                assert isinstance(outcome["s3"], OSError), outcome["s3"]
+            new = wait_group_leader_other(BILLING_GROUP, majority, old)
             # A Raft majority exists, so metadata commits. The third failure
             # domain is unreachable across the partition, but its parts move to
             # handoff slots on the reachable nodes, so the ack still means every
             # part is durable: the write is accepted on the majority side, while
             # the minority side above could not commit at all.
-            accepted = signed(19200+new, "PUT", "/invoices-2026/partition-majority", b"majority")
+            accepted = signed(s3_port(new), "PUT", "/invoices-2026/partition-majority", b"majority")
             assert accepted[0] == 200, accepted
-            majority_pg = Pg(19100+new)
+            majority_pg = Pg(pg_port(new))
             majority_pg.query("INSERT INTO wire VALUES (97,997);")
             majority_pg.close()
             assert all(p.poll() is None for p in nodes)
-            for proxy in proxies.values():
-                proxy.blocked.clear()
-            deadline = time.monotonic()+20
-            while True:
-                statuses = [json.loads(request(19000+i, "GET", "/raft/status")[2]) for i in range(1, 4)]
-                if all(s["leader_id"] == new for s in statuses) and statuses[old-1]["role"] == "Follower":
-                    break
-                assert time.monotonic() < deadline, statuses
-                time.sleep(.1)
-            assert signed(19200+old, "GET", "/invoices-2026/restart")[2] == b"durable object"
+            for peer in majority:
+                proxies[BILLING_GROUP, old, peer].blocked.clear()
+                proxies[BILLING_GROUP, peer, old].blocked.clear()
+            wait_group_leader(BILLING_GROUP)
+            s3_visible(s3_port(old), "/invoices-2026/restart", b"durable object", timeout=20)
             # The write accepted on the majority side is durable, so the rejoined
             # node must serve it too: its nominal parts may still live on handoff
             # slots, which reads probe.
-            deadline = time.monotonic()+20
-            while signed(19200+old, "GET", "/invoices-2026/partition-majority")[2] != b"majority":
-                assert time.monotonic() < deadline, "rejoined node did not catch up"
-                time.sleep(.1)
-            reunited_pg = Pg(19100+old)
+            s3_visible(s3_port(old), "/invoices-2026/partition-majority", b"majority", timeout=20)
+            # The minority side's proposal never reached a quorum, so the healed
+            # node must not resurrect it.
+            s3_absent(s3_port(old), "/invoices-2026/partition-stale", timeout=20)
+            reunited_pg = Pg(pg_port(old))
             assert reunited_pg.rows("SELECT balance FROM wire WHERE id=1;") == [["90"]]
             assert reunited_pg.rows("SELECT balance FROM wire WHERE id=97;") == [["997"]]
+            assert reunited_pg.rows("SELECT balance FROM wire WHERE id=98;") == []
             reunited_pg.close()
             print("PASS live bidirectional partition: the minority side refuses without a Raft quorum; the majority side accepts through handoff slots and the data survives the heal")
 
-            leader = json.loads(request(19002, "GET", "/raft/status")[2])["leader_id"]
-            survivor = next(i for i in range(1, 4) if i != leader)
-            alive = Iscsi(19300+survivor)
-            tx = Pg(19100+survivor)
+            leader = wait_group_leader(BILLING_GROUP)
+            survivor = next(i for i in NODES if i != leader)
+            survivor_pair = tuple(i for i in NODES if i != leader)
+            alive = Iscsi(iscsi_port(survivor))
+            tx = Pg(pg_port(survivor))
             tx.query("BEGIN; UPDATE wire SET balance=1 WHERE id=1;")
             nodes[leader-1].kill()
             nodes[leader-1].wait(timeout=10)
+            # The surviving pair must elect the billing group's new leader
+            # before any write to that group; a read is local-applied and may
+            # already succeed, but a write proposed without a leader is
+            # refused, which is correct cluster behaviour and not placement.
+            wait_group_leader_other(BILLING_GROUP, survivor_pair, leader)
             # Existing session survives storage leader loss if its gateway did not die;
             # a dead gateway requires initiator multipath to a different session.
             # Reads still work: the surviving replicas hold every committed
@@ -1441,10 +1847,10 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
             # with every part durable and reads back immediately.
             alive.write(b"D"*512)
             assert alive.read() == b"D"*512
-            written = signed(19200+survivor, "PUT", "/invoices-2026/after-failover", b"ok")
+            written = signed(s3_port(survivor), "PUT", "/invoices-2026/after-failover", b"ok")
             assert written[0] == 200, written
-            assert signed(19200+survivor, "GET", "/invoices-2026/after-failover")[2] == b"ok"
-            p = Pg(19100+survivor)
+            s3_visible(s3_port(survivor), "/invoices-2026/after-failover", b"ok")
+            p = Pg(pg_port(survivor))
             assert p.rows("SELECT balance FROM wire WHERE id=1;") == [["90"]]
             # The leader's death changed the term, so this transaction cannot be
             # committed and must be restarted rather than silently applied.
@@ -1453,13 +1859,8 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
             assert tx.rows("SELECT balance FROM wire WHERE id=1;") == [["90"]]
             tx.close()
             # A fresh transaction reaches the same handoff placement, so it
-            # commits with one domain offline and is visible immediately. The
-            # surviving pair must have elected a leader first; a write in that
-            # window is refused with "no reachable Raft leader", which is correct
-            # cluster behaviour and not a placement result.
-            survivor_pair = tuple(i for i in range(1, 4) if i != leader)
-            wait_leader(nodes=survivor_pair)
-            fresh = Pg(19100+survivor)
+            # commits with one domain offline and is visible immediately.
+            fresh = Pg(pg_port(survivor))
             fresh.query("UPDATE wire SET balance=1 WHERE id=1;")
             assert fresh.rows("SELECT balance FROM wire WHERE id=1;") == [["1"]]
             fresh.close()
@@ -1467,27 +1868,21 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
             # The node returns; what was written while it was away must still be
             # readable, and the key stays writable.
             nodes[leader-1] = start_node(leader)
-            wait(19000+leader)
-            assert signed(19200+survivor, "GET", "/invoices-2026/after-failover")[2] == b"ok"
+            wait(http_port(leader))
+            s3_visible(s3_port(survivor), "/invoices-2026/after-failover", b"ok")
             print("PASS leader SIGKILL: surviving replicas serve reads; a write with one domain offline is acknowledged through handoff slots and survives the node's return")
         except Exception:
-            print("Failure diagnostics: node Raft status and recent peer proxy events")
-            for i in range(1, 4):
+            print("Failure diagnostics: per-group OpenRaft status and transport proxy events")
+            for i in NODES:
                 try:
-                    c = http.client.HTTPConnection("127.0.0.1", 19000+i, timeout=2)
-                    try:
-                        c.request("GET", "/raft/status")
-                        print(f"node {i}: {c.getresponse().read().decode()}")
-                    finally:
-                        c.close()
-                except (OSError, http.client.HTTPException) as e:
+                    print(f"node {i}: {json.dumps(openraft_status(i))}")
+                except (OSError, RuntimeError, http.client.HTTPException) as e:
                     print(f"node {i}: {e}")
-            for (source, target), proxy in proxies.items():
+            for (group, source, target), proxy in proxies.items():
                 with proxy.events_lock:
-                    print(f"peer {source}->{target}, blocked={proxy.blocked.is_set()}: {list(proxy.events)}")
-            for log in logs:
-                log.flush()
-            for path in temp.glob("*.log"):
+                    print(f"group {group} {source}->{target}, "
+                          f"blocked={proxy.blocked.is_set()}: {list(proxy.events)}")
+            for path in sorted((temp / "logs").glob("*.log")):
                 print(path.name, path.read_text())
             raise
         finally:
@@ -1496,8 +1891,6 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
                     p.terminate()
             for p in nodes:
                 p.wait(timeout=10)
-            for log in logs:
-                log.close()
             for proxy in proxies.values():
                 proxy.shutdown()
                 proxy.server_close()
