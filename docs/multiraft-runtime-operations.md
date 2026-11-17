@@ -281,12 +281,42 @@ retained-log capacity, connection/byte-budget exhaustion, certificate expiry and
 trust mismatches. Thresholds and operator remediation need supported-host tests;
 this document does not imply a complete metrics/alert implementation exists.
 
-`client write timed out` from the metadata bridge means the bridge's 5 s deadline
+`client write timed out` from the metadata bridge means the bridge's 6 s deadline
 expired before the client write returned. The commit outcome is unknown to the
 caller: the bridge aborts its task, not the Raft entry, so the proposal may still
 commit. For a keyed `/v1/apply`, resolve the outcome with
 `POST /v1/idempotency/resolve`; for any other write, reconcile application state
 before retrying.
+
+A bridge timeout is not by itself evidence that the entry failed to replicate.
+OpenRaft answers `client_write` from `handle_apply_result`, i.e. only after the
+state machine has applied the entry, so `last_log_index` ahead of `last_applied`
+while the transport reports successful `AppendEntries` means the apply path is
+behind, not that the proposal was lost. Read both indices from
+`/openraft/status` before deciding whether to reconcile.
+
+Two runtime behaviours are required for the bridge to keep up with concurrent
+writers and are set explicitly rather than inherited:
+
+* **RPC deadline floor.** Every Raft RPC opens a fresh connection and performs
+  the pinned mTLS handshake, which measured about 120 ms at p50 and near 960 ms
+  in the tail on loopback. OpenRaft derives the `AppendEntries` deadline from
+  `heartbeat_interval` (250 ms with the dev timing), so without a floor a
+  noticeable fraction of appends are abandoned after the follower has already
+  applied them; each abandoned append costs a retry backoff and the commit
+  stalls while the cluster is healthy. `TransportConfig::rpc_ttl_floor` raises
+  the deadline, and the daemon sets it to one `election_timeout_min`, because an
+  append older than one election timeout is stale regardless. `None` keeps
+  OpenRaft's own deadline, which the in-process test transports rely on.
+  Snapshot transfers keep their own, longer deadline.
+* **Concurrent dispatch.** The bridge hands each write to the runtime without
+  waiting for the previous one to finish. `client_write` is safe to call
+  concurrently, and it is the only way the runtime can batch entries into one
+  apply and one state-image write; awaiting each write first turns N concurrent
+  writers into N serial round trips and persists one entry at a time.
+
+Connection reuse per peer remains a legitimate follow-up. The floor only makes
+the existing per-RPC cost tolerable; it does not remove it.
 
 S3 upload allocation ids are handed out in blocks of 32. A writer's first upload
 after its cache empties advances `/s3-upload-sequence/{project_id}` by 32 in one
