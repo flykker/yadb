@@ -1511,8 +1511,11 @@ A fresh root was provisioned and run with `scripts/yadb-openraft-dev.py` at port
 base 23500: three daemon processes, each hosting control group 1 and data groups
 2 and 3 (three replicas per group), mutual TLS, `--metadata-runtime openraft`,
 and the PostgreSQL, S3 and iSCSI listeners enabled. Every node reported
-`metadata_runtime: multiraft`, `client_traffic: multiraft` and
-`production_ready: false`. Initial leaders were g1 = node 1, g2 = node 2,
+`metadata_runtime: openraft`, `client_traffic: multiraft` and
+`production_ready: false`. `metadata_runtime` names the runtime, and the daemon
+emits only `openraft` or `legacy` there; `multiraft` is the topology
+(one control group plus data groups) and appears only in `client_traffic`.
+Initial leaders were g1 = node 1, g2 = node 2,
 g3 = node 3 at term 1.
 
 ### Control plane
