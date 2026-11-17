@@ -98,6 +98,21 @@ class PeerHandler(socketserver.BaseRequestHandler):
                             self.server.record("dropped Raft request")
                             return
                     upstream.sendall(header)
+                    if drop_raft_reply:
+                        # The proposal has reached this follower durably, but its
+                        # acknowledgement must never reach the leader again: a
+                        # later heartbeat carries no entries, so it is not
+                        # matched by the predicate, and its reply reports the
+                        # follower's match_index — which already includes the
+                        # entry. That reply confirms the write just as well as
+                        # the lost publication reply did. So the whole
+                        # leader->follower direction is cut: the leader cannot
+                        # learn that this follower holds the entry until the
+                        # fault is healed.
+                        self.server.record("dropped Raft reply; link cut")
+                        self.server.dropped_raft_reply.set()
+                        self.server.blocked.set()
+                        return
                 sockets = (self.request, upstream)
                 while not self.server.blocked.is_set():
                     ready, _, _ = select.select(sockets, [], [], .05)
@@ -1156,18 +1171,32 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
                 delivered = peers[0]
                 blocked = peers[1]
                 # One follower durably receives the proposal but its reply is
-                # lost; the other follower never receives it. The client sees
-                # an error without this test retrying the command.
+                # lost; the other follower never receives it. The proxy cuts the
+                # leader's link to the first follower as soon as it relays the
+                # proposal, so no later reply (a heartbeat reply carries the
+                # follower's match_index too) can confirm the entry. The client
+                # sees an error without this test retrying the command.
                 proxies[old, delivered].raft_reply_fault = predicate
                 proxies[old, blocked].raft_request_fault = predicate
                 for peer in peers:
                     proxies[old, peer].dropped_raft_reply.clear()
+                # The follower that holds the proposal must not be able to win
+                # the next election: if it could, the cluster would commit the
+                # write and answer the caller definitively, and the ambiguous
+                # path would never be exercised.
+                proxies[delivered, old].blocked.set()
+                proxies[delivered, blocked].blocked.set()
+                proxies[blocked, delivered].blocked.set()
 
                 def recover():
                     assert proxies[old, delivered].dropped_raft_reply.is_set(), (
                         f"{label}: publication response fault did not trigger")
                     proxies[old, delivered].raft_reply_fault = None
                     proxies[old, blocked].raft_request_fault = None
+                    # Heal the holder's links first: a new leader needs its log.
+                    proxies[delivered, old].blocked.clear()
+                    proxies[delivered, blocked].blocked.clear()
+                    proxies[blocked, delivered].blocked.clear()
                     for peer in peers:
                         proxies[old, peer].blocked.set()
                         proxies[peer, old].blocked.set()

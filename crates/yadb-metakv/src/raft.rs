@@ -21,10 +21,18 @@ const WAL_COMPACTION_ENTRIES: u64 = 4096;
 /// definite refusal instead of the follower reporting a lost response.
 const COMMIT_WAIT: Duration = Duration::from_millis(3000);
 
-/// If this many consecutive replication rounds reach no peer at all, the Leader
-/// has no quorum and there is nothing to wait for: refusing at once beats
-/// polling refused connections for the whole [`COMMIT_WAIT`] budget.
-const COMMIT_WAIT_EMPTY_ROUNDS: u32 = 3;
+/// How long a waiter may keep contacting peers without a single answer before it
+/// concludes there is no quorum and refuses. It must exceed one replication
+/// round's own timeout (two peers, each up to a 500 ms read timeout), otherwise a
+/// single slow round would be read as a missing quorum. Silence that has not held
+/// for this long is not evidence about a committed entry.
+const COMMIT_WAIT_NO_QUORUM: Duration = Duration::from_millis(1500);
+
+/// Minimum spacing between a waiter's own replication rounds. Without it every
+/// waiter re-broadcasts on each 2 ms poll, so a 24-way burst turns into a request
+/// storm against the two peers it is waiting for; the peers then answer slower
+/// than the RPC timeout, which is misread as a missing quorum.
+const COMMIT_WAIT_NUDGE_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DurableCheckpoint {
@@ -1240,15 +1248,21 @@ impl<FS: StorageFs> LocalMetaKv<FS> {
     }
 
     /// Runs one cascade of replication rounds and returns how many peer replies
-    /// it applied. Callers that are waiting for a specific entry use the count
-    /// to distinguish "no peer answered at all" from "a peer answered but the
-    /// entry is still not committed".
+    /// it applied, plus how many messages it actually tried to send.
+    ///
+    /// The second count is what separates "this leader has nothing new to ship,
+    /// because a concurrent proposer already did" from "peers were contacted and
+    /// none answered". A waiter that treats both as one thing refuses a proposal
+    /// that is already in flight, which is exactly what happened to a 24-way
+    /// burst: every waiter past the first had nothing to send, saw three rounds
+    /// without replies and gave up while its entry was still queued for apply.
     fn drive_round(
         &self,
         mut pending: Vec<OutboundMsg>,
         send: &mut impl FnMut(&str, &RaftRpc) -> Result<Option<RaftRpc>, std::io::Error>,
-    ) -> Result<usize, MetaError> {
+    ) -> Result<(usize, usize), MetaError> {
         let mut replies_applied = 0;
+        let mut attempted = 0;
         // Bound synchronous cascade rounds (e.g. RequestVote -> become_leader -> AppendEntries -> commit broadcast)
         for _round in 0..8 {
             if pending.is_empty() {
@@ -1258,6 +1272,7 @@ impl<FS: StorageFs> LocalMetaKv<FS> {
             let mut replies = Vec::new();
             for msg in batch {
                 if let Some(addr) = self.peer_addrs.get(&msg.to) {
+                    attempted += 1;
                     if let Ok(Some(reply_rpc)) = send(addr, &msg.rpc) {
                         replies.push(reply_rpc);
                     }
@@ -1273,7 +1288,7 @@ impl<FS: StorageFs> LocalMetaKv<FS> {
                 replies_applied += 1;
             }
         }
-        Ok(replies_applied)
+        Ok((replies_applied, attempted))
     }
 
     /// Returns the result only for this proposal's (index, term). An error after
@@ -1299,9 +1314,11 @@ impl<FS: StorageFs> LocalMetaKv<FS> {
             let (idx, msgs) = guard.propose(cmd)?;
             (idx, guard.current_term(), msgs)
         };
-        if !msgs.is_empty() {
-            self.drive_round(msgs, send)?;
-        }
+        let msgs_sent = if msgs.is_empty() {
+            false
+        } else {
+            self.drive_round(msgs, send)?.1 > 0
+        };
         // A proposal that is already in the log can commit at most once, so
         // waiting for it is not a retry: it only decides whether the client sees
         // the committed result or an explicit unknown outcome. A concurrent
@@ -1311,10 +1328,33 @@ impl<FS: StorageFs> LocalMetaKv<FS> {
         // PUTs on one Leader reported four committed writes as
         // `UncommittedIndex` merely because another thread had already shipped
         // the entry.
+        //
+        // Waiting is only sound if peer silence is read correctly. It was not, in
+        // two ways. First, three failed heartbeat rounds — tens of milliseconds
+        // during a stall, not a missing quorum — made the waiter refuse an entry
+        // that committed a moment later. Second, every waiter re-broadcast on
+        // each 2 ms poll, so a 24-way burst produced thousands of RPCs per second
+        // against the two peers it was waiting for; the peers then answered slower
+        // than the 500 ms RPC timeout and the resulting timeouts were read as a
+        // missing quorum. A burst therefore reported a contiguous range of
+        // committed indices as unknown while every node stayed in the same term.
+        //
+        // So: re-broadcast at a bounded rate, and treat silence as evidence only
+        // after it has held longer than one full round's own timeout.
         let deadline = Instant::now() + COMMIT_WAIT;
-        let mut heard_from_peer = false;
-        let mut empty_rounds = 0u32;
+        // When peers were contacted and none answered. Cleared by any reply, and
+        // by a round that had nothing to send (another proposer already shipped
+        // the entry, or the followers are caught up) — that is not peer silence.
+        let mut silent_since: Option<Instant> = None;
+        // The proposal round above already shipped this entry, so the first nudge
+        // can wait one interval.
+        let mut next_nudge = if msgs_sent {
+            Instant::now() + COMMIT_WAIT_NUDGE_INTERVAL
+        } else {
+            Instant::now()
+        };
         loop {
+            let due = Instant::now() >= next_nudge;
             let nudge = {
                 let mut guard = self.legacy().lock().unwrap();
                 // A new leader may have replaced the uncommitted proposal while
@@ -1332,27 +1372,37 @@ impl<FS: StorageFs> LocalMetaKv<FS> {
                 // timer tick. A replication failure is surfaced, not flattened
                 // into "no messages": that would turn a concrete error such as
                 // a compacted base into an ambiguous timeout.
-                guard.broadcast_append_entries_checked()
+                if due {
+                    guard.broadcast_append_entries_checked()
+                } else {
+                    Ok(Vec::new())
+                }
             }?;
             if Instant::now() >= deadline {
                 return Err(MetaError::UncommittedIndex(idx));
             }
-            let replies = self.drive_round(nudge, send)?;
+            if !due {
+                // Nothing to send yet: poll for the local apply, which is what a
+                // committed entry is waiting for.
+                std::thread::sleep(Duration::from_millis(2));
+                continue;
+            }
+            next_nudge = Instant::now() + COMMIT_WAIT_NUDGE_INTERVAL;
+            let (replies, attempted) = self.drive_round(nudge, send)?;
             if replies > 0 {
-                heard_from_peer = true;
-                empty_rounds = 0;
-            } else {
-                empty_rounds += 1;
-                // Several rounds without a single peer reply mean there is no
-                // quorum to wait for, so refuse instead of polling refused
-                // connections for the whole budget.
-                if empty_rounds >= COMMIT_WAIT_EMPTY_ROUNDS {
+                silent_since = None;
+            } else if attempted > 0 {
+                // Peers were contacted and none answered. Give up only once that
+                // has held for longer than one round can take: a single slow
+                // round is a loaded peer, not a missing quorum.
+                let since = *silent_since.get_or_insert_with(Instant::now);
+                if since.elapsed() >= COMMIT_WAIT_NO_QUORUM {
                     return Err(MetaError::UncommittedIndex(idx));
                 }
+            } else {
+                silent_since = None;
             }
-            // A round that reached a peer is worth retrying immediately; one
-            // that reached nobody should back off rather than spin.
-            std::thread::sleep(Duration::from_millis(if heard_from_peer { 2 } else { 20 }));
+            std::thread::sleep(Duration::from_millis(2));
         }
     }
 
@@ -1657,6 +1707,72 @@ mod transport_tests {
         assert!(
             sends > 2,
             "the wait must retry replication, not the command"
+        );
+    }
+
+    // Silence that lasts several rounds but less than one round's own timeout is
+    // a loaded or briefly stalled peer, not a missing quorum. Counting rounds
+    // instead of time refused committed writes: a 24-way burst reported fourteen
+    // consecutive committed indices as unknown while every node stayed in the
+    // same term.
+    #[test]
+    fn execute_keeps_waiting_through_silence_shorter_than_the_no_quorum_window() {
+        let nodes = cluster();
+        let mut sends = 0;
+        let result = nodes[&1].execute_with(
+            KvCommand::Put {
+                key: "stalled".into(),
+                value: b"value".to_vec(),
+            },
+            &mut |addr, rpc| {
+                sends += 1;
+                // Five full rounds (both peers each) answer nothing. The old
+                // three-empty-round rule refused here; the silence window must not.
+                if sends <= 10 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "injected stall",
+                    ));
+                }
+                deliver(&nodes, addr, rpc)
+            },
+        );
+        assert!(matches!(result, Ok(KvResult::PutOk { .. })), "{result:?}");
+        assert!(nodes[&1].get("stalled").is_some());
+        assert!(sends > 10, "the wait must keep replicating");
+    }
+
+    // The other side of the same rule: once peers have been contacted and have
+    // not answered for longer than one round can take, there is no quorum and
+    // the caller must be told so instead of being held for the whole budget.
+    #[test]
+    fn execute_refuses_after_sustained_silence_and_before_the_commit_budget() {
+        let nodes = cluster();
+        let started = Instant::now();
+        let result = nodes[&1].execute_with(
+            KvCommand::Put {
+                key: "unreachable".into(),
+                value: b"value".to_vec(),
+            },
+            &mut |_, _| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "injected silence",
+                ))
+            },
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(result, Err(MetaError::UncommittedIndex(2))),
+            "{result:?}"
+        );
+        assert!(
+            elapsed >= COMMIT_WAIT_NO_QUORUM,
+            "a short stall must not be reported as a missing quorum: {elapsed:?}"
+        );
+        assert!(
+            elapsed < COMMIT_WAIT,
+            "a missing quorum must be refused before the commit budget expires: {elapsed:?}"
         );
     }
 
