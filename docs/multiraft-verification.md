@@ -1934,7 +1934,7 @@ the live set stays group-scoped and no cross-group snapshot is needed.
 | Leadership | The pass runs only on the leader of group G, read through `role_info_for_group`. A follower refuses with the leader it knows. |
 | Snapshot | `try_linearizable_group_snapshot(G)` names the group directly and returns a quorum-confirmed snapshot. Followers and unavailable quorums are errors, never a fallback to local applied state. |
 | Collector lease | `/gc/g<group>/collector`, one key per group, held for `COLLECTOR_LEASE_MS` (120 s) and renewed before each pool. Two passes over different groups do not block each other. |
-| Writer fence | `/gc/g<group>/writer/<id>` (TTL 300 s) and `/gc/g<group>/reader/<id>` (TTL 30 s). A live lease in G refuses G only. The fence is read before admission closes and again after the collector record is acquired, so a writer cannot slip into the window between the check and the mark. |
+| Lease fence | The collector checks `/gc/g<group>/writer/<id>` (TTL 300 s) and `/gc/g<group>/reader/<id>` (TTL 30 s); a live record in G refuses G only. Multi-Raft writers publish group leases, but readers do not currently publish them, so this check does not protect in-flight reads. The fence is checked before and after collector admission closes. |
 | S3 intent | An unexpired `Prepared` intent is part of the mark, so chunks appended before publication are kept. |
 | Deletion | Only ids whose `project_id` the group's scope covers, and only when the pool enumerated successfully. A refused pool is left untouched for every group. |
 | Refusal | Not leader, unreadable fence, collector lease held, snapshot failure or an unprovable live set refuses the group with the reason in `gc_groups_refused`; `/v1/pools/gc` answers `409` with that reason. Other groups are unaffected. |
@@ -1985,6 +1985,13 @@ passes when run alone (pre-existing timing sensitivity, not touched here).
   collector record; the cost is one round trip, not a correctness issue.
 
 ## Handoff slots, a commit wait that reads silence correctly, and the live drill (2026-11-17)
+
+Historical verification record: the commit-wait and publication fault-injection
+details below describe the removed legacy runtime and its then-current tests,
+not the present OpenRaft bridge or protocol suite. Current tests cover a dropped
+successful S3 response and early quorum-loss refusals, but do not fault S3
+manifest or SQL shard publication itself. The historical gates below do not
+establish that coverage for OpenRaft.
 
 ### Placement
 
@@ -2066,7 +2073,7 @@ slot, a one-of-three write is refused with an explicit unknown outcome, and the
 refused mutation left nothing behind. The cluster was stopped immediately after
 the run; its data directory is kept.
 
-### Gates on the merged tree
+### Historical gates on the then-merged tree
 
 `cargo fmt --all -- --check` clean; `cargo test -p yadb-metakv --lib` 181/181;
 `cargo test -p yadbd --bins` 96/96; `cargo test -p yadbd --bins --features

@@ -168,12 +168,14 @@ without a matching `state.json`. Use it when you
 need the PostgreSQL, S3 and iSCSI frontends as well; `scripts/yadb-local.py`
 provisions a Multi-Raft cluster without the client protocol listeners.
 
-Reads on Multi-Raft do **not** take the single-namespace GC reader lease. Collection is
-refused there, so there is no pass to fence against, and the lease record's
-`revision` is a single-namespace value that multi-group metadata cannot supply
-(`LocalMetaKv::revision()` asserts). The SQL, block and S3 read paths therefore
-skip the lease when `meta.is_openraft()`, and a plain (non-`consistent=true`)
-read is served from the locally applied view.
+Multi-Raft collection is enabled per data group: a group leader checks leases
+and obtains a collector fence before sweeping. However, Multi-Raft read paths do
+not currently publish reader leases. A concurrent collection can therefore
+reclaim fragments referenced by an in-flight read's older manifest. A
+quorum-confirmed `consistent=true` snapshot does not fence fragment collection.
+The automatic sweep also runs periodically; avoiding manual GC alone does not
+eliminate this risk. Plain reads use the locally applied view. Per-group GC has
+not yet been verified by a live reclamation drill.
 
 `PersistentGroup::create` requires a new replica directory. It reserves that
 directory, syncs its parent, writes a versioned `replica.json` binding the exact

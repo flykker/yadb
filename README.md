@@ -647,41 +647,16 @@ answers `503` on client paths rather than `403`; once the image is installed the
 historical `403`/`404` answers are unchanged.
 
 Reclaiming disk: overwritten blocks, folded WAL blobs, replaced SSTs and
-overwritten S3 objects leave their old fragments behind. `POST /v1/pools/gc`
-runs one collection pass and returns `blobs_live`, `fragments_deleted`,
-`bytes_reclaimed` and either `gc_refusal: null` or an explicit reason with a
-`409`; the leader also sweeps on its own every five minutes. A pass refuses
-while any node is reading, so wait about 30 s after the last query:
+overwritten S3 objects leave old fragments behind. `POST /v1/pools/gc` runs a
+per-group collection pass and reports reclaimed bytes and any refusals. A group
+must be swept by its own leader, and writer leases fence concurrent writes.
 
-```bash
-curl -s -X POST http://127.0.0.1:23500/v1/pools/gc
-```
-
-While a pass runs, reads and writes are refused with `503` instead of being
-admitted unfenced, and a read whose lease expired mid-flight is refused rather
-than answered from fragments a pass may already have reclaimed. Because only the
-metadata leader can publish that lease, a read sent to a follower is proxied to
-the leader — the same path writes already take, and the reason a follower read
-reports `503 node is not Raft leader` when the leader is unreachable. This
-covers the HTTP, native S3 and block read paths (the native listener re-verifies
-SigV4 first and keeps its XML error format). A native read keeps its local
-contract across the hop because the leader decides it from the manifest it
-reads: `If-Match`/`If-None-Match` still answer `412`/`304`, an
-unsatisfiable range still answers `416 InvalidRange` with `Content-Range: bytes
-*/size`, the 16 MiB rules still answer `400 InvalidRequest`, and
-`Last-Modified`/`Accept-Ranges` are preserved. The gateway `/s3/...` GET accepts
-the same conditional headers. A proxied read is bounded by the
-forwarding wire cap (16 MiB of body); larger block or object reads must be sent
-to the leader directly. For that reason the gateway `GET /s3/...` path applies
-the same 16 MiB rule as the native listener (a larger full read or slice is
-`400 InvalidRequest`); before this it had no limit, so this is a deliberate
-change, not an accident. Native `HEAD` on a legacy follower is the one read that
-stays local: it fetches no fragments, so it takes no lease, and its `ETag`,
-size and `Last-Modified` can lag the leader. The forwarded `Range`,
-`If-Match` and `If-None-Match` values are copied from validated header values
-and carry no explicit size limit of their own; they are bounded by the HTTP
-parser's header limits, and a value that could add a header line is rejected
-before it reaches the proxy.
+**Reader-safety limitation:** Multi-Raft reads currently publish no reader lease.
+A collection can reclaim fragments referenced by an in-flight read's older
+manifest. The periodic sweep runs every five minutes, so avoiding manual GC does
+not eliminate the risk. `consistent=true` confirms the metadata snapshot but is
+not a fragment-lifetime fence. Per-group reclamation has not yet been verified
+in a live drill. Default reads use the locally applied view and may lag.
 
 Conditional reads are matched as RFC 9110 `*` / `#entity-tag`, not as a byte
 comparison of the whole header: `*`, a list of tags (commas inside the quotes
@@ -694,55 +669,25 @@ combined value that cannot be read never turns into an unconditional
 read: an unparsable `If-Match` answers `412`, while an unparsable
 `If-None-Match` names no confirmable version and does not suppress the bytes.
 
-The metadata Raft log is bounded: once `metakv/raft.wal` passes 8 MiB (or 4096
-applied entries above its base) each node writes an atomic
-`metakv/checkpoint.json` state image and rewrites the log, keeping everything
-above a replicated compaction floor. `GET /raft/status` reports `base_index`,
-`compaction_floor`, `wal_bytes` and `compaction_error`. A node that falls behind
-the compacted base is re-seeded with that same image: the leader streams
-`checkpoint.json` in 64 KiB `InstallSnapshot` chunks over the authenticated Raft
-RPC (bounded at 64 MiB, resumable per group, leader and snapshot id), and the
-receiver validates the group, membership, last included index/term and
-whole-image checksum before publishing it with one atomic rename, rewriting its
-log to the new base, and only then moving its applied pointer, so a crash leaves
-either the old or the new base. After the install it is an ordinary log
-follower. The checkpoint is still a full image, so its size tracks live metadata
-rather than history.
+Each OpenRaft group has its own log and state-machine storage and snapshot
+protocol; see [runtime operations](docs/multiraft-runtime-operations.md) for
+storage limits and recovery constraints. `GET /raft/status` reports the control
+group's role, term, leader and locally applied index, not legacy WAL compaction
+fields. Cross-process snapshot installation has not yet been exercised in a live
+drill.
 
 ## Quickstart
 
 ```bash
-# 1. Build & run deterministic simulation + unit tests
-cargo test --offline
+cargo build -p yadbd --offline --locked -j 2
 
-# 2. Start a local yadbd node
-./target/debug/yadbd --listen 127.0.0.1:8420 --data-dir /tmp/yadb-node1 &
+# Provisions a fresh root and applies examples/platform.yaml with a signed subject.
+python3 scripts/yadb-openraft-dev.py start
+python3 scripts/yadb-openraft-dev.py status
 
-# 3. Apply declarative cluster, pools, project RBAC, SQL DB, S3, and BlockVolume
-./target/debug/yadbctl -s http://127.0.0.1:8420 apply -f examples/platform.yaml
-./target/debug/yadbctl -s http://127.0.0.1:8420 status
-
-# 4. Run sharded SQL queries (Mirror-3 WAL + Reed-Solomon 4+2 SSTables)
-./target/debug/yadbctl -s http://127.0.0.1:8420 sql \
-  --project billing --db ledger --subject sa:billing-backend \
-  "CREATE TABLE accounts (id INT PRIMARY KEY, owner TEXT, balance INT, active BOOL)"
-
-./target/debug/yadbctl -s http://127.0.0.1:8420 sql \
-  --project billing --db ledger --subject sa:billing-backend \
-  "INSERT INTO accounts VALUES (1, 'alice', 5000, true), (2, 'bob', 1900, true)"
-
-./target/debug/yadbctl -s http://127.0.0.1:8420 sql \
-  --project billing --db ledger --subject user:auditor \
-  "SELECT id, owner, balance FROM accounts ORDER BY balance DESC"
-
-# 5. Store & range-read S3 objects and thin-provisioned block volumes
-./target/debug/yadbctl -s http://127.0.0.1:8420 s3-put \
-  --project billing --store receipts --bucket invoices-2026 --key nov/inv1.yaml \
-  --subject sa:billing-backend -f examples/platform.yaml
-
-./target/debug/yadbctl -s http://127.0.0.1:8420 block-write \
-  --project billing --volume vm-root --subject sa:billing-backend \
-  --offset 4096 --data "HELLO-YADB-BLOCK-STORE"
+# Use the PostgreSQL, S3 and iSCSI endpoints shown under Local dev cluster above.
+# Stop the processes when finished; the root and its data remain on disk.
+python3 scripts/yadb-openraft-dev.py stop
 ```
 
 ## Testing
