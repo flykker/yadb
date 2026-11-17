@@ -22,6 +22,13 @@ waits for caches on all nodes but asserts denial only through `public[0]`. State
 tests pass 16/16, storage 23/23, S3 19/19 and IO 7/7. These targeted results are
 included in the full gates above, not substitutes for them.
 
+Local three-process verification on 2026-11-17: `tests/protocols.py` passed 3/3
+consecutive runs, each 20 PASS / 4 SKIP, on a binary built from a tree with no
+instrumentation, with zero `BRIDGE TIMEOUT`, `TLS CONNECT FAIL` and `REPLY WRITE
+FAILED` events. That run covers the delta-log apply path, the transport deadline
+floor and concurrent dispatch. It does not cover per-group GC, which is refused,
+or an `InstallSnapshot` transfer between processes, which stays a `SKIP`.
+
 Authorization freshness is now lease-bound. In OpenRaft mode a node accepts
 control state only after a quorum-confirmed linearizable barrier on the current
 control-group leader; a follower obtains that snapshot from the leader through
@@ -249,6 +256,37 @@ below `total_parts()` accepts writes it cannot serve with full redundancy and
 counts them in `degraded_puts`; the default is `total_parts()`, so an
 acknowledgement promises every fragment.
 
+## Apply path: checkpoint plus delta log
+
+A replica's state directory holds two files. `state.json` is the full image, and
+`state.delta` is an append-only log of the entries applied since that image was
+written. Every apply batch appends one framed record to `state.delta` and syncs
+it *before* the in-memory view changes, so memory is never ahead of the file. The
+full image is republished only when the delta passes 4096 entries or 8 MiB, and
+when a snapshot is built or installed.
+
+This exists because republishing the image per apply batch was the post-restart
+commit stall: each batch serialized the whole map, wrote a temp file, synced it,
+renamed it and synced the directory, and the rename plus directory sync alone was
+measured at up to 1.6 s under concurrent writers. The apply pointer then fell
+behind the committed log faster than it advanced, and the 6 s bridge deadline
+expired on a cluster that was replicating normally.
+
+Consequences for an operator:
+
+* A `state.json` older than `state.delta` is normal, not damage. The delta is
+  replayed on open, and frames at or below the checkpoint's applied index are
+  skipped so a failed fold is harmless.
+* A torn *final* frame in `state.delta` is truncated on open. This is the one
+  automatic truncation in the runtime, and it is safe by construction: the
+  append writes one whole frame per `write_all`, the directory lock admits a
+  single writer, and the sync happens before the entry is acknowledged, so a
+  frame running past the end of the file is an unacknowledged append. Nothing
+  else about a damaged state directory is repaired automatically.
+* A failed append truncates the file back to its previous length before
+  returning the error, so an acknowledged entry is never absent from disk.
+* Copying a replica's state directory for evidence means copying both files.
+
 ## Normal shutdown
 
 Stop accepting RPCs, cancel and **join** owned handlers, then await OpenRaft core
@@ -337,7 +375,7 @@ boundary; uniqueness comes from the pair, not from `generation` alone.
 | Partial bootstrap | Preserve artifacts and diagnose; do not auto-create missing files or initialize again |
 | Replica identity/voters mismatch | Stop and verify the intended configuration and provenance; never rewrite the descriptor to fit |
 | Unsupported log version | Preserve the original bytes; use a separately reviewed migration or explicit disposable-test reprovisioning, not silent replay |
-| Corrupt/truncated log tail or state image | Preserve raw evidence, stop serving, and recover from validated replicas through an approved procedure; automatic truncation is not implemented |
+| Corrupt/truncated log tail or state image | Preserve raw evidence, stop serving, and recover from validated replicas through an approved procedure. The only automatic truncation is a torn final `state.delta` frame, whose unacknowledged status follows from the append order; nothing else is repaired automatically |
 | Write/sync/rename/directory-sync error | Treat the operation outcome as unknown; the handle is poisoned, and further participation requires reopen/recovery |
 | Quorum unavailable | Restore legitimate peers/connectivity; never reduce voters, accept singleton writes or treat timeout as abort |
 | Certificate/pin/signing-key rejection | Keep listener fail-closed; follow the credential incident runbook, never disable TLS verification |

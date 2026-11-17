@@ -2163,9 +2163,19 @@ first round is slower because every writer reserves an allocation block; the
 second round serves from the per-process cache. This is an improvement, not a
 target: per-peer connection reuse remains the real fix for the handshake cost.
 
-### Residual defect
+**The test proxy added latency of its own.** While chasing the defect below, the
+directed relay in `tests/protocols.py` was measured against the direct link with
+`proxy_rtt.py`. It relayed with Nagle enabled on both sockets, so a small
+request/response pair waited for a delayed ACK on either leg: proxied RTT was
+69 ms at the tail against ~1.1 ms direct, and the peers saw a cluster that was
+slow only under the harness. `TCP_NODELAY` on both legs brings proxied median to
+2.2-2.8 ms and max to 4.2-7.4 ms over four runs. This was a harness defect, not a
+daemon one, and it matters because every partition test measures the cluster
+through those proxies.
 
-The protocol suite still fails one scenario, reproducibly, immediately after a
+### Post-restart commit stall (resolved)
+
+The protocol suite used to fail one scenario, reproducibly, immediately after a
 full-cluster `SIGKILL`/restart:
 
 ```
@@ -2176,11 +2186,33 @@ BRIDGE TIMEOUT /s3-upload-sequence/1 after=6000ms
 The leader had appended entry 281 and `running_state` was `Ok(())`, while
 `last_applied` stayed at 280 for the whole deadline and `AppendEntries` to both
 peers kept succeeding at 60-250 ms. Because OpenRaft answers `client_write` from
-`handle_apply_result`, this isolates the stall to the apply path, not replication
-or commit. Ruled out by inspection: no `inner.lock()` guard in the state machine is
-held across an `await`, and watch notifications use an unbounded
+`handle_apply_result`, this isolated the stall to the apply path, not replication
+or commit. Ruled out by inspection: no `inner.lock()` guard in the state machine
+is held across an `await`, and watch notifications use an unbounded
 `std::sync::mpsc::channel()`, so `Watcher::tx.send` cannot block the apply loop.
-The remaining candidates are starvation of the state-machine task (the log store
-performs a synchronous `sync_data` plus directory `sync_all` inside an `async fn`,
-i.e. on a runtime worker thread) and the cost of rewriting the whole `state.json`
-per apply batch. This is open; the suite is not green until it is explained.
+
+The cause was the second candidate: every apply batch republished the whole
+`state.json` — serialize the full image, write a temp file, `sync_data`, rename,
+`sync_all` the directory. On this filesystem the rename plus directory sync alone
+was measured at up to 1.6 s under concurrent writers, so with several batches
+pending the apply pointer fell behind faster than it advanced, and the 6 s bridge
+deadline expired while the log was already committed.
+
+The fix is a delta log. `apply` appends one framed record holding the batch to
+`state.delta` and `sync_data`s it *before* mutating memory, so a crash can never
+leave memory ahead of the file; a torn final frame is truncated on the next open
+and cannot drop an acknowledged entry. The full `state.json` image is published
+only when the delta exceeds 4096 entries or 8 MiB, and when a snapshot is built or
+installed. An apply now costs one file append and one data sync, with no rename
+and no directory sync.
+
+Verification after the change: `tests/protocols.py` 3/3 consecutive clean runs on
+a binary built from a tree with no instrumentation, each 20 PASS / 4 SKIP, zero
+`BRIDGE TIMEOUT`, zero `TLS CONNECT FAIL`, zero `REPLY WRITE FAILED`.
+
+Residual cost, not a defect: `sync_data` still runs on a runtime worker thread
+inside `async fn apply`, because OpenRaft's state-machine trait is async and the
+call is not offloaded to a blocking pool. It is bounded to one sync per apply
+batch (not per entry) and no longer includes a directory sync. It has not starved
+the runtime on this 7-core host; a dedicated blocking pool is the change to make
+if apply latency ever shows up under a real fsync-heavy disk.
