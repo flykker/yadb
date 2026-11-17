@@ -277,12 +277,14 @@ Consequences for an operator:
 * A `state.json` older than `state.delta` is normal, not damage. The delta is
   replayed on open, and frames at or below the checkpoint's applied index are
   skipped so a failed fold is harmless.
-* A torn *final* frame in `state.delta` is truncated on open. This is the one
-  automatic truncation in the runtime, and it is safe by construction: the
-  append writes one whole frame per `write_all`, the directory lock admits a
-  single writer, and the sync happens before the entry is acknowledged, so a
-  frame running past the end of the file is an unacknowledged append. Nothing
-  else about a damaged state directory is repaired automatically.
+* A torn *final* frame is truncated on open — in both `state.delta` and the Raft
+  log. That is the only automatic repair in the runtime, and it is safe by
+  construction: an append writes one whole frame per `write_all`, the directory
+  lock admits a single writer, and the sync happens before the entry is
+  acknowledged, so a frame running past the end of the file is an
+  unacknowledged append. Nothing else about a damaged state directory is
+  repaired automatically: a bad header, a checksum mismatch or a gap in the
+  delta is refused, never truncated.
 * A failed append truncates the file back to its previous length before
   returning the error, so an acknowledged entry is never absent from disk.
 * Copying a replica's state directory for evidence means copying both files.
@@ -375,7 +377,7 @@ boundary; uniqueness comes from the pair, not from `generation` alone.
 | Partial bootstrap | Preserve artifacts and diagnose; do not auto-create missing files or initialize again |
 | Replica identity/voters mismatch | Stop and verify the intended configuration and provenance; never rewrite the descriptor to fit |
 | Unsupported log version | Preserve the original bytes; use a separately reviewed migration or explicit disposable-test reprovisioning, not silent replay |
-| Corrupt/truncated log tail or state image | Preserve raw evidence, stop serving, and recover from validated replicas through an approved procedure. The only automatic truncation is a torn final `state.delta` frame, whose unacknowledged status follows from the append order; nothing else is repaired automatically |
+| Corrupt/truncated log tail or state image | Preserve raw evidence, stop serving, and recover from validated replicas through an approved procedure. The only automatic truncation is a torn *final* frame in the Raft log or in `state.delta`, whose unacknowledged status follows from the append order; a bad header, checksum mismatch, delta gap or any mid-file damage is refused, not repaired |
 | Write/sync/rename/directory-sync error | Treat the operation outcome as unknown; the handle is poisoned, and further participation requires reopen/recovery |
 | Quorum unavailable | Restore legitimate peers/connectivity; never reduce voters, accept singleton writes or treat timeout as abort |
 | Certificate/pin/signing-key rejection | Keep listener fail-closed; follow the credential incident runbook, never disable TLS verification |
