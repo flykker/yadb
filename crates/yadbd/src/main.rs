@@ -336,10 +336,13 @@ struct AppState {
     #[allow(clippy::type_complexity)]
     local_vdisks: Arc<RwLock<BTreeMap<(String, usize), Arc<VolumeStore<OsFs>>>>>,
     last_scrub: Arc<RwLock<Option<ScrubSummary>>>,
-    /// The reader lease this node currently holds for garbage-collection
-    /// fencing. Reused across statements: publishing a fresh record per read
-    /// would put two Raft entries in the log for every `SELECT`.
-    reader_lease: Arc<std::sync::Mutex<Option<yadb_metakv::GcLease>>>,
+    /// The reader leases this node currently holds for garbage-collection
+    /// fencing, keyed by metadata group (`None` is the legacy namespace).
+    /// Reused across statements: publishing a fresh record per read would put
+    /// two Raft entries in the log for every `SELECT`. A record in another
+    /// group is not a fence for this read, so one slot for the whole node
+    /// cannot describe Multi-Raft.
+    reader_lease: Arc<std::sync::Mutex<BTreeMap<Option<u64>, yadb_metakv::GcLease>>>,
     s3: ObjectStoreEngine<OsFs>,
     db: DatabaseEngine<OsFs>,
     block: BlockVolumeEngine<OsFs>,
@@ -526,18 +529,24 @@ impl AppState {
             .is_fresh_at(Instant::now())
     }
 
-    /// Publishes a reader lease before a handler reads fragments.
+    /// Publishes or reuses this node's reader lease before a handler reads
+    /// fragments.
+    ///
+    /// The record lives in the metadata group that owns the project's
+    /// manifests, resolved exactly as a writer lease is. A record in another
+    /// group would be invisible to that group's collector, so the group is
+    /// resolved before a cached record is considered: only a record of the
+    /// same group is a fence for this read.
     ///
     /// A reader never refuses on a live collector lease: its applied view is at
     /// least as new as the collector's mark, and the collector re-checks reader
     /// leases after publishing its own, so the collector is the side that backs
-    /// off. Blocking; call from `spawn_blocking`.
-    /// Publishes or reuses this node's reader lease before a handler reads
-    /// fragments.
+    /// off.
     ///
     /// The record is kept for the next statement instead of being deleted: one
-    /// published record fences every read on this node, and a fresh record per
-    /// statement would put two Raft entries in the log for every `SELECT`.
+    /// published record fences every read on this node and group, and a fresh
+    /// record per statement would put two Raft entries in the log for every
+    /// `SELECT`.
     ///
     /// A cached record is *renewed*, not merely checked: a read must start with a
     /// full TTL in front of it, otherwise a slow read would run past the fence it
@@ -546,8 +555,9 @@ impl AppState {
     ///
     /// Blocking; call from `spawn_blocking`.
     fn begin_read_lease(&self, project_id: u32) -> Result<yadb_metakv::GcLease, MetaError> {
+        let group = self.meta.gc_group_for_project(project_id)?;
         let mut cached = self.reader_lease.lock().unwrap();
-        if let Some(lease) = cached.take() {
+        if let Some(lease) = cached.remove(&group) {
             match yadb_metakv::gc::renew(&self.meta, &lease, yadb_metakv::gc::DEFAULT_TTL_MS) {
                 Ok(renewed) => return Ok(renewed),
                 Err(error) => {
@@ -559,21 +569,39 @@ impl AppState {
                 }
             }
         }
+        // A group-scoped lease cannot carry the deployment-wide revision: there
+        // is none. It carries the owning group's applied log index instead, a
+        // value the group really supplies. The collector re-reads that index
+        // after closing admission and refuses a record that names another group
+        // or claims an index this group has not applied, so the field is a
+        // checkable provenance token rather than a decorative number.
+        let revision = match group {
+            Some(group) => self.meta.role_info_for_group(group)?.4,
+            None => self.meta.try_revision()?,
+        };
         let lease = yadb_metakv::gc::acquire(
             &self.meta,
             yadb_metakv::gc::LeaseKind::Reader,
             project_id,
-            self.meta.try_revision()?,
+            revision,
             yadb_metakv::gc::DEFAULT_TTL_MS,
         )?;
-        // The lease makes a concurrent pass refuse, but it cannot make this
-        // node's *applied* view current: a lagging follower can still hold an old
-        // manifest whose fragments a completed pass already reclaimed. Publishing
-        // the lease first and checking the sweep watermark second closes that
-        // window — the pass writes the watermark before it re-checks leases.
-        if let Err(error) = yadb_metakv::gc::reader_is_safe(&self.meta) {
-            let _ = yadb_metakv::gc::release(&self.meta, &lease);
-            return Err(error);
+        // The durable watermark is a single-namespace fence. On Multi-Raft the
+        // lease publication above is itself a committed write in the owning
+        // group, so this node's applied view includes every entry committed
+        // before it; the group collector's admission CAS is the other half of
+        // the fence, and it refuses a live record after taking its mark.
+        if group.is_none() {
+            // The lease makes a concurrent pass refuse, but it cannot make this
+            // node's *applied* view current: a lagging follower can still hold an
+            // old manifest whose fragments a completed pass already reclaimed.
+            // Publishing the lease first and checking the sweep watermark second
+            // closes that window — the pass writes the watermark before it
+            // re-checks leases.
+            if let Err(error) = yadb_metakv::gc::reader_is_safe(&self.meta) {
+                let _ = yadb_metakv::gc::release(&self.meta, &lease);
+                return Err(error);
+            }
         }
         Ok(lease)
     }
@@ -590,7 +618,10 @@ impl AppState {
     /// return it. A dead record is not cached either — it is already gone.
     fn end_read_lease(&self, lease: &yadb_metakv::GcLease) -> Result<(), MetaError> {
         yadb_metakv::gc::ensure_live(&self.meta, lease)?;
-        *self.reader_lease.lock().unwrap() = Some(lease.clone());
+        self.reader_lease
+            .lock()
+            .unwrap()
+            .insert(lease.group, lease.clone());
         Ok(())
     }
 
@@ -3935,35 +3966,28 @@ async fn handle_db_query(
     };
     let subject = extract_subject(&headers, st.subject_secret.as_deref());
 
-    // A quorum-confirmed read must run on the project-group leader. A legacy
-    // node cannot serve it at all, so it is not forwarded: the engine answers
-    // with the documented routing error instead of a stale local read.
-    //
-    // Every legacy read is forwarded as well, for a different reason: the reader
-    // lease that fences it is a metadata write, and only the leader can publish
-    // one. A follower that served the read locally would have to run unfenced,
-    // and one that published the lease would fail on every statement. Proxying
-    // keeps default reads working and fenced; on the leader this returns `None`
+    // Every request runs on the project-group leader. A quorum-confirmed read
+    // needs the leader's applied view; every other read needs it too, because
+    // the reader lease that fences it is a metadata write and only the leader
+    // can publish one. A follower that served the read locally would have to
+    // run unfenced, and one that published the lease would fail on every
+    // statement. A legacy node cannot serve a consistent read at all: it is
+    // still forwarded, and the engine answers with the documented routing
+    // error instead of a stale local read. On the leader this returns `None`
     // and the statement runs locally.
-    if has_writes
-        || req.force_leader
-        || (consistent && st.meta.is_openraft())
-        || !st.meta.is_openraft()
-    {
-        if let Ok(raw_body) = serde_json::to_vec(&req) {
-            if let Some(proxied) = maybe_forward_write(
-                &st,
-                &headers,
-                Some(&project),
-                "POST",
-                db_query_path(&project, &database),
-                "application/json".to_string(),
-                Bytes::from(raw_body),
-            )
-            .await
-            {
-                return proxied;
-            }
+    if let Ok(raw_body) = serde_json::to_vec(&req) {
+        if let Some(proxied) = maybe_forward_write(
+            &st,
+            &headers,
+            Some(&project),
+            "POST",
+            db_query_path(&project, &database),
+            "application/json".to_string(),
+            Bytes::from(raw_body),
+        )
+        .await
+        {
+            return proxied;
         }
     }
 
@@ -4012,14 +4036,17 @@ async fn handle_db_query(
     // the ids its tablet manifest names, and a concurrent compaction makes those
     // fragments unreferenced while the scan is still reading them. A write takes
     // its own writer lease as well; this reader lease covers the read half.
-    let mut reader_lease: Option<yadb_metakv::GcLease> = None;
-    if !st.meta.is_openraft() {
-        let st_fence = st.clone();
-        match tokio::task::spawn_blocking(move || st_fence.begin_read_lease(project_id)).await {
-            Ok(Ok(lease)) => reader_lease = Some(lease),
-            Ok(Err(error)) => return api_err(StatusCode::SERVICE_UNAVAILABLE, error.to_string()),
-            Err(error) => return api_err(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
-        }
+    //
+    // The lease is published in the metadata group that owns the project, in
+    // both modes. On Multi-Raft that is a committed group write, so the request
+    // has already been forwarded to that group's leader above; a failure here
+    // is fail-closed with the retryable 503 rather than an unfenced read.
+    let mut reader_lease: Option<yadb_metakv::GcLease>;
+    let st_fence = st.clone();
+    match tokio::task::spawn_blocking(move || st_fence.begin_read_lease(project_id)).await {
+        Ok(Ok(lease)) => reader_lease = Some(lease),
+        Ok(Err(error)) => return api_err(StatusCode::SERVICE_UNAVAILABLE, error.to_string()),
+        Err(error) => return api_err(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
     }
     let sql_raw = req.sql;
     let subj_session = req
@@ -4200,117 +4227,33 @@ async fn handle_block_read(
             "maximum block read is 16 MiB",
         );
     }
-    if q.consistent && st.meta.is_openraft() {
-        // The extent map is read through a quorum-confirmed snapshot on the
-        // project-group leader, so this request must run on that leader. The
-        // forward is the same one the legacy path uses; only the read primitive
-        // below differs.
-        if let Some(resp) = maybe_forward_write(
-            &st,
-            &headers,
-            Some(&project),
-            "GET",
-            format!(
-                "{}?offset={}&len={}&consistent=true",
-                block_path(&project, &volume),
-                q.offset,
-                q.len
-            ),
-            "application/octet-stream".into(),
-            Bytes::new(),
-        )
-        .await
-        {
-            return resp;
-        }
-        let subject = extract_subject(&headers, st.subject_secret.as_deref());
-        let (project_id, pool_name, size_bytes) = {
-            let cp = match st.control_for_authorization_async().await {
-                Ok(cp) => cp,
-                Err(e) => return e.into_response(),
-            };
-            match resolve_block_target(&cp, &project, &volume, &subject, Role::ReadOnly) {
-                Ok(v) => v,
-                Err(resp) => return resp,
-            }
-        };
-        let blk = st.block.clone();
-        let res = tokio::task::spawn_blocking(move || {
-            blk.read_at_consistent(project_id, &volume, &pool_name, size_bytes, q.offset, q.len)
-        })
-        .await;
-        return match res {
-            Ok(Ok(bytes)) => (
-                StatusCode::OK,
-                [(header::CONTENT_TYPE, "application/octet-stream")],
-                bytes,
-            )
-                .into_response(),
-            Ok(Err(e @ BlockError::OutOfBounds { .. })) => {
-                api_err(StatusCode::RANGE_NOT_SATISFIABLE, e.to_string())
-            }
-            Ok(Err(BlockError::Meta(me))) => meta_err_resp(&st, me),
-            // The linearizable map is a point-in-time view, not a GC fence: a
-            // newer write may have replaced a block and a barrier may have
-            // collected the old blob between the map read and the fetch. Failing
-            // is the only honest answer; zeros or a silent skip would return data
-            // that never existed at any single revision.
-            Ok(Err(e @ BlockError::Inconsistent { .. })) => {
-                api_err(StatusCode::SERVICE_UNAVAILABLE, e.to_string())
-            }
-            Ok(Err(e)) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-            Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-        };
-    }
+    // Every block read runs on the project-group leader. A consistent read
+    // needs the leader's quorum-confirmed map; every other read needs the
+    // leader because the reader lease that fences it is a committed metadata
+    // write only the leader can publish. A follower that served the read
+    // locally would run unfenced. On the leader this returns `None` and the
+    // read runs locally under the lease taken below.
+    let mut forward_path = format!(
+        "{}?offset={}&len={}",
+        block_path(&project, &volume),
+        q.offset,
+        q.len
+    );
     if q.consistent {
-        // Legacy metadata cannot take a quorum-confirmed *snapshot*, but it can
-        // fence: an empty `Txn` is a no-op proposal that returns only once this
-        // node has applied every entry committed before it, so the local map read
-        // below observes at least that revision. The iSCSI READ path always asks
-        // for this (`consistent=true`), so it is a real barrier rather than a
-        // silent fallback to stale state. A failed fence is an error, never a read.
-        if let Some(resp) = maybe_forward_write(
-            &st,
-            &headers,
-            Some(&project),
-            "GET",
-            format!(
-                "{}?offset={}&len={}&consistent=true",
-                block_path(&project, &volume),
-                q.offset,
-                q.len
-            ),
-            "application/octet-stream".into(),
-            Bytes::new(),
-        )
-        .await
-        {
-            return resp;
-        }
+        forward_path.push_str("&consistent=true");
     }
-    if !st.meta.is_openraft() {
-        // A legacy read publishes a reader lease, and only the leader can publish
-        // one, so a follower proxies the read instead of serving it unfenced (or
-        // failing on the lease). On the leader this is `None` and the read runs
-        // locally under the lease taken below.
-        if let Some(resp) = maybe_forward_write(
-            &st,
-            &headers,
-            Some(&project),
-            "GET",
-            format!(
-                "{}?offset={}&len={}",
-                block_path(&project, &volume),
-                q.offset,
-                q.len
-            ),
-            "application/octet-stream".into(),
-            Bytes::new(),
-        )
-        .await
-        {
-            return resp;
-        }
+    if let Some(resp) = maybe_forward_write(
+        &st,
+        &headers,
+        Some(&project),
+        "GET",
+        forward_path,
+        "application/octet-stream".into(),
+        Bytes::new(),
+    )
+    .await
+    {
+        return resp;
     }
     let subject = extract_subject(&headers, st.subject_secret.as_deref());
     let (project_id, pool_name, size_bytes) = {
@@ -4331,46 +4274,51 @@ async fn handle_block_read(
     // refused: the pass already proved the fence clear, so it would delete what
     // this read is about to pin.
     //
-    // A consistent read additionally takes one empty quorum transaction after
-    // the lease, so the map it reads is confirmed by a quorum and not just by
-    // this node's applied state.
-    let mut reader_lease: Option<yadb_metakv::GcLease> = None;
-    if !st.meta.is_openraft() {
-        let consistent = q.consistent;
-        let st_fence = st.clone();
-        let fence = tokio::task::spawn_blocking(move || {
-            let lease = st_fence.begin_read_lease(project_id)?;
-            if !consistent {
-                return Ok(lease);
-            }
-            match st_fence.meta.execute(KvCommand::Txn {
-                guards: vec![],
-                ops: vec![],
-            }) {
-                Ok(yadb_metakv::KvResult::TxnOk { .. }) => Ok(lease),
-                Ok(_) => {
-                    let _ = st_fence.end_read_lease(&lease);
-                    Err(MetaError::Routing(
-                        "read quorum unavailable or metadata changed".into(),
-                    ))
-                }
-                Err(error) => {
-                    let _ = st_fence.end_read_lease(&lease);
-                    Err(error)
-                }
-            }
-        })
-        .await;
-        match fence {
-            Ok(Ok(lease)) => reader_lease = Some(lease),
-            Ok(Err(error)) => return api_err(StatusCode::SERVICE_UNAVAILABLE, error.to_string()),
-            Err(error) => return api_err(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+    // On legacy metadata a consistent read additionally takes one empty quorum
+    // transaction after the lease, so the map it reads is confirmed by a quorum
+    // and not just by this node's applied state. On Multi-Raft the lease
+    // publication is itself a committed group write applied on this node, and
+    // a consistent read below reads a quorum-confirmed snapshot.
+    let mut reader_lease: Option<yadb_metakv::GcLease>;
+    let consistent = q.consistent;
+    let st_fence = st.clone();
+    let fence = tokio::task::spawn_blocking(move || {
+        let lease = st_fence.begin_read_lease(project_id)?;
+        if !consistent || st_fence.meta.is_openraft() {
+            return Ok(lease);
         }
+        match st_fence.meta.execute(KvCommand::Txn {
+            guards: vec![],
+            ops: vec![],
+        }) {
+            Ok(yadb_metakv::KvResult::TxnOk { .. }) => Ok(lease),
+            Ok(_) => {
+                let _ = st_fence.end_read_lease(&lease);
+                Err(MetaError::Routing(
+                    "read quorum unavailable or metadata changed".into(),
+                ))
+            }
+            Err(error) => {
+                let _ = st_fence.end_read_lease(&lease);
+                Err(error)
+            }
+        }
+    })
+    .await;
+    match fence {
+        Ok(Ok(lease)) => reader_lease = Some(lease),
+        Ok(Err(error)) => return api_err(StatusCode::SERVICE_UNAVAILABLE, error.to_string()),
+        Err(error) => return api_err(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
     }
 
     let blk = st.block.clone();
+    let read_consistent = q.consistent;
     let res = tokio::task::spawn_blocking(move || {
-        blk.read_at(project_id, &volume, &pool_name, size_bytes, q.offset, q.len)
+        if read_consistent {
+            blk.read_at_consistent(project_id, &volume, &pool_name, size_bytes, q.offset, q.len)
+        } else {
+            blk.read_at(project_id, &volume, &pool_name, size_bytes, q.offset, q.len)
+        }
     })
     .await;
 
@@ -4396,6 +4344,15 @@ async fn handle_block_read(
             .into_response(),
         Ok(Err(e @ BlockError::OutOfBounds { .. })) => {
             api_err(StatusCode::RANGE_NOT_SATISFIABLE, e.to_string())
+        }
+        Ok(Err(BlockError::Meta(me))) => meta_err_resp(&st, me),
+        // The linearizable map is a point-in-time view, not a GC fence: a
+        // newer write may have replaced a block and a barrier may have
+        // collected the old blob between the map read and the fetch. Failing
+        // is the only honest answer; zeros or a silent skip would return data
+        // that never existed at any single revision.
+        Ok(Err(e @ BlockError::Inconsistent { .. })) => {
+            api_err(StatusCode::SERVICE_UNAVAILABLE, e.to_string())
         }
         Ok(Err(e)) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
         Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
@@ -6256,35 +6213,6 @@ async fn handle_s3_get(
     Query(q): Query<S3GetQuery>,
 ) -> Response {
     let head = method == Method::HEAD;
-    if q.consistent && st.meta.is_openraft() {
-        // The manifest is read through a quorum-confirmed snapshot on the
-        // project-group leader, so this request must run on that leader. A
-        // legacy node cannot serve it at all, so it is not forwarded: the
-        // engine answers with the documented routing error instead of a stale
-        // local read.
-        if let Some(resp) = maybe_forward_write(
-            &st,
-            &headers,
-            Some(&project),
-            if head { "HEAD" } else { "GET" },
-            format!(
-                "/s3/{}/{}/{}/{}?consistent=true",
-                protocols::url(&project),
-                protocols::url(&store),
-                protocols::url(&bucket),
-                key.split('/')
-                    .map(protocols::url)
-                    .collect::<Vec<_>>()
-                    .join("/")
-            ),
-            "application/octet-stream".into(),
-            Bytes::new(),
-        )
-        .await
-        {
-            return resp;
-        }
-    }
     if q.consistent && !st.meta.is_openraft() {
         // Legacy metadata has no quorum-confirmed snapshot. Serving the locally
         // applied manifest would be a silent stale read, which is what the
@@ -6293,6 +6221,39 @@ async fn handle_s3_get(
             StatusCode::NOT_IMPLEMENTED,
             "consistent reads require OpenRaft metadata; this node cannot take a quorum-confirmed snapshot",
         );
+    }
+    // Every GET runs on the project-group leader: its reader lease is a
+    // committed metadata write only the leader can publish. A follower that
+    // served the read locally would run unfenced. A consistent HEAD also needs
+    // the leader's quorum-confirmed snapshot; a plain HEAD reads no fragments
+    // and stays local.
+    if !head || q.consistent {
+        let mut path = format!(
+            "/s3/{}/{}/{}/{}",
+            protocols::url(&project),
+            protocols::url(&store),
+            protocols::url(&bucket),
+            key.split('/')
+                .map(protocols::url)
+                .collect::<Vec<_>>()
+                .join("/")
+        );
+        if q.consistent {
+            path.push_str("?consistent=true");
+        }
+        if let Some(resp) = maybe_forward_write(
+            &st,
+            &headers,
+            Some(&project),
+            if head { "HEAD" } else { "GET" },
+            path,
+            "application/octet-stream".into(),
+            Bytes::new(),
+        )
+        .await
+        {
+            return resp;
+        }
     }
 
     let subject = extract_subject(&headers, st.subject_secret.as_deref());
@@ -6319,33 +6280,10 @@ async fn handle_s3_get(
         .await;
     }
 
-    if !st.meta.is_openraft() {
-        // A legacy read publishes a reader lease, and only the leader can publish
-        // one. A follower therefore proxies the read (with its Range header)
-        // instead of serving it unfenced; on the leader this returns `None` and
-        // the read runs locally under the lease taken below.
-        if let Some(resp) = maybe_forward_write(
-            &st,
-            &headers,
-            Some(&project),
-            "GET",
-            format!(
-                "/s3/{}/{}/{}/{}",
-                protocols::url(&project),
-                protocols::url(&store),
-                protocols::url(&bucket),
-                key.split('/')
-                    .map(protocols::url)
-                    .collect::<Vec<_>>()
-                    .join("/")
-            ),
-            "application/octet-stream".into(),
-            Bytes::new(),
-        )
-        .await
-        {
-            return resp;
-        }
+    // A HEAD is answered from the manifest alone: it reads no fragments, so
+    // there is nothing for a reader lease to pin and nothing to forward.
+    if head {
+        return s3_head_local(&st, project_id, &store, &bucket, &key, &headers).await;
     }
 
     // Fence the chunk read against collection. The manifest read and the chunk
@@ -6353,25 +6291,18 @@ async fn handle_s3_get(
     // previous manifest, so the chunks this read is about to fetch can become
     // unreferenced between the two steps.
     //
-    // Multi-Raft takes no reader lease: its collector runs per group and fences
-    // on that group's writer lease and S3 `Prepared` intent, not on reader
-    // records. A read that races an overwrite or delete and a pass can therefore
-    // find a chunk reclaimed between the manifest read and the fetch; that
-    // surfaces as an error response, never as a short or zero-filled body. The
-    // lease machinery stays legacy-only because only the legacy collector
-    // consults reader records.
-    let lease = if st.meta.is_openraft() {
-        None
-    } else {
-        let st_fence = st.clone();
-        let fence =
-            tokio::task::spawn_blocking(move || st_fence.begin_read_lease(project_id)).await;
-        match fence {
-            Ok(Ok(lease)) => Some(lease),
+    // The record lives in the group that owns the project, and on Multi-Raft
+    // its publication is a committed group write on the leader the request was
+    // forwarded to above. A read that starts during a collector's admission
+    // window loses that write's race with the collector's closed admission and
+    // is refused instead of reading fragments the pass is deleting.
+    let st_fence = st.clone();
+    let lease =
+        match tokio::task::spawn_blocking(move || st_fence.begin_read_lease(project_id)).await {
+            Ok(Ok(lease)) => lease,
             Ok(Err(error)) => return api_err(StatusCode::SERVICE_UNAVAILABLE, error.to_string()),
             Err(error) => return api_err(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
-        }
-    };
+        };
 
     let response = s3_get_fenced(
         &st,
@@ -6384,9 +6315,6 @@ async fn handle_s3_get(
     )
     .await;
 
-    let Some(lease) = lease else {
-        return response;
-    };
     let st_fence = st.clone();
     match tokio::task::spawn_blocking(move || st_fence.end_read_lease(&lease)).await {
         Ok(Ok(())) => response,
@@ -6395,6 +6323,36 @@ async fn handle_s3_get(
         // between and the answer cannot be vouched for.
         Ok(Err(error)) => api_err(StatusCode::SERVICE_UNAVAILABLE, error.to_string()),
         Err(error) => api_err(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+    }
+}
+
+/// One unfenced HEAD: the manifest is read once and answered directly. No
+/// fragment is fetched, so no reader lease is needed.
+async fn s3_head_local(
+    st: &AppState,
+    project_id: u32,
+    store: &str,
+    bucket: &str,
+    key: &str,
+    headers: &HeaderMap,
+) -> Response {
+    let s3 = st.s3.clone();
+    let (store, bucket, key) = (store.to_string(), bucket.to_string(), key.to_string());
+    let head =
+        tokio::task::spawn_blocking(move || s3.head_object(project_id, &store, &bucket, &key))
+            .await;
+    let mf = match head {
+        Ok(Ok(mf)) => mf,
+        Ok(Err(S3Error::ObjectNotFound { .. })) => {
+            return api_err(StatusCode::NOT_FOUND, "object not found")
+        }
+        Ok(Err(e)) => return api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        Err(e) => return api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+    match evaluate_conditions(headers, &mf.etag) {
+        Conditional::Passed => object_head_response(mf),
+        Conditional::Failed => api_err(StatusCode::PRECONDITION_FAILED, "ETag mismatch"),
+        Conditional::NotModified => StatusCode::NOT_MODIFIED.into_response(),
     }
 }
 
@@ -6475,16 +6433,53 @@ async fn s3_get_fenced(
 /// snapshot; the chunks are then fetched by the ids that manifest names. There
 /// is no fallback to the locally applied manifest and no retry.
 ///
-/// No reader lease is taken here: this path only runs on OpenRaft metadata (the
-/// legacy runtime answers 501 above). Multi-Raft collection is per group and
-/// fences on that group's writer lease and S3 `Prepared` intent, not on reader
-/// records. The manifest comes from a linearizable snapshot, so it is committed
-/// and any later pass marks the chunks it names; if an overwrite retires it
-/// before the fetch, a reclaimed chunk surfaces as an error rather than a short
-/// or zero-filled body. The legacy reader fence would add a metadata round trip
-/// to a read that no legacy collector can race.
+/// The quorum-confirmed snapshot is not a GC fence: an overwrite or delete
+/// retires the manifest it read, and a pass can reclaim the chunks it names
+/// before they are fetched. A reader lease is therefore taken before the
+/// snapshot and held across the chunk fetch, in the group that owns the
+/// project, exactly as on the non-consistent path. A read that starts during a
+/// collector's admission window loses that lease write and is refused. A HEAD
+/// reads no fragments and takes no lease.
 async fn s3_get_consistent(
     st: AppState,
+    project_id: u32,
+    store: String,
+    bucket: String,
+    key: String,
+    headers: &HeaderMap,
+    range_hdr: Option<String>,
+    head_request: bool,
+) -> Response {
+    if head_request {
+        return s3_get_consistent_fenced(
+            &st, project_id, store, bucket, key, headers, range_hdr, true,
+        )
+        .await;
+    }
+    let st_fence = st.clone();
+    let lease =
+        match tokio::task::spawn_blocking(move || st_fence.begin_read_lease(project_id)).await {
+            Ok(Ok(lease)) => lease,
+            Ok(Err(error)) => return api_err(StatusCode::SERVICE_UNAVAILABLE, error.to_string()),
+            Err(error) => return api_err(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+        };
+    let response = s3_get_consistent_fenced(
+        &st, project_id, store, bucket, key, headers, range_hdr, false,
+    )
+    .await;
+    let st_fence = st.clone();
+    match tokio::task::spawn_blocking(move || st_fence.end_read_lease(&lease)).await {
+        Ok(Ok(())) => response,
+        // The snapshot and the chunk fetch both happened under this lease; if
+        // it did not survive them, a pass may have reclaimed the chunks in
+        // between and the answer cannot be vouched for.
+        Ok(Err(error)) => api_err(StatusCode::SERVICE_UNAVAILABLE, error.to_string()),
+        Err(error) => api_err(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+    }
+}
+
+async fn s3_get_consistent_fenced(
+    st: &AppState,
     project_id: u32,
     store: String,
     bucket: String,
@@ -6500,7 +6495,7 @@ async fn s3_get_consistent(
             .await;
     let mf = match lookup {
         Ok(Ok(mf)) => mf,
-        Ok(Err(e)) => return s3_read_err(&st, e),
+        Ok(Err(e)) => return s3_read_err(st, e),
         Err(e) => return api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
     match evaluate_conditions(headers, &mf.etag) {
@@ -6548,7 +6543,7 @@ async fn s3_get_consistent(
     .await;
     match res {
         Ok(Ok(bytes)) => object_read_response(mf, range, bytes),
-        Ok(Err(e)) => s3_read_err(&st, e),
+        Ok(Err(e)) => s3_read_err(st, e),
         Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }
@@ -7836,7 +7831,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         pools: Arc::new(RwLock::new(BTreeMap::new())),
         local_vdisks: Arc::new(RwLock::new(BTreeMap::new())),
         last_scrub: Arc::new(RwLock::new(None)),
-        reader_lease: Arc::new(std::sync::Mutex::new(None)),
+        reader_lease: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
         s3,
         db,
         block,
@@ -8740,7 +8735,7 @@ mod security_tests {
             pools: Arc::new(RwLock::new(BTreeMap::new())),
             local_vdisks: Arc::new(RwLock::new(BTreeMap::new())),
             last_scrub: Arc::new(RwLock::new(None)),
-            reader_lease: Arc::new(std::sync::Mutex::new(None)),
+            reader_lease: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             s3: ObjectStoreEngine::new(meta.clone(), 4096),
             db: DatabaseEngine::new(meta.clone(), 100),
             block: BlockVolumeEngine::new(meta, DEFAULT_BLOCK_SIZE),
@@ -9370,7 +9365,7 @@ mod security_tests {
             pools: Arc::new(RwLock::new(BTreeMap::from([("data".to_string(), pool)]))),
             local_vdisks: Arc::new(RwLock::new(BTreeMap::new())),
             last_scrub: Arc::new(RwLock::new(None)),
-            reader_lease: Arc::new(std::sync::Mutex::new(None)),
+            reader_lease: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             s3: ObjectStoreEngine::new(meta.clone(), 4096),
             db: DatabaseEngine::new(meta.clone(), 100),
             block,
@@ -9431,7 +9426,7 @@ mod security_tests {
         assert!(outcome.refusal.unwrap().contains("live lease"));
         // Dropping the cached record, as an idle node does when it expires, lets
         // the pass run; the bytes stay because the extent map still references them.
-        let cached = st.reader_lease.lock().unwrap().take().unwrap();
+        let cached = st.reader_lease.lock().unwrap().remove(&None).unwrap();
         yadb_metakv::gc::release(&st.meta, &cached).unwrap();
         assert!(
             crate::gc::sweep(&st.meta, &pools, &control)
@@ -10695,7 +10690,7 @@ mod raft_status_tests {
             pools: Arc::new(RwLock::new(BTreeMap::new())),
             local_vdisks: Arc::new(RwLock::new(BTreeMap::new())),
             last_scrub: Arc::new(RwLock::new(None)),
-            reader_lease: Arc::new(std::sync::Mutex::new(None)),
+            reader_lease: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             s3: ObjectStoreEngine::new(meta.clone(), 4096),
             db: DatabaseEngine::new(meta.clone(), 100),
             block: BlockVolumeEngine::new(meta.clone(), DEFAULT_BLOCK_SIZE),
