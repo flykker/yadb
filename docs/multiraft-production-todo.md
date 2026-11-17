@@ -609,13 +609,32 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   megabytes), and the checkpoint settled at 56 KB. A `stop`/`start` cycle
   recovered every row with no WAL growth, and a node killed with `SIGKILL`
   caught up from the leader's retained suffix.
-  Open: there is no install-snapshot path, so a peer that falls below the
-  compacted base is refused with `PeerBehindCompactedBase` and adding or
-  re-seeding a node needs that protocol first; the checkpoint is a full image,
-  not an incremental history, so its size follows live metadata (small here:
-  SQL rows live in pool fragments, not in the metadata image); compaction runs
-  under the Raft mutex, so one pass briefly stalls proposals; and a single-node
-  cluster compacts on its own applied index without a peer bound.
+  A peer that falls behind the compacted base is re-seeded with the same
+  image: `InstallSnapshot` carries the `checkpoint.json` bytes in 64 KiB
+  chunks over the authenticated Raft RPC, bounded at 64 MiB and resumable per
+  (group, leader, snapshot id) through `metakv/snapshot.partial` (discarded on
+  open). Every chunk repeats the group id (CRC32 over the sorted voters), the
+  membership, the last included index/term, the total length and the content id
+  `(crc32 << 32) | len`, so a receiver refuses a wrong group, wrong membership,
+  stale index, conflicting term, gap, out-of-range offset or bad whole-image
+  checksum before touching its data and keeps serving what it had. The
+  assembled image is synced, checksummed, decoded and cross-checked, published
+  with one atomic rename plus `sync_dir`, then the WAL is rewritten to the new
+  base, and only then do the in-memory applied/base pointers move; nothing is
+  acknowledged before both files are durable, and a crash leaves either the old
+  or the new base (the checkpoint is authoritative on open). The rejoin then
+  continues as an ordinary log follower, with no second catch-up path.
+  `checkpoint.json` is version 2 (adds the membership); a version-1 image is
+  still read, an unknown version is refused. The leader no longer answers a
+  behind peer with `PeerBehindCompactedBase`; that error now means only the
+  follower-side refusal of an append whose prefix is below its own base (and the
+  impossible case where nothing has been compacted, so no image exists).
+  Open: the checkpoint is a full image, not an incremental history, so its size
+  follows live metadata (small here: SQL rows live in pool fragments, not in the
+  metadata image); compaction runs under the Raft mutex, so one pass briefly
+  stalls proposals; a single-node cluster compacts on its own applied index
+  without a peer bound; and a failed install retries from offset 0 on the next
+  heartbeat rather than keeping a per-snapshot failure state.
 - [x] Garbage collection on Multi-Raft. `POST /v1/pools/gc` and the sweep inside
   `POST /v1/pools/scrub` now run one leader-only, quorum-confirmed pass per
   metadata group instead of refusing with `garbage collection disabled for

@@ -15,6 +15,27 @@ use crate::{KvValue, MetaError, MetaSnapshot};
 const WAL_COMPACTION_BYTES: u64 = 8 * 1024 * 1024;
 const WAL_COMPACTION_ENTRIES: u64 = 4096;
 
+/// Version of `checkpoint.json`. Version 2 adds the membership the image was
+/// taken under. A version-1 image is still read (it predates membership), but a
+/// reader that only knows version 1 refuses version 2 explicitly instead of
+/// ignoring the field it cannot see.
+const CHECKPOINT_FORMAT_VERSION: u32 = 2;
+
+/// Upper bound on one snapshot image, matching the OpenRaft state machine's
+/// image bound. It is also the largest `total_len` a receiver will accept.
+const MAX_SNAPSHOT_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Bounded chunk of a snapshot image carried by one `InstallSnapshot` RPC.
+const SNAPSHOT_CHUNK_BYTES: usize = 64 * 1024;
+
+/// In-progress snapshot received from a leader. It was never acknowledged as a
+/// whole, so it is not authoritative and is discarded when the node opens.
+const SNAPSHOT_PARTIAL_FILE: &str = "snapshot.partial";
+
+/// Leader-side copy of the image streamed to peers. It is a cache of the
+/// checkpoint image plus membership, rebuilt whenever the base moves.
+const SNAPSHOT_EXPORT_FILE: &str = "snapshot.export";
+
 /// How long a Leader waits for its own proposal to be committed and applied
 /// before answering with an explicit unknown outcome. It must stay below the
 /// forwarding follower's 5 s reply timeout so the Leader can answer first with a
@@ -42,6 +63,10 @@ struct DurableCheckpoint {
     commit_index: u64,
     hard_state: DurableHardState,
     compaction_floor: u64,
+    /// Voters this image was taken under. Version-1 images predate the field
+    /// and deserialize to an empty list.
+    #[serde(default)]
+    membership: Vec<u32>,
     snapshot: MetaSnapshot,
 }
 
@@ -59,6 +84,108 @@ fn checkpoint_path(dir: &str) -> String {
     }
 }
 
+fn snapshot_partial_path(dir: &str) -> String {
+    if dir.is_empty() {
+        SNAPSHOT_PARTIAL_FILE.to_string()
+    } else {
+        format!("{}/{}", dir.trim_end_matches('/'), SNAPSHOT_PARTIAL_FILE)
+    }
+}
+
+fn snapshot_export_path(dir: &str) -> String {
+    if dir.is_empty() {
+        SNAPSHOT_EXPORT_FILE.to_string()
+    } else {
+        format!("{}/{}", dir.trim_end_matches('/'), SNAPSHOT_EXPORT_FILE)
+    }
+}
+
+/// Identity of a legacy Raft group. Legacy membership is fixed configuration,
+/// so the sorted voter set is the whole group identity: a snapshot built by
+/// another set of voters is a different group and must never be installed.
+fn group_id(membership: &[u32]) -> u64 {
+    let mut ids = membership.to_vec();
+    ids.sort_unstable();
+    ids.dedup();
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(b"yadb-raft-group/1");
+    for id in ids {
+        hasher.update(&id.to_le_bytes());
+    }
+    u64::from(hasher.finalize())
+}
+
+/// Content identity of one snapshot image: its CRC32 and its exact length. A
+/// chunk repeats it so a receiver can never mix bytes from two images, and the
+/// full checksum is re-derived from the assembled file before anything is
+/// published.
+fn snapshot_id(crc: u32, len: u64) -> u64 {
+    (u64::from(crc) << 32) | (len & 0xffff_ffff)
+}
+
+/// Streams `Write` calls into a `VirtualFile` at increasing offsets, hashing
+/// the same bytes so an image can be exported without holding it in memory.
+struct FsSink<'a, F: VirtualFile> {
+    file: &'a F,
+    pos: u64,
+    crc: crc32fast::Hasher,
+}
+
+impl<'a, F: VirtualFile> FsSink<'a, F> {
+    fn new(file: &'a F) -> Self {
+        Self {
+            file,
+            pos: 0,
+            crc: crc32fast::Hasher::new(),
+        }
+    }
+}
+
+impl<F: VirtualFile> std::io::Write for FsSink<'_, F> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.file.write_at(self.pos, buf)?;
+        self.pos += buf.len() as u64;
+        self.crc.update(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Reads a `VirtualFile` as a bounded `Read`, so a receiver can checksum and
+/// decode an assembled image without first copying it into one buffer.
+struct FsSource<'a, F: VirtualFile> {
+    file: &'a F,
+    pos: u64,
+    len: u64,
+}
+
+impl<'a, F: VirtualFile> FsSource<'a, F> {
+    fn new(file: &'a F, len: u64) -> Self {
+        Self { file, pos: 0, len }
+    }
+}
+
+impl<F: VirtualFile> std::io::Read for FsSource<'_, F> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.pos >= self.len || buf.is_empty() {
+            return Ok(0);
+        }
+        let want = (self.len - self.pos).min(buf.len() as u64) as usize;
+        let read = self.file.read_at(self.pos, &mut buf[..want])?;
+        if read == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "snapshot image ended before its declared length",
+            ));
+        }
+        self.pos += read as u64;
+        Ok(read)
+    }
+}
+
 fn load_checkpoint<FS: StorageFs>(
     fs: &FS,
     dir: &str,
@@ -72,7 +199,7 @@ fn load_checkpoint<FS: StorageFs>(
     file.read_at(0, &mut bytes)?;
     let checkpoint: DurableCheckpoint =
         serde_json::from_slice(&bytes).map_err(|e| MetaError::Checkpoint(format!("{e}")))?;
-    if checkpoint.format_version != 1 {
+    if checkpoint.format_version != 1 && checkpoint.format_version != CHECKPOINT_FORMAT_VERSION {
         return Err(MetaError::Checkpoint(format!(
             "unsupported format version {}",
             checkpoint.format_version
@@ -127,7 +254,35 @@ pub enum RaftRpc {
         from: u32,
         term: u64,
         success: bool,
+        /// On success, the highest index this follower now matches. On failure,
+        /// the follower's last log index, used only as a backoff hint so the
+        /// leader does not walk back one entry per round.
         match_index: u64,
+    },
+    /// One bounded chunk of a snapshot image. Every chunk repeats the full
+    /// identity (group, membership, last included log id, length and content
+    /// id) so the receiver validates it before touching its data.
+    InstallSnapshot {
+        term: u64,
+        leader_id: u32,
+        snapshot_id: u64,
+        group_id: u64,
+        membership: Vec<u32>,
+        last_index: u64,
+        last_term: u64,
+        total_len: u64,
+        offset: u64,
+        data: Vec<u8>,
+    },
+    InstallSnapshotReply {
+        from: u32,
+        term: u64,
+        snapshot_id: u64,
+        accepted: bool,
+        /// Bytes held for this snapshot; the offset the leader resumes from. A
+        /// refusal carries the offset the receiver will accept next.
+        next_offset: u64,
+        error: Option<String>,
     },
 }
 
@@ -135,6 +290,38 @@ pub enum RaftRpc {
 pub struct OutboundMsg {
     pub to: u32,
     pub rpc: RaftRpc,
+}
+
+/// The durable checkpoint image as it was last exported for peers, plus the
+/// pointers a chunk header must carry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SnapshotExport {
+    base_index: u64,
+    base_term: u64,
+    membership: Vec<u32>,
+    group_id: u64,
+    id: u64,
+    len: u64,
+}
+
+/// How far one peer has acknowledged an in-flight snapshot transfer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SnapshotSend {
+    id: u64,
+    next_offset: u64,
+}
+
+/// A partially received image. Bytes live in `snapshot.partial`; this is the
+/// identity that makes a resume safe and a different snapshot restart clean.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SnapshotReceive {
+    snapshot_id: u64,
+    group_id: u64,
+    membership: Vec<u32>,
+    last_index: u64,
+    last_term: u64,
+    total_len: u64,
+    received: u64,
 }
 
 /// Core Raft + Ordered KV state machine node (works identically in single-node mode,
@@ -169,6 +356,14 @@ pub struct RaftCore<FS: StorageFs> {
     /// for a mutation whose durable maintenance is broken. Only a restart (and
     /// an operator) clears it.
     compaction_error: Option<String>,
+    /// Image cached for peers that are below the compacted base.
+    snapshot_export: Option<SnapshotExport>,
+    /// Per-peer resume offsets for an in-flight snapshot transfer.
+    snapshot_sends: BTreeMap<u32, SnapshotSend>,
+    /// Partially received image, if any.
+    snapshot_receive: Option<SnapshotReceive>,
+    /// Bytes per `InstallSnapshot` chunk. A field so a test can shrink it.
+    snapshot_chunk_bytes: usize,
 }
 
 impl<FS: StorageFs> RaftCore<FS> {
@@ -187,6 +382,16 @@ impl<FS: StorageFs> RaftCore<FS> {
 
         let (mut wal, mut recovered) = RaftWal::open(fs, dir, sync_writes)?;
         let checkpoint = load_checkpoint(fs, dir)?;
+        // A partial or exported image is never authoritative: a received image
+        // is only installed by publishing it as `checkpoint.json`, and an
+        // export is only a cache. Drop both so a restart starts from the same
+        // place the leader will be told to resume from.
+        for path in [snapshot_partial_path(dir), snapshot_export_path(dir)] {
+            if fs.exists(&path) {
+                fs.remove_file(&path)?;
+                fs.sync_dir(dir)?;
+            }
+        }
         let (
             sm,
             applied_index,
@@ -195,6 +400,15 @@ impl<FS: StorageFs> RaftCore<FS> {
             checkpoint_term,
             checkpoint_vote,
         ) = if let Some(cp) = checkpoint {
+            // Version-1 images predate membership; a version-2 image records
+            // the voters it was written under, and installing it into a
+            // different group would be silently wrong.
+            if !cp.membership.is_empty() && cp.membership != peers {
+                return Err(MetaError::Checkpoint(format!(
+                    "checkpoint was written for voters {:?}, this replica is configured for {peers:?}",
+                    cp.membership
+                )));
+            }
             if cp.applied_index < recovered.base_index {
                 return Err(MetaError::Checkpoint(
                     "checkpoint applied index is below the WAL base".into(),
@@ -293,6 +507,10 @@ impl<FS: StorageFs> RaftCore<FS> {
             compaction_bytes: WAL_COMPACTION_BYTES,
             compaction_entries: WAL_COMPACTION_ENTRIES,
             compaction_error: None,
+            snapshot_export: None,
+            snapshot_sends: BTreeMap::new(),
+            snapshot_receive: None,
+            snapshot_chunk_bytes: SNAPSHOT_CHUNK_BYTES,
         };
 
         // Single-node cluster automatically becomes leader and replays its own durable WAL!
@@ -451,6 +669,7 @@ impl<FS: StorageFs> RaftCore<FS> {
         let next = self.last_log_index() + 1;
         self.next_index.clear();
         self.match_index.clear();
+        self.snapshot_sends.clear();
         for &peer in &self.peers {
             self.next_index.insert(peer, next);
             self.match_index.insert(
@@ -504,16 +723,16 @@ impl<FS: StorageFs> RaftCore<FS> {
         Ok((idx, self.broadcast_append_entries_checked()?))
     }
 
-    pub fn broadcast_append_entries(&self) -> Vec<OutboundMsg> {
+    pub fn broadcast_append_entries(&mut self) -> Vec<OutboundMsg> {
         self.broadcast_append_entries_checked().unwrap_or_default()
     }
 
-    fn broadcast_append_entries_checked(&self) -> Result<Vec<OutboundMsg>, MetaError> {
+    fn broadcast_append_entries_checked(&mut self) -> Result<Vec<OutboundMsg>, MetaError> {
         if self.ensure_operable().is_err() || self.role != RoleState::Leader {
             return Ok(Vec::new());
         }
         let mut out = Vec::new();
-        for &peer in &self.peers {
+        for peer in self.peers.clone() {
             if peer == self.node_id {
                 continue;
             }
@@ -523,11 +742,14 @@ impl<FS: StorageFs> RaftCore<FS> {
                 .copied()
                 .unwrap_or(self.last_log_index() + 1)
                 .max(1);
+            if next_idx <= self.base_index {
+                // The entries this peer needs are gone. Install the durable
+                // image instead of refusing it forever.
+                out.push(self.snapshot_chunk_for(peer)?);
+                continue;
+            }
             let prev_log_index = next_idx - 1;
             let prev_log_term = self.term_at(prev_log_index).unwrap_or(0);
-            if next_idx <= self.base_index {
-                return Err(MetaError::PeerBehindCompactedBase(peer));
-            }
             let entries = self.log[(next_idx - self.base_index - 1) as usize..].to_vec();
             out.push(OutboundMsg {
                 to: peer,
@@ -615,7 +837,7 @@ impl<FS: StorageFs> RaftCore<FS> {
                             from: self.node_id,
                             term: self.current_term,
                             success: false,
-                            match_index: 0,
+                            match_index: self.last_log_index(),
                         },
                     }]);
                 }
@@ -645,7 +867,7 @@ impl<FS: StorageFs> RaftCore<FS> {
                             from: self.node_id,
                             term: self.current_term,
                             success: false,
-                            match_index: 0,
+                            match_index: self.last_log_index(),
                         },
                     }]);
                 }
@@ -752,13 +974,140 @@ impl<FS: StorageFs> RaftCore<FS> {
                 } else {
                     let cur_next = self.next_index.get(&from).copied().unwrap_or(2);
                     let backed_off = cur_next.saturating_sub(1).max(1);
-                    if backed_off <= self.base_index {
-                        return Err(MetaError::PeerBehindCompactedBase(from));
-                    }
-                    self.next_index.insert(from, backed_off);
+                    // A failed reply carries the follower's last log index in
+                    // `match_index`. Jump to it when that skips more entries,
+                    // but never stall: an unchanged hint falls back to the
+                    // one-step backoff so a divergent entry still converges.
+                    let hint = if match_index > 0 {
+                        match_index + 1
+                    } else {
+                        backed_off
+                    };
+                    let next = if hint < cur_next {
+                        hint.max(1)
+                    } else {
+                        backed_off
+                    };
+                    self.next_index.insert(from, next);
+                    // If the entries are gone, this sends the durable image
+                    // rather than refusing the peer forever.
                     return self.broadcast_append_entries_checked();
                 }
                 Ok(Vec::new())
+            }
+
+            RaftRpc::InstallSnapshot {
+                term,
+                leader_id,
+                snapshot_id,
+                group_id,
+                membership,
+                last_index,
+                last_term,
+                total_len,
+                offset,
+                data,
+            } => {
+                if term < self.current_term {
+                    return Ok(vec![OutboundMsg {
+                        to: leader_id,
+                        rpc: RaftRpc::InstallSnapshotReply {
+                            from: self.node_id,
+                            term: self.current_term,
+                            snapshot_id,
+                            accepted: false,
+                            next_offset: 0,
+                            error: Some(format!(
+                                "snapshot term {term} is below the current term {}",
+                                self.current_term
+                            )),
+                        },
+                    }]);
+                }
+                if term > self.current_term || self.role != RoleState::Follower {
+                    if term > self.current_term {
+                        self.current_term = term;
+                        self.voted_for = None;
+                        self.wal.append(&WalRecord::HardState {
+                            term: self.current_term,
+                            voted_for: None,
+                        })?;
+                    }
+                    self.role = RoleState::Follower;
+                }
+                self.leader_id = Some(leader_id);
+                let result = self.receive_snapshot_chunk(
+                    snapshot_id,
+                    group_id,
+                    &membership,
+                    last_index,
+                    last_term,
+                    total_len,
+                    offset,
+                    data,
+                );
+                let (accepted, next_offset, error) = match result {
+                    Ok(next_offset) => (true, next_offset, None),
+                    Err((next_offset, reason)) => (false, next_offset, Some(reason)),
+                };
+                Ok(vec![OutboundMsg {
+                    to: leader_id,
+                    rpc: RaftRpc::InstallSnapshotReply {
+                        from: self.node_id,
+                        term: self.current_term,
+                        snapshot_id,
+                        accepted,
+                        next_offset,
+                        error,
+                    },
+                }])
+            }
+
+            RaftRpc::InstallSnapshotReply {
+                from,
+                term,
+                snapshot_id,
+                accepted,
+                next_offset,
+                error: _,
+            } => {
+                if term > self.current_term {
+                    self.step_down(term)?;
+                    return Ok(Vec::new());
+                }
+                if self.role != RoleState::Leader || term != self.current_term {
+                    return Ok(Vec::new());
+                }
+                if !accepted {
+                    // The receiver refused this image or cannot resume here.
+                    // Drop the progress so the next round restarts at 0; the
+                    // refusal is already explicit in the reply.
+                    self.snapshot_sends.remove(&from);
+                    return Ok(Vec::new());
+                }
+                let export = self.ensure_snapshot_export()?;
+                if snapshot_id != export.id || next_offset > export.len {
+                    // A superseded image or an impossible offset: never keep
+                    // streaming it.
+                    self.snapshot_sends.remove(&from);
+                    return Ok(Vec::new());
+                }
+                if next_offset < export.len {
+                    self.snapshot_sends.insert(
+                        from,
+                        SnapshotSend {
+                            id: export.id,
+                            next_offset,
+                        },
+                    );
+                    return Ok(vec![self.snapshot_chunk_for(from)?]);
+                }
+                // The image is durable on the follower. From here it is a
+                // normal log follower: start appending above the new base.
+                self.snapshot_sends.remove(&from);
+                self.match_index.insert(from, export.base_index);
+                self.next_index.insert(from, export.base_index + 1);
+                self.broadcast_append_entries_checked()
             }
         }
     }
@@ -769,6 +1118,7 @@ impl<FS: StorageFs> RaftCore<FS> {
         self.voted_for = None;
         self.leader_id = None;
         self.votes_received.clear();
+        self.snapshot_sends.clear();
         self.wal.append(&WalRecord::HardState {
             term: self.current_term,
             voted_for: None,
@@ -849,7 +1199,7 @@ impl<FS: StorageFs> RaftCore<FS> {
         }
         let snapshot = self.snapshot_at(target);
         let checkpoint = DurableCheckpoint {
-            format_version: 1,
+            format_version: CHECKPOINT_FORMAT_VERSION,
             applied_index: target,
             applied_term,
             commit_index: self.commit_index,
@@ -858,6 +1208,7 @@ impl<FS: StorageFs> RaftCore<FS> {
                 voted_for: self.voted_for,
             },
             compaction_floor: self.compaction_floor,
+            membership: self.peers.clone(),
             snapshot: snapshot.clone(),
         };
         let path = checkpoint_path(&self.dir);
@@ -890,6 +1241,402 @@ impl<FS: StorageFs> RaftCore<FS> {
         self.base_index = target;
         self.base_term = applied_term;
         self.checkpoint_snapshot = snapshot;
+        // The image for peers changed with the base: rebuild it on demand and
+        // make any in-flight transfer restart from the new snapshot.
+        self.snapshot_export = None;
+        self.snapshot_sends.clear();
+        Ok(())
+    }
+
+    /// Build (or reuse) the image streamed to peers below the compacted base.
+    ///
+    /// The image is the durable checkpoint format itself, so a receiver that
+    /// installs it publishes exactly the bytes `maybe_compact` writes. It is
+    /// serialised straight into a file and checksummed as it is written, so a
+    /// large image is never held in memory.
+    fn ensure_snapshot_export(&mut self) -> Result<SnapshotExport, MetaError> {
+        if let Some(export) = &self.snapshot_export {
+            if export.base_index == self.base_index
+                && export.base_term == self.base_term
+                && export.membership == self.peers
+            {
+                return Ok(export.clone());
+            }
+        }
+        let checkpoint = DurableCheckpoint {
+            format_version: CHECKPOINT_FORMAT_VERSION,
+            applied_index: self.base_index,
+            applied_term: self.base_term,
+            commit_index: self.commit_index,
+            // A snapshot carries no vote of its own: the receiver persists its
+            // own hard state in the rewritten WAL.
+            hard_state: DurableHardState {
+                term: self.current_term,
+                voted_for: None,
+            },
+            compaction_floor: self.compaction_floor,
+            membership: self.peers.clone(),
+            snapshot: self.checkpoint_snapshot.clone(),
+        };
+        let path = snapshot_export_path(&self.dir);
+        let file = self.fs.open_rw(&path, true)?;
+        file.set_len(0)?;
+        let mut sink = FsSink::new(&file);
+        serde_json::to_writer(&mut sink, &checkpoint)?;
+        let len = sink.pos;
+        let crc = sink.crc.finalize();
+        if len > MAX_SNAPSHOT_BYTES {
+            file.set_len(0)?;
+            return Err(MetaError::Checkpoint(format!(
+                "snapshot image is {len} bytes, above the {MAX_SNAPSHOT_BYTES} byte limit"
+            )));
+        }
+        let export = SnapshotExport {
+            base_index: self.base_index,
+            base_term: self.base_term,
+            membership: self.peers.clone(),
+            group_id: group_id(&self.peers),
+            id: snapshot_id(crc, len),
+            len,
+        };
+        self.snapshot_export = Some(export.clone());
+        self.snapshot_sends.clear();
+        Ok(export)
+    }
+
+    /// One bounded chunk of the current image for `peer`.
+    fn snapshot_chunk_for(&mut self, peer: u32) -> Result<OutboundMsg, MetaError> {
+        if self.base_index == 0 {
+            // Nothing has been compacted, so there is no image to install.
+            return Err(MetaError::PeerBehindCompactedBase(peer));
+        }
+        let export = self.ensure_snapshot_export()?;
+        let mut offset = match self.snapshot_sends.get(&peer) {
+            Some(send) if send.id == export.id => send.next_offset,
+            _ => 0,
+        };
+        if offset >= export.len {
+            // The previous transfer finished but its final reply was lost:
+            // restart deterministically instead of sending an empty chunk.
+            offset = 0;
+        }
+        let path = snapshot_export_path(&self.dir);
+        let file = self.fs.open_rw(&path, false)?;
+        let want = (export.len - offset).min(self.snapshot_chunk_bytes as u64) as usize;
+        let mut data = vec![0u8; want];
+        let read = file.read_at(offset, &mut data)?;
+        if read == 0 {
+            return Err(MetaError::Checkpoint(
+                "snapshot export ended before its declared length".into(),
+            ));
+        }
+        data.truncate(read);
+        self.snapshot_sends.insert(
+            peer,
+            SnapshotSend {
+                id: export.id,
+                next_offset: offset,
+            },
+        );
+        Ok(OutboundMsg {
+            to: peer,
+            rpc: RaftRpc::InstallSnapshot {
+                term: self.current_term,
+                leader_id: self.node_id,
+                snapshot_id: export.id,
+                group_id: export.group_id,
+                membership: export.membership,
+                last_index: export.base_index,
+                last_term: export.base_term,
+                total_len: export.len,
+                offset,
+                data,
+            },
+        })
+    }
+
+    /// Validate and durably hold one chunk. Returns the next offset the leader
+    /// should send, or the offset the receiver will accept on a refusal.
+    #[allow(clippy::too_many_arguments)]
+    fn receive_snapshot_chunk(
+        &mut self,
+        snapshot_id: u64,
+        image_group: u64,
+        membership: &[u32],
+        last_index: u64,
+        last_term: u64,
+        total_len: u64,
+        offset: u64,
+        data: Vec<u8>,
+    ) -> Result<u64, (u64, String)> {
+        let local_group = group_id(&self.peers);
+        if image_group != local_group {
+            return Err((
+                0,
+                format!("snapshot is for group {image_group}, this replica is {local_group}"),
+            ));
+        }
+        if membership != self.peers.as_slice() {
+            return Err((0, "snapshot membership does not match this replica".into()));
+        }
+        if total_len == 0 || total_len > MAX_SNAPSHOT_BYTES {
+            return Err((0, format!("snapshot length {total_len} is out of range")));
+        }
+        if last_index == 0 {
+            return Err((0, "snapshot index 0 is impossible".into()));
+        }
+        if last_index < self.base_index {
+            return Err((
+                0,
+                format!(
+                    "snapshot at {last_index} is older than the installed base {}",
+                    self.base_index
+                ),
+            ));
+        }
+        if last_index == self.base_index && last_term != self.base_term {
+            return Err((
+                0,
+                format!(
+                    "snapshot term {last_term} conflicts with base term {}",
+                    self.base_term
+                ),
+            ));
+        }
+        if last_index < self.last_applied {
+            return Err((
+                0,
+                format!(
+                    "snapshot at {last_index} would roll back applied state {}",
+                    self.last_applied
+                ),
+            ));
+        }
+        if let Some(term) = self.term_at(last_index) {
+            if term != last_term {
+                return Err((
+                    0,
+                    format!("snapshot at {last_index} conflicts with this log"),
+                ));
+            }
+        }
+        let end = offset
+            .checked_add(data.len() as u64)
+            .ok_or((0, "snapshot offset overflow".to_string()))?;
+        if data.is_empty() || end > total_len {
+            return Err((
+                0,
+                format!(
+                    "snapshot chunk at {offset} with {} bytes is outside {total_len}",
+                    data.len()
+                ),
+            ));
+        }
+        let path = snapshot_partial_path(&self.dir);
+        let file = self
+            .fs
+            .open_rw(&path, true)
+            .map_err(|e| (0, format!("cannot open the partial snapshot: {e}")))?;
+        let same = self.snapshot_receive.as_ref().is_some_and(|rx| {
+            rx.snapshot_id == snapshot_id
+                && rx.group_id == image_group
+                && rx.membership == membership
+                && rx.last_index == last_index
+                && rx.last_term == last_term
+                && rx.total_len == total_len
+        });
+        if !same {
+            if offset != 0 {
+                return Err((
+                    0,
+                    "a different snapshot is in progress; restart at offset 0".into(),
+                ));
+            }
+            file.set_len(0)
+                .map_err(|e| (0, format!("cannot reset the partial snapshot: {e}")))?;
+            self.snapshot_receive = Some(SnapshotReceive {
+                snapshot_id,
+                group_id: image_group,
+                membership: membership.to_vec(),
+                last_index,
+                last_term,
+                total_len,
+                received: 0,
+            });
+        }
+        let done = {
+            let rx = self
+                .snapshot_receive
+                .as_mut()
+                .expect("snapshot receive state was just installed");
+            if offset > rx.received {
+                return Err((
+                    rx.received,
+                    format!("snapshot chunk at {offset} leaves a gap at {}", rx.received),
+                ));
+            }
+            if offset < rx.received {
+                // A retransmitted chunk: drop everything after it so bytes of
+                // one snapshot can never be appended twice.
+                file.set_len(offset).map_err(|e| {
+                    (
+                        rx.received,
+                        format!("cannot truncate the partial snapshot: {e}"),
+                    )
+                })?;
+                rx.received = offset;
+            }
+            if let Err(e) = file.write_at(offset, &data) {
+                // A torn write leaves the file at an unknown point: the next
+                // attempt restarts at this offset.
+                rx.received = offset;
+                return Err((offset, format!("snapshot chunk write failed: {e}")));
+            }
+            rx.received = end;
+            rx.received == total_len
+        };
+        if done {
+            if let Err((offset, reason)) = self.finish_snapshot_install() {
+                // The image was refused as a whole: drop the scratch copy so
+                // the receiver is back to the state it was serving and the
+                // leader restarts from offset 0.
+                self.snapshot_receive = None;
+                let _ = self.fs.remove_file(&snapshot_partial_path(&self.dir));
+                return Err((offset, reason));
+            }
+            return Ok(total_len);
+        }
+        Ok(self.snapshot_receive.as_ref().map_or(0, |rx| rx.received))
+    }
+
+    /// Validate the assembled image and make it the base, durably.
+    ///
+    /// Order is: sync the image, verify its whole-image checksum, decode and
+    /// cross-check every pointer, publish it as `checkpoint.json` with one
+    /// atomic rename plus a directory sync, rewrite the WAL to the new base,
+    /// and only then move the in-memory applied/base pointer. A crash before
+    /// the rename leaves the old image; a crash after it leaves the new image
+    /// and `open` reconciles the older WAL to it. Nothing is acknowledged
+    /// before both files are durable.
+    fn finish_snapshot_install(&mut self) -> Result<(), (u64, String)> {
+        let rx = self
+            .snapshot_receive
+            .clone()
+            .ok_or((0, "no snapshot is being received".to_string()))?;
+        let path = snapshot_partial_path(&self.dir);
+        let file = self
+            .fs
+            .open_rw(&path, false)
+            .map_err(|e| (0, format!("cannot open the partial snapshot: {e}")))?;
+        let len = file
+            .len()
+            .map_err(|e| (0, format!("cannot size the partial snapshot: {e}")))?;
+        if len != rx.total_len {
+            return Err((
+                0,
+                format!("snapshot has {len} bytes, expected {}", rx.total_len),
+            ));
+        }
+        file.sync_data()
+            .map_err(|e| (0, format!("cannot sync the snapshot image: {e}")))?;
+        let mut source = FsSource::new(&file, len);
+        let mut hasher = crc32fast::Hasher::new();
+        let mut buffer = vec![0u8; SNAPSHOT_CHUNK_BYTES];
+        loop {
+            let read = source
+                .read(&mut buffer)
+                .map_err(|e| (0, format!("cannot read the snapshot image: {e}")))?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+        if snapshot_id(hasher.finalize(), len) != rx.snapshot_id {
+            return Err((0, "snapshot checksum mismatch".into()));
+        }
+        let mut source = FsSource::new(&file, len);
+        let image: DurableCheckpoint = serde_json::from_reader(&mut source)
+            .map_err(|e| (0, format!("snapshot image is not a checkpoint: {e}")))?;
+        if image.format_version != CHECKPOINT_FORMAT_VERSION {
+            return Err((
+                0,
+                format!(
+                    "unsupported snapshot format version {}",
+                    image.format_version
+                ),
+            ));
+        }
+        if image.applied_index != rx.last_index || image.applied_term != rx.last_term {
+            return Err((0, "snapshot log pointer disagrees with its header".into()));
+        }
+        if image.membership != self.peers {
+            return Err((0, "snapshot membership does not match this replica".into()));
+        }
+        if image.commit_index < image.applied_index {
+            return Err((0, "snapshot commit index is below its applied index".into()));
+        }
+        if image.applied_index < self.base_index {
+            return Err((
+                0,
+                format!(
+                    "snapshot at {} is older than the installed base {}",
+                    image.applied_index, self.base_index
+                ),
+            ));
+        }
+        if image.applied_index == self.base_index {
+            if image.applied_term != self.base_term {
+                return Err((0, "snapshot conflicts with the installed base".into()));
+            }
+            let current = self.sm.durable_snapshot();
+            if image.snapshot.revision != current.revision
+                || image.snapshot.values != current.values
+            {
+                return Err((
+                    0,
+                    "snapshot conflicts with the state at the same index".into(),
+                ));
+            }
+        }
+        // The checkpoint is authoritative on open, so publish it before the
+        // WAL: a crash in between is reconciled to the new base.
+        self.fs
+            .rename_atomic(&path, &checkpoint_path(&self.dir))
+            .map_err(|e| (0, format!("cannot publish the snapshot image: {e}")))?;
+        self.fs
+            .sync_dir(&self.dir)
+            .map_err(|e| (0, format!("cannot sync the published snapshot: {e}")))?;
+        let records = [
+            WalRecord::HardState {
+                term: self.current_term,
+                voted_for: self.voted_for,
+            },
+            WalRecord::Base {
+                index: image.applied_index,
+                term: image.applied_term,
+            },
+        ];
+        if let Err(error) = self.wal.rewrite(&records) {
+            // The image is already published, so the next open adopts it. Do
+            // not advance the in-memory base: refuse work until that restart.
+            self.compaction_error = Some(error.to_string());
+            return Err((
+                0,
+                format!("cannot rewrite the log for the snapshot: {error}"),
+            ));
+        }
+        self.sm.install_durable_snapshot(image.snapshot.clone());
+        self.checkpoint_snapshot = image.snapshot;
+        self.base_index = image.applied_index;
+        self.base_term = image.applied_term;
+        self.log.clear();
+        self.last_applied = image.applied_index;
+        self.commit_index = self.commit_index.max(image.applied_index);
+        self.compaction_floor = self.compaction_floor.max(image.compaction_floor);
+        self.applied_results.clear();
+        self.snapshot_receive = None;
+        self.snapshot_export = None;
+        self.snapshot_sends.clear();
         Ok(())
     }
 
@@ -1290,7 +2037,7 @@ impl<FS: StorageFs> LocalMetaKv<FS> {
             return Ok(());
         }
         let msgs = {
-            let guard = self.legacy().lock().unwrap();
+            let mut guard = self.legacy().lock().unwrap();
             if guard.role() == RoleState::Leader {
                 *self.last_leader_contact.lock().unwrap() = Instant::now();
             }
@@ -1993,7 +2740,7 @@ mod transport_tests {
 #[cfg(test)]
 mod compaction_tests {
     use super::*;
-    use yadb_io::SimFs;
+    use yadb_io::{FaultConfig, SimFs, SyncFault};
 
     const DIR: &str = "meta";
 
@@ -2036,6 +2783,9 @@ mod compaction_tests {
                 voted_for: core.voted_for(),
             },
             compaction_floor: core.compaction_floor(),
+            // Written as a version-1 image on purpose: the reader must keep
+            // accepting pre-membership checkpoints.
+            membership: Vec::new(),
             snapshot: core.snapshot_at(index),
         }
     }
@@ -2043,7 +2793,12 @@ mod compaction_tests {
     fn write_checkpoint(fs: &SimFs, checkpoint: &DurableCheckpoint) {
         fs.create_dir_all(DIR).unwrap();
         let file = fs.open_rw(&checkpoint_path(DIR), true).unwrap();
-        let bytes = serde_json::to_vec(checkpoint).unwrap();
+        let mut value = serde_json::to_value(checkpoint).unwrap();
+        if checkpoint.format_version == 1 {
+            // A genuine version-1 image predates the membership field.
+            value.as_object_mut().unwrap().remove("membership");
+        }
+        let bytes = serde_json::to_vec(&value).unwrap();
         file.set_len(0).unwrap();
         file.write_at(0, &bytes).unwrap();
         file.sync_data().unwrap();
@@ -2231,6 +2986,35 @@ mod compaction_tests {
     }
 
     #[test]
+    fn a_checkpoint_from_another_membership_refuses_to_start() {
+        let fs = SimFs::new(4106);
+        let mut core = single(&fs);
+        for i in 0..3u32 {
+            put(&mut core, i);
+        }
+        core.set_compaction_thresholds(1, 1);
+        put(&mut core, 3);
+        let base = core.base_index();
+        assert!(base > 0);
+
+        // A version-2 image records its voters; adopting it into a replica
+        // configured for another set would silently install another group.
+        let mut checkpoint = checkpoint_at(&core, base);
+        checkpoint.format_version = CHECKPOINT_FORMAT_VERSION;
+        checkpoint.membership = vec![1, 2, 3];
+        write_checkpoint(&fs, &checkpoint);
+        drop(core);
+
+        match try_single(&fs) {
+            Err(MetaError::Checkpoint(message)) => {
+                assert!(message.contains("voters"), "{message}");
+            }
+            Err(other) => panic!("expected a membership refusal, got {other:?}"),
+            Ok(_) => panic!("a checkpoint from another group must not open"),
+        }
+    }
+
+    #[test]
     fn an_unparsable_checkpoint_refuses_to_start() {
         let fs = SimFs::new(4104);
         fs.create_dir_all(DIR).unwrap();
@@ -2325,8 +3109,197 @@ mod compaction_tests {
         assert!(nodes[&3].get(&key(99)).is_some());
     }
 
+    /// The first chunk the leader would stream for its current base.
+    fn snapshot_chunk(
+        nodes: &BTreeMap<u32, LocalMetaKv<SimFs>>,
+        leader: u32,
+        follower: u32,
+    ) -> OutboundMsg {
+        let base = nodes[&leader].legacy().lock().unwrap().base_index();
+        assert!(base > 0, "the leader must have compacted first");
+        let msgs = {
+            let mut guard = nodes[&leader].legacy().lock().unwrap();
+            guard.next_index.insert(follower, base);
+            guard.broadcast_append_entries_checked().unwrap()
+        };
+        let msg = msgs
+            .into_iter()
+            .find(|m| m.to == follower)
+            .expect("a chunk for the follower");
+        assert!(
+            matches!(msg.rpc, RaftRpc::InstallSnapshot { .. }),
+            "{msg:?}"
+        );
+        msg
+    }
+
+    fn edited_chunk(msg: &OutboundMsg, edit: impl FnOnce(&mut RaftRpc)) -> RaftRpc {
+        let mut rpc = msg.rpc.clone();
+        edit(&mut rpc);
+        rpc
+    }
+
+    fn expect_refusal(reply: Option<RaftRpc>, needle: &str) {
+        match reply {
+            Some(RaftRpc::InstallSnapshotReply {
+                accepted: false,
+                error: Some(error),
+                next_offset,
+                ..
+            }) => {
+                assert!(
+                    error.contains(needle),
+                    "{error:?} does not mention {needle:?}"
+                );
+                assert_eq!(next_offset, 0, "a refusal restarts the transfer");
+            }
+            other => panic!("expected a refusal mentioning {needle:?}, got {other:?}"),
+        }
+    }
+
+    /// A replica that lost its whole directory comes back empty; the leader must
+    /// discover that, stream the compacted image and then use the ordinary log.
+    fn replace_with_empty_replica(
+        fss: &mut BTreeMap<u32, SimFs>,
+        nodes: &mut BTreeMap<u32, LocalMetaKv<SimFs>>,
+        id: u32,
+        seed: u64,
+    ) {
+        let fs = SimFs::new(seed);
+        let peers: BTreeMap<u32, String> = fss.keys().map(|&i| (i, i.to_string())).collect();
+        let meta =
+            LocalMetaKv::open_clustered_with_token(&fs, DIR, id, peers, "test-token".to_string())
+                .unwrap();
+        fss.insert(id, fs);
+        nodes.insert(id, meta);
+    }
+
+    /// Leader id and follower state agree and `last_key` is present.
+    fn converged(nodes: &BTreeMap<u32, LocalMetaKv<SimFs>>, last_key: &str) -> bool {
+        let (leader_base, leader_revision) = {
+            let g = nodes[&1].legacy().lock().unwrap();
+            (g.base_index(), g.revision())
+        };
+        let (follower_base, follower_revision) = {
+            let g = nodes[&3].legacy().lock().unwrap();
+            (g.base_index(), g.revision())
+        };
+        follower_base == leader_base
+            && follower_revision == leader_revision
+            && nodes[&3].get(last_key).is_some()
+    }
+
+    fn drive_until(
+        nodes: &BTreeMap<u32, LocalMetaKv<SimFs>>,
+        limit: usize,
+        done: impl Fn(&BTreeMap<u32, LocalMetaKv<SimFs>>) -> bool,
+    ) {
+        for _ in 0..limit {
+            if done(nodes) {
+                return;
+            }
+            let msgs = nodes[&1]
+                .legacy()
+                .lock()
+                .unwrap()
+                .broadcast_append_entries_checked()
+                .unwrap();
+            nodes[&1]
+                .drive_outbound_with(msgs, &mut |addr, rpc| deliver(nodes, addr, rpc))
+                .unwrap();
+        }
+        assert!(
+            done(nodes),
+            "the cluster did not converge in {limit} rounds"
+        );
+    }
+
     #[test]
-    fn a_peer_below_the_compacted_base_is_refused_explicitly() {
+    fn a_replica_that_lost_its_log_rejoins_through_the_durable_image() {
+        let mut fss = cluster_fs(&[1, 2, 3]);
+        let mut nodes = open_cluster(&fss);
+        elect(&nodes, 1);
+        let none = BTreeSet::new();
+        for i in 0..5u32 {
+            propose_on(&nodes, 1, i, &none);
+        }
+        nodes[&1]
+            .legacy()
+            .lock()
+            .unwrap()
+            .set_compaction_thresholds(1, 1);
+        propose_on(&nodes, 1, 5, &none);
+        let (base, revision) = {
+            let g = nodes[&1].legacy().lock().unwrap();
+            (g.base_index(), g.revision())
+        };
+        assert!(base > 0, "the leader must have compacted");
+
+        // The replica comes back with an empty directory: no log, no state.
+        replace_with_empty_replica(&mut fss, &mut nodes, 3, 7103);
+        assert_eq!(nodes[&3].legacy().lock().unwrap().base_index(), 0);
+        assert!(nodes[&3].get(&key(0)).is_none());
+
+        drive_until(&nodes, 64, |nodes| converged(nodes, &key(5)));
+
+        assert_eq!(
+            nodes[&3].legacy().lock().unwrap().base_index(),
+            base,
+            "the follower must install the leader's image, not replay a log"
+        );
+        for i in 0..=5u32 {
+            assert_eq!(
+                nodes[&3].get(&key(i)).unwrap().value,
+                value(i),
+                "key {i} must arrive through the image"
+            );
+        }
+        assert_eq!(
+            nodes[&3]
+                .legacy()
+                .lock()
+                .unwrap()
+                .sm
+                .durable_snapshot()
+                .revision,
+            revision
+        );
+        assert!(
+            fss[&3].exists(&checkpoint_path(DIR)),
+            "the installed image must be published as the durable checkpoint"
+        );
+        assert!(
+            !fss[&3].exists(&snapshot_partial_path(DIR)),
+            "a finished install must not leave a partial image"
+        );
+        assert!(
+            nodes[&3].legacy().lock().unwrap().wal_bytes().unwrap() < 4096,
+            "the log must be rewritten to the new base, not replayed"
+        );
+
+        // Catch-up after the image is the ordinary log path: no second image.
+        nodes[&1]
+            .legacy()
+            .lock()
+            .unwrap()
+            .set_compaction_thresholds(u64::MAX, u64::MAX);
+        for i in 6..9u32 {
+            propose_on(&nodes, 1, i, &none);
+        }
+        drive_until(&nodes, 8, |nodes| converged(nodes, &key(8)));
+        assert_eq!(
+            nodes[&3].legacy().lock().unwrap().base_index(),
+            base,
+            "later entries must be appended, not installed again"
+        );
+        assert!(nodes[&1].legacy().lock().unwrap().snapshot_sends.is_empty());
+        for i in 6..9u32 {
+            assert_eq!(nodes[&3].get(&key(i)).unwrap().value, value(i));
+        }
+    }
+
+    #[test]
+    fn a_peer_below_the_compacted_base_is_sent_the_durable_image() {
         let fss = cluster_fs(&[1, 2, 3]);
         let nodes = open_cluster(&fss);
         elect(&nodes, 1);
@@ -2341,54 +3314,11 @@ mod compaction_tests {
             .set_compaction_thresholds(1, 1);
         propose_on(&nodes, 1, 5, &none);
 
-        let (base, term) = {
-            let g = nodes[&1].legacy().lock().unwrap();
-            (g.base_index(), g.current_term())
-        };
+        let base = nodes[&1].legacy().lock().unwrap().base_index();
         assert!(base > 0);
 
-        // A peer that lost its log needs entries from below the base.
-        nodes[&1]
-            .legacy()
-            .lock()
-            .unwrap()
-            .next_index
-            .insert(3, base);
-        let refused = nodes[&1]
-            .legacy()
-            .lock()
-            .unwrap()
-            .broadcast_append_entries_checked();
-        assert!(
-            matches!(refused, Err(MetaError::PeerBehindCompactedBase(3))),
-            "{refused:?}"
-        );
-
-        // Backing off to the base is refused too, never turned into a silent skip.
-        nodes[&1]
-            .legacy()
-            .lock()
-            .unwrap()
-            .next_index
-            .insert(3, base + 1);
-        let refused = nodes[&1]
-            .legacy()
-            .lock()
-            .unwrap()
-            .step(RaftRpc::AppendEntriesReply {
-                from: 3,
-                term,
-                success: false,
-                match_index: 0,
-            });
-        assert!(
-            matches!(refused, Err(MetaError::PeerBehindCompactedBase(3))),
-            "{refused:?}"
-        );
-
-        // The follower side of the same boundary: with its own base at `base`,
-        // an append whose prefix lies below it cannot be verified, so it is
-        // rejected instead of being treated as a match.
+        // An ordinary round teaches the follower the floor, so it compacts to
+        // the same base the leader did.
         nodes[&3]
             .legacy()
             .lock()
@@ -2403,13 +3333,41 @@ mod compaction_tests {
         nodes[&1]
             .drive_outbound_with(msgs, &mut |addr, rpc| deliver(&nodes, addr, rpc))
             .unwrap();
-        let floor = nodes[&1].legacy().lock().unwrap().compaction_floor();
-        let follower_base = nodes[&3].legacy().lock().unwrap().base_index();
-        assert_eq!(
-            follower_base, floor,
-            "the follower must compact to the floor the leader published"
-        );
 
+        let chunk = snapshot_chunk(&nodes, 1, 3);
+        match chunk.rpc {
+            RaftRpc::InstallSnapshot {
+                offset,
+                last_index,
+                last_term,
+                group_id: image_group,
+                ref membership,
+                total_len,
+                ref data,
+                ..
+            } => {
+                assert_eq!(offset, 0);
+                assert_eq!(last_index, base);
+                assert_eq!(last_term, nodes[&1].legacy().lock().unwrap().base_term);
+                assert_eq!(image_group, group_id(&[1, 2, 3]));
+                assert_eq!(membership, &vec![1, 2, 3]);
+                assert!(total_len > 0 && total_len as usize == data.len());
+            }
+            other => panic!("expected an image chunk, got {other:?}"),
+        }
+
+        // The follower side of the same boundary still refuses an append whose
+        // prefix lies below its own base: it can never verify it.
+        let (term, follower_base, floor) = {
+            let leader = nodes[&1].legacy().lock().unwrap();
+            let follower = nodes[&3].legacy().lock().unwrap();
+            (
+                leader.current_term(),
+                follower.base_index(),
+                leader.compaction_floor(),
+            )
+        };
+        assert!(follower_base > 0, "the follower must have compacted too");
         let replies = nodes[&3]
             .legacy()
             .lock()
@@ -2431,5 +3389,347 @@ mod compaction_tests {
             ),
             "{replies:?}"
         );
+    }
+
+    #[test]
+    fn a_snapshot_from_another_group_or_membership_is_refused() {
+        let fss = cluster_fs(&[1, 2, 3]);
+        let nodes = open_cluster(&fss);
+        elect(&nodes, 1);
+        let none = BTreeSet::new();
+        for i in 0..5u32 {
+            propose_on(&nodes, 1, i, &none);
+        }
+        nodes[&1]
+            .legacy()
+            .lock()
+            .unwrap()
+            .set_compaction_thresholds(1, 1);
+        propose_on(&nodes, 1, 5, &none);
+
+        let before = nodes[&2].legacy().lock().unwrap().sm.durable_snapshot();
+        let chunk = snapshot_chunk(&nodes, 1, 2);
+
+        let wrong_group = edited_chunk(&chunk, |rpc| {
+            if let RaftRpc::InstallSnapshot { group_id, .. } = rpc {
+                *group_id ^= 0xffff;
+            }
+        });
+        expect_refusal(nodes[&2].step_rpc(wrong_group).unwrap(), "group");
+
+        // Legacy membership is the whole group identity: a replica configured
+        // with different voters is a different group, not a new incarnation.
+        let wrong_membership = edited_chunk(&chunk, |rpc| {
+            if let RaftRpc::InstallSnapshot { membership, .. } = rpc {
+                *membership = vec![1, 2, 4];
+            }
+        });
+        expect_refusal(nodes[&2].step_rpc(wrong_membership).unwrap(), "membership");
+
+        let after = nodes[&2].legacy().lock().unwrap().sm.durable_snapshot();
+        assert_eq!(after.revision, before.revision);
+        assert_eq!(after.values, before.values);
+        assert_eq!(nodes[&2].legacy().lock().unwrap().base_index(), 0);
+        assert!(!fss[&2].exists(&checkpoint_path(DIR)));
+        assert!(!fss[&2].exists(&snapshot_partial_path(DIR)));
+    }
+
+    #[test]
+    fn a_corrupted_or_stale_snapshot_is_refused_without_publishing() {
+        let mut fss = cluster_fs(&[1, 2, 3]);
+        let mut nodes = open_cluster(&fss);
+        elect(&nodes, 1);
+        let none = BTreeSet::new();
+        for i in 0..5u32 {
+            propose_on(&nodes, 1, i, &none);
+        }
+        nodes[&1]
+            .legacy()
+            .lock()
+            .unwrap()
+            .set_compaction_thresholds(1, 1);
+        propose_on(&nodes, 1, 5, &none);
+
+        // A replica that must actually take the image, so the chunk reaches
+        // the whole-image validation instead of being refused as stale.
+        replace_with_empty_replica(&mut fss, &mut nodes, 3, 7403);
+        let before = nodes[&3].legacy().lock().unwrap().sm.durable_snapshot();
+        let chunk = snapshot_chunk(&nodes, 1, 3);
+
+        let corrupted = edited_chunk(&chunk, |rpc| {
+            if let RaftRpc::InstallSnapshot { data, .. } = rpc {
+                data[0] ^= 0xff;
+            }
+        });
+        expect_refusal(nodes[&3].step_rpc(corrupted).unwrap(), "checksum");
+        let after = nodes[&3].legacy().lock().unwrap().sm.durable_snapshot();
+        assert_eq!(after.revision, before.revision);
+        assert_eq!(after.values, before.values);
+        assert_eq!(nodes[&3].legacy().lock().unwrap().base_index(), 0);
+        assert!(!fss[&3].exists(&checkpoint_path(DIR)));
+        assert!(!fss[&3].exists(&snapshot_partial_path(DIR)));
+
+        // The refusal must not wedge the receiver: the same image, intact this
+        // time, still installs.
+        let reply = nodes[&3].step_rpc(chunk.rpc.clone()).unwrap();
+        assert!(
+            matches!(
+                reply,
+                Some(RaftRpc::InstallSnapshotReply { accepted: true, .. })
+            ),
+            "{reply:?}"
+        );
+        let installed_base = nodes[&3].legacy().lock().unwrap().base_index();
+        assert!(installed_base > 0);
+
+        // A stale image (below the installed base) is refused, as is one that
+        // reuses the base index with another term.
+        let stale = edited_chunk(&chunk, |rpc| {
+            if let RaftRpc::InstallSnapshot { last_index, .. } = rpc {
+                *last_index = installed_base - 1;
+            }
+        });
+        expect_refusal(nodes[&3].step_rpc(stale).unwrap(), "older than");
+        let conflicting = edited_chunk(&chunk, |rpc| {
+            if let RaftRpc::InstallSnapshot { last_term, .. } = rpc {
+                *last_term += 1;
+            }
+        });
+        expect_refusal(
+            nodes[&3].step_rpc(conflicting).unwrap(),
+            "conflicts with base term",
+        );
+        assert_eq!(
+            nodes[&3].legacy().lock().unwrap().base_index(),
+            installed_base
+        );
+        // The image covers the state at its index; later entries still come
+        // from the log.
+        for i in 0..5u32 {
+            assert_eq!(nodes[&3].get(&key(i)).unwrap().value, value(i));
+        }
+    }
+
+    fn next_offset(reply: &RaftRpc) -> u64 {
+        match reply {
+            RaftRpc::InstallSnapshotReply { next_offset, .. } => *next_offset,
+            other => panic!("expected a snapshot reply, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_snapshot_transfer_resumes_without_duplicating_bytes() {
+        let mut fss = cluster_fs(&[1, 2, 3]);
+        let mut nodes = open_cluster(&fss);
+        elect(&nodes, 1);
+        let none = BTreeSet::new();
+        for i in 0..5u32 {
+            propose_on(&nodes, 1, i, &none);
+        }
+        nodes[&1]
+            .legacy()
+            .lock()
+            .unwrap()
+            .set_compaction_thresholds(1, 1);
+        propose_on(&nodes, 1, 5, &none);
+
+        replace_with_empty_replica(&mut fss, &mut nodes, 3, 7503);
+        nodes[&1].legacy().lock().unwrap().snapshot_chunk_bytes = 32;
+
+        let first = snapshot_chunk(&nodes, 1, 3).rpc;
+        let reply = nodes[&3].step_rpc(first.clone()).unwrap().unwrap();
+        assert_eq!(next_offset(&reply), 32, "one bounded chunk");
+
+        // A retransmitted chunk must not append the same bytes twice.
+        let again = nodes[&3].step_rpc(first).unwrap().unwrap();
+        assert_eq!(next_offset(&again), 32);
+
+        // The leader asks for the next chunk, which then arrives too far ahead.
+        let second = nodes[&1]
+            .legacy()
+            .lock()
+            .unwrap()
+            .step(reply)
+            .unwrap()
+            .pop()
+            .unwrap()
+            .rpc;
+        let gapped = edited_chunk(
+            &OutboundMsg {
+                to: 3,
+                rpc: second.clone(),
+            },
+            |rpc| {
+                if let RaftRpc::InstallSnapshot { offset, .. } = rpc {
+                    *offset += 32;
+                }
+            },
+        );
+        let refusal = nodes[&3].step_rpc(gapped).unwrap().unwrap();
+        assert!(matches!(
+            refusal,
+            RaftRpc::InstallSnapshotReply {
+                accepted: false,
+                ..
+            }
+        ));
+        assert_eq!(next_offset(&refusal), 32, "the receiver asks for its gap");
+
+        // The correct chunk resumes the transfer and the rest completes from
+        // the leader's recorded offset.
+        let accepted = nodes[&3].step_rpc(second).unwrap().unwrap();
+        assert!(matches!(
+            accepted,
+            RaftRpc::InstallSnapshotReply { accepted: true, .. }
+        ));
+        drive_until(&nodes, 64, |nodes| converged(nodes, &key(5)));
+        assert_eq!(
+            nodes[&3].legacy().lock().unwrap().base_index(),
+            nodes[&1].legacy().lock().unwrap().base_index()
+        );
+        for i in 0..=5u32 {
+            assert_eq!(nodes[&3].get(&key(i)).unwrap().value, value(i));
+        }
+    }
+
+    #[test]
+    fn an_install_interrupted_by_a_power_cut_leaves_the_old_state() {
+        let mut fss = cluster_fs(&[1, 2, 3]);
+        let mut nodes = open_cluster(&fss);
+        elect(&nodes, 1);
+        let none = BTreeSet::new();
+        for i in 0..5u32 {
+            propose_on(&nodes, 1, i, &none);
+        }
+        nodes[&1]
+            .legacy()
+            .lock()
+            .unwrap()
+            .set_compaction_thresholds(1, 1);
+        propose_on(&nodes, 1, 5, &none);
+
+        replace_with_empty_replica(&mut fss, &mut nodes, 3, 7203);
+        // Small chunks so the transfer can be stopped in the middle.
+        nodes[&1].legacy().lock().unwrap().snapshot_chunk_bytes = 32;
+
+        let mut rpc = snapshot_chunk(&nodes, 1, 3).rpc;
+        for _ in 0..2 {
+            let reply = nodes[&3].step_rpc(rpc).unwrap().unwrap();
+            rpc = nodes[&1]
+                .legacy()
+                .lock()
+                .unwrap()
+                .step(reply)
+                .unwrap()
+                .pop()
+                .unwrap()
+                .rpc;
+        }
+        assert!(fss[&3].exists(&snapshot_partial_path(DIR)));
+        assert_eq!(nodes[&3].legacy().lock().unwrap().base_index(), 0);
+        assert!(nodes[&3].get(&key(0)).is_none());
+
+        fss[&3].simulate_power_cut();
+        nodes.remove(&3);
+        nodes.insert(
+            3,
+            LocalMetaKv::open_clustered_with_token(
+                &fss[&3],
+                DIR,
+                3,
+                fss.keys().map(|&i| (i, i.to_string())).collect(),
+                "test-token".to_string(),
+            )
+            .unwrap(),
+        );
+
+        assert_eq!(
+            nodes[&3].legacy().lock().unwrap().base_index(),
+            0,
+            "a half-received image must never become the base"
+        );
+        assert!(nodes[&3].get(&key(0)).is_none());
+        assert!(
+            !fss[&3].exists(&snapshot_partial_path(DIR)),
+            "opening must discard a partial image"
+        );
+        assert!(!fss[&3].exists(&checkpoint_path(DIR)));
+    }
+
+    #[test]
+    fn a_crash_after_publishing_the_image_keeps_the_new_base() {
+        let mut fss = cluster_fs(&[1, 2, 3]);
+        let mut nodes = open_cluster(&fss);
+        elect(&nodes, 1);
+        let none = BTreeSet::new();
+        for i in 0..5u32 {
+            propose_on(&nodes, 1, i, &none);
+        }
+        nodes[&1]
+            .legacy()
+            .lock()
+            .unwrap()
+            .set_compaction_thresholds(1, 1);
+        propose_on(&nodes, 1, 5, &none);
+        let (base, base_term) = {
+            let g = nodes[&1].legacy().lock().unwrap();
+            (g.base_index(), g.base_term)
+        };
+
+        replace_with_empty_replica(&mut fss, &mut nodes, 3, 7303);
+        // The rename of the image reaches the disk, the following sync fails:
+        // this is exactly the window between publishing the checkpoint and
+        // rewriting the log.
+        fss[&3].set_faults(FaultConfig {
+            sync_dir_fault: SyncFault::AfterPersist,
+            ..Default::default()
+        });
+        let reply = nodes[&3]
+            .step_rpc(snapshot_chunk(&nodes, 1, 3).rpc)
+            .unwrap();
+        expect_refusal(reply, "cannot sync the published snapshot");
+        assert_eq!(
+            nodes[&3].legacy().lock().unwrap().base_index(),
+            0,
+            "the in-memory base must not advance before the log is rewritten"
+        );
+        let published = load_checkpoint(&fss[&3], DIR).unwrap().unwrap();
+        assert_eq!(published.applied_index, base);
+        assert_eq!(published.applied_term, base_term);
+
+        fss[&3].simulate_power_cut();
+        fss[&3].set_faults(FaultConfig::default());
+        nodes.remove(&3);
+        nodes.insert(
+            3,
+            LocalMetaKv::open_clustered_with_token(
+                &fss[&3],
+                DIR,
+                3,
+                fss.keys().map(|&i| (i, i.to_string())).collect(),
+                "test-token".to_string(),
+            )
+            .unwrap(),
+        );
+
+        assert_eq!(
+            nodes[&3].legacy().lock().unwrap().base_index(),
+            base,
+            "a published image is adopted and the stale log reconciled to it"
+        );
+        for i in 0..5u32 {
+            assert_eq!(nodes[&3].get(&key(i)).unwrap().value, value(i));
+        }
+        // The entry above the image is still only in the leader's log: the
+        // retried install is idempotent and the normal append carries it.
+        assert!(nodes[&3].get(&key(5)).is_none());
+        drive_until(&nodes, 16, |nodes| nodes[&3].get(&key(5)).is_some());
+        assert_eq!(nodes[&3].get(&key(5)).unwrap().value, value(5));
+        assert_eq!(nodes[&3].legacy().lock().unwrap().base_index(), base);
+        assert!(
+            nodes[&3].legacy().lock().unwrap().wal_bytes().unwrap() < 4096,
+            "opening must rewrite the log to the published base"
+        );
+        assert!(!fss[&3].exists(&snapshot_partial_path(DIR)));
     }
 }
