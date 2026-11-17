@@ -168,14 +168,17 @@ without a matching `state.json`. Use it when you
 need the PostgreSQL, S3 and iSCSI frontends as well; `scripts/yadb-local.py`
 provisions a Multi-Raft cluster without the client protocol listeners.
 
-Multi-Raft collection is enabled per data group: a group leader checks leases
-and obtains a collector fence before sweeping. However, Multi-Raft read paths do
-not currently publish reader leases. A concurrent collection can therefore
-reclaim fragments referenced by an in-flight read's older manifest. A
-quorum-confirmed `consistent=true` snapshot does not fence fragment collection.
-The automatic sweep also runs periodically; avoiding manual GC alone does not
-eliminate this risk. Plain reads use the locally applied view. Per-group GC has
-not yet been verified by a live reclamation drill.
+Multi-Raft mark-and-sweep is temporarily refused, both manually and by the
+periodic task, because lease expiry races can make its fence unsafe. Manual GC
+and scrub return `409`; the periodic task logs the refusal. Garbage therefore
+accumulates and can exhaust disk space. This change does not cancel requests
+already in flight from older processes or prove unrelated deletion paths safe.
+Stop old processes before deploying it and account for in-flight storage work.
+
+Multi-Raft readers do not publish reader leases; a quorum-confirmed
+`consistent=true` snapshot does not fence fragment collection. Plain reads use
+the locally applied view. Per-group GC has not been verified by a live
+reclamation drill and must not be re-enabled without a safe fencing protocol.
 
 `PersistentGroup::create` requires a new replica directory. It reserves that
 directory, syncs its parent, writes a versioned `replica.json` binding the exact

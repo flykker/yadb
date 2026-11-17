@@ -1929,6 +1929,11 @@ are impossible (a fragment id carries its `project_id`, a manifest only names
 fragments of its own project, and a project maps to exactly one data group), so
 the live set stays group-scoped and no cross-group snapshot is needed.
 
+The rules and tests in this historical section describe the former per-group
+implementation, which is now disabled because of lease-expiry fencing races.
+They are not a current safety guarantee. Manual and periodic Multi-Raft
+mark-and-sweep now refuse; a live reclamation proof remains open.
+
 | Concern | Per-group rule |
 | --- | --- |
 | Leadership | The pass runs only on the leader of group G, read through `role_info_for_group`. A follower refuses with the leader it knows. |

@@ -647,16 +647,18 @@ answers `503` on client paths rather than `403`; once the image is installed the
 historical `403`/`404` answers are unchanged.
 
 Reclaiming disk: overwritten blocks, folded WAL blobs, replaced SSTs and
-overwritten S3 objects leave old fragments behind. `POST /v1/pools/gc` runs a
-per-group collection pass and reports reclaimed bytes and any refusals. A group
-must be swept by its own leader, and writer leases fence concurrent writes.
+overwritten S3 objects leave old fragments behind. **Multi-Raft mark-and-sweep
+is temporarily disabled** because its lease fencing does not safely cover all
+expiry races. Manual GC and scrub return an explicit refusal; periodic collection
+also refuses and logs the reason. Garbage accumulates and can fill the disk.
+This does not cancel already-running requests from older processes or establish
+the safety of unrelated deletion paths; stop old processes before deploying the
+new version and account for any in-flight storage requests.
 
-**Reader-safety limitation:** Multi-Raft reads currently publish no reader lease.
-A collection can reclaim fragments referenced by an in-flight read's older
-manifest. The periodic sweep runs every five minutes, so avoiding manual GC does
-not eliminate the risk. `consistent=true` confirms the metadata snapshot but is
-not a fragment-lifetime fence. Per-group reclamation has not yet been verified
-in a live drill. Default reads use the locally applied view and may lag.
+Multi-Raft reads currently publish no reader lease. `consistent=true` confirms
+the metadata snapshot but is not a fragment-lifetime fence. Default reads use
+the locally applied view and may lag. Per-group reclamation has not yet been
+verified in a live drill.
 
 Conditional reads are matched as RFC 9110 `*` / `#entity-tag`, not as a byte
 comparison of the whole header: `*`, a list of tags (commas inside the quotes
