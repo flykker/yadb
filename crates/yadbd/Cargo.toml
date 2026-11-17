@@ -9,7 +9,9 @@ name = "yadbd"
 path = "src/main.rs"
 
 [features]
-openraft-storage = ["yadb-metakv/openraft-storage", "dep:openraft"]
+# Retained as a no-op so existing `--features openraft-storage` invocations
+# keep working; OpenRaft is the only metadata runtime and is always compiled in.
+openraft-storage = []
 
 [dependencies]
 yadb-io = { path = "../yadb-io" }
@@ -19,7 +21,7 @@ yadb-metakv = { path = "../yadb-metakv" }
 yadb-s3 = { path = "../yadb-s3" }
 yadb-db = { path = "../yadb-db" }
 yadb-block = { path = "../yadb-block" }
-openraft = { workspace = true, optional = true }
+openraft.workspace = true
 # Blocking TLS for the opt-in pgwire listener; also used by the OpenRaft peer
 # transport, which is why it is not optional.
 tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring"] }

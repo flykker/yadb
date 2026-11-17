@@ -1285,9 +1285,8 @@ mod tests {
     }
 
     /// Multi-Raft passes: one leader-only, quorum-confirmed sweep per data
-    /// group. These tests need the OpenRaft adapters, so they are gated on the
-    /// daemon feature that enables them.
-    #[cfg(feature = "openraft-storage")]
+    /// group. These tests use the OpenRaft adapters, which are always compiled
+    /// in now.
     mod openraft_tests {
         use super::*;
         use std::collections::{BTreeMap, BTreeSet};

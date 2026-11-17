@@ -392,6 +392,9 @@ impl StartupShutdown for MultiRunning {
     }
 }
 pub enum Owner {
+    /// Single-group owner. OpenRaft is always started from a multi-group
+    /// configuration now, so the daemon never constructs this variant.
+    #[allow(dead_code)]
     Single(Running),
     Multi(MultiRunning),
 }

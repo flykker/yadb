@@ -5,8 +5,9 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-# Opt-in OpenRaft adapters; the legacy Raft core remains the default.
-openraft-storage = ["dep:ring", "dep:tokio-rustls"]
+# Retained as a no-op so downstream `--features openraft-storage` invocations
+# keep working; the OpenRaft adapters are always compiled in now.
+openraft-storage = []
 
 [dependencies]
 yadb-io = { path = "../yadb-io" }
@@ -15,8 +16,8 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 openraft.workspace = true
-ring = { workspace = true, optional = true }
-tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring"], optional = true }
+ring.workspace = true
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring"] }
 tokio = { workspace = true, features = ["io-util"] }
 
 [dev-dependencies]
