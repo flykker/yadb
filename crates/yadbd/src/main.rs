@@ -2378,11 +2378,25 @@ async fn handle_openraft_status(State(st): State<AppState>, headers: HeaderMap) 
             );
         }
     }
+    // Transport counters are process-wide, not per group: a node has one peer
+    // listener per group but one set of sockets. They are reported next to the
+    // group observations because a connection failure has no Raft error that
+    // names it, so this is the only place an operator can see one.
+    let transport = yadb_metakv::openraft_net::transport_counters();
     Json(match &st.openraft {
-        Some(status) => status.snapshot(),
-        None => {
-            serde_json::json!({"enabled": false, "client_traffic": "none", "production_ready": false})
+        Some(status) => {
+            let mut snapshot = status.snapshot();
+            if let Some(object) = snapshot.as_object_mut() {
+                object.insert("transport".into(), transport);
+            }
+            snapshot
         }
+        None => serde_json::json!({
+            "enabled": false,
+            "client_traffic": "none",
+            "production_ready": false,
+            "transport": transport,
+        }),
     })
     .into_response()
 }
@@ -7307,6 +7321,21 @@ async fn handle_pools_gc(State(st): State<AppState>, headers: HeaderMap) -> Resp
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+    // OpenRaft reports replication failures (`RPCError`, `StorageError`,
+    // election and commit events) through `tracing`. With no subscriber those
+    // events are dropped, which is why a stalled commit previously left no
+    // daemon-side trace: the only visible symptom was a client-side 503. The
+    // subscriber is installed only when `RUST_LOG` is set, so a normal start is
+    // byte-for-byte the same and pays nothing for a filter that would reject
+    // every event.
+    if std::env::var_os("RUST_LOG").is_some() {
+        use tracing_subscriber::EnvFilter;
+        let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(std::io::stderr)
+            .try_init();
+    }
     // `--metadata-runtime` is parsed and pinned to `openraft`; read it so the
     // value is not silently ignored.
     debug_assert_eq!(args.metadata_runtime, "openraft");

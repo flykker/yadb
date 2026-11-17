@@ -156,9 +156,36 @@ secret no subject can be verified, so the route stays open. `--subject-secret` i
 mandatory, so in a supported deployment the route is always authenticated. It
 reports `production_ready: false`; `client_traffic` is `multiraft` for the
 multi-group owner and `single-group` for a single-group one. Group node/state/term/
-leader are cached local observations. Metrics, authenticated operator controls and
+leader are cached local observations, alongside `last_log_index`,
+`last_applied`, `millis_since_quorum_ack` and (on a leader) `replication`, which
+maps each peer to the highest log id it has acknowledged. Comparing
+`last_log_index` with `last_applied` says whether an uncommitted write reached the
+log or stalled in the apply loop; a peer whose `replication` entry is `None` has
+not acknowledged anything in the current term. The `transport` object reports
+process-wide counters for events that otherwise leave no trace — connections
+dropped because all handler slots were busy (`connections_cap_dropped`),
+connections that ended before dispatch (`connections_failed`), envelopes rejected
+by decode, signature or challenge (`envelopes_rejected`), and outgoing RPCs that
+failed before a verified reply (`outgoing_rpc_failures`). They are monotonic
+since process start and are not a health verdict: a nonzero `outgoing_rpc_failures`
+is expected under churn, while a nonzero `connections_cap_dropped` means the
+64-handler cap was reached and a peer was refused rather than delayed. Metrics,
+authenticated operator controls and
 daemon integration validation remain incomplete. Protect the public diagnostics
 listener according to the deployment's existing access policy.
+
+OpenRaft reports replication failures, election changes and commit events through
+`tracing`. `yadbd` installs a subscriber only when `RUST_LOG` is set, so a normal
+start writes nothing extra:
+
+```
+RUST_LOG=openraft=info yadbd --openraft-config ...
+```
+
+`RUST_LOG=openraft=debug` adds per-append detail and is very verbose — one suite
+run produced 310 MB — so use it for a single targeted reproduction, not for a
+long-lived daemon. Without the subscriber those events are discarded, which is
+why a stalled commit once left no daemon-side trace at all.
 
 ## Provision storage before starting
 
@@ -343,13 +370,18 @@ writers and are set explicitly rather than inherited:
 * **RPC deadline floor.** Every Raft RPC opens a fresh connection and performs
   the pinned mTLS handshake, which measured about 120 ms at p50 and near 960 ms
   in the tail on loopback. OpenRaft derives the `AppendEntries` deadline from
-  `heartbeat_interval` (250 ms with the dev timing), so without a floor a
-  noticeable fraction of appends are abandoned after the follower has already
-  applied them; each abandoned append costs a retry backoff and the commit
-  stalls while the cluster is healthy. `TransportConfig::rpc_ttl_floor` raises
-  the deadline, and the daemon sets it to one `election_timeout_min`, because an
-  append older than one election timeout is stale regardless. `None` keeps
-  OpenRaft's own deadline, which the in-process test transports rely on.
+  `heartbeat_interval`, and 0.9.25 wraps the call in
+  `C::timeout(heartbeat_interval, ...)` itself, so the transport's own deadline
+  cannot extend an append: a miss becomes `RPCError::Timeout`, which is not
+  retried, and the replication session for that peer ends. `heartbeat_ms` is
+  therefore the real append budget and must be sized above the transport's
+  worst-case handshake; the dev timing uses 750 ms against a measured 1.8 ms
+  median / 2.4 ms max proxied round trip, with election timeouts at
+  2250/3000/3500 ms (the validator requires
+  `election_min_ms >= 3 x heartbeat_ms`). `TransportConfig::rpc_ttl_floor`
+  raises the deadline for the RPC types OpenRaft does not wrap, and the daemon
+  sets it to one `election_timeout_min`. `None` keeps OpenRaft's own deadline,
+  which the in-process test transports rely on.
   Snapshot transfers use `install_snapshot_timeout` (200 ms by default) as their
   hard TTL, which the same floor raises: a snapshot cannot cross a fresh mTLS
   handshake in 200 ms either.

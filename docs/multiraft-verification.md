@@ -2143,11 +2143,43 @@ fresh TCP connection and performs the pinned mTLS handshake. Measured on loopbac
 under suite load that round trip is about 120 ms at p50, 285 ms at p90 and 960 ms
 at the tail. OpenRaft derives an `AppendEntries` deadline from `heartbeat_interval`
 (250 ms with the dev timing), so roughly a fifth of appends were abandoned after
-the follower had already applied them; each abandoned append is retried after a
-backoff, so a healthy cluster stalled for seconds. `TransportConfig::rpc_ttl_floor`
-raises the deadline to one `election_timeout_min` (1500 ms here), on the grounds
-that an append older than one election timeout is stale anyway. Snapshot transfers
-keep their own, longer deadline.
+the follower had already applied them.
+
+`TransportConfig::rpc_ttl_floor` was added to raise that deadline, and that was
+wrong: OpenRaft 0.9.25 wraps the call itself —
+
+```rust
+let the_timeout = Duration::from_millis(self.config.heartbeat_interval);
+let res = C::timeout(the_timeout, self.network.append_entries(payload, option)).await;
+```
+
+— so an append is bounded by `heartbeat_ms` no matter what the transport's own
+deadline is, and a miss becomes `RPCError::Timeout`, which
+`replication/mod.rs` does **not** retry: the replication session for that peer
+ends and `matched` stays at its old value until the next event. A tracing run
+with the debug subscriber enabled recorded exactly this: 668 `timeout after 250ms
+when AppendEntries 2->1`, and a leader whose follower held every entry up to
+index 290 while `replication[1]` was still `None`.
+
+The floor is retained because it is correct for the RPC types OpenRaft does not
+wrap, but the append budget is now the configured heartbeat: the dev timing uses
+`heartbeat_ms: 750` (election 2250/3000/3500) so the budget is far above the
+measured 1.8 ms median / 2.4 ms max proxied handshake instead of roughly equal to
+it. The validation rule `election_min_ms >= 3 x heartbeat_ms` already forbids
+setting the heartbeat below the election window, so this is a config change, not
+a new invariant.
+
+That is also its limit: the fix lives in the dev launcher
+(`scripts/yadb-openraft-dev.py`), not in the daemon. An operator who supplies
+`heartbeat_ms: 250` through `--openraft-config` will reproduce the stall, because
+nothing in `prepare` rejects a heartbeat that is too short for the transport.
+Making this structural would mean deriving a minimum heartbeat from the
+transport's worst-case handshake and rejecting a config below it; that is not
+implemented, and the requirement is recorded in
+`docs/multiraft-runtime-operations.md` instead. Verification after the change:
+`tests/protocols.py` 3/3 consecutive clean runs, each 20 PASS / 4 SKIP, with zero
+`timeout after` lines in any daemon log (previously 668+ per run on the billing
+group alone) and zero `BRIDGE TIMEOUT`.
 
 **The bridge serialised concurrent writers.** `OpenRaftClient::execute` awaited one
 `client_write` before dequeuing the next, so N concurrent writers became N serial
@@ -2217,7 +2249,7 @@ batch (not per entry) and no longer includes a directory sync. It has not starve
 the runtime on this 7-core host; a dedicated blocking pool is the change to make
 if apply latency ever shows up under a real fsync-heavy disk.
 
-### Open finding: the connection cap drops peers silently
+### The connection cap: instrumented, backpressure reverted
 
 `RaftPeerServer::serve_until` admits at most `MAX_CONNECTIONS` (64) handlers and
 drops the accepted socket when the semaphore is exhausted:
@@ -2235,20 +2267,32 @@ replication to that peer pauses until the next event. Because every RPC opens a
 fresh TCP + mTLS connection, a burst of N concurrent writers asks for roughly
 `N x 2` connections per node, and 64 is reachable on a three-node cluster.
 
-This is not corruption, and it did not produce the observed stalls, but it is
-invisible: the drop emits no frame, no counter and no log line. The server only
-logs snapshot failures (`snapshot_failure` is called when `phase > 0`), so every
-ordinary `AppendEntries`/`Vote` connection failure — cap drop, bad signature,
-replayed envelope, identity mismatch — leaves no trace. That silence is what made
-the instrumented investigation expensive: 16 019 `TLS CONNECT FAIL ... tls
-handshake eof` client-side events in one run had no server-side counterpart.
+The silence was the actual problem, and it is fixed. `openraft_net` now keeps
+process-wide counters for the events that produce no attributable frame —
+connections dropped because all handler slots were busy, connections that ended
+before dispatch, envelopes rejected by decode/signature/challenge, and outgoing
+RPCs that failed before a verified reply — logs the first eight and then powers
+of two of each, and reports them as `transport` in `/openraft/status`.
+`envelope_rejected` replaced four silent `Ok(())` returns: a frame that decodes
+but does not verify is a protocol violation, and it now counts and logs the
+reason instead of leaving a closed socket with no trace. The control flow is
+unchanged — the connection closes exactly as before — so the change adds
+visibility and nothing else.
 
-Recommended, in order: count and log cap rejections (rate-limited) so an operator
-can tell "cap reached" from "peer down"; then reuse one connection per peer
-instead of dialling per RPC, which removes the pressure rather than raising the
-limit.
+Two backpressure variants were implemented and both were reverted. Acquiring the
+handler slot before `accept`, and acquiring it after `accept` but before
+`spawn`, both failed the protocol suite 3/3 — but so did the unmodified binary in
+an interleaved A/B run (see the flake below), so those failures are not
+attributable to the change. Neither variant was shown to help, and the counter
+never fired in a suite run: `connections_cap_dropped` stayed at 0, so the cap was
+never reached and the variants could not have helped. The original
+`try_acquire_owned` + `continue` therefore stays, with the finding recorded
+rather than papered over — the drop now counts and logs instead of vanishing.
+Per-peer connection reuse remains the real fix, because it removes the pressure
+instead of raising the limit; until then the counter is what tells an operator
+"cap reached" apart from "peer down".
 
-### Open finding: a failed checkpoint fold is swallowed
+### A failed checkpoint fold is now reported (resolved)
 
 ```rust
 if inner.delta_entries >= COMPACT_AFTER_ENTRIES || inner.delta_bytes >= COMPACT_AFTER_BYTES {
@@ -2260,5 +2304,123 @@ The entries are already durable in the delta, so this is not data loss, and
 `persist_locked` poisons the handle so the next operation fails closed. But the
 apply that triggered the failed fold still returns `Ok`, and if no further
 operation arrives the node keeps answering applies from a state machine whose
-checkpoint is unreadable, with nothing reported. The failure should surface on a
-channel an operator can see, not only through the next call's error.
+checkpoint is unreadable, with nothing reported.
+
+The fold's error is now logged with the group and node, and the message states
+that the applied entries remain durable in the delta and that the replica now
+requires recovery. Because the handle is poisoned, the line is emitted at most
+once per failed state machine, so it cannot flood the log. The apply still
+returns `Ok` — that part is deliberate: the entries it reports are durable, and
+turning a successful apply into an error would make OpenRaft replay entries that
+are already committed.
+
+### The flake: a 250 ms append budget, not a slow machine
+
+While validating the counters above, the protocol suite failed repeatedly on
+`protocols.py:1778` and `:1854` with `503 ... OpenRaft write outcome unknown:
+metadata bridge response timed out or stopped`. Because the failures appeared
+only after the counters were added, they read as a regression, and the accept
+loop was bisected back to its original form — which did not help. An interleaved
+A/B run settled the attribution: two binaries, base and instrumented,
+alternating base → instrumented → base → instrumented on the same machine,
+`pkill -x yadbd` between runs and a fresh `TemporaryDirectory` per run.
+
+| round | binary | result | wall time |
+| --- | --- | --- | --- |
+| 1 | base (no counters) | **FAIL** at `:1854`, same bridge timeout | 419 s |
+| 1 | instrumented | 20 PASS / 4 SKIP | 608 s |
+| 2 | base | 20 PASS / 4 SKIP | 78 s |
+| 2 | instrumented | 20 PASS / 4 SKIP | 73 s |
+
+A second A/B of six alternating runs then failed 6/6 — three base, three
+instrumented, all at `:1778` or `:1854` — which ruled out the instrumentation
+definitively but left the machine looking like the cause. It was not. The
+wall-time spread (73 s to 608 s) was a symptom, not the mechanism.
+
+The mechanism came from a tracing run. `yadbd` had no `tracing` subscriber, so
+OpenRaft's own `ERROR ... RPCError` lines were discarded; installing an
+`RUST_LOG`-gated subscriber exposed them, and the counts named the defect:
+
+```
+668  timeout after 250ms when AppendEntries 2->1
+129  timeout after 250ms when AppendEntries 2->3
+```
+
+`250ms` is `heartbeat_interval` from the dev timing. OpenRaft 0.9.25 wraps every
+append in `C::timeout(heartbeat_interval, ...)` and maps a miss to
+`RPCError::Timeout`, which `replication/mod.rs` does **not** retry: the
+replication session for that peer ends, `matched` stays put, and the commit index
+stops advancing even though the follower already holds the entries. A status
+snapshot taken during one failure shows exactly that shape:
+
+```
+node 2 (leader): last_log=290  applied=283  replication={1: None, 3: None}
+node 1 (follower): last_log=290  applied=283
+```
+
+The earlier belief that `rpc_ttl_floor` fixed this was wrong. The floor raises the
+deadline the transport enforces; it cannot raise the one OpenRaft imposes from
+outside, and the outer deadline always fires first. Raising the heartbeat to
+750 ms — far above the measured 1.8 ms median / 2.4 ms max proxied handshake —
+removed the failure: 3/3 consecutive clean runs, 20 PASS / 4 SKIP each, zero
+`timeout after` lines, zero `BRIDGE TIMEOUT`.
+
+The 6 s bridge deadline is still a fixed budget, and it still reports an
+ambiguous mutation rather than retrying one. That part is unchanged and correct.
+What was wrong was the append budget being shorter than the transport's own round
+trip, which turned a healthy cluster into one that abandoned appends it had
+already delivered.
+
+The counters separate the two explanations. `connections_cap_dropped` and
+`envelopes_rejected` stayed at 0 in every instrumented run, so the cap was never
+reached and no envelope was refused; what the failing runs did show was
+`outgoing_rpc_failures` in the thousands and `connections_failed` in the 0-50
+range — mostly dials to a node the test had deliberately killed, which OpenRaft
+retries. The counters made that visible; they were never the cause.
+
+One correction to the record: an earlier version of this instrumentation counted
+`connections_throttled` at a point in the accept loop that never ran, so it
+reported 0 unconditionally. That field was replaced by `connections_cap_dropped`,
+incremented at the actual `try_acquire_owned` failure, and a test now asserts
+that a forged envelope raises `envelopes_rejected`. A counter that cannot move is
+worse than no counter: it reports a clean transport while the event it names
+happens.
+
+One residual risk remains, and it is smaller than it looked: a 6 s bridge wait is
+still a fixed budget. With the append deadline no longer shorter than the
+transport's own round trip, no run in the final 3/3 batch came close to it, and
+the suite is no longer flaky on this host. Raising the 6 s timeout is still the
+wrong response to any future miss: an ambiguous mutation that is retried is worse
+than one that is reported.
+
+### What the status now shows when the write does not commit
+
+`/openraft/status` used to report `last_applied` and nothing else, which cannot
+distinguish "the entry never arrived" from "the entry arrived and the apply loop
+is stuck" from "the entry is in the log but no peer acknowledged it". Each group
+observation now also carries `last_log_index`, `replication` (leader only: the
+highest log id each peer has acknowledged) and `millis_since_quorum_ack`.
+
+The distinction is not academic. In one failing `quorum-restored` run the two
+live nodes reported, for the billing group:
+
+```
+node 2 (leader): last_log=290  applied=283  replication={1: None, 3: None}
+node 1 (follower): last_log=290  applied=283
+```
+
+Node 1 held every entry up to 290 in its Raft log, yet the leader's replication
+state for it was `None`: no `AppendEntries` reply in that term had been accepted.
+The commit index therefore stayed at 283, the follower could not apply past it
+(its applied index follows the leader's commit), and the client's 6 s bridge wait
+expired. `outgoing_rpc_failures` was 10 977 on that leader, almost all of it dials
+to the node that the test had killed — so the count alone is not the diagnosis;
+the pairing of `last_log_index` with `replication` is. Without those two fields
+the only visible symptom was `503 ... write outcome unknown`, which reads exactly
+like a slow machine.
+
+That diagnosis led to the root cause above: the reply was lost because the append
+exceeded the 250 ms heartbeat budget and OpenRaft ended the replication session
+instead of retrying. The status fields are what made the shape visible before the
+tracing subscriber was installed, and they remain the cheapest first look at any
+future stall.

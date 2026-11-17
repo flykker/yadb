@@ -422,8 +422,19 @@ def provision(root, base):
                 'incarnation': 1,
                 'node': node,
                 'preferred_leader': group,
-                'raft_timing': {'heartbeat_ms': 250, 'election_min_ms': 1500,
-                                'nonpreferred_election_min_ms': 2750, 'election_max_ms': 3000},
+                # OpenRaft wraps `append_entries` in
+                # `C::timeout(heartbeat_interval, ...)` and does not retry a
+                # miss: the replication session for that peer ends. Every Raft
+                # RPC here opens a fresh TCP connection and pays a pinned mTLS
+                # handshake, measured at 1.8 ms median / 2.4 ms max through the
+                # test proxy but spiking under load. A 250 ms heartbeat made that
+                # handshake the append budget, so a loaded host abandoned
+                # appends the follower had already written and commits stalled
+                # for seconds. 750 ms keeps the budget far above the transport
+                # cost while staying well below election_min (the constraint is
+                # election_min >= 3 x heartbeat).
+                'raft_timing': {'heartbeat_ms': 750, 'election_min_ms': 2250,
+                                'nonpreferred_election_min_ms': 3000, 'election_max_ms': 3500},
                 'listen': peers[node - 1]['address'],
                 'signing_key_der': str(credential_dir / f'signing-{node}.der'),
                 'tls': {'roots_der': [str(credential_dir / 'ca.der')],

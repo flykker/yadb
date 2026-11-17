@@ -15,8 +15,8 @@ use openraft::{BasicNode, Snapshot};
 
 use crate::multiraft::{GroupIdentity, ReplicaIdentity};
 use crate::openraft_net::{
-    AuthenticatedTcpNetworkFactory, BoxFuture, RaftPeerServer, TransportConfig, WireRequest,
-    WireResponse,
+    transport_counters, AuthenticatedTcpNetworkFactory, BoxFuture, RaftPeerServer, TransportConfig,
+    WireRequest, WireResponse,
 };
 use crate::openraft_runtime::YadbRaft;
 use crate::openraft_state_machine::DurableMetaStateMachine;
@@ -238,6 +238,13 @@ async fn replicate_over_tcp(tls: bool) {
     .expect("TCP cluster test timed out");
 }
 
+/// Reads the process-wide rejected-envelope counter.
+fn rejected_envelopes() -> u64 {
+    transport_counters()["envelopes_rejected"]
+        .as_u64()
+        .expect("envelopes_rejected is a number")
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn server_rejects_unknown_address_and_forged_sender() {
     tokio::time::timeout(Duration::from_secs(30), async {
@@ -305,10 +312,20 @@ async fn server_rejects_unknown_address_and_forged_sender() {
             registry.clone(),
         ));
         let mut network = factory.new_client(node, &BasicNode::new("node-1")).await;
+        let before = rejected_envelopes();
         let result = network.call_for_test(request, Duration::from_secs(2)).await;
         assert!(
             result.is_err(),
             "server accepted a message signed by a different key"
+        );
+        // The counter is process-wide and other tests run concurrently, so
+        // assert only that this rejection was counted. Without it the counter
+        // could stay at zero and report a clean transport while refusing
+        // frames, which is exactly the silence it exists to remove.
+        let after = rejected_envelopes();
+        assert!(
+            after > before,
+            "a forged envelope was refused but not counted ({before} -> {after})"
         );
     })
     .await

@@ -66,6 +66,74 @@ const SNAPSHOT_CHUNK_FRAME: usize = SNAPSHOT_CHUNK_BYTES * 16 + 16384;
 // Bound repeated diagnostic volume while retaining evidence of persistent faults.
 static SNAPSHOT_FAILURES: AtomicU64 = AtomicU64::new(0);
 
+/// Process-wide transport counters, reported through `/openraft/status`.
+///
+/// Every Raft RPC opens a fresh TCP connection and performs a fresh mTLS
+/// handshake, so the events worth counting are connection-level: a peer that
+/// closed mid-handshake, an envelope that failed verification, and a listener
+/// that dropped a connection because every handler slot was busy. None of them
+/// produce a frame the peer can attribute, and OpenRaft turns all of them into a
+/// progress error, so without a counter they look exactly like a healthy peer
+/// with nothing to say. That silence is what made one investigation read 16 019
+/// client-side handshake failures with no server-side counterpart.
+struct TransportCounters {
+    /// Accepted connections dropped because every handler slot was busy.
+    cap_dropped: AtomicU64,
+    /// Dispatched connections that ended in an I/O or TLS error.
+    failed: AtomicU64,
+    /// Envelopes rejected by decoding, signature or challenge verification.
+    rejected: AtomicU64,
+    /// Outgoing RPCs that failed before a reply was verified.
+    rpc_failed: AtomicU64,
+}
+
+static TRANSPORT: TransportCounters = TransportCounters {
+    cap_dropped: AtomicU64::new(0),
+    failed: AtomicU64::new(0),
+    rejected: AtomicU64::new(0),
+    rpc_failed: AtomicU64::new(0),
+};
+
+/// A snapshot of the process-wide transport counters.
+pub fn transport_counters() -> serde_json::Value {
+    serde_json::json!({
+        "connections_cap_dropped": TRANSPORT.cap_dropped.load(Ordering::Relaxed),
+        "connections_failed": TRANSPORT.failed.load(Ordering::Relaxed),
+        "envelopes_rejected": TRANSPORT.rejected.load(Ordering::Relaxed),
+        "outgoing_rpc_failures": TRANSPORT.rpc_failed.load(Ordering::Relaxed),
+    })
+}
+
+/// Count one connection dropped by the handler cap, logging the first few.
+///
+/// The cap itself is not changed here: two backpressure variants were tried and
+/// neither was shown to help (see `docs/multiraft-verification.md`). What was
+/// missing was evidence, so this is the smallest change that supplies it.
+fn cap_dropped(node: u32, group: u64, peer: Option<u32>) {
+    let n = TRANSPORT.cap_dropped.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 8 || n.is_power_of_two() {
+        eprintln!(
+            "openraft transport node={node} group={group} peer={peer:?} connection dropped: \
+             all {MAX_CONNECTIONS} handler slots busy occurrence={n}"
+        );
+    }
+}
+
+/// Count one rejected envelope and log the first few, then powers of two.
+///
+/// A rejected envelope is a protocol violation, not a slow peer: the frame
+/// decoded, but its signature, challenge or body did not match. Volume is
+/// bounded the same way [`snapshot_failure`] bounds it, so a peer that keeps
+/// talking wrong leaves evidence without flooding the log.
+fn envelope_rejected(node: u32, group: u64, reason: &'static str) {
+    let n = TRANSPORT.rejected.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 8 || n.is_power_of_two() {
+        eprintln!(
+            "openraft transport node={node} group={group} rejected envelope: {reason} occurrence={n}"
+        );
+    }
+}
+
 fn snapshot_failure(node: u32, group: u64, peer: Option<u32>, phase: &str, reason: &str) {
     let n = SNAPSHOT_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
     if n <= 8 || n.is_power_of_two() {
@@ -185,17 +253,16 @@ pub struct TransportConfig {
     pub require_known_address: bool,
     pub connect_timeout: Duration,
     pub request_timeout: Duration,
-    /// Optional floor for every RPC's hard TTL.
+    /// Optional floor for this transport's own RPC deadline.
     ///
-    /// This transport opens a fresh TCP connection and performs a pinned mTLS
-    /// handshake for every RPC: measured on loopback that is ~120 ms at p50 and
-    /// ~960 ms at the tail. OpenRaft derives an append's deadline from
-    /// `heartbeat_interval` (250 ms in the dev timing), so a deadline shorter
-    /// than the transport's own round trip abandons appends that the follower
-    /// did apply; each abandoned append is retried after a backoff and the
-    /// commit stalls for seconds while nothing is wrong with the cluster. A
-    /// caller that knows its election timeout sets it here as the floor, since
-    /// an append older than one election timeout is stale anyway. `None` keeps
+    /// This raises the deadline *this* transport enforces. It does not raise
+    /// OpenRaft's: 0.9.25 wraps `append_entries` in
+    /// `C::timeout(heartbeat_interval, ...)` and turns a miss into
+    /// `RPCError::Timeout`, which is not retried. An append is therefore bounded
+    /// by the configured heartbeat interval, and a heartbeat shorter than one
+    /// handshake abandons appends the follower already applied. Use this floor
+    /// for the RPC types OpenRaft does not wrap, and size `heartbeat_ms` above
+    /// the transport's worst-case round trip for appends. `None` keeps
     /// OpenRaft's own deadline, which is what the in-process test transports
     /// rely on.
     pub rpc_ttl_floor: Option<Duration>,
@@ -432,6 +499,12 @@ impl AuthenticatedTcpNetwork {
             Ok(result) => result,
             Err(_) => Err(TransportError::InvalidInput("request timeout")),
         };
+        if result.is_err() {
+            // The peer sees the same event from its own side, but only this
+            // counter says the failure was ours to observe: a refused connect,
+            // a handshake the peer closed, or an RPC that outlived its TTL.
+            TRANSPORT.rpc_failed.fetch_add(1, Ordering::Relaxed);
+        }
         if is_snapshot {
             if let Err(error) = &result {
                 snapshot_failure(
@@ -538,9 +611,24 @@ impl RaftNetwork<C> for AuthenticatedTcpNetwork {
     }
 }
 
+/// Maps an I/O failure into a transport error, naming the failure class.
+///
+/// The previous version collapsed every non-timeout failure into the string
+/// `"transport failure"`, so a handshake EOF, a reset mid-frame and a TLS
+/// verification error were indistinguishable in both the returned error and the
+/// OpenRaft log line that reports it. That cost an investigation: 10 584
+/// identical `RPCError::Network(InvalidInput("transport failure"))` lines said
+/// nothing about which of the three had happened. The classification is
+/// unchanged — a non-timeout I/O error is still not retried — only the text now
+/// names the class, using the same mapping the snapshot path already applies.
 fn transport_io(error: io::Error) -> TransportError {
     TransportError::InvalidInput(match error.kind() {
         io::ErrorKind::TimedOut => "request timeout",
+        io::ErrorKind::UnexpectedEof => "transport failure: peer closed the connection",
+        io::ErrorKind::ConnectionReset => "transport failure: connection reset",
+        io::ErrorKind::ConnectionRefused => "transport failure: connection refused",
+        io::ErrorKind::BrokenPipe => "transport failure: broken pipe",
+        io::ErrorKind::InvalidData => "transport failure: invalid frame or TLS record",
         _ => "transport failure",
     })
 }
@@ -651,6 +739,18 @@ impl RaftPeerServer {
                 continue;
             }
             let Ok(permit) = connections.clone().try_acquire_owned() else {
+                // Every handler slot is busy, so the accepted socket is
+                // dropped without being served. That is the one cap-related
+                // event a peer cannot distinguish from a dead peer: it sees a
+                // connection closed mid-handshake, which `rpc_error` turns into
+                // `RPCError::Network`, and OpenRaft treats that as a progress
+                // error rather than a retry. Counting it is what lets an
+                // operator tell "cap reached" from "peer down".
+                cap_dropped(
+                    self.config.identity.node(),
+                    self.config.identity.group().group,
+                    node_id,
+                );
                 continue;
             };
             let config = self.config.clone();
@@ -713,6 +813,25 @@ impl RaftPeerServer {
                                 _ => "transport or validation error",
                             },
                         ),
+                        Ok(Ok(())) => {}
+                    }
+                } else {
+                    // An ordinary Raft connection. Count and report it here:
+                    // `serve_connection` cannot answer a peer whose request it
+                    // refused, so a handshake EOF, a deadline and a peer that
+                    // simply had nothing to say are otherwise indistinguishable.
+                    match result {
+                        Err(_) => {
+                            TRANSPORT.failed.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Ok(Err(_)) => {
+                            let n = TRANSPORT.failed.fetch_add(1, Ordering::Relaxed) + 1;
+                            if n <= 8 || n.is_power_of_two() {
+                                eprintln!(
+                                    "openraft transport node={node} group={group} peer={node_id:?} connection closed before dispatch occurrence={n}"
+                                );
+                            }
+                        }
                         Ok(Ok(())) => {}
                     }
                 }
@@ -790,14 +909,30 @@ async fn serve_connection(
         Err(_) if kind == SNAPSHOT_MANIFEST => {
             return Err(io::Error::other("invalid snapshot manifest envelope"))
         }
-        Err(_) => return Ok(()),
+        Err(_) => {
+            envelope_rejected(
+                config.identity.node(),
+                config.identity.group().group,
+                "request envelope does not decode",
+            );
+            // Return `Ok` so this is counted once, as a rejection, not again
+            // as a failed connection. The peer sees a closed socket either way.
+            return Ok(());
+        }
     };
     let payload = match envelope.verify(&config.identity, node_id, &config.registry) {
         Ok(payload) => payload,
         Err(_) if kind == SNAPSHOT_MANIFEST => {
             return Err(io::Error::other("invalid snapshot manifest signature"))
         }
-        Err(_) => return Ok(()),
+        Err(_) => {
+            envelope_rejected(
+                config.identity.node(),
+                config.identity.group().group,
+                "request signature, sender or recipient does not verify",
+            );
+            return Ok(());
+        }
     };
     let sender = envelope.sender;
     if kind == SNAPSHOT_MANIFEST {
@@ -807,12 +942,26 @@ async fn serve_connection(
     let (nonce, request, _assembly_permit) = if kind == REQUEST {
         let call: WireCall = match serde_json::from_slice(payload) {
             Ok(call) => call,
-            Err(_) => return Ok(()),
+            Err(_) => {
+                envelope_rejected(
+                    config.identity.node(),
+                    config.identity.group().group,
+                    "request body does not decode",
+                );
+                return Ok(());
+            }
         };
         if call.challenge != challenge
             || !call.request.sender_matches(sender)
             || matches!(call.request, WireRequest::InstallSnapshot { .. })
         {
+            // A wrong challenge is the one case a replayed or re-targeted
+            // frame produces, so it is counted rather than ignored.
+            envelope_rejected(
+                config.identity.node(),
+                config.identity.group().group,
+                "request challenge, sender or request kind does not match",
+            );
             return Ok(());
         }
         (call.nonce, call.request, None)

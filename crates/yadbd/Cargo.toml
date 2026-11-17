@@ -33,5 +33,10 @@ serde_json.workspace = true
 tokio.workspace = true
 ring = "0.17.14"
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
+# Opt-in, `RUST_LOG`-gated subscriber. OpenRaft reports replication failures
+# through `tracing`, and without a subscriber they are discarded: that is why a
+# stalled commit left no daemon-side trace at all. It is off unless `RUST_LOG`
+# is set, so the default path is unchanged.
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "env-filter", "ansi"] }
 base64 = "0.22.1"
 crc32fast.workspace = true

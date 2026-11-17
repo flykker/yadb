@@ -985,8 +985,19 @@ impl RaftStateMachine<C> for DurableMetaStateMachine {
             // The entries are already durable in the delta, so a failed fold is
             // not a failed apply: `persist_locked` poisons the handle and the
             // next operation fails closed, while this call still reports what
-            // it durably applied.
-            let _ = compact_locked(&mut inner);
+            // it durably applied. It must still be reported here, because the
+            // handle is poisoned only for *later* calls: without this line a
+            // node keeps answering from a state machine whose checkpoint could
+            // not be published, and the only symptom is an error on some later,
+            // unrelated request. The handle is poisoned, so this is logged at
+            // most once per failed state machine.
+            if let Err(error) = compact_locked(&mut inner) {
+                eprintln!(
+                    "openraft state machine group={} node={} checkpoint fold failed: {error}; \
+                     the applied entries remain durable in the delta and this replica now requires recovery",
+                    inner.group.group, inner.node_id
+                );
+            }
         }
         Ok(results)
     }

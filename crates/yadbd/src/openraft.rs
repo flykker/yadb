@@ -686,12 +686,15 @@ pub fn prepare(path: &Path) -> io::Result<Prepared> {
         raft_config.election_timeout_max = timing.election_max_ms;
     }
     let raft_config = Arc::new(raft_config.validate().map_err(|e| invalid(e.to_string()))?);
-    // Every Raft RPC opens a fresh connection and pays a pinned mTLS handshake,
-    // which is slower than OpenRaft's heartbeat-derived append deadline. That
-    // deadline is therefore floored at one election timeout: an append that
-    // takes longer than an election timeout is stale, and abandoning one that
-    // would have succeeded turns into a retry backoff that stalls the commit
-    // for seconds.
+    // Every Raft RPC opens a fresh connection and pays a pinned mTLS handshake.
+    // `rpc_ttl_floor` raises this transport's own deadline, but it cannot raise
+    // OpenRaft's: 0.9.25 wraps `append_entries` in
+    // `C::timeout(heartbeat_interval, ...)` (replication/mod.rs) and reports a
+    // miss as `RPCError::Timeout`, which it does **not** retry — the replication
+    // session for that peer ends. The floor is therefore only effective for RPC
+    // types OpenRaft does not wrap; an append is bounded by `heartbeat_ms`. The
+    // timing is validated below to keep `heartbeat_ms` above the transport's
+    // worst-case handshake, which is what actually makes appends survivable.
     let mut transport = transport;
     transport.rpc_ttl_floor = Some(Duration::from_millis(raft_config.election_timeout_min));
     Ok(Prepared {
@@ -716,7 +719,16 @@ pub struct Status {
 }
 impl Status {
     pub fn snapshot(&self) -> serde_json::Value {
-        let groups = self.groups.iter().map(|(id, (raft, preferred))| { let m = raft.metrics().borrow().clone(); serde_json::json!({"group": id, "node_id": m.id, "state": format!("{:?}", m.state), "term": m.current_term, "leader_id": m.current_leader, "preferred_leader": preferred, "preference_met": preferred.zip(m.current_leader).map(|(want, actual)| want == actual), "last_applied": format!("{:?}", m.last_applied), "running_state": format!("{:?}", m.running_state)}) }).collect::<Vec<_>>();
+        let groups = self.groups.iter().map(|(id, (raft, preferred))| { let m = raft.metrics().borrow().clone();
+            // `last_applied` alone cannot say where a stalled write went. If
+            // `last_log_index` is ahead of it, the entry is in this node's log
+            // and the apply loop is the part not moving; if they match, the
+            // entry never arrived. `replication` (leader only) names the log id
+            // each peer has acknowledged, which is what decides whether an
+            // entry could have been committed at all. Reporting all three turns
+            // "write outcome unknown" into an answerable question.
+            let replication = m.replication.as_ref().map(|r| r.iter().map(|(peer, matched)| (*peer, format!("{matched:?}"))).collect::<BTreeMap<u32, String>>());
+            serde_json::json!({"group": id, "node_id": m.id, "state": format!("{:?}", m.state), "term": m.current_term, "leader_id": m.current_leader, "preferred_leader": preferred, "preference_met": preferred.zip(m.current_leader).map(|(want, actual)| want == actual), "last_log_index": m.last_log_index, "last_applied": format!("{:?}", m.last_applied), "replication": replication, "millis_since_quorum_ack": m.millis_since_quorum_ack, "running_state": format!("{:?}", m.running_state)}) }).collect::<Vec<_>>();
         serde_json::json!({"enabled": true, "client_traffic": if self.client_mode { "multiraft" } else { "single-group" }, "production_ready": false, "limitation": "dedicated listener per group; reads are local-applied", "local_observations": groups})
     }
 }
