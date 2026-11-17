@@ -194,7 +194,8 @@ with a different range or a byte-different JSON body of the same range returns
 `committed` from the project group; a fenced key returns `not_committed` and a
 later keyed UNMAP with it returns 409 `idempotency_key_fenced`; a control payload
 carrying `project`, a project payload without it, and an unknown scope all return
-400. The legacy runtime refuses a keyed UNMAP with 501.
+400. A keyed write on the single-node metadata store is refused with 501,
+because that store keeps no record namespace; the daemon never runs on it.
 
 Block write and S3 PUT/DELETE share the same contract and the same record
 namespace and counter, but their evidence is in-process only. Block write
