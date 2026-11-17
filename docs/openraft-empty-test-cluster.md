@@ -81,11 +81,15 @@ background refresh thread. A `SIGSTOP` of the control leader for about 1.2 s kep
 follower health and 403 denial responses in the 4–14 ms range. This is supporting
 evidence only; it is not a causal fix for historical client write timeouts.
 
-Preferred leaders are group 1→node 1, 2→node 2 and 3→node 3, with heartbeat
-250 ms, preferred election minimum 1500 ms, nonpreferred minimum 2750 ms and
-maximum 3000 ms. In one current observation all three nodes reported those leaders
-and `preference_met: true`. This probabilistic soft bias is not a placement guarantee
-or workload balance, and does not resolve historical election churn.
+Preferred leaders are group 1→node 1, 2→node 2 and 3→node 3. The root described
+in this document was provisioned with heartbeat 250 ms, preferred election
+minimum 1500 ms, nonpreferred minimum 2750 ms and maximum 3000 ms, and in one
+observation all three nodes reported those leaders and `preference_met: true`.
+The launcher now provisions heartbeat 750 ms / election 2250-3000 / maximum
+3500 ms, because the heartbeat is also OpenRaft's append budget (see
+`docs/multiraft-verification.md`); this root is unchanged on disk. This
+probabilistic soft bias is not a placement guarantee or workload balance, and
+does not resolve historical election churn.
 
 Relocation was cancelled and no relocation script exists. The prior root
 `/data/data/com.foxdebug.acodefree/cache/opencode/yadb-local-20261114T135536Z-54c1c388-188b-4a5b-927a-4dd5cf4a7a62`

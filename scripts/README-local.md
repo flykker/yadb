@@ -102,8 +102,13 @@ secrets to sufficiently privileged users. Certificates expire after 30 days.
 
 The generated local configuration uses an opt-in **soft** leadership preference:
 group 1 prefers node 1, group 2 prefers node 2, and group 3 prefers node 3.
-Each group uses `heartbeat_ms: 250`, `election_min_ms: 1500`,
-`nonpreferred_election_min_ms: 2750`, and a common `election_max_ms: 3000`.
+Each group uses `heartbeat_ms: 750`, `election_min_ms: 2250`,
+`nonpreferred_election_min_ms: 3000`, and a common `election_max_ms: 3500`.
+The heartbeat is the append budget: OpenRaft wraps every `append_entries` in
+`C::timeout(heartbeat_interval, ...)` and does not retry a miss, so a value
+shorter than a TCP + mTLS handshake abandons appends the follower already wrote
+and stalls the commit. 750 ms is far above the measured 1.8 ms median / 2.4 ms
+max proxied handshake; the daemon requires `election_min_ms >= 3 x heartbeat_ms`.
 All replicas in a group must use matching timing and preference values. This is
 only a probabilistic election bias: a nonpreferred node may legitimately become
 leader, and a returning preferred node does not automatically reclaim leadership.
@@ -120,8 +125,9 @@ ambiguous mutation by blindly retrying it.
 ## Multi-Raft launcher with protocol frontends
 
 `scripts/yadb-openraft-dev.py` is the explicit-OpenRaft sibling of
-`scripts/yadb-local.py`. `yadb-local.py` stays the legacy/default launcher and
-its behaviour is unchanged; this one always starts every daemon with
+`scripts/yadb-local.py`. `yadb-local.py` stays the legacy/default launcher, with
+one shared change: both now provision `heartbeat_ms: 750` for the reason above.
+This one always starts every daemon with
 `--metadata-runtime openraft` and the feature-enabled binary, and it also enables
 the PostgreSQL, S3 and iSCSI listeners so the same protocols can be exercised
 against the Multi-Raft runtime.

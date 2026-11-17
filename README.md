@@ -21,8 +21,14 @@ automatically displaced when the preferred node returns. The
 ordinary health leader refers only to the control group. All replicas of a
 group must use the same preference and timing values; the election maximum is
 also the OpenRaft leader-lease duration. Defaults remain unchanged when the
-opt-in fields are absent. These local timing values are not a diagnosed fix
-for replication issues and require evaluation for each deployment.
+opt-in fields are absent.
+
+`heartbeat_ms` is the append budget, not a tuning knob. OpenRaft wraps every
+`append_entries` in `C::timeout(heartbeat_interval, ...)` and does not retry a
+miss, so the replication session for that peer ends and the commit index stops
+advancing even though the follower already holds the entries. Keep it well above
+the cost of one TCP + mTLS handshake; the daemon requires
+`election_min_ms >= 3 x heartbeat_ms`.
 
 For example, for group 2 on **all** its voters, add to the version-1 group
 config (choose preferred node 1 for group 1 and 3 for group 3):
@@ -30,10 +36,10 @@ config (choose preferred node 1 for group 1 and 3 for group 3):
 ```json
 "preferred_leader": 2,
 "raft_timing": {
-  "heartbeat_ms": 250,
-  "election_min_ms": 1500,
-  "nonpreferred_election_min_ms": 2750,
-  "election_max_ms": 3000
+  "heartbeat_ms": 750,
+  "election_min_ms": 2250,
+  "nonpreferred_election_min_ms": 3000,
+  "election_max_ms": 3500
 }
 ```
 

@@ -385,6 +385,13 @@ writers and are set explicitly rather than inherited:
   Snapshot transfers use `install_snapshot_timeout` (200 ms by default) as their
   hard TTL, which the same floor raises: a snapshot cannot cross a fresh mTLS
   handshake in 200 ms either.
+
+  Not implemented: the daemon does not derive a minimum `heartbeat_ms` from the
+  transport's worst-case handshake, so a config that supplies a heartbeat shorter
+  than one round trip is accepted and will reproduce the stall. The only guard is
+  `election_min_ms >= 3 x heartbeat_ms`, which bounds the heartbeat from above,
+  not from below. Both launchers provision 750 ms; treat a hand-written config
+  below that as unsupported until the check exists.
 * **Concurrent dispatch.** The bridge hands each write to the runtime without
   waiting for the previous one to finish. `client_write` is safe to call
   concurrently, and it is the only way the runtime can batch entries into one

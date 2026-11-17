@@ -331,7 +331,10 @@ and asserts denial of the old subject through `public[0]` only.
 Preferred leaders are group 1→node 1, 2→node 2 and 3→node 3, with heartbeat
 250 ms, preferred election minimum 1500 ms, nonpreferred minimum 2750 ms and
 maximum 3000 ms. In one current observation all three nodes reported those leaders
-and `preference_met: true`. This probabilistic soft bias is not a placement guarantee
+and `preference_met: true`. This root predates the heartbeat change recorded under
+"Transport deadline floor" below (750 ms / 2250-3000 / 3500 ms); it was not
+reprovisioned, and its configs stay as written. This probabilistic soft bias is
+not a placement guarantee
 or workload balance, and does not resolve historical election churn.
 
 Relocation was cancelled and no relocation script exists. The prior root
@@ -2142,7 +2145,7 @@ independent causes were measured, not inferred.
 fresh TCP connection and performs the pinned mTLS handshake. Measured on loopback
 under suite load that round trip is about 120 ms at p50, 285 ms at p90 and 960 ms
 at the tail. OpenRaft derives an `AppendEntries` deadline from `heartbeat_interval`
-(250 ms with the dev timing), so roughly a fifth of appends were abandoned after
+(250 ms with the dev timing as it was), so roughly a fifth of appends were abandoned after
 the follower had already applied them.
 
 `TransportConfig::rpc_ttl_floor` was added to raise that deadline, and that was

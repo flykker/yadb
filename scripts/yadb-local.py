@@ -322,8 +322,17 @@ def prepare(root=None, http_base=DEFAULT_HTTP_BASE):
             save(path, {'version': 1, 'root': str(root / 'metadata'), 'mode': 'create', 'initialize': node == group,
                          'cluster': cluster, 'group': group, 'incarnation': 1, 'node': node,
                          'preferred_leader': group,
-                         'raft_timing': {'heartbeat_ms': 250, 'election_min_ms': 1500,
-                                         'nonpreferred_election_min_ms': 2750, 'election_max_ms': 3000},
+                         # `heartbeat_ms` is the append budget, not a tuning knob:
+                         # OpenRaft wraps `append_entries` in
+                         # `C::timeout(heartbeat_interval, ...)` and does not retry a
+                         # miss, so the replication session for that peer ends. At
+                         # 250 ms a fresh TCP + mTLS handshake could consume the
+                         # whole budget under load and a healthy cluster abandoned
+                         # appends the follower had already written. 750 ms keeps
+                         # the budget above the transport cost; the daemon requires
+                         # `election_min_ms >= 3 x heartbeat_ms`.
+                         'raft_timing': {'heartbeat_ms': 750, 'election_min_ms': 2250,
+                                         'nonpreferred_election_min_ms': 3000, 'election_max_ms': 3500},
                         'listen': peers[node-1]['address'], 'signing_key_der': str(cred / f'signing-{node}.der'),
                         'tls': {'roots_der': [str(cred / 'ca.der')], 'chain_der': [str(cred / f'node-{node}.der')],
                                 'key_der': str(cred / f'node-{node}-key.der')}, 'peers': peers})
