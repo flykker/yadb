@@ -11,7 +11,7 @@
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Cursor, Read, Write};
+use std::io::{self, Cursor, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -25,7 +25,7 @@ use yadb_io::OsDirectoryLock;
 use crate::kv::{MetaSnapshot, MetaStateMachine};
 use crate::multiraft::{GroupIdentity, ReplicaIdentity};
 use crate::openraft_runtime::YadbRaftTypeConfig as C;
-use crate::openraft_storage::LogCoverage;
+use crate::openraft_storage::{frame_payload, read_frame, Frame, LogCoverage, TailRepair};
 use crate::{KvResult, MetaError, WatchEvent};
 
 const MAGIC: &[u8; 8] = b"YORSM001";
@@ -33,6 +33,45 @@ const SNAPSHOT_MAGIC: &[u8; 8] = b"YORSNAP1";
 const VERSION: u32 = 1;
 const MAX_IMAGE: usize = 64 * 1024 * 1024;
 const IMAGE_HEADER_LEN: usize = 24;
+
+/// Applied entries appended after the last full-image checkpoint.
+///
+/// `state.json` is a checkpoint: publishing it writes the whole image, syncs
+/// it, renames it over the previous one and syncs the directory. Measured on
+/// this host's f2fs volume with eight concurrent writers, that sequence has a
+/// 1.6 s tail (the rename alone reached 1.65 s) even though its median is 8 ms.
+/// Paying it on every apply puts that tail between a committed entry and the
+/// client's answer, because OpenRaft answers a `client_write` only after the
+/// state machine has applied the entry.
+///
+/// The delta file holds the same entries as small appended frames, so the
+/// steady state of `apply` is one append plus one file sync: the same load
+/// measured a 25 ms maximum and no tail at all. The checkpoint is rewritten
+/// only when the delta outgrows a bound, and whenever a snapshot is built.
+const DELTA_FILE: &str = "state.delta";
+/// Fold the delta into a fresh checkpoint once it holds this many entries.
+const COMPACT_AFTER_ENTRIES: u64 = 4096;
+/// ...or once it holds this many bytes. Both bounds are deliberately well above
+/// one apply batch: folding costs one full-image publish, and that cost is only
+/// amortised if it happens far less often than the applies it replaces.
+const COMPACT_AFTER_BYTES: u64 = 8 * 1024 * 1024;
+
+/// One delta frame: the entries of one `apply` call, in log order.
+///
+/// The frame is serialised by reference so appending never clones the batch.
+#[derive(Serialize)]
+#[serde(bound = "")]
+struct DeltaFrameRef<'a> {
+    version: u32,
+    entries: &'a [Entry<C>],
+}
+
+#[derive(Deserialize)]
+#[serde(bound = "")]
+pub(crate) struct DeltaFrame {
+    pub(crate) version: u32,
+    pub(crate) entries: Vec<Entry<C>>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(bound = "")]
@@ -66,6 +105,15 @@ struct Inner {
     state: MetaStateMachine,
     current_snapshot: Option<SnapshotImage>,
     rebuilt: Option<ImageRebuild>,
+    /// Open handle for [`DELTA_FILE`], opened lazily on the first append and
+    /// dropped whenever the delta is folded into a checkpoint.
+    delta: Option<File>,
+    /// Entries and bytes currently in [`DELTA_FILE`]. Both are advisory: they
+    /// only decide when to fold, and the file itself stays authoritative.
+    delta_entries: u64,
+    delta_bytes: u64,
+    /// A torn final delta frame discarded by the last open.
+    repaired_delta: Option<TailRepair>,
     failed: bool,
     fault: Option<PersistFault>,
 }
@@ -85,7 +133,7 @@ pub struct ImageRebuild {
     pub corrupt_bytes: u64,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 #[cfg_attr(not(test), allow(dead_code))]
 enum PersistFault {
     AfterWrite,
@@ -263,6 +311,194 @@ fn snapshot_from_image(image: SnapshotImage) -> io::Result<Snapshot<C>> {
         meta,
         snapshot: Box::new(Cursor::new(bytes)),
     })
+}
+
+/// Apply one entry to a state machine, returning what a client would observe.
+///
+/// Both the live `apply` path and delta replay use this, so replay cannot drift
+/// from the code that produced the durable record in the first place.
+fn apply_entry(
+    state: &mut MetaStateMachine,
+    membership: &mut StoredMembership<u32, BasicNode>,
+    entry: &Entry<C>,
+) -> KvResult {
+    match &entry.payload {
+        EntryPayload::Normal(command) => state.apply(command.clone()),
+        EntryPayload::Membership(updated) => {
+            *membership = StoredMembership::new(Some(entry.log_id), updated.clone());
+            KvResult::TxnOk {
+                revision: state.revision(),
+                versions: BTreeMap::new(),
+            }
+        }
+        EntryPayload::Blank => KvResult::TxnOk {
+            revision: state.revision(),
+            versions: BTreeMap::new(),
+        },
+    }
+}
+
+/// Append one frame holding `entries` to [`DELTA_FILE`] and sync it.
+///
+/// The caller appends before it mutates its in-memory view, so a crash can
+/// never leave memory ahead of the file. One frame per `apply` batch keeps
+/// replay cheap and makes an interrupted append visible as a torn *final*
+/// frame, the same way the Raft log store frames its records.
+fn append_delta_locked(inner: &mut Inner, entries: &[Entry<C>]) -> io::Result<()> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let payload = serde_json::to_vec(&DeltaFrameRef {
+        version: VERSION,
+        entries,
+    })
+    .map_err(|e| invalid(e.to_string()))?;
+    let frame = frame_payload(payload)?;
+    if inner.delta.is_none() {
+        let path = inner.dir.join(DELTA_FILE);
+        // The directory entry is synced once, when the file is first created
+        // (after every fold). Paying it per apply is exactly the cost this
+        // change removes; paying it once makes the delta self-contained rather
+        // than relying on the Raft log to replay a file a crash never linked.
+        let existed = path.exists();
+        let file = OpenOptions::new().append(true).create(true).open(&path)?;
+        if !existed {
+            File::open(&inner.dir)?.sync_all()?;
+        }
+        inner.delta = Some(file);
+    }
+    // Only the two phases an append actually has are consumed here. The
+    // rename and directory-sync faults belong to `persist_locked`, so they must
+    // survive an apply for the checkpoint path to observe them.
+    let fault = match inner.fault {
+        Some(PersistFault::AfterWrite) | Some(PersistFault::AfterFileSync) => inner.fault.take(),
+        _ => None,
+    };
+    let file = inner.delta.as_mut().expect("delta handle is open");
+    let start_len = file.metadata()?.len();
+    let result = (|| -> io::Result<()> {
+        file.write_all(&frame)?;
+        if matches!(fault, Some(PersistFault::AfterWrite)) {
+            return Err(io::Error::other("simulated failure after write"));
+        }
+        file.sync_data()?;
+        if matches!(fault, Some(PersistFault::AfterFileSync)) {
+            return Err(io::Error::other("simulated failure after file sync"));
+        }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        // A failed append must leave no trace: a complete-but-unsynced frame
+        // would otherwise be replayed after a restart and apply an entry this
+        // call reported as failed. Truncating back to the previous end makes
+        // the durable delta exactly what was acknowledged. If the truncation
+        // itself fails the handle is poisoned anyway, and `replay_delta`
+        // resolves a torn final frame on the next open.
+        let _ = file.set_len(start_len);
+        let _ = file.sync_data();
+        return Err(error);
+    }
+    inner.delta_entries = inner.delta_entries.saturating_add(entries.len() as u64);
+    inner.delta_bytes = inner.delta_bytes.saturating_add(frame.len() as u64);
+    Ok(())
+}
+
+/// Replay the delta frames that follow the checkpoint's applied index.
+///
+/// Frames at or below `applied` are skipped rather than rejected: that is what
+/// makes a failed fold harmless, because the checkpoint and the delta may both
+/// cover the same entries for as long as the unlink has not landed.
+///
+/// Returns the replayed entry count, the valid length of the file and the torn
+/// final frame that was truncated away, if any.
+fn replay_delta(
+    dir: &Path,
+    state: &mut MetaStateMachine,
+    applied: &mut Option<LogId<u32>>,
+    membership: &mut StoredMembership<u32, BasicNode>,
+) -> io::Result<(u64, u64, Option<TailRepair>)> {
+    let mut file = match OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(dir.join(DELTA_FILE))
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok((0, 0, None)),
+        Err(error) => return Err(error),
+    };
+    let file_len = file.metadata()?.len();
+    let mut replayed = 0u64;
+    let mut valid_len = 0u64;
+    loop {
+        let payload = match read_frame(&mut file)? {
+            Frame::End => break,
+            Frame::Torn => {
+                // `append_delta_locked` writes one whole frame per `write_all`
+                // and syncs it before acknowledging, and the directory lock
+                // admits a single writer, so a frame that runs past the end of
+                // the file is that writer's final, unacknowledged append.
+                // Truncating here cannot drop an acknowledged entry.
+                file.set_len(valid_len)?;
+                file.sync_data()?;
+                return Ok((
+                    replayed,
+                    valid_len,
+                    Some(TailRepair {
+                        valid_len,
+                        discarded: file_len.saturating_sub(valid_len),
+                    }),
+                ));
+            }
+            Frame::Complete { payload, .. } => payload,
+        };
+        let frame: DeltaFrame =
+            serde_json::from_slice(&payload).map_err(|e| invalid(e.to_string()))?;
+        if frame.version != VERSION {
+            return Err(invalid("unsupported state-machine delta version"));
+        }
+        for entry in frame.entries {
+            if applied.is_some_and(|id| entry.log_id.index <= id.index) {
+                continue;
+            }
+            // The delta is a suffix of the log, so a missing frame is a gap in
+            // the applied history. Applying past it would silently produce a
+            // state the log never described; fail closed instead, exactly as
+            // the live `apply` path does.
+            if applied.is_some_and(|id| entry.log_id.index != id.index.saturating_add(1)) {
+                return Err(invalid("state-machine delta has a gap"));
+            }
+            apply_entry(state, membership, &entry);
+            *applied = Some(entry.log_id);
+            replayed = replayed.saturating_add(1);
+        }
+        valid_len = file.stream_position()?;
+    }
+    Ok((replayed, valid_len, None))
+}
+
+/// Fold the delta into a fresh checkpoint and start an empty one.
+///
+/// The checkpoint is published before the delta is dropped, so a crash in
+/// between leaves a delta whose frames the checkpoint already covers; replay
+/// skips them. Dropping the file is therefore best-effort: failing to unlink it
+/// only costs replay work on the next open, never correctness.
+fn compact_locked(inner: &mut Inner) -> Result<(), StorageError<u32>> {
+    persist_locked(inner)?;
+    reset_delta_locked(inner);
+    Ok(())
+}
+
+fn reset_delta_locked(inner: &mut Inner) {
+    inner.delta = None;
+    inner.delta_entries = 0;
+    inner.delta_bytes = 0;
+    match fs::remove_file(inner.dir.join(DELTA_FILE)) {
+        Ok(()) => {
+            let _ = File::open(&inner.dir).and_then(|dir| dir.sync_all());
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(_) => {}
+    }
 }
 
 fn persist_locked(inner: &mut Inner) -> Result<(), StorageError<u32>> {
@@ -505,6 +741,10 @@ impl DurableMetaStateMachine {
                 state: MetaStateMachine::new(),
                 current_snapshot: None,
                 rebuilt: None,
+                delta: None,
+                delta_entries: 0,
+                delta_bytes: 0,
+                repaired_delta: None,
                 failed: false,
                 fault: None,
             })),
@@ -583,6 +823,21 @@ impl DurableMetaStateMachine {
         }
         let mut state = MetaStateMachine::new();
         state.restore_durable_snapshot(image.state);
+        if rebuilt.is_some() {
+            // A rebuilt image is empty and the log replays from its start, so a
+            // delta suffix must not be replayed on top: it holds only the last
+            // few entries and would produce a state missing everything before
+            // them.
+            match fs::remove_file(dir.join(DELTA_FILE)) {
+                Ok(()) => File::open(&dir)?.sync_all()?,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        let mut applied = image.applied;
+        let mut membership = image.membership;
+        let (delta_entries, delta_bytes, repaired_delta) =
+            replay_delta(&dir, &mut state, &mut applied, &mut membership)?;
         File::open(&dir)?.sync_all()?;
         Ok(Self {
             inner: Arc::new(Mutex::new(Inner {
@@ -590,11 +845,15 @@ impl DurableMetaStateMachine {
                 _lock: lock,
                 group: identity.group().clone(),
                 node_id: identity.node(),
-                applied: image.applied,
-                membership: image.membership,
+                applied,
+                membership,
                 state,
                 current_snapshot: image.current_snapshot,
                 rebuilt,
+                delta: None,
+                delta_entries,
+                delta_bytes,
+                repaired_delta,
                 failed: false,
                 fault: None,
             })),
@@ -609,6 +868,15 @@ impl DurableMetaStateMachine {
     /// reports `None`, so a rebuild is reported once per discard.
     pub fn rebuilt_image(&self) -> Option<ImageRebuild> {
         self.inner.lock().unwrap().rebuilt.clone()
+    }
+
+    /// A torn final delta frame that the last open truncated away, if any.
+    ///
+    /// The frame was never acknowledged, so nothing was lost; the report exists
+    /// because the truncation itself is silent and an operator must be able to
+    /// tell a clean start from a recovered one.
+    pub fn repaired_delta(&self) -> Option<TailRepair> {
+        self.inner.lock().unwrap().repaired_delta
     }
 
     #[cfg(test)]
@@ -636,6 +904,8 @@ impl RaftSnapshotBuilder<C> for DurableMetaStateMachine {
             inner.current_snapshot = previous;
             return Err(error);
         }
+        // The checkpoint now covers every entry the delta holds.
+        reset_delta_locked(&mut inner);
         Ok(result)
     }
 }
@@ -682,45 +952,42 @@ impl RaftStateMachine<C> for DurableMetaStateMachine {
             }
             expected = Some(entry.log_id.index.saturating_add(1));
         }
-        let old_applied = inner.applied;
-        let old_membership = inner.membership.clone();
-        let old_state = inner.state.clone();
         let mut candidate_state = inner.state.clone();
         candidate_state.defer_notifications();
         let mut candidate_membership = inner.membership.clone();
         let mut candidate_applied = inner.applied;
         let mut results = Vec::new();
-        for entry in entries {
+        // Durability first: the frame must be on disk before any of it becomes
+        // visible in memory or to a watcher.
+        if let Err(error) = append_delta_locked(&mut inner, &entries) {
+            inner.failed = true;
+            return Err(storage_error(
+                ErrorSubject::StateMachine,
+                ErrorVerb::Write,
+                error,
+            ));
+        }
+        for entry in &entries {
             candidate_applied = Some(entry.log_id);
-            results.push(match entry.payload {
-                EntryPayload::Normal(command) => candidate_state.apply(command),
-                EntryPayload::Membership(membership) => {
-                    candidate_membership = StoredMembership::new(Some(entry.log_id), membership);
-                    KvResult::TxnOk {
-                        revision: candidate_state.revision(),
-                        versions: BTreeMap::new(),
-                    }
-                }
-                EntryPayload::Blank => KvResult::TxnOk {
-                    revision: candidate_state.revision(),
-                    versions: BTreeMap::new(),
-                },
-            });
+            results.push(apply_entry(
+                &mut candidate_state,
+                &mut candidate_membership,
+                entry,
+            ));
         }
         let events = candidate_state.take_deferred_notifications();
         inner.applied = candidate_applied;
         inner.membership = candidate_membership;
         inner.state = candidate_state;
-        if let Err(error) = persist_locked(&mut inner) {
-            // `persist_locked` poisons the handle on an unknown filesystem
-            // outcome. Restore the in-memory view too, so no caller observes
-            // state that was not acknowledged as durable.
-            inner.applied = old_applied;
-            inner.membership = old_membership;
-            inner.state = old_state;
-            return Err(error);
-        }
         inner.state.deliver_notifications(events);
+        if inner.delta_entries >= COMPACT_AFTER_ENTRIES || inner.delta_bytes >= COMPACT_AFTER_BYTES
+        {
+            // The entries are already durable in the delta, so a failed fold is
+            // not a failed apply: `persist_locked` poisons the handle and the
+            // next operation fails closed, while this call still reports what
+            // it durably applied.
+            let _ = compact_locked(&mut inner);
+        }
         Ok(results)
     }
 
@@ -838,6 +1105,9 @@ impl RaftStateMachine<C> for DurableMetaStateMachine {
             inner.current_snapshot = old_snapshot;
             return Err(error);
         }
+        // The installed snapshot is authoritative up to its own applied index,
+        // so every delta frame is either covered by it or obsolete.
+        reset_delta_locked(&mut inner);
         inner.state.deliver_notifications(events);
         Ok(())
     }
@@ -930,6 +1200,83 @@ mod tests {
         assert_eq!(reopened.applied_state().await.unwrap().0.unwrap().index, 1);
         assert_eq!(reopened.snapshot().get("a").unwrap().version, 1);
         assert_eq!(reopened.inner.lock().unwrap().state.watcher_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn apply_appends_to_the_delta_instead_of_republishing_the_checkpoint() {
+        let dir = TempDir::new();
+        let mut sm = DurableMetaStateMachine::create(&dir.0, &identity()).unwrap();
+        let checkpoint = fs::read(dir.0.join("state.json")).unwrap();
+        sm.apply(vec![put(1, "a", b"one")]).await.unwrap();
+        sm.apply(vec![put(2, "b", b"two")]).await.unwrap();
+        // The whole point of the delta: an apply must not rewrite the
+        // checkpoint. Before this change every batch published a new full
+        // image, and its rename plus directory sync was measured at up to
+        // 1.6s under concurrent writers on this filesystem.
+        assert_eq!(fs::read(dir.0.join("state.json")).unwrap(), checkpoint);
+        assert!(!fs::read(dir.0.join(DELTA_FILE)).unwrap().is_empty());
+        assert_eq!(sm.snapshot().get("a").unwrap().value, b"one");
+        assert_eq!(sm.snapshot().get("b").unwrap().value, b"two");
+        drop(sm);
+        let mut reopened = DurableMetaStateMachine::open(&dir.0, &identity()).unwrap();
+        assert_eq!(reopened.snapshot().get("a").unwrap().value, b"one");
+        assert_eq!(reopened.snapshot().get("b").unwrap().value, b"two");
+        assert_eq!(reopened.applied_state().await.unwrap().0.unwrap().index, 2);
+        assert!(reopened.repaired_delta().is_none());
+    }
+
+    #[tokio::test]
+    async fn torn_delta_tail_is_truncated_and_reported() {
+        let dir = TempDir::new();
+        let mut sm = DurableMetaStateMachine::create(&dir.0, &identity()).unwrap();
+        sm.apply(vec![put(1, "a", b"one")]).await.unwrap();
+        sm.apply(vec![put(2, "b", b"two")]).await.unwrap();
+        let valid = fs::metadata(dir.0.join(DELTA_FILE)).unwrap().len();
+        {
+            let mut file = OpenOptions::new()
+                .append(true)
+                .open(dir.0.join(DELTA_FILE))
+                .unwrap();
+            // A complete, checksum-valid header whose payload never reached
+            // disk: exactly the final unacknowledged append of a crash.
+            let mut torn = Vec::new();
+            torn.extend_from_slice(b"YORF");
+            torn.extend_from_slice(&64u32.to_le_bytes());
+            torn.extend_from_slice(&0u32.to_le_bytes());
+            let header_crc = crc32fast::hash(&torn);
+            torn.extend_from_slice(&header_crc.to_le_bytes());
+            file.write_all(&torn).unwrap();
+            file.sync_data().unwrap();
+        }
+        drop(sm);
+        let mut reopened = DurableMetaStateMachine::open(&dir.0, &identity()).unwrap();
+        assert_eq!(reopened.snapshot().get("a").unwrap().value, b"one");
+        assert_eq!(reopened.snapshot().get("b").unwrap().value, b"two");
+        assert_eq!(reopened.applied_state().await.unwrap().0.unwrap().index, 2);
+        let repair = reopened.repaired_delta().expect("torn delta reported");
+        assert_eq!(repair.valid_len, valid);
+        assert_eq!(repair.discarded, 16);
+        assert_eq!(fs::metadata(dir.0.join(DELTA_FILE)).unwrap().len(), valid);
+    }
+
+    #[tokio::test]
+    async fn a_delta_over_the_bound_is_folded_into_the_checkpoint() {
+        let dir = TempDir::new();
+        let mut sm = DurableMetaStateMachine::create(&dir.0, &identity()).unwrap();
+        let entries: Vec<_> = (1..=COMPACT_AFTER_ENTRIES)
+            .map(|index| put(index, "key", b"value"))
+            .collect();
+        sm.apply(entries).await.unwrap();
+        // The fold published a checkpoint covering every entry and removed the
+        // delta, so the next apply starts a fresh one.
+        assert!(!dir.0.join(DELTA_FILE).exists());
+        drop(sm);
+        let mut reopened = DurableMetaStateMachine::open(&dir.0, &identity()).unwrap();
+        assert_eq!(
+            reopened.applied_state().await.unwrap().0.unwrap().index,
+            COMPACT_AFTER_ENTRIES
+        );
+        assert_eq!(reopened.snapshot().get("key").unwrap().value, b"value");
     }
 
     #[tokio::test]
@@ -1073,15 +1420,18 @@ mod tests {
         let mut sm = DurableMetaStateMachine::create(&dir.0, &identity()).unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
         sm.inner.lock().unwrap().state.watch_prefix("", tx);
-        // A pre-existing temporary file forces create_new to fail; this is an
-        // in-process simulation, not a power-loss or real filesystem fault.
-        fs::write(dir.0.join("state.json.tmp"), b"occupied").unwrap();
+        // The apply path now appends to the delta file instead of publishing
+        // `state.json`, so a stale `state.json.tmp` no longer reaches it. Fail
+        // the append at its write phase instead; this is still an in-process
+        // simulation, not a power-loss or real filesystem fault.
+        sm.inner.lock().unwrap().fault = Some(PersistFault::AfterWrite);
         assert!(sm.apply(vec![put(1, "key", b"value")]).await.is_err());
         assert!(rx.try_recv().is_err());
         assert!(sm.applied_state().await.is_err());
         drop(sm);
         let reopened = DurableMetaStateMachine::open(&dir.0, &identity()).unwrap();
         assert!(reopened.snapshot().get("key").is_none());
+        assert!(reopened.inner.lock().unwrap().applied.is_none());
     }
 
     #[tokio::test]
@@ -1214,12 +1564,12 @@ mod tests {
 
     #[tokio::test]
     async fn failed_apply_does_not_publish_and_recovery_accepts_unknown_outcome() {
-        for (fault, expected) in [
-            (PersistFault::AfterWrite, false),
-            (PersistFault::AfterFileSync, false),
-            (PersistFault::AfterRename, true),
-            (PersistFault::AfterDirSync, true),
-        ] {
+        // An apply has two durability phases: the frame write and the file
+        // sync. A failure at either must not leave an entry behind for a
+        // restart to replay. The checkpoint's rename and directory-sync phases
+        // are not part of `apply` any more; `snapshot_install_simulated_
+        // failures_require_reopen` still covers them through `persist_locked`.
+        for fault in [PersistFault::AfterWrite, PersistFault::AfterFileSync] {
             let dir = TempDir::new();
             let mut sm = DurableMetaStateMachine::create(&dir.0, &identity()).unwrap();
             let (tx, rx) = std::sync::mpsc::channel();
@@ -1236,24 +1586,10 @@ mod tests {
                 "state-machine handle retained for {}",
                 dir.0.display()
             );
-            let mut reopened =
-                DurableMetaStateMachine::open(&dir.0, &identity()).unwrap_or_else(|error| {
-                    panic!(
-                        "reopen {} after fault {}: {error:?}",
-                        dir.0.display(),
-                        match fault {
-                            PersistFault::AfterWrite => "AfterWrite",
-                            PersistFault::AfterFileSync => "AfterFileSync",
-                            PersistFault::AfterRename => "AfterRename",
-                            PersistFault::AfterDirSync => "AfterDirSync",
-                        }
-                    )
-                });
-            assert_eq!(reopened.snapshot().get("key").is_some(), expected);
-            assert_eq!(
-                reopened.applied_state().await.unwrap().0.is_some(),
-                expected
-            );
+            let mut reopened = DurableMetaStateMachine::open(&dir.0, &identity())
+                .unwrap_or_else(|error| panic!("reopen after fault {fault:?}: {error:?}"));
+            assert!(reopened.snapshot().get("key").is_none());
+            assert!(reopened.applied_state().await.unwrap().0.is_none());
             assert_eq!(reopened.inner.lock().unwrap().state.watcher_count(), 0);
         }
     }

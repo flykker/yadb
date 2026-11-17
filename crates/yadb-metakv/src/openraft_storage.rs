@@ -190,7 +190,7 @@ fn encode(record: &Record) -> io::Result<Vec<u8>> {
     frame_payload(payload)
 }
 
-fn frame_payload(payload: Vec<u8>) -> io::Result<Vec<u8>> {
+pub(crate) fn frame_payload(payload: Vec<u8>) -> io::Result<Vec<u8>> {
     if payload.len() > MAX_FRAME_PAYLOAD {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -435,7 +435,7 @@ fn header(identity: &ReplicaIdentity) -> Vec<u8> {
 }
 
 /// One step of a log walk.
-enum Frame {
+pub(crate) enum Frame {
     /// The log ends exactly on a frame boundary.
     End,
     /// The file ends inside its final frame.
@@ -466,7 +466,7 @@ fn read_full_or_eof(file: &mut File, buf: &mut [u8]) -> io::Result<bool> {
 /// being acknowledged and discarding them would lose committed entries. The
 /// header checksum is what makes a damaged `len` detectable, so the only way to
 /// reach a length past EOF is a payload that genuinely never reached disk.
-fn read_frame(file: &mut File) -> io::Result<Frame> {
+pub(crate) fn read_frame(file: &mut File) -> io::Result<Frame> {
     let mut frame_header = [0; FRAME_HEADER_LEN];
     loop {
         match file.read(&mut frame_header[..1]) {
