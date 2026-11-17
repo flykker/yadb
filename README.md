@@ -584,6 +584,9 @@ launcher, because the daemon has no other metadata runtime. It never wipes a dat
 directory, never changes daemon defaults, never retries an ambiguous mutation and
 never switches an existing root.
 
+Build the daemon once (`cargo build -p yadbd --offline --locked -j 2`; the
+`openraft-storage` feature is a no-op, so it is neither needed nor harmful), then:
+
 ```bash
 # optional: provision a fresh root without starting it
 python3 scripts/yadb-openraft-dev.py prepare
