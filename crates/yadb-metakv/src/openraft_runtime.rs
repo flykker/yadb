@@ -55,15 +55,18 @@ pub mod persistent {
 
     /// Storage damage that opening a replica repaired or discarded.
     ///
-    /// Both repairs are silent by construction: a torn log tail is truncated
-    /// and a corrupt `state.json` is replaced with an empty image plus a full
-    /// replay. The bytes are preserved, but an operator who is never told sees
-    /// a healthy cluster and cannot distinguish a clean start from a recovered
-    /// one. This report is what a caller surfaces; it is empty for a clean open.
+    /// Every repair is silent by construction: a torn log tail or delta frame
+    /// is truncated and a corrupt `state.json` is replaced with an empty image
+    /// plus a full replay. The bytes are preserved, but an operator who is
+    /// never told sees a healthy cluster and cannot distinguish a clean start
+    /// from a recovered one. This report is what a caller surfaces; it is empty
+    /// for a clean open.
     #[derive(Debug, Clone, Default)]
     pub struct RecoveryReport {
         /// A torn final log frame that `open` truncated away.
         pub repaired_tail: Option<TailRepair>,
+        /// A torn final state-machine delta frame that `open` truncated away.
+        pub repaired_delta: Option<TailRepair>,
         /// A corrupt `state.json` that was renamed aside and rebuilt empty.
         pub rebuilt_image: Option<ImageRebuild>,
     }
@@ -71,7 +74,9 @@ pub mod persistent {
     impl RecoveryReport {
         /// Whether the replica opened without repairing or discarding anything.
         pub fn is_clean(&self) -> bool {
-            self.repaired_tail.is_none() && self.rebuilt_image.is_none()
+            self.repaired_tail.is_none()
+                && self.repaired_delta.is_none()
+                && self.rebuilt_image.is_none()
         }
     }
 
@@ -169,6 +174,7 @@ pub mod persistent {
             )?;
             let recovered = RecoveryReport {
                 repaired_tail,
+                repaired_delta: state.repaired_delta(),
                 rebuilt_image: state.rebuilt_image(),
             };
             let raft = YadbRaft::new(identity.node(), config, network, log, state.clone()).await?;

@@ -889,6 +889,15 @@ impl Prepared {
                     tail.discarded,
                 );
             }
+            if let Some(tail) = recovery.repaired_delta {
+                eprintln!(
+                    "group {} node {}: truncated a torn state-machine delta at byte {}, discarded {} byte(s)",
+                    self.identity.group().group,
+                    self.identity.node(),
+                    tail.valid_len,
+                    tail.discarded,
+                );
+            }
             if let Some(image) = &recovery.rebuilt_image {
                 eprintln!(
                     "group {} node {}: rebuilt a corrupt state image ({} byte(s), preserved as {})",

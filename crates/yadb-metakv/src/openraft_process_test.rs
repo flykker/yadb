@@ -6,12 +6,12 @@ use crate::{
         WireResponse,
     },
     openraft_runtime::{persistent::PersistentGroup, YadbRaft},
-    openraft_state_machine::DurableMetaStateMachine,
-    openraft_storage::DurableOpenRaftLog,
+    openraft_state_machine::{DeltaFrame, DurableMetaStateMachine},
+    openraft_storage::{read_frame, DurableOpenRaftLog, Frame},
     openraft_transport::{NodeSigningKey, PeerKeyRegistry},
     KvCommand, KvResult,
 };
-use openraft::{storage::RaftLogStorage, BasicNode, Snapshot};
+use openraft::{storage::RaftLogStorage, BasicNode, EntryPayload, Snapshot};
 use serde_json::{json, Value};
 use std::{
     collections::BTreeMap,
@@ -86,6 +86,38 @@ fn atomic_json(path: &Path, value: &Value) {
 
 // The state image is atomically replaced by the adapter. This read-only test
 // observer checks its bounded header and checksum before inspecting its value.
+//
+// Entries applied since the last checkpoint live in the append-only delta file
+// next to the image, so the observer replays those frames too: that is the same
+// durable state the state machine reconstructs on reopen.
+fn delta_value(dir: &Path, key: &str, checkpoint_index: Option<u64>) -> Option<Option<Vec<u8>>> {
+    let mut file = std::fs::File::open(dir.join("state.delta")).ok()?;
+    let mut found: Option<Option<Vec<u8>>> = None;
+    loop {
+        match read_frame(&mut file).ok()? {
+            Frame::End | Frame::Torn => break,
+            Frame::Complete { payload, .. } => {
+                let frame: DeltaFrame = serde_json::from_slice(&payload).ok()?;
+                for entry in frame.entries {
+                    if checkpoint_index.is_some_and(|index| entry.log_id.index <= index) {
+                        continue;
+                    }
+                    match entry.payload {
+                        EntryPayload::Normal(KvCommand::Put { key: k, value }) if k == key => {
+                            found = Some(Some(value));
+                        }
+                        EntryPayload::Normal(KvCommand::Delete { key: k }) if k == key => {
+                            found = Some(None);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    found
+}
+
 fn image_value(path: &Path, key: &str) -> Option<Vec<u8>> {
     let mut bytes = Vec::new();
     std::fs::File::open(path)
@@ -107,7 +139,16 @@ fn image_value(path: &Path, key: &str) -> Option<Vec<u8>> {
         return None;
     }
     let image: Value = serde_json::from_slice(&bytes[24..]).ok()?;
-    serde_json::from_value(image["state"]["values"][key]["value"].clone()).ok()
+    let checkpoint_index = image["applied"]["index"].as_u64();
+    let mut value: Option<Vec<u8>> =
+        serde_json::from_value(image["state"]["values"][key]["value"].clone()).ok();
+    if let Some(delta) = path
+        .parent()
+        .and_then(|dir| delta_value(dir, key, checkpoint_index))
+    {
+        value = delta;
+    }
+    value
 }
 
 async fn child(config: Value) {
