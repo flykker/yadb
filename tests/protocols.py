@@ -190,6 +190,12 @@ class TransportHandler(socketserver.BaseRequestHandler):
             server.record("open")
             sockets = (self.request, upstream)
             try:
+                # The relay must not add latency of its own: with Nagle enabled
+                # on both legs, a small request/response pair waits for a
+                # delayed ACK on either side and every Raft RPC pays tens of
+                # milliseconds, which the peers then see as a slow cluster.
+                for sock in sockets:
+                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 self.request.settimeout(0.2)
                 upstream.settimeout(0.2)
                 while not server.blocked.is_set():
@@ -955,13 +961,20 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
         env = DEV.daemon_env(temp)
         nodes = [None, None, None]
         proxies = {}
-        def start_node(i):
+        def start_nodes(subset):
             # A replica that already exists must be reopened, not re-created.
             # The launcher owns that bookkeeping (`mode`/`initialize` per group
             # config), so a restart of the same storage directories is its
             # decision, not a second copy of the rule here.
+            #
+            # The decision covers all three replicas of a group at once, so it
+            # must be taken once per batch. Calling it before each individual
+            # launch makes the first start racy: node 1 creates its replica
+            # directory while nodes 2 and 3 have none yet, which the launcher
+            # correctly refuses as a partial bootstrap that it will not guess
+            # about.
             DEV.sync_replica_modes(temp)
-            return launch_node(temp, i, env)
+            return [launch_node(temp, i, env) for i in subset]
         try:
             # One directed proxy per (group, source, target): a test can cut a
             # single group's link without touching the other two groups.
@@ -973,7 +986,7 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
                         proxy = TransportProxy(group, source, target)
                         proxies[group, source, target] = proxy
                         threading.Thread(target=proxy.serve_forever, daemon=True).start()
-            nodes[:] = [start_node(i) for i in NODES]
+            nodes[:] = start_nodes(NODES)
             for i in NODES:
                 wait(http_port(i))
             # A bound listener is not an elected cluster: the bootstrap apply
@@ -1545,7 +1558,7 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
             b.s.close()
             x.s.close()
             y.s.close()
-            nodes[:] = [start_node(i) for i in NODES]
+            nodes[:] = start_nodes(NODES)
             for i in NODES:
                 wait(http_port(i))
             for i in NODES:
@@ -1704,7 +1717,7 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
                 node.kill()
             for node in nodes:
                 node.wait(timeout=10)
-            nodes[:] = [start_node(i) for i in NODES]
+            nodes[:] = start_nodes(NODES)
             for i in NODES:
                 wait(http_port(i))
                 deadline = time.monotonic()+20
@@ -1752,7 +1765,7 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
             # means every part is durable, so the write is accepted rather than
             # refused for a missing domain, and it is not counted as degraded.
             i = stopped[0]
-            nodes[i-1] = start_node(i)
+            nodes[i-1] = start_nodes([i])[0]
             wait(http_port(i))
             live = [leader, i]
             wait_group_leader(CONTROL_GROUP, nodes=live)
@@ -1772,7 +1785,7 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
             assert check.rows("SELECT balance FROM wire WHERE id=1;") == [["90"]]
             check.close()
             i = stopped[1]
-            nodes[i-1] = start_node(i)
+            nodes[i-1] = start_nodes([i])[0]
             wait(http_port(i))
             # The blob written while that node was down lives partly on handoff
             # slots. Reads probe the nominal slot and then every spare, so it
@@ -1913,7 +1926,7 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
             p.close()
             # The node returns; what was written while it was away must still be
             # readable, and the key stays writable.
-            nodes[leader-1] = start_node(leader)
+            nodes[leader-1] = start_nodes([leader])[0]
             wait(http_port(leader))
             s3_visible(s3_port(survivor), "/invoices-2026/after-failover", b"ok")
             print("PASS leader SIGKILL: surviving replicas serve reads; a write with one domain offline is acknowledged through handoff slots and survives the node's return")
@@ -1932,11 +1945,14 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
                 print(path.name, path.read_text())
             raise
         finally:
+            # A failure before every node was launched leaves `None` entries;
+            # masking the real error with an AttributeError hides it.
             for p in nodes:
-                if p.poll() is None:
+                if p is not None and p.poll() is None:
                     p.terminate()
             for p in nodes:
-                p.wait(timeout=10)
+                if p is not None:
+                    p.wait(timeout=10)
             for proxy in proxies.values():
                 proxy.shutdown()
                 proxy.server_close()
