@@ -367,6 +367,29 @@ from legacy S3/SQL data and block extents. The allocator must never be deleted/r
 metadata and fragment data must always come from the same point in time: rebuilding
 one without the other silently reuses or loses IDs.
 
+Allocation ids are handed out in blocks of 32 (`ALLOCATION_BLOCK`). A writer's first
+upload after its cache empties performs one guarded update of
+`/s3-upload-sequence/{project_id}` that advances the durable counter by 32, then serves
+the rest of the block from a process-local, per-project cache. One block therefore costs
+one sequence transaction per process per round instead of one per upload: with 24
+concurrent writers, 48 uploads produced 596 sequence transactions on that single key, and
+transactions that exceeded the metadata bridge deadline surfaced as `503 ... metadata
+bridge response timed out or stopped`.
+
+The unused tail of a block is deliberately not returned to the counter. An allocation id
+only has to be unique and increasing; skipping ids is safe, while reusing one would alias
+two uploads, including after a restart, when the durable counter already sits at the end
+of the block. A crash loses the unused tail of the current block rather than handing out a
+duplicate. `reserve_upload` still refuses to reuse the ids of failed or ambiguous
+allocations and still fails with `GenerationExhausted` when the counter would pass `MAX_ALLOCATION`
+(`(1<<56)-1`).
+
+`generation` in a BlobId is the low 24 bits of the allocation id, so blocks of 32 make
+generation values advance in steps of 32 rather than by 1. Generation exhaustion still
+happens after the same total number of allocations, but it is consumed 32 ids at a time,
+so a project that runs out of generations may do so up to 31 ids earlier than a per-upload
+allocator would.
+
 Publishing a manifest, retiring its previous version and removing the upload intent
 is one revision-guarded Raft transaction. Revision guards prevent a deleted/recreated
 key from accidentally satisfying an old per-key-version check (ABA). If publication
@@ -648,12 +671,17 @@ historical `403`/`404` answers are unchanged.
 
 Reclaiming disk: overwritten blocks, folded WAL blobs, replaced SSTs and
 overwritten S3 objects leave old fragments behind. **Multi-Raft mark-and-sweep
-is temporarily disabled** because its lease fencing does not safely cover all
-expiry races. Manual GC and scrub return an explicit refusal; periodic collection
-also refuses and logs the reason. Garbage accumulates and can fill the disk.
-This does not cancel already-running requests from older processes or establish
-the safety of unrelated deletion paths; stop old processes before deploying the
-new version and account for any in-flight storage requests.
+is temporarily disabled.** A writer lease can be renewed while a collector pass
+is in flight, and collector RPCs can continue past lease expiry, so a reader
+lease alone is not a sufficient fence. Storage-side fencing (an epoch on every
+target and a versioned RPC) is designed only conceptually and is not
+implemented. Manual GC and scrub return `409` with an explicit refusal reason,
+report zero deletions and zero reclaimed bytes, and leave fragments intact;
+periodic collection also refuses and logs the reason. Garbage accumulates and
+can fill the disk. This does not cancel already-running requests from older
+processes or establish the safety of unrelated deletion paths; stop old
+processes before deploying the new version and account for any in-flight
+storage requests.
 
 Multi-Raft reads currently publish no reader lease. `consistent=true` confirms
 the metadata snapshot but is not a fragment-lifetime fence. Default reads use

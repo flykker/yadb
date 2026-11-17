@@ -637,21 +637,22 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   stalls proposals; a single-node cluster compacts on its own applied index
   without a peer bound; and a failed install retries from offset 0 on the next
   heartbeat rather than keeping a per-snapshot failure state.
-- [x] Garbage collection on Multi-Raft. `POST /v1/pools/gc` and the sweep inside
-  `POST /v1/pools/scrub` now run one leader-only, quorum-confirmed pass per
-  metadata group instead of refusing with `garbage collection disabled for
-  Multi-Raft: no single atomic cross-group metadata snapshot`. Each group has its
-  own collector lease (`/gc/g<group>/collector`) and writer leases
-  (`/gc/g<group>/writer/<id>`), so passes on different groups neither block each
-  other nor share a fence. A group this node does not lead, whose linearizable
-  snapshot fails, whose fence cannot be read, or that has a live lease is
-  refused with its reason in `gc_groups_refused` and deletes nothing; the
-  endpoint answers `409`. Only the repair (orphan) scan is still refused,
-  because it needs one whole-deployment view. Open: no live-cluster drill of the
-  per-group path, and readers on Multi-Raft take no reader lease, so only the
-  per-group writer lease and an S3 `Prepared` intent fence in-flight writes.
+- [ ] Garbage collection on Multi-Raft. A per-group, leader-only,
+  quorum-confirmed pass was implemented (each group with its own collector lease
+  `/gc/g<group>/collector` and writer leases `/gc/g<group>/writer/<id>`) and is
+  now **disabled** (fail-closed). `POST /v1/pools/gc` and the sweep inside
+  `POST /v1/pools/scrub` return `409` with `MULTIRAFT_GC_REFUSAL`, delete
+  nothing, reclaim nothing and leave fragments intact; the periodic task logs
+  the same reason. The fence is not safe: a writer lease can be renewed while a
+  collector pass is in flight, and collector RPCs can continue past lease
+  expiry, so a reader lease alone is not a sufficient fence. Storage-side
+  fencing (a per-target epoch and a versioned RPC) is designed only conceptually
+  and is not implemented. Garbage therefore accumulates and can fill the disk;
+  this is a knowingly accepted temporary measure. The repair (orphan) scan is
+  also still refused, because it needs one whole-deployment view.
 
-  The plan that was implemented, from the read-only analysis of the primitives:
+  The per-group design that was implemented and then disabled, from the
+  read-only analysis of the primitives:
 
   * **Cross-group references are impossible, so the mark can stay group-scoped.**
     Every fragment id carries its `project_id`, and a manifest only names
