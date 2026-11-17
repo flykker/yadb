@@ -1041,7 +1041,8 @@ unparsable lease record and a held collector lease; each asserts zero fragments
 deleted and unchanged disk usage. The non-leader refusal is implemented but not
 covered by a test, because it needs a multi-node metadata group.
 
-On a live three-node cluster started by `scripts/yadb-dev.py`, eight overwrites
+On a live three-node cluster started by `scripts/yadb-dev.py` (the launcher that
+existed then; the runtime and that script have since been removed), eight overwrites
 of one 8 KB block region through iSCSI left `node-1`'s pools at 963,124 bytes
 against a 897,060-byte floor; `POST /v1/pools/gc` then reported
 `blobs_live: 419, fragments_deleted: 42, bytes_reclaimed: 173,418,

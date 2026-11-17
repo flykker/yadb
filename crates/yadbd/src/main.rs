@@ -2384,7 +2384,7 @@ async fn handle_openraft_status(State(st): State<AppState>, headers: HeaderMap) 
     Json(match &st.openraft {
         Some(status) => status.snapshot(),
         None => {
-            serde_json::json!({"enabled": false, "client_traffic": "legacy", "production_ready": false})
+            serde_json::json!({"enabled": false, "client_traffic": "none", "production_ready": false})
         }
     })
     .into_response()
