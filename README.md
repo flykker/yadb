@@ -384,11 +384,11 @@ duplicate. `reserve_upload` still refuses to reuse the ids of failed or ambiguou
 allocations and still fails with `GenerationExhausted` when the counter would pass `MAX_ALLOCATION`
 (`(1<<56)-1`).
 
-`generation` in a BlobId is the low 24 bits of the allocation id, so blocks of 32 make
-generation values advance in steps of 32 rather than by 1. Generation exhaustion still
-happens after the same total number of allocations, but it is consumed 32 ids at a time,
-so a project that runs out of generations may do so up to 31 ids earlier than a per-upload
-allocator would.
+A BlobId splits the allocation id into `owner_id` (the high 32 bits) and `generation`
+(the low 24 bits), so blocks of 32 make `generation` advance in steps of 32 rather than by
+1 and wrap at the 24-bit boundary. Uniqueness does not rest on `generation` alone: two
+allocations 2^24 apart share a generation but differ in `owner_id`, and the allocator only
+stops at `MAX_ALLOCATION`, not at the generation boundary.
 
 Publishing a manifest, retiring its previous version and removing the upload intent
 is one revision-guarded Raft transaction. Revision guards prevent a deleted/recreated
