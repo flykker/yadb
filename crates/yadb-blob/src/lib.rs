@@ -66,6 +66,26 @@ pub enum BlobError {
     },
 }
 
+impl BlobError {
+    /// Whether this failure only says "this slot could not answer", so the same
+    /// part may be placed on another slot.
+    ///
+    /// Conservative by construction: only `Io` qualifies. A remote slot maps a
+    /// connection failure and an unexpected HTTP status to `Io`, and a local
+    /// volume maps an I/O failure to `Io`; both mean the slot did not answer.
+    ///
+    /// Every other variant is a statement about the *data* or the slot's durable
+    /// state and must never be bypassed by writing the part elsewhere:
+    /// `ImmutableConflict` (the id already holds different bytes),
+    /// `FencedByBarrier` and `Tombstoned` are fences that a handoff would
+    /// silently defeat, and `StorageUnavailable` means the slot's outcome is
+    /// unknown until it is recovered, so acknowledging the write somewhere else
+    /// would hide a fault an operator has to see. If in doubt, this is `false`.
+    pub fn is_unavailable(&self) -> bool {
+        matches!(self, BlobError::Io(_))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -839,6 +859,11 @@ mod tests {
         /// that was momentarily unreachable, which the handoff round must survive
         /// by reassigning the part to another spare instead of failing the write.
         fail_once: Arc<std::sync::atomic::AtomicBool>,
+        /// HTTP status a PUT answers with while non-zero, e.g. 409 for an
+        /// immutable conflict or 412 for a barrier fence. Zero accepts the write.
+        /// The other switches model an unreachable slot; this one models a slot
+        /// that answers with a *permanent* refusal.
+        put_status: Arc<std::sync::atomic::AtomicU16>,
         seen: Arc<std::sync::Mutex<Vec<String>>>,
         server: Option<std::thread::JoinHandle<()>>,
     }
@@ -852,9 +877,11 @@ mod tests {
             let store = Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
             let fail_puts = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let fail_once = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let put_status = Arc::new(std::sync::atomic::AtomicU16::new(0));
             let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
             let (store_c, fail_c, seen_c) = (store.clone(), fail_puts.clone(), seen.clone());
             let fail_once_c = fail_once.clone();
+            let put_status_c = put_status.clone();
             let server = std::thread::spawn(move || loop {
                 let (mut stream, _) = match listener.accept() {
                     Ok(pair) => pair,
@@ -892,7 +919,13 @@ mod tests {
                 }
                 seen_c.lock().unwrap().push(request_line);
 
+                // Read once: a status line must not mix two observations.
+                let refused_status = put_status_c.load(Ordering::Relaxed);
                 let response: Vec<u8> = match method.as_str() {
+                    "PUT" if refused_status != 0 => format!(
+                        "HTTP/1.1 {refused_status} Refused\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                    .into_bytes(),
                     "PUT" if fail_c.load(Ordering::Relaxed) => {
                         b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
                     }
@@ -938,6 +971,7 @@ mod tests {
                 store,
                 fail_puts,
                 fail_once,
+                put_status,
                 seen,
                 server: Some(server),
             }
@@ -1095,6 +1129,37 @@ mod tests {
         (from..to)
             .map(|i| vdisks[i].store.lock().unwrap().len())
             .sum()
+    }
+
+    /// A local-only pool with `handoff` spare slots. Every slot is a real
+    /// `VolumeStore`, so a tombstone and a barrier are genuine durable refusals
+    /// rather than an HTTP status a mock was told to answer. Slot `i` sits on
+    /// node `i % 3 + 1`, mirroring `remote_pool`, so a spare on the failed
+    /// nominal slot's node stays distinguishable from one on a healthy node.
+    fn local_pool(
+        seed: u64,
+        scheme: ErasureScheme,
+        handoff: usize,
+    ) -> (Vec<Arc<VolumeStore<SimFs>>>, PoolStriper<SimFs>) {
+        let fs = SimFs::new(seed);
+        let mut stores = Vec::new();
+        let mut slots = Vec::new();
+        for i in 0..(scheme.total_parts() + handoff) {
+            let store = Arc::new(
+                VolumeStore::open(fs.clone(), format!("az{i}"), VolumeConfig::default()).unwrap(),
+            );
+            let node = (i % 3) as u32 + 1;
+            slots.push(PoolSlot::local(
+                i,
+                format!("az{i}"),
+                node,
+                None,
+                store.clone(),
+            ));
+            stores.push(store);
+        }
+        let striper = PoolStriper::from_slots("pool", scheme, slots).unwrap();
+        (stores, striper)
     }
 
     // YDB's handoff-disk rule: a part whose nominal slot does not answer is
@@ -1266,6 +1331,215 @@ mod tests {
             assert_eq!(striper.get_blob(id).unwrap(), payload);
             stop_all(vdisks);
         }
+    }
+
+    // Defect: `put_blob` reduced every nominal result to `is_ok()`, so a
+    // permanent refusal looked exactly like an unreachable slot. The part was
+    // then written to a handoff slot and the write was acknowledged, and the ack
+    // described bytes that reads never return: the nominal slots still hold the
+    // first payload, while the spares hold fragments of the second.
+    #[test]
+    fn conflicting_nominal_put_refuses_the_write_instead_of_handing_off() {
+        let scheme = ErasureScheme::ReedSolomon { k: 4, m: 2 };
+        // Six spares, so the buggy code could place every part and ack.
+        let (vdisks, striper) = remote_pool("pool", scheme, 6);
+        let id = BlobId::new(13, 1, 1, 1, 2, 0);
+        let first = b"Multi-tenant erasure-coded tablet SSTable block #0001";
+        let second = b"a different payload for the same immutable id #0002";
+        striper.put_blob(id, first).unwrap();
+
+        // Every nominal slot now answers 409: the id already holds other bytes.
+        for vdisk in vdisks.iter().take(scheme.total_parts()) {
+            vdisk.put_status.store(409, Ordering::Relaxed);
+        }
+
+        match striper.put_blob(id, second) {
+            // The error is propagated unchanged, so it names the fragment the
+            // slot refused, not the logical blob: same blob, part 1.
+            Err(BlobError::ImmutableConflict(refused)) => {
+                assert_eq!(
+                    refused.with_part(0),
+                    id,
+                    "refusal names a part of this blob"
+                )
+            }
+            other => panic!("a conflicting put must refuse with ImmutableConflict, got {other:?}"),
+        }
+        assert_eq!(
+            stored(&vdisks, 6, 12),
+            0,
+            "a permanent refusal must never be handed off to a spare"
+        );
+        assert_eq!(
+            striper.get_blob(id).unwrap(),
+            first,
+            "an ack for `second` would describe bytes that reads never return"
+        );
+        stop_all(vdisks);
+    }
+
+    // A tombstone is a durable fence, not a missing slot. Writing the part to a
+    // spare would resurrect a blob the tombstone just deleted, from a copy the
+    // tombstone never covered (a delete that reached the nominal slots only).
+    #[test]
+    fn tombstoned_nominal_slot_refuses_the_write_without_resurrecting() {
+        let scheme = ErasureScheme::ReedSolomon { k: 4, m: 2 };
+        let (stores, striper) = local_pool(7301, scheme, 6);
+        let id = BlobId::new(13, 2, 1, 1, 2, 0);
+        let payload = b"Multi-tenant erasure-coded tablet SSTable block #0001";
+        striper.put_blob(id, payload).unwrap();
+
+        // A delete that reached the nominal placement but not the spares: every
+        // part id is tombstoned where it nominally lives, and the spares would
+        // still accept the same bytes.
+        for store in stores.iter().take(scheme.total_parts()) {
+            for part in 1..=scheme.total_parts() as u8 {
+                store.delete(id.with_part(part)).unwrap();
+            }
+        }
+
+        match striper.put_blob(id, payload) {
+            Err(BlobError::Tombstoned(refused)) => {
+                assert_eq!(
+                    refused.with_part(0),
+                    id,
+                    "refusal names a part of this blob"
+                )
+            }
+            other => panic!("a put over a tombstone must refuse with Tombstoned, got {other:?}"),
+        }
+        for (i, store) in stores.iter().enumerate() {
+            assert_eq!(
+                store.stats().unwrap().live_blobs,
+                0,
+                "slot {i} must hold no fragment: a tombstone is not a missing slot"
+            );
+        }
+        // No fragment is readable from anywhere, nominal or spare: the deleted
+        // blob is gone, not resurrected on a handoff slot.
+        assert!(
+            matches!(
+                striper.get_blob(id),
+                Err(BlobError::InsufficientFragments { available: 0, .. })
+            ),
+            "the tombstoned blob must not be resurrected, got {:?}",
+            striper.get_blob(id)
+        );
+    }
+
+    // Same rule for a barrier fence: the generation barrier is durable on the
+    // nominal slots, and rerouting the part to a spare the barrier does not cover
+    // would defeat it.
+    #[test]
+    fn barrier_fenced_nominal_slot_refuses_the_write_instead_of_handing_off() {
+        let scheme = ErasureScheme::ReedSolomon { k: 4, m: 2 };
+        let (stores, striper) = local_pool(7302, scheme, 6);
+        let id = BlobId::new(13, 3, 1, 1, 2, 0);
+        let payload = b"Multi-tenant erasure-coded tablet SSTable block #0001";
+
+        for slot in striper.slots().iter().take(scheme.total_parts()) {
+            slot.apply_barrier(id.project_id(), id.owner_id(), id.channel(), 1, false)
+                .unwrap();
+        }
+
+        match striper.put_blob(id, payload) {
+            Err(BlobError::FencedByBarrier {
+                id: refused,
+                barrier_gen,
+            }) => {
+                assert_eq!(
+                    refused.with_part(0),
+                    id,
+                    "refusal names a part of this blob"
+                );
+                assert_eq!(barrier_gen, 1);
+            }
+            other => panic!("a fenced put must refuse with FencedByBarrier, got {other:?}"),
+        }
+        for (i, store) in stores.iter().enumerate() {
+            assert_eq!(
+                store.stats().unwrap().live_blobs,
+                0,
+                "slot {i} must hold no fragment: a fence is not a missing slot"
+            );
+        }
+        assert!(striper.get_blob(id).is_err());
+    }
+
+    // The behaviour the fix must preserve: a slot that could not answer *is*
+    // handoff-eligible. One I/O failure on a nominal slot costs nothing but the
+    // placement, and the ack still means full redundancy.
+    #[test]
+    fn a_nominal_slot_that_fails_once_is_handed_off() {
+        let scheme = ErasureScheme::ReedSolomon { k: 4, m: 2 };
+        let (vdisks, striper) = remote_pool("pool", scheme, 3);
+        let id = BlobId::new(13, 4, 1, 1, 2, 0);
+        let payload = b"Multi-tenant erasure-coded tablet SSTable block #0001";
+
+        // Nominal slot 2 misses its first PUT with a 500, which a remote slot
+        // maps to `Io`: the only handoff-eligible failure.
+        vdisks[2].fail_once.store(true, Ordering::Relaxed);
+
+        striper
+            .put_blob(id, payload)
+            .expect("a transient I/O failure must still be handed off");
+        assert_eq!(stored(&vdisks, 2, 3), 0);
+        assert_eq!(stored(&vdisks, 6, 9), 1);
+        assert_eq!(stored(&vdisks, 0, 9), 6);
+        assert_eq!(striper.get_blob(id).unwrap(), payload);
+        let health = striper.health_snapshot(false);
+        assert_eq!(health.refused_puts, 0);
+        assert_eq!(health.degraded_puts, 0);
+        stop_all(vdisks);
+    }
+
+    // Defect: the handoff loop broke out as soon as a whole round made no
+    // progress. One refusing spare then stopped the search while a healthy spare
+    // was still untried, so a write that had a spare available was refused. The
+    // search now ends only when no unplaced part has an untried eligible spare.
+    #[test]
+    fn handoff_tries_the_next_spare_when_the_first_eligible_spare_refuses() {
+        let scheme = ErasureScheme::ReedSolomon { k: 4, m: 2 };
+        let (vdisks, striper) = remote_pool("pool", scheme, 3);
+        let id = BlobId::new(13, 5, 1, 1, 2, 0);
+        let payload = b"Multi-tenant erasure-coded tablet SSTable block #0001";
+
+        // Nominal slot 2 (node 3) stops answering puts.
+        vdisks[2].fail_puts.store(true, Ordering::Relaxed);
+        let failed_node = striper.slots()[2].node_id();
+        // The spare on the failed node is skipped, so two spares are eligible.
+        let eligible: Vec<usize> = striper
+            .handoff_order_for(id)
+            .into_iter()
+            .filter(|&slot| striper.slots()[slot].node_id() != failed_node)
+            .collect();
+        assert!(
+            eligible.len() >= 2,
+            "the fixture must offer two eligible spares, got {eligible:?}"
+        );
+        let (first, second) = (eligible[0], eligible[1]);
+        vdisks[first].fail_puts.store(true, Ordering::Relaxed);
+
+        striper.put_blob(id, payload).unwrap_or_else(|e| {
+            panic!(
+                "spare {first} refusing must not stop the search while spare {second} is \
+                 untried: {e:?}"
+            )
+        });
+        assert_eq!(
+            stored(&vdisks, first, first + 1),
+            0,
+            "the refusing spare must hold nothing"
+        );
+        assert_eq!(
+            stored(&vdisks, second, second + 1),
+            1,
+            "the part must land on the next eligible spare"
+        );
+        assert_eq!(stored(&vdisks, 0, 9), 6);
+        assert_eq!(striper.get_blob(id).unwrap(), payload);
+        assert_eq!(striper.health_snapshot(false).degraded_puts, 0);
+        stop_all(vdisks);
     }
 
     // Adding handoff slots must not move a single existing part: `select_slot`

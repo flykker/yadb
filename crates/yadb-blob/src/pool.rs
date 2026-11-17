@@ -787,6 +787,15 @@ impl<FS: StorageFs> PoolStriper<FS> {
         (0..count).map(move |i| self.nominal_slots + (start + i) % count)
     }
 
+    /// Test-only view of the spare order for one blob, so a test can fail the
+    /// spare the writer would try first and assert the one it would try next.
+    /// Deliberately not part of the public surface: callers must never pin a
+    /// placement.
+    #[cfg(test)]
+    pub(crate) fn handoff_order_for(&self, logical_id: BlobId) -> Vec<usize> {
+        self.handoff_order(logical_id).collect()
+    }
+
     /// Every slot that may hold part `idx` of `logical_id`, nominal first.
     ///
     /// A part is written to exactly one slot, but which one depends on whether
@@ -838,6 +847,13 @@ impl<FS: StorageFs> PoolStriper<FS> {
     /// replacement — accumulate until a pool-wide collector exists. Refusing is
     /// deliberate: an ack that only means "readable" would let a client believe
     /// data survived a node loss when it cannot.
+    ///
+    /// A slot that *refuses* the write — `ImmutableConflict`,
+    /// `FencedByBarrier`, `Tombstoned`, or any other non-`Io` failure — is not a
+    /// missing slot. Such a refusal aborts the write and is returned unchanged:
+    /// the part is never retried on a spare, because an ack that the refused
+    /// bytes were durable elsewhere would be a lie about what reads return.
+    /// Only `BlobError::Io` is handoff-eligible.
     pub fn put_blob(&self, logical_id: BlobId, payload: &[u8]) -> Result<(), BlobError> {
         let fragments = self.codec.encode(payload);
         let required = self.min_write_quorum();
@@ -848,6 +864,10 @@ impl<FS: StorageFs> PoolStriper<FS> {
             .map(|idx| self.select_slot(logical_id, idx))
             .collect();
         let mut landed = vec![false; total];
+        // Why each part did not land, when the slot gave a reason. Keeping the
+        // reason is what lets a refusal be told apart from an unreachable slot;
+        // flattening the result to `landed[idx] = r.is_ok()` loses that.
+        let mut failures: Vec<Option<BlobError>> = (0..total).map(|_| None).collect();
 
         if self.has_remote {
             let results: Vec<(usize, Result<(), BlobError>)> = std::thread::scope(|s| {
@@ -874,14 +894,33 @@ impl<FS: StorageFs> PoolStriper<FS> {
 
             for (idx, r) in results {
                 // The reason is recorded by the slot's own counters; the write
-                // reports only the shortfall.
-                landed[idx] = r.is_ok();
+                // reports the refusal itself when it is permanent.
+                match r {
+                    Ok(()) => landed[idx] = true,
+                    Err(e) => failures[idx] = Some(e),
+                }
             }
         } else {
             for (idx, frag) in fragments.iter().enumerate() {
                 let part_id = logical_id.with_part((idx + 1) as u8);
-                landed[idx] = self.slots[nominal[idx]].put(part_id, frag).is_ok();
+                match self.slots[nominal[idx]].put(part_id, frag) {
+                    Ok(()) => landed[idx] = true,
+                    Err(e) => failures[idx] = Some(e),
+                }
             }
+        }
+
+        // A permanent refusal is not a missing slot. `ImmutableConflict`,
+        // `FencedByBarrier` and `Tombstoned` are durable statements about the
+        // id: the pool was told "no", and writing the part to a spare would
+        // acknowledge bytes that reads can never return (or resurrect a blob
+        // that a barrier or a tombstone just fenced). Only a slot that could not
+        // answer is handoff-eligible, and a refusal is propagated unchanged
+        // rather than retried or reported as a generic shortfall. `refused_puts`
+        // is deliberately not bumped: it counts lost write *availability*, and a
+        // refusal here is a correctness decision, not an availability loss.
+        if let Some(refusal) = failures.into_iter().flatten().find(|e| !e.is_unavailable()) {
+            return Err(refusal);
         }
 
         // Handoff: a part whose nominal slot did not answer is placed on a spare
@@ -902,11 +941,20 @@ impl<FS: StorageFs> PoolStriper<FS> {
         // `failed_parts * handoff_slots` connection timeouts inside a single
         // write, which on its own pushed a 24-way burst past the commit budget
         // and turned a slow node into an election. A round is bounded by one
-        // slot's timeout instead, and the loop only repeats when a spare itself
-        // did not answer.
+        // slot's timeout instead, and the loop repeats for as long as some
+        // unplaced part still has an untried eligible spare.
+        //
+        // Termination is by exhaustion, never by a progress check: an earlier
+        // version broke out of the loop when a whole round failed, so one
+        // unreachable spare stopped the search while a healthy spare beside it
+        // was still untried. `used` grows by every assigned slot in every round
+        // and never shrinks, so each round consumes at least one spare from the
+        // finite handoff set and the loop runs at most `handoff_slot_count()`
+        // times. `assignments.is_empty()` is the only exit.
         // Slots unavailable to this blob: its nominal slots, plus every spare
         // that already holds a part or refused one.
         let mut used: BTreeSet<usize> = nominal.iter().copied().collect();
+        let mut rounds = 0usize;
         loop {
             // Assign each still-unplaced part a distinct spare, skipping spares
             // on the node whose nominal slot failed for that part.
@@ -928,6 +976,12 @@ impl<FS: StorageFs> PoolStriper<FS> {
             if assignments.is_empty() {
                 break;
             }
+            rounds += 1;
+            debug_assert!(
+                rounds <= self.handoff_slot_count(),
+                "handoff loop must terminate by exhausting the {} spare slots, ran {rounds} rounds",
+                self.handoff_slot_count()
+            );
             let placed = if self.has_remote {
                 std::thread::scope(|s| {
                     let handles: Vec<(usize, usize, _)> = assignments
@@ -936,16 +990,24 @@ impl<FS: StorageFs> PoolStriper<FS> {
                             let part_id = logical_id.with_part((idx + 1) as u8);
                             let frag = &fragments[idx];
                             let target = &self.slots[slot];
-                            (
-                                idx,
-                                slot,
-                                s.spawn(move || target.put(part_id, frag).is_ok()),
-                            )
+                            (idx, slot, s.spawn(move || target.put(part_id, frag)))
                         })
                         .collect();
                     handles
                         .into_iter()
-                        .map(|(idx, slot, h)| (idx, slot, h.join().unwrap_or(false)))
+                        .map(|(idx, slot, h)| {
+                            (
+                                idx,
+                                slot,
+                                // A panicked thread is an unavailable slot, not
+                                // a refusal: there is no reason to report.
+                                h.join().unwrap_or_else(|_| {
+                                    Err(BlobError::Io(std::io::Error::other(
+                                        "slot put thread panicked",
+                                    )))
+                                }),
+                            )
+                        })
                         .collect::<Vec<_>>()
                 })
             } else {
@@ -953,27 +1015,25 @@ impl<FS: StorageFs> PoolStriper<FS> {
                     .iter()
                     .map(|&(idx, slot)| {
                         let part_id = logical_id.with_part((idx + 1) as u8);
-                        (
-                            idx,
-                            slot,
-                            self.slots[slot].put(part_id, &fragments[idx]).is_ok(),
-                        )
+                        (idx, slot, self.slots[slot].put(part_id, &fragments[idx]))
                     })
                     .collect()
             };
-            let mut progressed = false;
-            for (idx, slot, ok) in placed {
+            for (idx, slot, result) in placed {
                 // The slot is consumed either way: a spare that accepted the part
                 // holds it, and one that refused must not be retried with a
                 // different part of the same blob in the same write.
                 used.insert(slot);
-                if ok {
-                    landed[idx] = true;
-                    progressed = true;
+                match result {
+                    Ok(()) => landed[idx] = true,
+                    // A spare that refuses permanently refuses the whole write
+                    // with that refusal. Moving the part to another spare would
+                    // be exactly the bypass the nominal attempt already rejects.
+                    Err(e) if !e.is_unavailable() => return Err(e),
+                    // An unreachable spare only costs this attempt; the next
+                    // round offers the part to the next untried spare.
+                    Err(_) => {}
                 }
-            }
-            if !progressed {
-                break;
             }
         }
 
