@@ -308,7 +308,9 @@ writers and are set explicitly rather than inherited:
   the deadline, and the daemon sets it to one `election_timeout_min`, because an
   append older than one election timeout is stale regardless. `None` keeps
   OpenRaft's own deadline, which the in-process test transports rely on.
-  Snapshot transfers keep their own, longer deadline.
+  Snapshot transfers use `install_snapshot_timeout` (200 ms by default) as their
+  hard TTL, which the same floor raises: a snapshot cannot cross a fresh mTLS
+  handshake in 200 ms either.
 * **Concurrent dispatch.** The bridge hands each write to the runtime without
   waiting for the previous one to finish. `client_write` is safe to call
   concurrently, and it is the only way the runtime can batch entries into one
