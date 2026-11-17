@@ -178,7 +178,12 @@ pub struct GcLease {
     pub project_id: u32,
     /// Metadata group whose namespace holds this record. `None` is the single
     /// legacy namespace; a legacy record never carries this field.
-    #[serde(default)]
+    ///
+    /// `skip_serializing_if` is part of the legacy contract, not cosmetics: a
+    /// record written before per-group GC must be byte-identical to the one
+    /// written after it, otherwise a mixed-version deployment produces a
+    /// different `revision` for the same logical event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<u64>,
     /// The metadata revision the holder is reading (readers) or the revision it
     /// observed before writing (writers). Informational: the collector refuses on
@@ -1272,6 +1277,43 @@ mod tests {
         release(&meta, &writer).unwrap();
         assert!(live_leases_in(&meta, 2).unwrap().is_empty());
         assert!(meta.get(&key).is_none());
+    }
+
+    #[test]
+    fn a_legacy_lease_record_is_byte_identical_to_the_pre_group_format() {
+        // Per-group GC added a `group` field. A legacy record must still encode
+        // exactly as it did before that field existed: same keys, same order,
+        // no `"group":null`. Otherwise the same logical event produces a
+        // different stored revision in a mixed-version deployment.
+        let lease = GcLease {
+            id: "abc".into(),
+            kind: LeaseKind::Writer,
+            project_id: 7,
+            group: None,
+            revision: 5,
+            expires_at_ms: 1_700_000_000_000,
+            mod_revision: 0,
+        };
+        let encoded = serde_json::to_string(&lease).unwrap();
+        assert_eq!(
+            encoded,
+            r#"{"id":"abc","kind":"writer","project_id":7,"revision":5,"expires_at_ms":1700000000000,"mod_revision":0}"#
+        );
+        // The pre-group format still decodes, so an older record stays readable.
+        let decoded: GcLease = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, lease);
+        assert_eq!(decoded.group, None);
+
+        // A group record does carry the field, and it is the only difference.
+        let grouped = GcLease {
+            group: Some(2),
+            ..lease
+        };
+        let grouped = serde_json::to_string(&grouped).unwrap();
+        assert_eq!(
+            grouped,
+            r#"{"id":"abc","kind":"writer","project_id":7,"group":2,"revision":5,"expires_at_ms":1700000000000,"mod_revision":0}"#
+        );
     }
 
     #[test]
