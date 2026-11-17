@@ -169,11 +169,16 @@ need the PostgreSQL, S3 and iSCSI frontends as well; `scripts/yadb-local.py`
 provisions a Multi-Raft cluster without the client protocol listeners.
 
 Multi-Raft mark-and-sweep is temporarily refused, both manually and by the
-periodic task, because lease expiry races can make its fence unsafe. Manual GC
-and scrub return `409`; the periodic task logs the refusal. Garbage therefore
-accumulates and can exhaust disk space. This change does not cancel requests
-already in flight from older processes or prove unrelated deletion paths safe.
-Stop old processes before deploying it and account for in-flight storage work.
+periodic task. A writer lease can be renewed while a collector pass is in
+flight, and collector RPCs can continue past lease expiry, so a reader lease
+alone is not a sufficient fence. Storage-side fencing (an epoch on every target
+and a versioned RPC) is designed only conceptually and is not implemented.
+Manual GC and scrub return `409`, report zero deletions and zero reclaimed
+bytes, and leave fragments intact; the periodic task logs the refusal. Garbage
+therefore accumulates and can exhaust disk space. This change does not cancel
+requests already in flight from older processes or prove unrelated deletion
+paths safe. Stop old processes before deploying it and account for in-flight
+storage work.
 
 Multi-Raft readers do not publish reader leases; a quorum-confirmed
 `consistent=true` snapshot does not fence fragment collection. Plain reads use
@@ -282,6 +287,14 @@ caller: the bridge aborts its task, not the Raft entry, so the proposal may stil
 commit. For a keyed `/v1/apply`, resolve the outcome with
 `POST /v1/idempotency/resolve`; for any other write, reconcile application state
 before retrying.
+
+S3 upload allocation ids are handed out in blocks of 32. A writer's first upload
+after its cache empties advances `/s3-upload-sequence/{project_id}` by 32 in one
+guarded write and serves the rest of the block locally, so a burst performs one
+sequence transaction per process per round instead of one per upload. A process
+that exits with ids unused loses that tail; the ids are never reused. `generation`
+is the low 24 bits of the allocation id, so generation values advance in steps of
+32 rather than by 1.
 
 ## Fail-closed recovery matrix
 

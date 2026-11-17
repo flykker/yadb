@@ -109,7 +109,10 @@ serializable or transaction-wide snapshot isolation without separate work.
   `/sql-blob-sequence/{project}` reserve non-reused 56-bit allocations before
   fragment PUT. Counters must not be reset, cloned, deleted or rolled back while
   fragments from their previous history can exist. Unknown reservations cannot
-  authorize PUT. A single allocator per project would remain a hot shared group.
+  authorize PUT. S3 now advances its counter by a block of 32 ids per guarded
+  update and serves the rest locally, skipping the unused tail instead of
+  reusing it; the other counters still reserve one id per write, so a single
+  allocator per project remains a hot shared group for them.
 * Old and unpublished SQL/block fragments and retired S3 versions are retained.
   Moving metadata or a group does not by itself establish reader-safe GC.
 

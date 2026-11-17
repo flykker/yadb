@@ -1112,15 +1112,16 @@ the object and the 602 rows intact. Gates on this tree: `yadbd --bins` **76/76**
 `tests/protocols.py --native-clients` **17/17** on the legacy three-node
 cluster.
 
-**Open.** The collector is legacy-only: on Multi-Raft both endpoints refuse with
-`garbage collection disabled for Multi-Raft: no single atomic cross-group
-metadata snapshot`, because one node cannot enumerate every group's manifests
-while deletion is pool-scoped. (Superseded for Multi-Raft by the per-group
-collector described in "Per-group garbage collection on Multi-Raft" below; the
-legacy behaviour in this section is unchanged.) A pass needs each node read-idle
-for one lease TTL
-(30 s), because a node keeps its reader lease for reuse instead of deleting it
-per statement; a continuously busy node refuses instead of waiting. A read that
+**Open.** The collector is legacy-only. On Multi-Raft both endpoints return
+`409` with `MULTIRAFT_GC_REFUSAL`: a writer lease can be renewed while a
+collector pass is in flight, and collector RPCs can continue past lease expiry,
+so a reader lease alone is not a sufficient fence. The per-group collector
+described in "Per-group garbage collection on Multi-Raft" below was implemented
+and then disabled for the same reason; storage-side fencing is not implemented,
+so garbage accumulates. The legacy behaviour in this section is unchanged. A
+pass needs each node read-idle for one lease TTL (30 s), because a node keeps
+its reader lease for reuse instead of deleting it per statement; a
+continuously busy node refuses instead of waiting. A read that
 outlives its own lease is not refreshed mid-read, so a query longer than 30 s is
 refused with `503` after it finishes rather than returning bytes a pass may have
 reclaimed; the client must re-issue it. `/s3-retired/` records are kept
@@ -1546,15 +1547,16 @@ and `beta`) and the same control-group leader.
 
 ### GC and scrub refusal
 
-With Multi-Raft metadata, `POST /v1/pools/gc` returned **409** on all three
-nodes with `gc_refusal: "garbage collection disabled for Multi-Raft: no single
-atomic cross-group metadata snapshot"`. `POST /v1/pools/scrub` returned 200 with
-the same `gc_refusal` field and an empty pool list: the repair scan runs, and it
-reports that collection was skipped rather than silently reporting zero
-collected fragments.
+With Multi-Raft metadata, `POST /v1/pools/gc` and `POST /v1/pools/scrub` return
+**409** with `gc_refusal` set to `MULTIRAFT_GC_REFUSAL`: a writer lease can be
+renewed while a collector pass is in flight and collector RPCs can outlive their
+lease, so a reader lease alone does not fence collection. Both report zero
+deletions and zero reclaimed bytes and leave fragments intact.
 
-(That was the behaviour at `234d49a`. The per-group collector replaces it; see
-"Per-group garbage collection on Multi-Raft" below.)
+(At `234d49a` the reason was `garbage collection disabled for Multi-Raft: no
+single atomic cross-group metadata snapshot`, and scrub answered 200. The
+per-group collector described below replaced that, then was itself disabled;
+current behaviour is the fail-closed refusal above.)
 
 ### Failure drills
 
@@ -1988,6 +1990,36 @@ passes when run alone (pre-existing timing sensitivity, not touched here).
   fence in-flight writes there.
 * A pass over a group whose project set is empty still takes and releases its
   collector record; the cost is one round trip, not a correctness issue.
+
+## S3 allocation ids in blocks (2026-11-17)
+
+S3 uploads no longer perform one guarded update of
+`/s3-upload-sequence/{project_id}` per upload. A writer's first upload after its
+cache empties advances the durable counter by `ALLOCATION_BLOCK` (32) and serves
+the rest of the block from a process-local, per-project cache; the next guarded
+update happens only when that block is spent.
+
+The contention that motivated it was measured on the 24-writer S3 burst: 48
+uploads produced 596 sequence transactions on the single
+`/s3-upload-sequence/` key, and individual transactions exceeded the metadata
+bridge deadline and surfaced as `503 ... metadata bridge response timed out or
+stopped`. With the block allocator the same burst needs one sequence transaction
+per process per round instead of one per upload.
+
+The unused tail of a block is not returned to the counter. An allocation id only
+has to be unique and increasing; skipping ids is safe, while reusing one would
+alias two uploads, including after a restart, because the durable counter already
+sits at the end of the block. A crash therefore loses the unused tail of the
+current block instead of handing out a duplicate. `reserve_upload` still refuses
+to reuse the ids of failed or ambiguous allocations and still returns
+`GenerationExhausted` when the counter would pass `MAX_ALLOCATION`
+(`(1<<56)-1`).
+
+`generation` in a BlobId is the low 24 bits of the allocation id (`MAX_U24`), so
+blocks of 32 make generation values advance in steps of 32 rather than by 1.
+Generation exhaustion still happens after the same total number of allocations,
+but it is consumed 32 ids at a time, so a project that runs out of generations may
+do so up to 31 ids earlier than a per-upload allocator would.
 
 ## Handoff slots, a commit wait that reads silence correctly, and the live drill (2026-11-17)
 
