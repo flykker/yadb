@@ -996,7 +996,7 @@ mod tests {
             fs.sync_dir("legacy_epoch").unwrap();
         }
 
-        let store = VolumeStore::open(fs, "legacy_epoch", cfg).unwrap();
+        let store = VolumeStore::open(fs.clone(), "legacy_epoch", cfg).unwrap();
         assert_eq!(store.epoch(), 0);
         assert_eq!(store.get(id).unwrap(), payload);
         assert_eq!(store.fragment_epoch(id), Some(0));
@@ -1010,6 +1010,22 @@ mod tests {
         ));
         assert_eq!(store.get(id).unwrap(), payload);
         assert!(store.delete_fenced(id, 0).unwrap());
+        drop(store);
+
+        // The real upgrade path is: open a legacy volume, append current records
+        // to the same segment, restart. Recovery has to parse the 33-byte record
+        // and land exactly on the 41-byte one that follows, or it truncates the
+        // tail and loses the tombstone - which would resurrect a deleted blob.
+        let reopened = VolumeStore::open(fs.clone(), "legacy_epoch", cfg).unwrap();
+        assert_eq!(reopened.epoch(), 0);
+        assert!(
+            !reopened.contains(id),
+            "the tombstone appended after a legacy record must survive reopen"
+        );
+        assert!(matches!(
+            reopened.put(id, payload),
+            Err(BlobError::Tombstoned { .. })
+        ));
     }
 
     #[test]
