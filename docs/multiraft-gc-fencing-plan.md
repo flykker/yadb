@@ -137,6 +137,24 @@ What it does **not** establish, and why the invariant still does not hold:
   delete RPC is replaced, nothing forces the collector path to use
   `delete_fenced` at all; the unfenced `delete` is still callable.
 
+### On-disk format: the upgrade is one-way
+
+The record header grew from 33 to 41 bytes and its magic changed from `YBRC` to
+`YBRD`, because the epoch had to be covered by the header CRC rather than appended
+outside it. The direction of compatibility is deliberate and only one way:
+
+* an older volume (all `YBRC` records) opens on this code, with every record in
+  epoch 0;
+* a volume written by this code does **not** open on an older binary. The old
+  recovery compares the magic, does not recognise `YBRD`, and refuses with
+  `InvalidSegment("corrupt record header")` instead of skipping the record.
+
+That is the fail-closed direction — an old binary cannot read a fragment, let
+alone delete one — but it means a rollback after an upgrade requires restoring the
+volume from a backup taken before it, not just swapping the binary back. Plan the
+upgrade as irreversible per volume, and do not mix binaries across a rollback of
+the same directory.
+
 ## Invariant to establish
 
 > A fragment is deleted only if no reader can still hold a reference to it, and
