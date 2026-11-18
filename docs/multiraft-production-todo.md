@@ -456,7 +456,12 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   not necessarily reaped it yet. A pass renews its own collector record before the
   watermark, before the first deletion and before each pool, re-checks it while a
   pool deletes — before the first deletion, before every barrier group and every
-  32 exact tombstones — and stops deleting if a check loses. A write joins its
+  32 exact tombstones — and stops deleting if a check loses. Renewal itself refuses
+  in both directions: the record must be live when checked *and* the write must be
+  acknowledged before the deadline it extends, because a compare-and-swap proves
+  ownership but not liveness, and a record that expired during the round trip was
+  otherwise resurrected. The write is left in place when the acknowledgement is
+  late, so admission stays refused until it lapses. A write joins its
   lease's guard to the transaction that
   publishes the map or manifest, so a writer that stalled past its lease is
   refused instead of publishing fragments a pass has already reclaimed; a read

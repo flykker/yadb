@@ -274,39 +274,22 @@ impl<'a, FS: StorageFs> GcLeaseGuard<'a, FS> {
     }
 
     /// Extends the lease to a full `ttl_ms` from now, refusing if this holder no
-    /// longer owns the record or if the record's lifetime already ran out.
+    /// longer owns the record, if the record's lifetime already ran out, or if the
+    /// write is acknowledged only after the deadline it was extending.
     ///
     /// Long writes and reads call this before the step that must stay fenced
     /// (the publication transaction, the fragment fetch), so a slow operation
     /// does not silently run past the lifetime its fence promised.
     pub fn renew(&mut self, ttl_ms: u64) -> Result<(), MetaError> {
-        if let Some(error) = renew_refusal(&self.lease) {
-            return Err(error);
-        }
-        let mut next = self.lease.clone();
-        next.expires_at_ms = now_ms().saturating_add(ttl_ms.max(1));
-        let value = serde_json::to_vec(&next)?;
-        match self.meta.execute(KvCommand::RevisionTxn {
-            guards: vec![self.guard()],
-            ops: vec![TxnOp::Put {
-                key: self.key.clone(),
-                value,
-            }],
-        })? {
-            KvResult::TxnOk { revision, .. } => {
-                next.mod_revision = revision;
-                self.lease = next;
-                Ok(())
-            }
-            KvResult::CasConflict { .. } => Err(MetaError::Routing(format!(
-                "gc {} lease {} is no longer held by this operation; refusing to continue under a fence that was lost",
-                kind_name(self.lease.kind),
-                self.lease.id
-            ))),
-            other => Err(MetaError::Routing(format!(
-                "gc lease renewal returned an unexpected result: {other:?}"
-            ))),
-        }
+        self.lease = extend(
+            self.meta,
+            &self.key,
+            &self.lease,
+            ttl_ms,
+            lost_writer_or_reader(&self.lease),
+            &now_ms,
+        )?;
+        Ok(())
     }
 
     /// Verifies the record is still the one this holder published.
@@ -642,8 +625,8 @@ pub fn release<FS: StorageFs>(meta: &LocalMetaKv<FS>, lease: &GcLease) -> Result
 /// fresh record, so a read could start under a lease that no longer excluded
 /// anything. Expiry is checked before the transaction, so the stale record is
 /// left untouched rather than rewritten with a new deadline.
-fn renew_refusal(lease: &GcLease) -> Option<MetaError> {
-    (!lease.is_live_at(now_ms())).then(|| {
+fn renew_refusal(lease: &GcLease, now: u64) -> Option<MetaError> {
+    (!lease.is_live_at(now)).then(|| {
         MetaError::Routing(format!(
             "gc {} lease {} expired at {} ms and cannot be renewed; publish a fresh lease instead of extending a fence that no longer holds",
             kind_name(lease.kind),
@@ -651,6 +634,97 @@ fn renew_refusal(lease: &GcLease) -> Option<MetaError> {
             lease.expires_at_ms
         ))
     })
+}
+
+/// The single renewal implementation behind [`renew`], [`GcLeaseGuard::renew`]
+/// and [`CollectorGuard::renew`].
+///
+/// They were three copies of the same transaction, and one of them silently kept
+/// the old behaviour when the others learned to refuse an expired record. Funnelling
+/// them through one function is what stops that from happening again.
+///
+/// Two refusals matter, and the second is why this is more than a guarded write:
+///
+/// * before the transaction, the record must still be live;
+/// * after it, the write must have been acknowledged before the deadline it was
+///   extending. A compare-and-swap proves the holder still *owns* the record; it
+///   does not prove the record was still *live* when the write was applied. The
+///   deadline can pass during the round trip, and the write then replaces an
+///   expired record with a live one — resurrecting a fence that another pass is
+///   entitled to treat as dead, and letting this holder delete or publish under a
+///   fence that stopped holding before its own check returned. The acknowledgement
+///   time bounds the apply time from above, so refusing whenever the
+///   acknowledgement is at or past the deadline is the conservative direction: a
+///   holder that cannot prove its renewal landed in time stops instead.
+///
+/// The write has already been applied when the second refusal fires, so the
+/// record stays behind with its extended deadline and expires on its own. The
+/// caller's release loses its CAS and leaves it, which is the safe direction:
+/// admission stays refused until the record lapses rather than being admitted
+/// under a fence this holder is abandoning.
+///
+/// `clock` is a parameter so a test can place the two readings on either side of
+/// the deadline without sleeping; production passes [`now_ms`].
+fn extend<FS: StorageFs>(
+    meta: &LocalMetaKv<FS>,
+    key: &str,
+    lease: &GcLease,
+    ttl_ms: u64,
+    lost: String,
+    clock: &dyn Fn() -> u64,
+) -> Result<GcLease, MetaError> {
+    if lease.mod_revision == 0 {
+        return Err(MetaError::Routing(
+            "refusing to renew a lease without the revision it was published at".into(),
+        ));
+    }
+    let checked = clock();
+    if let Some(error) = renew_refusal(lease, checked) {
+        return Err(error);
+    }
+    let mut next = lease.clone();
+    next.expires_at_ms = checked.saturating_add(ttl_ms.max(1));
+    let value = serde_json::to_vec(&next)?;
+    let revision = match meta.execute(KvCommand::RevisionTxn {
+        guards: vec![RevisionGuard {
+            key: key.into(),
+            expected_mod_revision: lease.mod_revision,
+        }],
+        ops: vec![TxnOp::Put {
+            key: key.into(),
+            value,
+        }],
+    })? {
+        KvResult::TxnOk { revision, .. } => revision,
+        KvResult::CasConflict { .. } => return Err(MetaError::Routing(lost)),
+        other => {
+            return Err(MetaError::Routing(format!(
+                "gc lease renewal returned an unexpected result: {other:?}"
+            )))
+        }
+    };
+    // `next.expires_at_ms` can be earlier than the old deadline when the caller
+    // renews with a shorter TTL, so the binding deadline is the earlier of the
+    // two: the record must be live at the acknowledgement either way.
+    let deadline = lease.expires_at_ms.min(next.expires_at_ms);
+    let acknowledged = clock();
+    if acknowledged >= deadline {
+        return Err(MetaError::Routing(format!(
+            "gc {} lease {} renewal was acknowledged at {acknowledged} ms, at or after the deadline {deadline} ms it was meant to extend; the write may have been applied after the fence lapsed, so the holder stops instead of continuing under a renewed record it cannot prove was still live",
+            kind_name(lease.kind),
+            lease.id
+        )));
+    }
+    next.mod_revision = revision;
+    Ok(next)
+}
+
+fn lost_writer_or_reader(lease: &GcLease) -> String {
+    format!(
+        "gc {} lease {} is no longer held by this operation; refusing to continue under a fence that was lost",
+        kind_name(lease.kind),
+        lease.id
+    )
 }
 
 /// Extends a lease published by [`acquire`] to a full `ttl_ms` from now.
@@ -663,37 +737,14 @@ pub fn renew<FS: StorageFs>(
     lease: &GcLease,
     ttl_ms: u64,
 ) -> Result<GcLease, MetaError> {
-    if lease.mod_revision == 0 {
-        return Err(MetaError::Routing(
-            "refusing to renew a lease without the revision it was published at".into(),
-        ));
-    }
-    if let Some(error) = renew_refusal(lease) {
-        return Err(error);
-    }
-    let mut next = lease.clone();
-    next.expires_at_ms = now_ms().saturating_add(ttl_ms.max(1));
-    let value = serde_json::to_vec(&next)?;
-    match meta.execute(KvCommand::RevisionTxn {
-        guards: vec![lease.guard()],
-        ops: vec![TxnOp::Put {
-            key: lease_key(lease),
-            value,
-        }],
-    })? {
-        KvResult::TxnOk { revision, .. } => {
-            next.mod_revision = revision;
-            Ok(next)
-        }
-        KvResult::CasConflict { .. } => Err(MetaError::Routing(format!(
-            "gc {} lease {} is no longer held by this operation",
-            kind_name(lease.kind),
-            lease.id
-        ))),
-        other => Err(MetaError::Routing(format!(
-            "gc lease renewal returned an unexpected result: {other:?}"
-        ))),
-    }
+    extend(
+        meta,
+        &lease_key(lease),
+        lease,
+        ttl_ms,
+        lost_writer_or_reader(lease),
+        &now_ms,
+    )
 }
 
 /// Publishes a reader lease. Callers must hold it across the metadata read *and*
@@ -752,8 +803,9 @@ impl<'a, FS: StorageFs> CollectorGuard<'a, FS> {
         &self.lease
     }
 
-    /// Extends the collector record, refusing if this pass no longer owns it or
-    /// if the record's lifetime already ran out.
+    /// Extends the collector record, refusing if this pass no longer owns it, if
+    /// the record's lifetime already ran out, or if the write is acknowledged only
+    /// after the deadline it was extending.
     ///
     /// A pass is allowed to take arbitrarily long between its fence check and its
     /// last deletion only while it keeps proving it is still the pass that owns
@@ -761,33 +813,18 @@ impl<'a, FS: StorageFs> CollectorGuard<'a, FS> {
     /// over, this fails and the caller must stop deleting. Expiry is refused for
     /// the same reason — an expired record no longer keeps another pass out, so
     /// extending it would resume deleting under a fence that was already gone.
+    /// The acknowledgement is checked as well because the CAS alone cannot tell
+    /// whether the record was still live when the write was applied.
     pub fn renew(&mut self, ttl_ms: u64) -> Result<(), MetaError> {
-        if let Some(error) = renew_refusal(&self.lease) {
-            return Err(error);
-        }
-        let mut next = self.lease.clone();
-        next.expires_at_ms = now_ms().saturating_add(ttl_ms.max(1));
-        let value = serde_json::to_vec(&next)?;
-        match self.meta.execute(KvCommand::RevisionTxn {
-            guards: vec![self.lease.guard()],
-            ops: vec![TxnOp::Put {
-                key: self.key.clone(),
-                value,
-            }],
-        })? {
-            KvResult::TxnOk { revision, .. } => {
-                next.mod_revision = revision;
-                self.lease = next;
-                Ok(())
-            }
-            KvResult::CasConflict { .. } => Err(MetaError::Routing(
-                "this collection pass lost the collector lease; no further fragment is deleted"
-                    .into(),
-            )),
-            other => Err(MetaError::Routing(format!(
-                "collector lease renewal returned an unexpected result: {other:?}"
-            ))),
-        }
+        self.lease = extend(
+            self.meta,
+            &self.key,
+            &self.lease,
+            ttl_ms,
+            "this collection pass lost the collector lease; no further fragment is deleted".into(),
+            &now_ms,
+        )?;
+        Ok(())
     }
 
     /// Verifies this pass still owns the record without extending it.
@@ -1342,6 +1379,75 @@ mod tests {
         assert!(error.contains("no longer held"), "{error}");
         assert!(!error.contains("expired at"), "{error}");
         assert!(renew(&meta, &renewed, DEFAULT_TTL_MS).is_ok());
+    }
+
+    #[test]
+    fn a_renewal_acknowledged_after_its_deadline_is_refused_even_though_the_write_landed() {
+        // The gap this closes: `renew` checked liveness and then did its CAS, so
+        // a record that expired *during* the round trip was still extended. The
+        // holder then deleted under a record it had just resurrected, which is
+        // the exact failure the expiry refusal exists to prevent - only narrowed
+        // from a whole TTL to one round trip.
+        let meta = meta();
+        let guard = acquire_writer(&meta, 1, 1, DEFAULT_TTL_MS).unwrap();
+        let lease = guard.lease().clone();
+        let key = lease_key(&lease);
+        // Live when checked, acknowledged one millisecond after the deadline.
+        let checked = lease.expires_at_ms - 1;
+        let calls = std::cell::Cell::new(0u32);
+        let clock = || {
+            calls.set(calls.get() + 1);
+            if calls.get() == 1 {
+                checked
+            } else {
+                lease.expires_at_ms + 1
+            }
+        };
+        let error = extend(&meta, &key, &lease, DEFAULT_TTL_MS, "lost".into(), &clock)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("acknowledged at"), "{error}");
+        assert!(error.contains("deadline"), "{error}");
+
+        // The write did land. Asserting that keeps the refusal from being
+        // satisfied by a second pre-check, which would leave the original window
+        // open; the record really does carry the extended deadline that the
+        // holder is refusing to trust.
+        let stored = meta.get(&key).expect("the renewal was written");
+        assert_ne!(stored.mod_revision, lease.mod_revision);
+        let stored: GcLease = serde_json::from_slice(&stored.value).unwrap();
+        assert!(stored.is_live_at(lease.expires_at_ms));
+    }
+
+    #[test]
+    fn a_renewal_acknowledged_before_its_deadline_is_still_accepted() {
+        // The positive control for the same seam: the post-write check must not
+        // refuse a renewal that provably landed while the fence was live.
+        let meta = meta();
+        let guard = acquire_reader(&meta, 1, 1, DEFAULT_TTL_MS).unwrap();
+        let lease = guard.lease().clone();
+        let checked = lease.expires_at_ms - 1000;
+        let calls = std::cell::Cell::new(0u32);
+        let clock = || {
+            calls.set(calls.get() + 1);
+            if calls.get() == 1 {
+                checked
+            } else {
+                checked + 10
+            }
+        };
+        let renewed = extend(
+            &meta,
+            &lease_key(&lease),
+            &lease,
+            DEFAULT_TTL_MS,
+            "lost".into(),
+            &clock,
+        )
+        .unwrap();
+        assert!(renewed.is_live_at(checked));
+        assert!(renewed.expires_at_ms >= lease.expires_at_ms);
+        assert_ne!(renewed.mod_revision, lease.mod_revision);
     }
 
     #[test]

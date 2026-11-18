@@ -180,6 +180,23 @@ async fn child(config: Value) {
             snapshot_policy: openraft::SnapshotPolicy::Never,
             max_in_snapshot_log_to_keep: 0,
             purge_batch_size: 1,
+            // These were left at OpenRaft's defaults (50 ms heartbeat, 150-300 ms
+            // elections) and that made the fixture flaky in two distinct ways:
+            // the first client write after `initialize` sometimes never committed
+            // (term 42, zero acks, `applied_index: None`), and a leader
+            // installing a snapshot to the restarted follower was voted out
+            // mid-install. Both are the same cause the daemon already refuses:
+            // `C::timeout(heartbeat_interval, ...)` wraps every append, the
+            // follower may have applied it, and OpenRaft does not retry a miss.
+            // The daemon rejects a heartbeat below 500 ms for exactly this reason
+            // and was measured clean at 750 ms (`docs/multiraft-verification.md`).
+            // This fixture bypassed that validation, so it exercised a
+            // configuration the product never accepts. Use the same budget as
+            // `crates/yadbd/tests/openraft_daemon.rs`, keeping the 3:1 ratio
+            // OpenRaft requires between election timeout and heartbeat.
+            heartbeat_interval: 750,
+            election_timeout_min: 2250,
+            election_timeout_max: 3000,
             ..Default::default()
         }
         .validate()
@@ -504,8 +521,9 @@ async fn three_process_mtls_network_partition() {
     if std::env::var_os(CHILD_ENV).is_some() {
         panic!("partition parent cannot be a child");
     }
-    // Three real processes with mTLS and default 150–300 ms election timeouts:
-    // only one such test may run at a time.
+    // Three real processes with mTLS and 2250-3000 ms election timeouts (see the
+    // child config for why they are not OpenRaft's 150-300 ms defaults): only one
+    // such test may run at a time.
     let _gate = super::test_gate::exclusive().await;
     tokio::time::timeout(Duration::from_secs(90), async {
         let base = std::env::var_os("YADB_TEST_TMPDIR")

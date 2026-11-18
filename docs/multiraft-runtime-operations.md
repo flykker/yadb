@@ -225,8 +225,14 @@ The metadata half of the lease is now stricter than the paragraph above
 suggests, and the difference matters when reading the plan. `ensure_live` refuses
 a record whose `expires_at_ms` has passed even when the record is still present
 and still carries the holder's `mod_revision`; all three renewal paths
-(`gc::renew`, `GcLeaseGuard::renew`, `CollectorGuard::renew`) refuse to extend
-such a record instead of resurrecting it. A reader or writer therefore cannot
+(`gc::renew`, `GcLeaseGuard::renew`, `CollectorGuard::renew`) share one
+implementation and refuse to extend such a record instead of resurrecting it.
+That implementation also refuses a renewal whose write is acknowledged at or
+after the deadline it was extending, because the compare-and-swap proves
+ownership but not liveness: a record that expired during the round trip was
+otherwise extended and the holder continued under a fence that had already
+lapsed. The write is left in place when that happens, so admission stays refused
+until the record expires on its own. A reader or writer therefore cannot
 act under a lease the collector already considers dead, and `begin_read_lease`
 publishes a fresh record instead of reusing a dead one. What remains unproven is
 exactly item 3 of the plan: the record lives in metadata, the deletion happens on

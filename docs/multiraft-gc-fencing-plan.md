@@ -35,19 +35,27 @@ renewal paths refuse to extend an expired record rather than resurrecting it
 collector already considers dead, and `begin_read_lease` publishes a fresh record
 instead of reusing a dead one.
 
+The renewal race is closed too. The three renewal paths are now one function
+(`extend`), and it refuses in both directions: the record must be live when it is
+checked, and the write must be acknowledged before the deadline it was extending.
+A compare-and-swap proves ownership, not liveness, so without the second check a
+record that expired during the round trip was extended and the holder went on
+deleting under a fence that had already lapsed. The write still lands in that
+case, which is deliberate: the record keeps its extended deadline and expires on
+its own, so admission stays refused until it lapses rather than being admitted
+under a fence the holder is abandoning. The cost is that a holder cannot renew
+with less than one round trip of its TTL left, and it stops instead of guessing.
+
 Item 1 is partly closed. A collector pass now re-proves the fence *while* it
 deletes: `sweep_pool` checks before its first deletion, before every barrier
 group and every 32 exact tombstones, and stops the pool and the pass on a failed
 check. The overshoot after expiry is therefore bounded to a few dozen tombstones
 per pool instead of the whole dead set.
 
-Two parts of item 1 remain open, and neither is closed by the above:
-
-- a barrier that is already in flight can still evict its entire dead generation
-  range after the record expired;
-- `renew` tests liveness and then performs its CAS, so a lease that expires
-  between those two steps is renewed successfully and the pass believes it holds
-  the fence until the next interval check.
+One part of item 1 remains open, and it is not closed by the above: a barrier that
+is already in flight can still evict its entire dead generation range after the
+record expired. The check runs before each barrier group, not inside the barrier
+itself, so the eviction it triggers is not bounded by the interval.
 
 The fix does not reduce the weight of item 3. The remaining gap is unchanged:
 metadata can be airtight and the target still deletes bytes a reader is holding.
