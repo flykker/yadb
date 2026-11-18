@@ -219,6 +219,17 @@ alone is not a sufficient fence. Storage-side fencing (an epoch on every target
 and a versioned RPC) is designed only conceptually and is not implemented; the
 plan, including the invariant it has to establish and the drill that would prove
 it, is in `multiraft-gc-fencing-plan.md`.
+
+The metadata half of the lease is now stricter than the paragraph above
+suggests, and the difference matters when reading the plan. `ensure_live` refuses
+a record whose `expires_at_ms` has passed even when the record is still present
+and still carries the holder's `mod_revision`; all three renewal paths
+(`gc::renew`, `GcLeaseGuard::renew`, `CollectorGuard::renew`) refuse to extend
+such a record instead of resurrecting it. A reader or writer therefore cannot
+act under a lease the collector already considers dead, and `begin_read_lease`
+publishes a fresh record instead of reusing a dead one. What remains unproven is
+exactly item 3 of the plan: the record lives in metadata, the deletion happens on
+a storage target that never sees it.
 Manual GC and scrub return `409`, report zero deletions and zero reclaimed
 bytes, and leave fragments intact; the periodic task logs the refusal. Garbage
 therefore accumulates and can exhaust disk space. This change does not cancel

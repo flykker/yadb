@@ -449,7 +449,11 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   CAS. Every record carries the `mod_revision` it was published at as an
   ownership token: renewal, release and drop are CAS-guarded by it, so a holder
   that lost its record cannot extend it, delete it, or delete the record of the
-  pass that took over. A pass renews its own collector record before the
+  pass that took over. Ownership is not the only condition: a record whose
+  `expires_at_ms` has passed is refused by `ensure_live` and by every renewal
+  path, even when it is still present and still carries the holder's token,
+  because the collector is entitled to treat it as dead at that moment and has
+  not necessarily reaped it yet. A pass renews its own collector record before the
   watermark, before the first deletion and before each pool, and stops deleting
   if a renewal loses. A write joins its lease's guard to the transaction that
   publishes the map or manifest, so a writer that stalled past its lease is

@@ -26,6 +26,24 @@ Only (3) is fundamental. A lease can be made airtight inside the metadata group
 actually unlinks the fragment. Collection is only safe if the target itself can
 tell a safe delete from an unsafe one.
 
+### What has since been closed
+
+Item 2 no longer holds. `ensure_live` refuses a record whose `expires_at_ms` has
+passed, even when the record is still present and still owned, and all three
+renewal paths refuse to extend an expired record rather than resurrecting it
+(`crates/yadb-metakv/src/gc.rs`). A reader or writer cannot act under a lease the
+collector already considers dead, and `begin_read_lease` publishes a fresh record
+instead of reusing a dead one.
+
+Item 1 is unchanged in this document's scope: a collector pass renews before the
+watermark, before its first deletion and before each pool, but the deletion loop
+inside a pool is the subject of a separate change. Until that lands, treat a long
+sweep of one pool as able to outlive its lease.
+
+The fix does not reduce the weight of item 3. The remaining gap is unchanged:
+metadata can be airtight and the target still deletes bytes a reader is holding.
+Do not read it as permission to enable collection.
+
 ## Invariant to establish
 
 > A fragment is deleted only if no reader can still hold a reference to it, and
