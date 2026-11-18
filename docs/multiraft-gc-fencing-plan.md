@@ -1,12 +1,13 @@
 # Plan: storage-side fencing for Multi-Raft garbage collection
 
-**Status: the mechanism below is design only and is not implemented.** One narrow
-piece of storage-side fencing does exist — a barrier carries the collector lease
-deadline and the target refuses an expired one (see below) — but it does not
-establish the invariant, and Multi-Raft mark-and-sweep stays refused (`409` on
-`/v1/pools/gc` and `/v1/pools/scrub`, periodic task logged and skipped) until the
-mechanism below exists and is proven. Garbage accumulates in the meantime; that
-cost was accepted deliberately.
+**Status: the mechanism below is design only and is not implemented**, apart from
+two narrow pieces of storage-side fencing: a barrier carries the collector lease
+deadline and the target refuses an expired one, and a target now keeps a durable
+epoch it can refuse an exact delete against (see "What the target epoch now
+establishes"). Neither piece establishes the invariant, and Multi-Raft
+mark-and-sweep stays refused (`409` on `/v1/pools/gc` and `/v1/pools/scrub`,
+periodic task logged and skipped) until the mechanism below exists and is proven.
+Garbage accumulates in the meantime; that cost was accepted deliberately.
 
 ## Why the current refusal exists
 
@@ -86,6 +87,56 @@ The fix does not reduce the weight of item 3. The remaining gap is unchanged:
 metadata can be airtight and the target still deletes bytes a reader is holding.
 Do not read it as permission to enable collection.
 
+## What the target epoch now establishes
+
+The first increment of item 3 is in place, and only its durable, single-target
+half, in `crates/yadb-blob` (`VolumeStore`). Nothing crosses a process boundary
+yet.
+
+What exists now:
+
+* Each volume keeps a durable `epoch: u64`. On open it is derived as the maximum
+  over every record in the volume's own log; it is never invented, and it is
+  never advanced by open, recovery, a put, a delete, a barrier or a compaction.
+* An advance is an appended `REC_KIND_EPOCH` record plus its sync, through
+  `advance_epoch(expected_epoch)`. The method refuses a caller whose expected
+  epoch is not the target's current one, so a superseded collector cannot move
+  the epoch past a newer one. Because the value is the maximum over records and
+  the record is never rewritten in place, a torn advance can only fail to raise
+  the epoch, never reset it, and an acknowledged advance is always one that
+  survived. A sync that fails after persisting leaves the higher value behind:
+  the epoch can over-advance, which fences more, never less.
+* Every PUT record carries the epoch it was written under. The previous 33-byte
+  record header is still read and its records belong to epoch 0, so a volume
+  written before this increment keeps opening. Compaction preserves each
+  fragment's epoch and rewrites the current epoch record, so neither is lost when
+  a segment is reclaimed.
+* `delete_fenced(id, expected_epoch)` refuses to unlink a fragment recorded under
+  any other epoch, with `BlobError::FencedByEpoch`, which names both epochs. The
+  refusal happens before any record is appended, so a refused delete leaves no
+  tombstone. The unfenced `delete` remains, documented as unfenced, and the
+  epoch comparison is equality — the strict form.
+
+These properties are covered by unit tests in `crates/yadb-blob/src/lib.rs`,
+including the torn-advance case driven through `SimFs` fault injection
+(`torn_write_prob`) and a legacy 33-byte record built by hand.
+
+What it does **not** establish, and why the invariant still does not hold:
+
+* Equality, not "older than". A collector that advanced to N+1 cannot collect an
+  epoch-N fragment through this path, because nothing on the target says whether
+  an epoch-N reader still holds it. That relaxation is only sound with pins, and
+  it belongs to the increment that adds them.
+* Nothing carries the epoch over the wire. `PoolSlot::delete` is still the
+  unfenced delete, there is no fence header or signed token on the fragment
+  endpoint, and `BarrierRequest`, `apply_barrier` and `collect_garbage_barrier`
+  are unchanged. A remote collector cannot be fenced by any of this yet.
+* There is no pin table, so a target can still only answer "which epoch does this
+  fragment belong to?", not "is this epoch still readable?".
+* No collector advances an epoch, and GC enablement is still refused. Until the
+  delete RPC is replaced, nothing forces the collector path to use
+  `delete_fenced` at all; the unfenced `delete` is still callable.
+
 ## Invariant to establish
 
 > A fragment is deleted only if no reader can still hold a reference to it, and
@@ -106,6 +157,11 @@ Each storage target keeps a durable `epoch: u64`, monotonic, incremented only by
 the collector under the target's directory lock. Every fragment write records the
 epoch it was created under, so a target can always say which epoch a fragment
 belongs to.
+
+The storage half of this is implemented (see "What the target epoch now
+establishes"). What is not implemented is the collector side: no pass takes the
+directory lock, reads a pin set, or advances an epoch, so nothing advances an
+epoch today except a test.
 
 ### 2. A delete that names its epoch
 
@@ -163,7 +219,7 @@ concurrently either lands before the check (pass aborts) or after the advance
 | --- | --- |
 | `crates/yadb-metakv/src/gc.rs` | Keep the admission CAS and the provenance check, but demote the lease to an optimisation: correctness no longer depends on it |
 | `crates/yadbd/src/gc.rs` | Sweep only with a fence epoch obtained per target; treat `stale fence` as "stop this pass", never as retryable |
-| storage target (blob volume + the daemon's fragment endpoint) | Durable epoch, pin table with expiry, versioned delete RPC, signed fence token |
+| storage target (blob volume + the daemon's fragment endpoint) | Durable epoch (done for the volume, see above), pin table with expiry, versioned delete RPC, signed fence token |
 | reader path (S3/DB/iSCSI fragment fetch) | Pin before fetch, unpin after; fail closed when a pin is refused |
 | `crates/yadb-metakv/src/openraft_transport.rs` | Sign the fence token with the existing per-node key; do not invent a second identity |
 | `tests/protocols.py` | A live drill: start a pass, hold a read open, assert the fragment survives; then assert it is collected after the pin is released |
