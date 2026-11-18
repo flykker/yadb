@@ -1282,10 +1282,11 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
             # snapshot, so that refusal became a success assertion. Nothing here
             # falls back to a locally applied manifest.
             skip("reader lease",
-                 "begin_read_lease is legacy-gated (crates/yadbd/src/protocols/s3.rs:685 "
-                 "and crates/yadbd/src/main.rs:534), so Multi-Raft has no fenced read "
-                 "lease to acquire, renew or expire; consistent reads use the quorum "
-                 "snapshot instead")
+                 "begin_read_lease is legacy-gated: the gate is `!st.app.meta."
+                 "is_openraft()` at crates/yadbd/src/protocols/s3.rs:683, and the "
+                 "lease itself is declared at crates/yadbd/src/main.rs:524, so "
+                 "Multi-Raft has no fenced read lease to acquire, renew or expire; "
+                 "consistent reads use the quorum snapshot instead")
             # Multipart upload: the parts are real durable allocations, and the
             # completed object must be indistinguishable from a single PUT.
             # An option the object store cannot honour is refused at initiate,

@@ -7272,12 +7272,13 @@ async fn handle_pools_health(State(st): State<AppState>) -> Response {
 }
 
 async fn handle_pools_scrub(State(st): State<AppState>, headers: HeaderMap) -> Response {
-    // Scrub is not a read: in legacy mode it collects orphan blobs, rewrites
-    // fragments and records the summary. Any client that can reach the port must
-    // not be able to start it. The check mirrors `/v1/apply` exactly so a legacy
-    // deployment with no `--admin-subject` keeps working unchanged: an empty
-    // allowlist is the historical no-auth mode, a configured allowlist requires a
-    // signed admin subject.
+    // Scrub is not a read: on single-node metadata it collects orphan blobs,
+    // rewrites fragments and records the summary. Any client that can reach the
+    // port must not be able to start it, so the check mirrors `/v1/apply`
+    // exactly: a signed subject on the `--admin-subject` allowlist. Startup
+    // refuses an empty allowlist (`main`), so every daemon that reaches this
+    // handler has one configured; `require_admin`'s empty-allowlist branch is
+    // kept for library callers and tests, not as a reachable daemon mode.
     if let Err(e) = require_admin(
         &headers,
         st.subject_secret.as_deref(),
