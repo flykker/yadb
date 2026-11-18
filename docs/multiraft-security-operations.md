@@ -47,7 +47,9 @@ carries the deadline of the collector lease that issued it
 (`lease_expires_at_ms`). The target compares that deadline with its own clock
 immediately before writing the barrier and refuses with `409` when it has passed,
 so a barrier that waited in a queue or crossed a paused peer cannot delete for a
-pass that lost its fence. The request field is required, not defaulted: a caller
+pass that lost its fence. A target that cannot read its own clock also refuses
+(`BarrierClockUnreadable`, same `409`) instead of assuming the lease is live. The
+request field is required, not defaulted: a caller
 that omits it is rejected at deserialization rather than silently getting an
 unfenced barrier.
 

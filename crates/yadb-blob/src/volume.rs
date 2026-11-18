@@ -368,6 +368,10 @@ impl<FS: StorageFs> VolumeStore<FS> {
     /// The residual window is this call's own barrier write and fsync; the
     /// caller's clock and this one are compared directly, so a target clock that
     /// is behind extends that window by the skew.
+    ///
+    /// A target that cannot read its own clock refuses rather than proceeds: this
+    /// is a guard on deletion, and "the clock is broken, so assume the lease is
+    /// fine" is the one direction that must not be taken.
     pub fn collect_garbage_barrier(
         &self,
         project_id: u32,
@@ -376,19 +380,11 @@ impl<FS: StorageFs> VolumeStore<FS> {
         up_to_generation: u32,
         lease_expires_at_ms: u64,
     ) -> Result<usize, BlobError> {
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |elapsed| elapsed.as_millis() as u64);
-        if now_ms >= lease_expires_at_ms {
-            return Err(BlobError::BarrierLeaseExpired {
-                project_id,
-                owner_id,
-                channel,
-                up_to_generation,
-                expires_at_ms: lease_expires_at_ms,
-                now_ms,
-            });
-        }
+        check_barrier_deadline(
+            (project_id, owner_id, channel, up_to_generation),
+            lease_expires_at_ms,
+            target_clock(),
+        )?;
         let marker_id = BlobId::new(project_id, owner_id, up_to_generation, 0, channel, 0);
         let mut writer = self.writer.lock().unwrap();
         writer.ensure_healthy()?;
@@ -655,6 +651,49 @@ fn join_path(dir: &str, name: &str) -> String {
     } else {
         format!("{}/{}", dir.trim_end_matches('/'), name)
     }
+}
+
+/// The target's own wall clock, in milliseconds since the Unix epoch.
+///
+/// Returns the failure rather than a default: a barrier is a deletion guard, and
+/// substituting `0` for an unreadable clock would make every deadline look live.
+fn target_clock() -> Result<u64, String> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis().min(u64::MAX as u128) as u64)
+        .map_err(|error| error.to_string())
+}
+
+/// Refuses a barrier whose collector lease has lapsed at the target.
+///
+/// Split out of [`VolumeStore::collect_garbage_barrier`] so the refusal can be
+/// tested with an injected clock and an injected clock *failure*: the second is
+/// the case that must not silently pass, and it cannot be produced by calling
+/// `SystemTime::now()` in a test.
+pub(crate) fn check_barrier_deadline(
+    ids: (u32, u32, u8, u32),
+    lease_expires_at_ms: u64,
+    now_ms: Result<u64, String>,
+) -> Result<(), BlobError> {
+    let (project_id, owner_id, channel, up_to_generation) = ids;
+    let now_ms = now_ms.map_err(|reason| BlobError::BarrierClockUnreadable {
+        project_id,
+        owner_id,
+        channel,
+        up_to_generation,
+        reason,
+    })?;
+    if now_ms >= lease_expires_at_ms {
+        return Err(BlobError::BarrierLeaseExpired {
+            project_id,
+            owner_id,
+            channel,
+            up_to_generation,
+            expires_at_ms: lease_expires_at_ms,
+            now_ms,
+        });
+    }
+    Ok(())
 }
 
 fn segment_path(dir: &str, seg_id: u32) -> String {

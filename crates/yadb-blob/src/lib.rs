@@ -48,6 +48,19 @@ pub enum BlobError {
         now_ms: u64,
     },
 
+    #[error(
+        "barrier {project_id}/{owner_id}/ch{channel}<={up_to_generation} refused: the target could \
+         not read its own clock ({reason}), so it cannot tell whether the collector lease that \
+         issued this barrier has expired; the range is left intact"
+    )]
+    BarrierClockUnreadable {
+        project_id: u32,
+        owner_id: u32,
+        channel: u8,
+        up_to_generation: u32,
+        reason: String,
+    },
+
     #[error("blob size {size} exceeds max {max}")]
     BlobTooLarge { size: usize, max: usize },
 
@@ -411,6 +424,46 @@ mod tests {
             "expected segment compaction to reclaim bytes"
         );
         assert_eq!(store.get(live_id).unwrap(), vec![b'y'; 180]);
+    }
+
+    /// The deadline check is a guard on deletion, so its failure directions matter
+    /// more than its success direction: an unreadable clock must refuse, not
+    /// default to zero (which would make every deadline look live and let the
+    /// barrier evict), and an unreadable clock is a distinct refusal from an
+    /// expired lease so an operator can tell "clock broken" from "pass too slow".
+    #[test]
+    fn an_unreadable_target_clock_refuses_a_barrier_instead_of_assuming_it_is_live() {
+        let ids = (10, 50, 2, 1);
+        // Production used to compute `map_or(0, ...)`, i.e. a broken clock read as
+        // the epoch and every lease looked live. That is the direction that
+        // deletes, so it is the one asserted against here.
+        match volume::check_barrier_deadline(ids, u64::MAX, Err("clock stepped".into())) {
+            Err(BlobError::BarrierClockUnreadable {
+                project_id,
+                owner_id,
+                channel,
+                up_to_generation,
+                reason,
+            }) => {
+                assert_eq!(
+                    (project_id, owner_id, channel, up_to_generation),
+                    ids,
+                    "the refusal must name the range it left intact"
+                );
+                assert!(reason.contains("clock stepped"), "{reason}");
+            }
+            other => panic!("an unreadable clock must refuse, got {other:?}"),
+        }
+
+        // The same guard still admits a barrier whose deadline is provably ahead,
+        // so the refusal above is the clock and not a blanket rejection.
+        assert!(volume::check_barrier_deadline(ids, 1000, Ok(999)).is_ok());
+        // Boundary: the deadline is exclusive. At the deadline the lease has
+        // lapsed, and that is the case that must refuse.
+        assert!(matches!(
+            volume::check_barrier_deadline(ids, 1000, Ok(1000)),
+            Err(BlobError::BarrierLeaseExpired { .. })
+        ));
     }
 
     #[test]

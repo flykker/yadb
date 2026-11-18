@@ -67,6 +67,13 @@ caller must stop rather than retry. A barrier that waited in a queue, or crossed
 paused peer, therefore evicts nothing instead of deleting for a pass that lost its
 fence.
 
+A target that cannot read its own clock refuses as well, with
+`BlobError::BarrierClockUnreadable` and the same `409`. The check is a guard on
+deletion, and the tempting default — substitute `0` for an unreadable clock — makes
+every deadline look live, which is the direction that deletes. The two refusals
+stay distinct so an operator can tell "the pass was too slow" from "this target's
+clock is broken".
+
 What remains open for a barrier is a window, not a missing check: the deadline is
 read, then the barrier record is written and fsynced, and a lease that lapses
 inside that write-and-fsync still lets the eviction through. The window is the

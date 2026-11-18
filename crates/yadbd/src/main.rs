@@ -7183,8 +7183,11 @@ async fn handle_vdisk_barrier(
         // The collector's lease lapsed before this target applied the barrier, so
         // the range was left intact. `409` rather than `500`: the request was
         // well formed and refused on purpose, and the caller must stop deleting
-        // instead of retrying.
-        Ok(Err(error @ BlobError::BarrierLeaseExpired { .. })) => {
+        // instead of retrying. An unreadable target clock is the same class of
+        // refusal for the same reason: the target cannot prove the lease is live,
+        // so it declines the eviction and the collector must stop.
+        Ok(Err(error @ BlobError::BarrierLeaseExpired { .. }))
+        | Ok(Err(error @ BlobError::BarrierClockUnreadable { .. })) => {
             api_err(StatusCode::CONFLICT, error.to_string())
         }
         Ok(Err(e)) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
