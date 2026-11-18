@@ -190,9 +190,17 @@ What exists now:
   is refused with `FragmentPinned`; both name the fragment's epoch and the
   collector's, and both happen before any record is appended. `delete_fenced` is
   unchanged: still the strict equality primitive, still documented as such.
-* Liveness is `now < expires_at_ms` through one helper for every caller, and an
-  unreadable clock refuses (`PinClockUnreadable`) instead of reading as zero -
-  the same failure direction as the barrier clock.
+* Liveness is `now < expires_at_ms`. Recovery and every read of the table go
+  through one helper, and an unreadable clock refuses there
+  (`PinClockUnreadable`) instead of reading as zero - the same failure direction
+  as the barrier clock. Compaction is the one exception, and deliberately the
+  other way: with no readable clock it keeps every pin, because dropping a live
+  one is the worse error, and it drops only pins the clock proves expired. That
+  branch is **not covered by a test**: `target_clock()` has no injection point,
+  so the only clock a test can present is a working one, and the helper-level
+  unreadable-clock tests pass a `Result` directly rather than going through a
+  volume. Adding a seam is a separate change; until then this is a property of
+  the code as written, not a verified one.
 
 What it does **not** establish, and why the invariant still does not hold:
 
