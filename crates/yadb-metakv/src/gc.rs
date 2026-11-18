@@ -274,12 +274,15 @@ impl<'a, FS: StorageFs> GcLeaseGuard<'a, FS> {
     }
 
     /// Extends the lease to a full `ttl_ms` from now, refusing if this holder no
-    /// longer owns the record.
+    /// longer owns the record or if the record's lifetime already ran out.
     ///
     /// Long writes and reads call this before the step that must stay fenced
     /// (the publication transaction, the fragment fetch), so a slow operation
     /// does not silently run past the lifetime its fence promised.
     pub fn renew(&mut self, ttl_ms: u64) -> Result<(), MetaError> {
+        if let Some(error) = renew_refusal(&self.lease) {
+            return Err(error);
+        }
         let mut next = self.lease.clone();
         next.expires_at_ms = now_ms().saturating_add(ttl_ms.max(1));
         let value = serde_json::to_vec(&next)?;
@@ -629,6 +632,27 @@ pub fn release<FS: StorageFs>(meta: &LocalMetaKv<FS>, lease: &GcLease) -> Result
     }
 }
 
+/// Refuses to renew a lease whose record is still present but whose lifetime has
+/// run out.
+///
+/// `renew` used to extend any record this holder still owned, including one that
+/// had already expired but had not been reaped yet. That resurrected a fence
+/// that had stopped fencing: a collector was entitled to treat the record as
+/// dead, and `begin_read_lease` took its "renewed" branch instead of publishing a
+/// fresh record, so a read could start under a lease that no longer excluded
+/// anything. Expiry is checked before the transaction, so the stale record is
+/// left untouched rather than rewritten with a new deadline.
+fn renew_refusal(lease: &GcLease) -> Option<MetaError> {
+    (!lease.is_live_at(now_ms())).then(|| {
+        MetaError::Routing(format!(
+            "gc {} lease {} expired at {} ms and cannot be renewed; publish a fresh lease instead of extending a fence that no longer holds",
+            kind_name(lease.kind),
+            lease.id,
+            lease.expires_at_ms
+        ))
+    })
+}
+
 /// Extends a lease published by [`acquire`] to a full `ttl_ms` from now.
 ///
 /// Returns the updated record (with its new `mod_revision`). Refuses when this
@@ -643,6 +667,9 @@ pub fn renew<FS: StorageFs>(
         return Err(MetaError::Routing(
             "refusing to renew a lease without the revision it was published at".into(),
         ));
+    }
+    if let Some(error) = renew_refusal(lease) {
+        return Err(error);
     }
     let mut next = lease.clone();
     next.expires_at_ms = now_ms().saturating_add(ttl_ms.max(1));
@@ -725,13 +752,19 @@ impl<'a, FS: StorageFs> CollectorGuard<'a, FS> {
         &self.lease
     }
 
-    /// Extends the collector record, refusing if this pass no longer owns it.
+    /// Extends the collector record, refusing if this pass no longer owns it or
+    /// if the record's lifetime already ran out.
     ///
     /// A pass is allowed to take arbitrarily long between its fence check and its
     /// last deletion only while it keeps proving it is still the pass that owns
     /// the record. Renewal is that proof: if the record expired and was taken
-    /// over, this fails and the caller must stop deleting.
+    /// over, this fails and the caller must stop deleting. Expiry is refused for
+    /// the same reason — an expired record no longer keeps another pass out, so
+    /// extending it would resume deleting under a fence that was already gone.
     pub fn renew(&mut self, ttl_ms: u64) -> Result<(), MetaError> {
+        if let Some(error) = renew_refusal(&self.lease) {
+            return Err(error);
+        }
         let mut next = self.lease.clone();
         next.expires_at_ms = now_ms().saturating_add(ttl_ms.max(1));
         let value = serde_json::to_vec(&next)?;
@@ -1144,11 +1177,14 @@ mod tests {
     #[test]
     fn a_renewed_lease_keeps_its_ownership_and_extends_its_ttl() {
         let meta = meta();
-        let guard = acquire_writer(&meta, 1, 1, 1).unwrap();
+        // A live lease: renewing an expired one is refused now, and that case has
+        // its own test. The TTL is doubled on renewal so the deadline must move
+        // forward even if both calls land in the same millisecond.
+        let guard = acquire_writer(&meta, 1, 1, DEFAULT_TTL_MS).unwrap();
         let lease = guard.lease().clone();
         let first = lease.mod_revision;
         assert!(first > 0, "the publication revision is the ownership token");
-        let renewed = renew(&meta, &lease, DEFAULT_TTL_MS).unwrap();
+        let renewed = renew(&meta, &lease, DEFAULT_TTL_MS * 2).unwrap();
         assert!(
             renewed.mod_revision > first,
             "renewal republishes the record"
@@ -1237,6 +1273,88 @@ mod tests {
         let lease = guard.lease().clone();
         assert!(lease.is_live_at(now_ms()));
         assert!(ensure_live(&meta, &lease).is_ok());
+    }
+
+    /// Rewrites a lease record in place with a past expiry, keeping ownership:
+    /// the transaction returns the record's new `mod_revision` and the holder
+    /// adopts it, so only the clock moved.
+    fn expire_in_place<FS: StorageFs>(meta: &LocalMetaKv<FS>, lease: &mut GcLease) {
+        lease.expires_at_ms = now_ms() - 1;
+        let key = lease_key(lease);
+        let revision = match meta
+            .execute(KvCommand::RevisionTxn {
+                guards: vec![RevisionGuard {
+                    key: key.clone(),
+                    expected_mod_revision: lease.mod_revision,
+                }],
+                ops: vec![TxnOp::Put {
+                    key,
+                    value: serde_json::to_vec(&*lease).unwrap(),
+                }],
+            })
+            .unwrap()
+        {
+            KvResult::TxnOk { revision, .. } => revision,
+            other => panic!("the expired rewrite must commit, got {other:?}"),
+        };
+        lease.mod_revision = revision;
+    }
+
+    #[test]
+    fn renew_refuses_an_expired_but_unreaped_record_and_leaves_it_untouched() {
+        let meta = meta();
+        let guard = acquire_reader(&meta, 1, 1, DEFAULT_TTL_MS).unwrap();
+        let mut lease = guard.lease().clone();
+        expire_in_place(&meta, &mut lease);
+        let before = meta.get(&lease_key(&lease)).unwrap();
+
+        let error = renew(&meta, &lease, DEFAULT_TTL_MS)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("expired at"), "{error}");
+        assert!(
+            !error.contains("no longer held"),
+            "an expired record must not be reported as lost: {error}"
+        );
+        // A refusal must not rewrite the record: the deadline it carries is the
+        // evidence that this lease had already stopped fencing.
+        let after = meta.get(&lease_key(&lease)).unwrap();
+        assert_eq!(after.mod_revision, before.mod_revision);
+        assert_eq!(after.value, before.value);
+        assert_eq!(after.mod_revision, lease.mod_revision);
+    }
+
+    #[test]
+    fn renew_extends_a_live_owned_record_and_still_refuses_a_replaced_one() {
+        let meta = meta();
+        let guard = acquire_reader(&meta, 1, 1, DEFAULT_TTL_MS).unwrap();
+        let stale = guard.lease().clone();
+        let renewed = renew(&meta, &stale, DEFAULT_TTL_MS).unwrap();
+        assert!(renewed.is_live_at(now_ms()));
+        assert!(renewed.expires_at_ms >= stale.expires_at_ms);
+        assert_ne!(renewed.mod_revision, stale.mod_revision);
+
+        // The superseded token is refused as replaced, not as expired, so the
+        // two failures stay distinguishable for the operator.
+        let error = renew(&meta, &stale, DEFAULT_TTL_MS)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no longer held"), "{error}");
+        assert!(!error.contains("expired at"), "{error}");
+        assert!(renew(&meta, &renewed, DEFAULT_TTL_MS).is_ok());
+    }
+
+    #[test]
+    fn a_guard_cannot_renew_its_own_expired_record() {
+        // The guard shares the free function's refusal. The collector mid-pass is
+        // the caller that depends on it: continuing to delete under an expired
+        // record is the failure this prevents.
+        let meta = meta();
+        let mut guard = acquire_collector(&meta, 0, 1).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert!(!guard.lease().is_live_at(now_ms()));
+        let error = guard.renew(DEFAULT_TTL_MS).unwrap_err().to_string();
+        assert!(error.contains("expired at"), "{error}");
     }
 
     #[test]

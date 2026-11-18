@@ -527,8 +527,10 @@ impl AppState {
             match yadb_metakv::gc::renew(&self.meta, &lease, yadb_metakv::gc::DEFAULT_TTL_MS) {
                 Ok(renewed) => return Ok(renewed),
                 Err(error) => {
-                    // The record expired and was reaped (or taken over): publish a
-                    // fresh one below instead of reading under a lost fence.
+                    // The record expired — reaped or not — or was taken over:
+                    // publish a fresh one below instead of reading under a lost
+                    // fence. `renew` refuses an expired record precisely so this
+                    // branch is taken rather than extending a dead lease.
                     eprintln!("reader lease renewal failed, publishing a fresh one: {error}");
                 }
             }
