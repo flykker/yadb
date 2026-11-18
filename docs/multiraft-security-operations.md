@@ -143,9 +143,11 @@ deployment cannot reach the unauthenticated branch.
   intended consequence of the counter having to live in the group it bounds.
 * `POST /v1/pools/scrub` mutates (it collects orphan blobs, rewrites fragments and
   records a summary) and therefore requires the same signed, allowlisted admin
-  subject as `/v1/apply`. A legacy deployment with no `--admin-subject` keeps its
-  historical unauthenticated behaviour; configuring the allowlist opts the route
-  into the check.
+  subject as `/v1/apply`. There is no unauthenticated deployment to preserve: a
+  daemon with an empty `--admin-subject` refuses to start, so every reachable
+  scrub is checked. (`crates/yadbd/src/main.rs:7372` enforces the allowlist; the
+  comment above the handler still describes an empty-allowlist mode that startup
+  makes unreachable.)
 
 ## Current rotation procedure: coordinated offline restart only
 

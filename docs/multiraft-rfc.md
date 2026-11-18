@@ -1,11 +1,14 @@
 # Multi-Raft for YADB: architecture and staged migration
 
-Status: design proposal; production Multi-Raft is not implemented. The current
-implementation checklist and evidence are in [multiraft-production-todo.md](multiraft-production-todo.md).
+Status: design proposal. Multi-Raft is implemented and runs the daemon, but it is
+not production-ready: collection is refused, and the open gates in the
+implementation checklist are listed in
+[multiraft-production-todo.md](multiraft-production-todo.md).
 This RFC specifies safety gates and
 an initial direction; open choices below require implementation-level designs and
-tests. Existing single-group behavior remains in force, except for explicitly
-documented fail-closed legacy authentication requirements in the checklist.
+tests. There is no longer a legacy daemon runtime to fall back to: the removed
+single-group runtime is recorded in the checklist, and the surviving `LocalKv` is
+a non-replicated test/library store.
 
 The isolated `multiraft` prototype module contains group identities, a typed WAL and an
 incomplete deterministic memory-only core. The core is not connected to the WAL,
@@ -14,7 +17,8 @@ The selected production consensus dependency is OpenRaft 0.9.x. Its integration
 boundary includes opt-in file-backed adapters, persistent group ownership,
 an in-process registry and signed TCP RPCs with opt-in pinned TLS 1.3 mTLS.
 The opt-in daemon module runs one isolated group with a dedicated mandatory-mTLS
-listener; legacy Raft still serves all client traffic. These are not a production
+listener; at the time of writing, legacy Raft still served all client traffic.
+These are not a production
 runtime: multi-group daemon routing, resource isolation, storage-contract
 equivalence and deployment/recovery gates remain incomplete.
 The user has authorized a new empty nonproduction Multi-Raft client deployment.

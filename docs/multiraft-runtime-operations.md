@@ -1,6 +1,16 @@
 # OpenRaft runtime operations and recovery boundaries
 
-## Current status (2026-11-14)
+## Status snapshot (2026-11-14), superseded where noted
+
+This section is a dated record, not a statement about the current tree. Since it
+was written the legacy multi-node Raft runtime was **removed** rather than kept as
+a default: `--metadata-runtime` is pinned to `openraft`, `--openraft-config` is
+mandatory, and there is no fallback runtime
+(`crates/yadbd/src/main.rs:7352-7358`, `crates/yadb-metakv/src/raft.rs:4-21`). The
+only non-replicated store left is the single-node `LocalKv`, which is a test and
+library facility. Statements below about a "legacy default", a "legacy mode" or a
+legacy `checkpoint.json` describe the tree as it was on 2026-11-14 and no longer
+hold. Where a sentence is still true, it has been left alone.
 
 The latest offline, locked `-j 2` full workspace gates are **GREEN** on the
 authorization-freshness delta, the nonblocking-refresh fix and post-review
@@ -57,13 +67,15 @@ non-admin subject gets 403. This is a shared-secret check, not per-operator
 credentials: anyone holding the secret can sign any allowlisted subject.
 Focused shutdown cancellation passes retain the borrowed owner and retry;
 startup cancellation remains unsafe. The POSIX compaction stale-FD claim was false;
-explicit reopen and an append regression are retained only. Legacy remains default,
-no existing cluster was switched, old data is untouched, no migration occurred, and
+explicit reopen and an append regression are retained only. At the time of this
+snapshot the legacy runtime was still the default, no existing cluster had been
+switched, old data was untouched, no migration had occurred, and
 `production_ready: false`.
 
-Status: **not production-ready**. Legacy remains the default; no existing or
-production cluster has been switched. The user has authorized implementation of
-actual OpenRaft client routing for a new nonproduction cluster only. That
+Status: **not production-ready**. At the time of this snapshot the legacy runtime
+was the default; no existing or production cluster had been switched. The user
+had authorized implementation of actual OpenRaft client routing for a new
+nonproduction cluster only. That
 local loopback cluster is running at `/public/cluster_data` under supervisor
 PID **16793** (children **16795**, **16796**, **16808**), all nine group configs
 in `mode: open, initialize: false`, binary SHA-256
@@ -112,8 +124,9 @@ committed state. That snapshot is **not** a GC fence: if a newer write replaced 
 block and a barrier collected the old blob, the read fails with `503`
 (`BlockError::Inconsistent`) rather than returning zeros, and the engine does not
 retry. A follower forwards the read to the leader instead of serving its local
-view; `NotLeader` is an error, not a stale fallback. Legacy mode retains its
-existing behavior.
+view; `NotLeader` is an error, not a stale fallback. There is no legacy daemon
+mode to keep behaviour for: `--metadata-runtime` is pinned to `openraft` and a
+daemon without `--openraft-config` refuses to start.
 
 Version-1 JSON configuration fields:
 
@@ -216,18 +229,18 @@ provisions a Multi-Raft cluster without the client protocol listeners.
 Multi-Raft mark-and-sweep is temporarily refused, both manually and by the
 periodic task. A writer lease can be renewed while a collector pass is in
 flight, and collector RPCs can continue past lease expiry, so a reader lease
-alone is not a sufficient fence. Storage-side fencing (an epoch on every target
-and a versioned RPC) is designed only conceptually and is not implemented; the
-plan, including the invariant it has to establish and the drill that would prove
-it, is in `multiraft-gc-fencing-plan.md`. Two narrow pieces are implemented: a
-barrier carries the collector lease deadline, and a target refuses an expired one
-with `409` instead of evicting a whole generation range for a pass that lost its
-fence (an unreadable target clock refuses the same way); and a volume keeps a
-durable epoch and stamps each fragment with the epoch it was written under, so a
-fenced delete can refuse a fragment from another epoch. Neither crosses a process
-boundary yet — no RPC carries the epoch, the delete path is still unfenced, and no
-collector advances an epoch — so they narrow the window without making collection
-safe.
+alone is not a sufficient fence. Storage-side fencing is partial: the versioned
+delete RPC and the reader pin table do not exist, and nothing carries an epoch
+over the wire. Two target-side pieces do exist. A barrier carries the collector
+lease deadline, and a target refuses an expired one with `409` instead of evicting
+a whole generation range for a pass that lost its fence (an unreadable target clock
+refuses the same way). And a volume keeps a durable epoch and stamps each fragment
+with the epoch it was written under, so a fenced delete can refuse a fragment from
+another epoch. Neither crosses a process boundary yet — no RPC carries the epoch,
+the delete path is still unfenced, and no collector advances an epoch — so they
+narrow the window without making collection safe. The plan, including the invariant
+it has to establish and the drill that would prove it, is in
+`multiraft-gc-fencing-plan.md`.
 
 The metadata half of the lease is now stricter than the paragraph above
 suggests, and the difference matters when reading the plan. `ensure_live` refuses

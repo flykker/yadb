@@ -75,13 +75,14 @@ are both covered: a dropped startup future releases the acquired replica and the
 durable lock. The POSIX compaction stale-FD claim was
 false; explicit reopen and an append regression are retained only.
 
-`force_leader` is routing preference, not a linearizable-read guarantee. Legacy
-remains default, `production_ready: false`, no existing cluster was switched,
-old data was untouched, and no migration occurred. Do not claim known
-regressions resolved.
+`force_leader` is routing preference, not a linearizable-read guarantee. At the
+time of this snapshot the legacy runtime was still the daemon default,
+`production_ready: false`, no existing cluster had been switched, old data was
+untouched, and no migration had occurred. Do not claim known regressions resolved.
 
-Status: **not production-ready**. Legacy Raft remains the daemon default; the
-v2 client integration is still being hardened. A local
+Status: **not production-ready**. At the time of this snapshot the legacy Raft
+runtime was still the daemon default; the v2 client integration was still being
+hardened. A local
 nonproduction loopback cluster is running at `/public/cluster_data`: three
 daemon processes host nine replicas. It is **not empty**: at 21:25:24 on
 2026-11-14 an unidentified apply committed exactly `examples/platform.yaml`
@@ -590,7 +591,15 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   `gateway_read_enforces_the_16_mib_cap`,
   `map_error_frames_gateway_range_errors_as_s3_errors`,
   `map_error_frames_gateway_bad_requests_as_invalid_request`).
-- [x] Bound the metadata Raft log. The legacy Raft log is now checkpointed and
+- [x] Bound the metadata Raft log. **Historical: this describes the legacy runtime,
+  which has since been removed** (`crates/yadb-metakv/src/raft.rs:4-21`). Nothing
+  writes `metakv/checkpoint.json` any more, and the single-node `LocalKv` refuses a
+  WAL that starts from a compacted base because it has no image to restore; the
+  equivalent capability now lives in the OpenRaft storage adapters as the
+  `state.json` image plus the delta log, tracked under "Bound memory, disk growth,
+  startup replay and snapshot reception" above. The text below is kept as the
+  record of what the removed runtime did, not as a claim about `main`.
+  The legacy Raft log is now checkpointed and
   compacted: `metakv/checkpoint.json` holds the durable state image (atomic
   write: tmp, `sync_data`, rename, `sync_dir`), `raft.wal` is rewritten through
   a tmp file plus rename, and every rewritten WAL begins with a `HardState`
@@ -656,10 +665,11 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   nothing, reclaim nothing and leave fragments intact; the periodic task logs
   the same reason. The fence is not safe: a writer lease can be renewed while a
   collector pass is in flight, and collector RPCs can continue past lease
-  expiry, so a reader lease alone is not a sufficient fence. Storage-side
-  fencing (a per-target epoch and a versioned RPC) is designed only conceptually
-  and is not implemented. Two narrow pieces of it do exist. A barrier carries the
-  collector lease deadline and the target refuses an expired one with `409`
+  expiry, so a reader lease alone is not a sufficient fence. Storage-side fencing
+  is partial: the versioned delete RPC and the reader pin table do not exist, and
+  nothing carries an epoch over the wire. Two target-side pieces do exist. A
+  barrier carries the collector lease deadline and the target refuses an expired
+  one with `409`
   (`BlobError::BarrierLeaseExpired`), which bounds the barrier path to the target's
   own write-and-fsync window plus clock skew instead of leaving it unchecked; an
   unreadable target clock refuses with `409` too (`BarrierClockUnreadable`)
@@ -701,7 +711,15 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
     intent committed before its fragments plus the intent lease, and the
     collector must treat an unexpired intent as live. SQL has no equivalent
     intent record, so a per-group writer lease (or an intent committed before
-    the fragment) is a prerequisite, not an optimization.
+    the fragment) is a prerequisite, not an optimization. **This prerequisite is
+    now met for the write path:** the function keeps its name but always
+    publishes a writer lease (`acquire_writer(...).map(Some)`,
+    `crates/yadb-metakv/src/gc.rs:790`), and the SQL and block write paths call
+    it unconditionally (`crates/yadb-db/src/lib.rs:832`,
+    `crates/yadb-db/src/tablet.rs:913`, `:979`, `crates/yadb-block/src/lib.rs:311`);
+    S3 keeps using its `Prepared` intent. What is still missing is the collector
+    side: the per-group sweep that would honour those leases is unreachable while
+    `sweep` refuses.
   * **Order of work:** per-group collector lease and writer fence → leader-only
     per-group sweep with the intent grace → a drill that kills the group leader
     between fragment write and manifest commit and proves nothing is reclaimed.

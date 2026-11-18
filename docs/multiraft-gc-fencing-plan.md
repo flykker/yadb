@@ -129,8 +129,10 @@ What it does **not** establish, and why the invariant still does not hold:
   it belongs to the increment that adds them.
 * Nothing carries the epoch over the wire. `PoolSlot::delete` is still the
   unfenced delete, there is no fence header or signed token on the fragment
-  endpoint, and `BarrierRequest`, `apply_barrier` and `collect_garbage_barrier`
-  are unchanged. A remote collector cannot be fenced by any of this yet.
+  endpoint, and this increment changed nothing in `BarrierRequest`,
+  `apply_barrier` or `collect_garbage_barrier` — a barrier carries the collector
+  lease deadline, not an epoch, so it cannot express "delete only epoch N".
+  A remote collector cannot be fenced by any of this yet.
 * There is no pin table, so a target can still only answer "which epoch does this
   fragment belong to?", not "is this epoch still readable?".
 * No collector advances an epoch, and GC enablement is still refused. Until the

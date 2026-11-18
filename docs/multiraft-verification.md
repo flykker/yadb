@@ -412,9 +412,11 @@ established. The interval is a wakeup cadence, not a completion guarantee, and
 the fetch uses per-operation socket timeouts rather than a total deadline. The
 narrow-scope independent review is recorded above; the open findings there remain.
 `force_leader` remains a routing preference, not a linearizable-read guarantee.
-**No production deployment.** Legacy remains the default,
-`production_ready: false`, no existing cluster was switched and no migration was
-performed; the prior disposable test root was deleted as noted above.
+**No production deployment.** At the time of this snapshot the legacy runtime was
+still the default, `production_ready: false`, no existing cluster had been
+switched and no migration had been performed; the prior disposable test root was
+deleted as noted above. That runtime has since been removed; see
+`multiraft-runtime-operations.md` for the current boundary.
 
 Historically, the deleted deployment passed SQL, S3 and block smoke readback for
 alpha and beta through all three endpoints, including a clean stop and reopen.
@@ -1120,8 +1122,13 @@ cluster.
 collector pass is in flight, and collector RPCs can continue past lease expiry,
 so a reader lease alone is not a sufficient fence. The per-group collector
 described in "Per-group garbage collection on Multi-Raft" below was implemented
-and then disabled for the same reason; storage-side fencing is not implemented,
-so garbage accumulates. The legacy behaviour in this section is unchanged. A
+and then disabled for the same reason: `sweep` returns the refusal before
+`sweep_groups`, and `sweep_groups` carries
+`#[allow(dead_code)] // Retained temporarily, unreachable while Multi-Raft GC is
+disabled`, so the code exists but nothing calls it. Storage-side fencing is
+partial — a barrier carries the collector lease deadline and a volume keeps a
+durable epoch with a fenced delete — and neither crosses a process boundary, so
+garbage accumulates. The legacy behaviour in this section is unchanged. A
 pass needs each node read-idle for one lease TTL (30 s), because a node keeps
 its reader lease for reuse instead of deleting it per statement; a
 continuously busy node refuses instead of waiting. A read that
@@ -1225,6 +1232,13 @@ Publish filesystem/hardware assumptions and unsupported recovery states with the
 release. Do not claim these tests ran without actual supported-host evidence.
 
 ## Metadata WAL compaction (2026-11-15)
+
+**Historical: the runtime this section describes was removed**
+(`crates/yadb-metakv/src/raft.rs:4-21`). No code in `main` writes
+`metakv/checkpoint.json` or `RaftCore`'s `base_index`/`base_term`; the equivalent
+guarantee is OpenRaft's `state.json` image plus the delta log. The measurements
+below are retained as the record of that runtime, not as a claim about the
+current tree.
 
 The legacy Raft log is checkpointed and compacted. `metakv/checkpoint.json`
 carries the durable state image plus `applied_index`, `applied_term`,
@@ -1611,8 +1625,10 @@ returning 500 instead of the expected 501).
 
 ### Open items
 
-* Per-group GC on Multi-Raft is refused by design and not implemented; the
-  refusal is the contract, not a gap in this evidence.
+* Per-group GC on Multi-Raft is refused by design and unreachable, not absent:
+  `sweep` returns the refusal before `sweep_groups`, and `sweep_groups` is kept
+  under `#[allow(dead_code)]`. The refusal is the contract, not a gap in this
+  evidence.
 * `production_ready` stays false: this run proves the runtime works on three
   processes, not that the durability and authorization gates for production are
   met.
@@ -2180,13 +2196,17 @@ either value; the point is only that a 250 ms budget sits inside that spread whi
 constrains the heartbeat from above, not from below, so it does not by itself
 guarantee a usable append budget.
 
-That is also the limit: the fix lives in the two launchers, not in the daemon. An
-operator who supplies `heartbeat_ms: 250` through `--openraft-config` can
-reproduce the stall, because nothing in `prepare` rejects a heartbeat that is too
-short for the transport. Making this structural would mean deriving a minimum
-heartbeat from the transport's worst-case handshake and rejecting a config below
-it; that is not implemented, and the requirement is recorded in
-`docs/multiraft-runtime-operations.md` instead. Verification after the change:
+That is also the limit: the fix lives in the two launchers, and the daemon's own
+guard is only a floor, not a proof. `prepare` rejects a `mode: create` config
+whose `heartbeat_ms` is below `MIN_HEARTBEAT_MS` (500 ms) and opens an existing
+root with a warning; the floor was chosen to reject gross misconfiguration, not
+to bound the transport's worst-case handshake, so a value between 500 ms and the
+measured 960 ms tail is accepted. An operator who supplies `heartbeat_ms: 250`
+through `--openraft-config` is refused on create and warned on open. Making this
+structural would mean deriving the minimum from the transport's worst-case
+handshake and refusing a config below it; that is not implemented, and
+`docs/multiraft-runtime-operations.md` records the same bound. Verification after
+the change:
 `tests/protocols.py` 3/3 consecutive clean runs, each 20 PASS / 4 SKIP, with zero
 `timeout after` lines in any daemon log (previously 668+ per run on the billing
 group alone) and zero `BRIDGE TIMEOUT`.

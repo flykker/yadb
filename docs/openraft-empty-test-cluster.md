@@ -107,9 +107,10 @@ framing, URL segment encoding and UNMAP 416 changes at source level. Later green
 tests do not establish causal fixes or a new overall acceptance. The freshness
 delta and nonblocking-refresh fix separately received a narrow-scope ACCEPT with
 open findings, recorded in `multiraft-verification.md`; production readiness
-remains unaccepted. Legacy remains
-default, `production_ready: false`, no existing cluster was switched and no
+remains unaccepted. At the time of this snapshot the legacy runtime was still the
+default, `production_ready: false`, no existing cluster had been switched and no
 migration occurred; the prior disposable test root was deleted as noted above.
+That runtime has since been removed.
 
 Earlier full gates were green historically: all-features MetaKV **124/124**
 (73.94 s), yadbd **21/21**, clients **2/2**, daemon **2/2**, S3 **19/19**, IO
@@ -158,7 +159,9 @@ consensus engine, not a replacement for fragment storage.
 
 The explicit selection being implemented is `--metadata-runtime openraft` with the
 `openraft-storage` build feature and a mandatory-mTLS group config.
-Legacy remains the default. A child-daemon integration test passed with three
+At the time of this snapshot the legacy runtime was still the default; it has
+since been removed, and `--metadata-runtime` now accepts only `openraft`.
+A child-daemon integration test passed with three
 singleton groups, before final control-cache hardening and full-suite validation.
 A targeted three-process test also covered multi-node HTTP leader routing for
 SQL/S3 writes; broader daemon validation remains open. The current loopback
