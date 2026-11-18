@@ -842,6 +842,18 @@ design; the removed draft is not kept in the tree.
 - [x] Test replication over a real TCP transport with authenticated envelopes
   and durable file stores (`openraft_net_test`), including rejection of unknown
   addresses and forged signatures.
+- [ ] Make an unavailable metadata read an answer instead of a panic.
+  `LocalMetaKv::get` (`crates/yadb-metakv/src/raft.rs`) is
+  `try_snapshot(...).expect("invalid or unavailable metadata read")`, so any
+  transient inability to serve a quorum snapshot - a group that has not yet
+  applied its log after a restart, for instance - aborts the calling task instead
+  of returning an error. Read paths reach it from request handlers, where the
+  caller sees a dropped connection rather than a `503`, and the distinction
+  between "the key is absent" and "the value cannot be read right now" is lost.
+  The fix is not a local one: `get` returns `Option`, and call sites across
+  `yadb-db`, `yadb-s3` and `yadbd` treat `None` as absence, so a fallible variant
+  has to be threaded through them. Until then, do not read a `None` from this
+  path as proof that a key was never written.
 - [ ] Test node shutdown/restart, partitions, leadership changes, quorum loss,
   delayed/duplicate messages, snapshots and catch-up with independent
   processes, real filesystems and TLS.
