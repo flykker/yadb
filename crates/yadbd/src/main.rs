@@ -7163,6 +7163,7 @@ async fn handle_vdisk_barrier(
             req.owner_id,
             req.channel,
             req.up_to_generation,
+            req.lease_expires_at_ms,
         )?;
         let mut response = BarrierResponse {
             evicted,
@@ -7179,6 +7180,13 @@ async fn handle_vdisk_barrier(
     .await;
     match res {
         Ok(Ok(response)) => Json(response).into_response(),
+        // The collector's lease lapsed before this target applied the barrier, so
+        // the range was left intact. `409` rather than `500`: the request was
+        // well formed and refused on purpose, and the caller must stop deleting
+        // instead of retrying.
+        Ok(Err(error @ BlobError::BarrierLeaseExpired { .. })) => {
+            api_err(StatusCode::CONFLICT, error.to_string())
+        }
         Ok(Err(e)) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
         Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
@@ -8345,6 +8353,10 @@ mod security_tests {
                     channel: 9,
                     up_to_generation: 0x00ff_ffff,
                     compact: false,
+                    // This test drives the handler directly and holds no
+                    // collector lease; the deadline is the far future so the
+                    // refusal path under test is the auth/route one, not expiry.
+                    lease_expires_at_ms: u64::MAX,
                 }),
             )
             .await;
@@ -8399,7 +8411,100 @@ mod security_tests {
                     channel: 9,
                     up_to_generation: 0x00ff_ffff,
                     compact: false,
+                    // No collector lease in this test: see the note above.
+                    lease_expires_at_ms: u64::MAX,
                 })
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+        drop(st);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_expired_barrier_answers_409_and_evicts_nothing() {
+        // The target-side deadline check has to surface as a refusal the collector
+        // stops on, not as a 500 it might retry. `409` also keeps it distinct from
+        // a malformed request (422) and a missing slot (404).
+        let dir = std::env::temp_dir().join(format!(
+            "yadb-vdisk-barrier-expired-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let fs = OsFs::new(&dir).unwrap();
+        let meta = LocalMetaKv::open_single_node(&fs, "meta", 1).unwrap();
+        let st = AppState {
+            openraft: None,
+            listen_addr: "127.0.0.1:0".into(),
+            fs,
+            meta: meta.clone(),
+            raft_token: None,
+            subject_secret: None,
+            admin_subjects: vec![],
+            control: Arc::new(RwLock::new(ControlPlaneState::new())),
+            control_refresh: Arc::new(std::sync::Mutex::new(())),
+            control_freshness: Arc::new(std::sync::Mutex::new(ControlFreshness::default())),
+            pools: Arc::new(RwLock::new(BTreeMap::new())),
+            local_vdisks: Arc::new(RwLock::new(BTreeMap::new())),
+            last_scrub: Arc::new(RwLock::new(None)),
+            reader_lease: Arc::new(std::sync::Mutex::new(None)),
+            s3: ObjectStoreEngine::new(meta.clone(), 4096),
+            db: DatabaseEngine::new(meta.clone(), 100),
+            block: BlockVolumeEngine::new(meta, DEFAULT_BLOCK_SIZE),
+        };
+        st.open_or_get_local_vdisk("pool", 0).unwrap();
+        let id = BlobId::new(1, 2, 1, 0, yadb_s3::S3_CHANNEL, 0);
+        let path = || Path(("pool".to_string(), 0, id.to_hex()));
+        let headers = HeaderMap::new();
+        assert_eq!(
+            handle_vdisk_put(
+                State(st.clone()),
+                path(),
+                headers.clone(),
+                Bytes::from_static(b"pinned fragment"),
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+
+        let response = handle_vdisk_barrier(
+            State(st.clone()),
+            Path(("pool".to_string(), 0)),
+            headers.clone(),
+            Json(BarrierRequest {
+                project_id: id.project_id(),
+                owner_id: id.owner_id(),
+                channel: id.channel(),
+                up_to_generation: id.generation(),
+                compact: false,
+                lease_expires_at_ms: 1,
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+
+        // The fragment the barrier would have evicted is still readable, and no
+        // durable barrier was left behind: a later write in the same range is
+        // still accepted. A different step, because the same id is immutable.
+        assert_eq!(
+            handle_vdisk_get(State(st.clone()), path(), headers.clone())
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        let later = BlobId::new(1, 2, 1, 1, yadb_s3::S3_CHANNEL, 0);
+        assert_eq!(
+            handle_vdisk_put(
+                State(st.clone()),
+                Path(("pool".to_string(), 0, later.to_hex())),
+                headers,
+                Bytes::from_static(b"still writable"),
             )
             .await
             .status(),

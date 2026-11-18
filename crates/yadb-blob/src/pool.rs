@@ -83,6 +83,15 @@ pub struct BarrierRequest {
     /// previous barrier-then-compact behaviour.
     #[serde(default = "compact_by_default")]
     pub compact: bool,
+    /// Deadline of the collector lease this barrier was issued under.
+    ///
+    /// It travels with the request because a barrier evicts a whole generation
+    /// range in one durable record: once it is on the wire, the per-tombstone
+    /// fence interval cannot bound it. The target compares this deadline with its
+    /// own clock immediately before the eviction and refuses the barrier if the
+    /// lease already lapsed, so a request that waited in a queue or crossed a
+    /// paused peer does not delete on behalf of a pass that lost its fence.
+    pub lease_expires_at_ms: u64,
 }
 
 fn compact_by_default() -> bool {
@@ -359,6 +368,12 @@ impl<FS: StorageFs> PoolSlot<FS> {
     /// of `(project, owner, channel)` at or below `up_to_generation` and fences
     /// later writes of that range. Compaction is a separate step the collector
     /// drives once per slot so its bytes and failures can be reported.
+    ///
+    /// `lease_expires_at_ms` is the deadline of the collector lease the caller
+    /// issued this barrier under. A local slot checks it here and a remote slot
+    /// sends it so the target checks it again on arrival: the eviction is the one
+    /// deletion that is not bounded by the fence interval, so it must not happen
+    /// after the lease that authorised it has lapsed.
     pub fn apply_barrier(
         &self,
         project_id: u32,
@@ -366,6 +381,7 @@ impl<FS: StorageFs> PoolSlot<FS> {
         channel: u8,
         up_to_generation: u32,
         compact: bool,
+        lease_expires_at_ms: u64,
     ) -> Result<BarrierResponse, BlobError> {
         match &self.backend {
             SlotBackend::Local(store) => {
@@ -374,6 +390,7 @@ impl<FS: StorageFs> PoolSlot<FS> {
                     owner_id,
                     channel,
                     up_to_generation,
+                    lease_expires_at_ms,
                 )?;
                 if !compact {
                     return Ok(BarrierResponse {
@@ -404,6 +421,7 @@ impl<FS: StorageFs> PoolSlot<FS> {
                     channel,
                     up_to_generation,
                     compact,
+                    lease_expires_at_ms,
                 })
                 .map_err(|e| BlobError::Io(std::io::Error::other(e)))?;
                 match http_raw_request(

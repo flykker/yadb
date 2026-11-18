@@ -311,8 +311,12 @@ fn sweep_legacy(
             continue;
         }
         let mut fence = || {
+            // The deadline travels with each barrier: a successful renewal proves
+            // the lease is live now, and the value it returns is what a target
+            // compares against its own clock when the barrier arrives.
             collector
                 .renew(COLLECTOR_LEASE_MS)
+                .map(|_| collector.lease().expires_at_ms)
                 .map_err(|error| error.to_string())
         };
         if sweep_pool(striper, pool_name, &dead, live, &mut fence, &mut outcome).is_err() {
@@ -544,8 +548,12 @@ fn sweep_group(
             continue;
         }
         let mut fence = || {
+            // The deadline travels with each barrier: a successful renewal proves
+            // the lease is live now, and the value it returns is what a target
+            // compares against its own clock when the barrier arrives.
             collector
                 .renew(COLLECTOR_LEASE_MS)
+                .map(|_| collector.lease().expires_at_ms)
                 .map_err(|error| error.to_string())
         };
         if sweep_pool(striper, pool_name, &dead, live, &mut fence, outcome).is_err() {
@@ -670,7 +678,7 @@ fn sweep_pool(
     pool_name: &str,
     dead: &BTreeSet<BlobId>,
     live: &BTreeSet<BlobId>,
-    fence: &mut dyn FnMut() -> Result<(), String>,
+    fence: &mut dyn FnMut() -> Result<u64, String>,
     outcome: &mut SweepOutcome,
 ) -> Result<(), String> {
     // Nothing below may delete under an expired fence. The caller renewed before
@@ -712,7 +720,13 @@ fn sweep_pool(
         }
         // A barrier evicts every fragment in the range in one durable record, so
         // it is checked like a deletion batch even though it is not a tombstone.
-        check_fence(
+        //
+        // The check also returns the deadline it just proved, and that deadline
+        // travels with the barrier. This is the one deletion the interval below
+        // cannot bound: one record evicts a whole generation range, so a request
+        // that reaches a target after the lease lapsed must be refused there
+        // instead of deleting on behalf of a pass that lost its fence.
+        let lease_expires_at_ms = check_fence(
             fence,
             pool_name,
             &format!("before barrier {project}/{owner}/ch{channel}<={up_to}"),
@@ -720,7 +734,7 @@ fn sweep_pool(
         )?;
         let mut barrier_ok = true;
         for slot in striper.slots() {
-            match slot.apply_barrier(project, owner, channel, up_to, false) {
+            match slot.apply_barrier(project, owner, channel, up_to, false, lease_expires_at_ms) {
                 Ok(response) => outcome.fragments_deleted += response.evicted,
                 Err(error) => {
                     barrier_ok = false;
@@ -766,12 +780,15 @@ fn sweep_pool(
 /// The returned reason is what makes the caller stop: a pass that can no longer
 /// prove it owns the collector record must not delete another fragment, and the
 /// pool loop must not continue as if this pool finished.
+///
+/// A successful check also returns the lease deadline it proved, so the caller can
+/// carry it to a target that must refuse the deletion if it applies it late.
 fn check_fence(
-    fence: &mut dyn FnMut() -> Result<(), String>,
+    fence: &mut dyn FnMut() -> Result<u64, String>,
     pool_name: &str,
     when: &str,
     outcome: &mut SweepOutcome,
-) -> Result<(), String> {
+) -> Result<u64, String> {
     fence().map_err(|error| {
         let reason = format!(
             "pool `{pool_name}`: collector fence lost {when}: {error}; no further fragment was deleted"
@@ -1203,7 +1220,7 @@ mod tests {
         // and no released collector lease. This is the state a pass leaves behind
         // if the process dies after its barrier records are durable.
         for slot in f.pool.slots() {
-            slot.apply_barrier(1, owner, channel, newest.generation() - 1, false)
+            slot.apply_barrier(1, owner, channel, newest.generation() - 1, false, DEADLINE)
                 .unwrap();
         }
         let collector = yadb_metakv::gc::acquire_collector(&f.meta, 0, 120_000).unwrap();
@@ -1363,6 +1380,10 @@ mod tests {
     /// deletion at a time.
     const EXACT_ONLY_CHANNEL: u8 = 6;
 
+    /// The deadline a test fence reports as proved: far enough away that the
+    /// barrier path is not exercising expiry, only the plumbing.
+    const DEADLINE: u64 = u64::MAX;
+
     /// Writes `count` unreferenced fragments and returns their logical ids.
     fn seed_exact_dead(f: &Fixture, count: u32) -> BTreeSet<BlobId> {
         let mut dead = BTreeSet::new();
@@ -1398,7 +1419,7 @@ mod tests {
                 first_call_saw_everything.set(dead.iter().all(|id| fragment_present(&f, *id)));
             }
             calls.set(calls.get() + 1);
-            Ok(())
+            Ok(DEADLINE)
         };
 
         let mut outcome = SweepOutcome::default();
@@ -1441,7 +1462,7 @@ mod tests {
             if calls.get() == 2 {
                 Err("injected fence loss".to_string())
             } else {
-                Ok(())
+                Ok(DEADLINE)
             }
         };
 
@@ -1504,6 +1525,87 @@ mod tests {
         assert!(
             dead.iter().all(|id| !fragment_present(&f, *id)),
             "a pass whose checks all succeed must delete every dead fragment: {outcome:?}"
+        );
+    }
+
+    /// A barrier is the one deletion the fence interval cannot bound, so the
+    /// deadline a successful check proved has to reach the target. A pass that
+    /// dropped it — passing `u64::MAX`, or checking the lease again only after the
+    /// barrier — would evict a whole generation range under a lapsed lease, and
+    /// nothing else in this file would notice.
+    #[test]
+    fn a_barrier_carries_the_deadline_the_fence_proved_and_a_lapsed_one_evicts_nothing() {
+        let f = Fixture::new("barrier-deadline");
+        // S3's channel is barrier-safe, so `sweep_pool` takes the barrier path
+        // rather than the exact-tombstone one.
+        let mut dead = BTreeSet::new();
+        for generation in 0..3 {
+            let id = BlobId::new(1, 1, generation, 0, yadb_s3::S3_CHANNEL, 0);
+            f.pool.put_blob(id, b"garbage").unwrap();
+            dead.insert(id);
+        }
+
+        // The check succeeds and reports a deadline that has already passed. The
+        // real fence cannot produce that by itself — `extend` refuses a late
+        // acknowledgement — but the deadline it proves can lapse during the leg
+        // that follows it: the grouping above, then one RPC per remote slot. The
+        // target is the only party that sees the barrier at the moment it would
+        // evict, so this stub puts the deadline in the past deterministically
+        // instead of racing that window.
+        let mut expired = || Ok(1u64);
+        let mut outcome = SweepOutcome::default();
+        sweep_pool(
+            &f.pool,
+            POOL,
+            &dead,
+            &BTreeSet::new(),
+            &mut expired,
+            &mut outcome,
+        )
+        .expect("a refused barrier is reported in the outcome, not returned");
+
+        assert_eq!(outcome.fragments_deleted, 0, "{outcome:?}");
+        assert_eq!(outcome.barriers_applied, 0, "{outcome:?}");
+        assert_eq!(
+            outcome.errors.len(),
+            f.pool.slots().len(),
+            "every slot must report its refusal: {outcome:?}"
+        );
+        assert!(
+            outcome
+                .errors
+                .iter()
+                .all(|e| e.contains("expired at 1 ms") && e.contains("barrier")),
+            "{outcome:?}"
+        );
+        assert!(
+            dead.iter().all(|id| fragment_present(&f, *id)),
+            "an expired barrier must evict nothing: {outcome:?}"
+        );
+
+        // Positive control on the same pool: the only change is the deadline, so
+        // the refusal above is the deadline and not a broken barrier path.
+        let mut live = || Ok(DEADLINE);
+        let mut outcome = SweepOutcome::default();
+        sweep_pool(
+            &f.pool,
+            POOL,
+            &dead,
+            &BTreeSet::new(),
+            &mut live,
+            &mut outcome,
+        )
+        .unwrap();
+        assert_eq!(outcome.errors, Vec::<String>::new(), "{outcome:?}");
+        assert_eq!(outcome.barriers_applied, 1, "{outcome:?}");
+        assert_eq!(
+            outcome.fragments_deleted,
+            dead.len() * f.pool.scheme().total_parts(),
+            "{outcome:?}"
+        );
+        assert!(
+            dead.iter().all(|id| !fragment_present(&f, *id)),
+            "{outcome:?}"
         );
     }
 

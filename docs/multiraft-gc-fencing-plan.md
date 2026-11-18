@@ -1,9 +1,12 @@
 # Plan: storage-side fencing for Multi-Raft garbage collection
 
-**Status: design only. Nothing in this document is implemented.** Multi-Raft
-mark-and-sweep stays refused (`409` on `/v1/pools/gc` and `/v1/pools/scrub`,
-periodic task logged and skipped) until the mechanism below exists and is proven.
-Garbage accumulates in the meantime; that cost was accepted deliberately.
+**Status: the mechanism below is design only and is not implemented.** One narrow
+piece of storage-side fencing does exist — a barrier carries the collector lease
+deadline and the target refuses an expired one (see below) — but it does not
+establish the invariant, and Multi-Raft mark-and-sweep stays refused (`409` on
+`/v1/pools/gc` and `/v1/pools/scrub`, periodic task logged and skipped) until the
+mechanism below exists and is proven. Garbage accumulates in the meantime; that
+cost was accepted deliberately.
 
 ## Why the current refusal exists
 
@@ -52,10 +55,25 @@ group and every 32 exact tombstones, and stops the pool and the pass on a failed
 check. The overshoot after expiry is therefore bounded to a few dozen tombstones
 per pool instead of the whole dead set.
 
-One part of item 1 remains open, and it is not closed by the above: a barrier that
-is already in flight can still evict its entire dead generation range after the
-record expired. The check runs before each barrier group, not inside the barrier
-itself, so the eviction it triggers is not bounded by the interval.
+The barrier half of item 1 is closed to the same standard. A barrier is the one
+deletion the check interval cannot bound — one durable record evicts a whole
+generation range — so the deadline a successful check proves now travels with the
+request: `BarrierRequest.lease_expires_at_ms`, through `apply_barrier` into
+`collect_garbage_barrier`, which compares it with its own clock immediately before
+the barrier record and the eviction and refuses with
+`BlobError::BarrierLeaseExpired`. `handle_vdisk_barrier` answers that refusal with
+`409`, not `500`: the request was well formed and refused on purpose, and the
+caller must stop rather than retry. A barrier that waited in a queue, or crossed a
+paused peer, therefore evicts nothing instead of deleting for a pass that lost its
+fence.
+
+What remains open for a barrier is a window, not a missing check: the deadline is
+read, then the barrier record is written and fsynced, and a lease that lapses
+inside that write-and-fsync still lets the eviction through. The window is the
+target's own write latency, and it widens by the skew between the collector's
+clock and the target's — the two are compared directly, so a target clock running
+behind extends it. This is narrower than the previous "no check at all" by the
+whole duration of a queued or retried request, and it is not zero.
 
 The fix does not reduce the weight of item 3. The remaining gap is unchanged:
 metadata can be airtight and the target still deletes bytes a reader is holding.

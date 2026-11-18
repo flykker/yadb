@@ -358,13 +358,37 @@ impl<FS: StorageFs> VolumeStore<FS> {
 
     /// YDB-style generation barrier GC: durably records a barrier and evicts all blobs belonging
     /// to `(project_id, owner_id, channel)` with `generation <= up_to_generation`.
+    ///
+    /// `lease_expires_at_ms` is the deadline of the collector lease the caller
+    /// issued this barrier under. It is checked here, immediately before the
+    /// durable barrier record and the eviction, because a barrier is the one
+    /// deletion a per-tombstone fence interval cannot bound: one record evicts a
+    /// whole generation range. A barrier that arrives after its lease lapsed
+    /// therefore evicts nothing and reports [`BlobError::BarrierLeaseExpired`].
+    /// The residual window is this call's own barrier write and fsync; the
+    /// caller's clock and this one are compared directly, so a target clock that
+    /// is behind extends that window by the skew.
     pub fn collect_garbage_barrier(
         &self,
         project_id: u32,
         owner_id: u32,
         channel: u8,
         up_to_generation: u32,
+        lease_expires_at_ms: u64,
     ) -> Result<usize, BlobError> {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_millis() as u64);
+        if now_ms >= lease_expires_at_ms {
+            return Err(BlobError::BarrierLeaseExpired {
+                project_id,
+                owner_id,
+                channel,
+                up_to_generation,
+                expires_at_ms: lease_expires_at_ms,
+                now_ms,
+            });
+        }
         let marker_id = BlobId::new(project_id, owner_id, up_to_generation, 0, channel, 0);
         let mut writer = self.writer.lock().unwrap();
         writer.ensure_healthy()?;

@@ -219,7 +219,11 @@ flight, and collector RPCs can continue past lease expiry, so a reader lease
 alone is not a sufficient fence. Storage-side fencing (an epoch on every target
 and a versioned RPC) is designed only conceptually and is not implemented; the
 plan, including the invariant it has to establish and the drill that would prove
-it, is in `multiraft-gc-fencing-plan.md`.
+it, is in `multiraft-gc-fencing-plan.md`. One narrow piece is implemented: a
+barrier carries the collector lease deadline, and a target refuses an expired one
+with `409` instead of evicting a whole generation range for a pass that lost its
+fence. That narrows the barrier window to the target's own write-and-fsync plus
+clock skew; it does not make collection safe.
 
 The metadata half of the lease is now stricter than the paragraph above
 suggests, and the difference matters when reading the plan. `ensure_live` refuses

@@ -33,6 +33,21 @@ pub enum BlobError {
     #[error("write to deleted immutable blob {0} rejected")]
     Tombstoned(BlobId),
 
+    #[error(
+        "barrier {project_id}/{owner_id}/ch{channel}<={up_to_generation} refused: the collector \
+         lease it was issued under expired at {expires_at_ms} ms and the target read the request \
+         at {now_ms} ms, so the range is left intact rather than evicted for a pass that is no \
+         longer entitled to delete"
+    )]
+    BarrierLeaseExpired {
+        project_id: u32,
+        owner_id: u32,
+        channel: u8,
+        up_to_generation: u32,
+        expires_at_ms: u64,
+        now_ms: u64,
+    },
+
     #[error("blob size {size} exceeds max {max}")]
     BlobTooLarge { size: usize, max: usize },
 
@@ -110,7 +125,7 @@ mod tests {
             match operation {
                 "put" => assert!(store.put(id, b"payload").is_err()),
                 "delete" => assert!(store.delete(id).is_err()),
-                _ => assert!(store.collect_garbage_barrier(1, 1, 4, 1).is_err()),
+                _ => assert!(store.collect_garbage_barrier(1, 1, 4, 1, u64::MAX).is_err()),
             }
             drop(store);
             // Recovery must not expose the page-cache record while sync is
@@ -159,7 +174,9 @@ mod tests {
                 let result = match operation {
                     "put" => store.put(unknown, b"unknown"),
                     "delete" => store.delete(old).map(|_| ()),
-                    _ => store.collect_garbage_barrier(1, 1, 4, 1).map(|_| ()),
+                    _ => store
+                        .collect_garbage_barrier(1, 1, 4, 1, u64::MAX)
+                        .map(|_| ()),
                 };
                 assert!(matches!(result, Err(BlobError::Io(_))));
                 fs.set_faults(FaultConfig::default());
@@ -178,7 +195,7 @@ mod tests {
                     Err(BlobError::StorageUnavailable)
                 ));
                 assert!(matches!(
-                    store.collect_garbage_barrier(1, 1, 4, 1),
+                    store.collect_garbage_barrier(1, 1, 4, 1, u64::MAX),
                     Err(BlobError::StorageUnavailable)
                 ));
                 assert!(matches!(
@@ -383,7 +400,9 @@ mod tests {
         let before = store.stats().unwrap();
         assert_eq!(before.live_blobs, 7);
 
-        let evicted = store.collect_garbage_barrier(10, 50, 2, 1).unwrap();
+        let evicted = store
+            .collect_garbage_barrier(10, 50, 2, 1, u64::MAX)
+            .unwrap();
         assert_eq!(evicted, 6);
 
         let reclaimed = store.compact_sealed_segments().unwrap();
@@ -392,6 +411,77 @@ mod tests {
             "expected segment compaction to reclaim bytes"
         );
         assert_eq!(store.get(live_id).unwrap(), vec![b'y'; 180]);
+    }
+
+    #[test]
+    fn a_barrier_whose_lease_expired_evicts_nothing_and_does_not_fence() {
+        // The barrier is the one deletion a per-tombstone fence interval cannot
+        // bound: one durable record evicts a whole generation range. It therefore
+        // carries the deadline of the collector lease that issued it, and a target
+        // that receives it after that deadline refuses. This is the check that
+        // makes the refusal real rather than advisory - if it were missing, the
+        // eviction below would still happen.
+        let fs = SimFs::new(1236);
+        let cfg = VolumeConfig {
+            max_segment_bytes: 512,
+            max_blob_bytes: 1024 * 1024,
+            sync_on_put: true,
+        };
+        let store = VolumeStore::open(fs, "disk_expired_barrier", cfg).unwrap();
+        let mut ids = Vec::new();
+        for step in 1..=4 {
+            let id = BlobId::new(10, 50, 1, step, 2, 0);
+            store.put(id, &[b'x'; 180]).unwrap();
+            ids.push(id);
+        }
+        let before = store.stats().unwrap();
+        assert_eq!(before.live_blobs, 4);
+
+        // A deadline in the past: the pass that issued this barrier is no longer
+        // entitled to delete, so every fragment must still be readable.
+        let error = store
+            .collect_garbage_barrier(10, 50, 2, 1, 1)
+            .expect_err("an expired barrier must be refused");
+        match &error {
+            BlobError::BarrierLeaseExpired {
+                project_id,
+                owner_id,
+                channel,
+                up_to_generation,
+                expires_at_ms,
+                now_ms,
+            } => {
+                assert_eq!(
+                    (*project_id, *owner_id, *channel, *up_to_generation),
+                    (10, 50, 2, 1)
+                );
+                assert_eq!(*expires_at_ms, 1);
+                assert!(*now_ms >= 1);
+            }
+            other => panic!("expected BarrierLeaseExpired, got {other:?}"),
+        }
+        assert_eq!(store.stats().unwrap().live_blobs, 4);
+        for id in &ids {
+            assert_eq!(store.get(*id).unwrap(), vec![b'x'; 180]);
+        }
+        // The refusal must also not have left the durable barrier behind: a
+        // barrier record written before the check would fence later writes even
+        // though nothing was evicted, which is a different, permanent effect.
+        // The probe is a generation-1 write, the range the refused barrier named,
+        // so a durable record would refuse it with `FencedByBarrier`.
+        let extra = BlobId::new(10, 50, 1, 5, 2, 0);
+        store.put(extra, b"still writable").unwrap();
+        assert_eq!(store.get(extra).unwrap(), b"still writable");
+
+        // The same range with a live deadline is evicted, so the refusal above is
+        // the deadline and not a broken barrier path. Five, not four: the probe
+        // above is in the same generation and is evicted too.
+        let evicted = store
+            .collect_garbage_barrier(10, 50, 2, 1, u64::MAX)
+            .unwrap();
+        assert_eq!(evicted, 5);
+        assert!(matches!(store.get(ids[0]), Err(BlobError::NotFound(_))));
+        assert!(matches!(store.get(extra), Err(BlobError::NotFound(_))));
     }
 
     #[test]
@@ -406,7 +496,9 @@ mod tests {
         let live = BlobId::new(10, 50, 2, 1, 2, 0);
         let store = VolumeStore::open(fs.clone(), "gc_restart", cfg).unwrap();
         store.put(old, &[b'x'; 100]).unwrap();
-        store.collect_garbage_barrier(10, 50, 2, 1).unwrap();
+        store
+            .collect_garbage_barrier(10, 50, 2, 1, u64::MAX)
+            .unwrap();
         // Seal the segment containing the barrier, then compact it away.
         store.put(live, &[b'y'; 100]).unwrap();
         assert!(store.compact_sealed_segments().unwrap() > 0);
@@ -504,7 +596,7 @@ mod tests {
                             store.delete(id).map(|_| ())
                         } else {
                             store
-                                .collect_garbage_barrier(1, 1, 4, generation)
+                                .collect_garbage_barrier(1, 1, 4, generation, u64::MAX)
                                 .map(|_| ())
                         }
                     });
@@ -578,7 +670,7 @@ mod tests {
                 ..Default::default()
             });
             assert!(store.delete(id).is_err());
-            assert!(store.collect_garbage_barrier(1, 1, 4, 1).is_err());
+            assert!(store.collect_garbage_barrier(1, 1, 4, 1, u64::MAX).is_err());
             fs.set_faults(FaultConfig::default());
             let next = BlobId::new(1, 1, 2, 1, 4, 0);
             store.put(next, b"next").unwrap();
@@ -1427,6 +1519,54 @@ mod tests {
         );
     }
 
+    // The collector reaches a slot through `apply_barrier`, not the volume
+    // directly, so the slot must forward the deadline instead of dropping it. A
+    // remote slot sends it to the target; a local one passes it to the store.
+    // Without this the check would exist and still be bypassed by the only path
+    // the sweep uses.
+    #[test]
+    fn a_slot_refuses_a_barrier_whose_lease_expired() {
+        let scheme = ErasureScheme::Mirror { replicas: 3 };
+        let (_, striper) = local_pool(7303, scheme, 3);
+        let id = BlobId::new(14, 4, 1, 1, 2, 0);
+        striper.put_blob(id, b"unreferenced fragment").unwrap();
+
+        let slot = &striper.slots()[0];
+        let error = slot
+            .apply_barrier(id.project_id(), id.owner_id(), id.channel(), 1, false, 1)
+            .expect_err("an expired barrier must be refused by the slot");
+        assert!(
+            matches!(error, BlobError::BarrierLeaseExpired { .. }),
+            "expected BarrierLeaseExpired, got {error:?}"
+        );
+        // Nothing was evicted on this slot, and no durable fence was installed.
+        assert!(slot
+            .local_store()
+            .unwrap()
+            .live_ids()
+            .iter()
+            .any(|present| present.with_part(0) == id));
+
+        slot.apply_barrier(
+            id.project_id(),
+            id.owner_id(),
+            id.channel(),
+            1,
+            false,
+            u64::MAX,
+        )
+        .unwrap();
+        assert!(
+            !slot
+                .local_store()
+                .unwrap()
+                .live_ids()
+                .iter()
+                .any(|present| present.with_part(0) == id),
+            "a live barrier must still evict"
+        );
+    }
+
     // Same rule for a barrier fence: the generation barrier is durable on the
     // nominal slots, and rerouting the part to a spare the barrier does not cover
     // would defeat it.
@@ -1438,8 +1578,15 @@ mod tests {
         let payload = b"Multi-tenant erasure-coded tablet SSTable block #0001";
 
         for slot in striper.slots().iter().take(scheme.total_parts()) {
-            slot.apply_barrier(id.project_id(), id.owner_id(), id.channel(), 1, false)
-                .unwrap();
+            slot.apply_barrier(
+                id.project_id(),
+                id.owner_id(),
+                id.channel(),
+                1,
+                false,
+                u64::MAX,
+            )
+            .unwrap();
         }
 
         match striper.put_blob(id, payload) {
