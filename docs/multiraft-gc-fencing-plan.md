@@ -1,10 +1,12 @@
 # Plan: storage-side fencing for Multi-Raft garbage collection
 
 **Status: the mechanism below is design only and is not implemented**, apart from
-two narrow pieces of storage-side fencing: a barrier carries the collector lease
-deadline and the target refuses an expired one, and a target now keeps a durable
+three narrow pieces of storage-side fencing: a barrier carries the collector
+lease deadline and the target refuses an expired one, a target keeps a durable
 epoch it can refuse an exact delete against (see "What the target epoch now
-establishes"). Neither piece establishes the invariant, and Multi-Raft
+establishes"), and a target keeps a durable pin table it can refuse an epoch
+advance and a collectable delete against (see "What the pin table now
+establishes"). None of the three establishes the invariant, and Multi-Raft
 mark-and-sweep stays refused (`409` on `/v1/pools/gc` and `/v1/pools/scrub`,
 periodic task logged and skipped) until the mechanism below exists and is proven.
 Garbage accumulates in the meantime; that cost was accepted deliberately.
@@ -133,8 +135,9 @@ What it does **not** establish, and why the invariant still does not hold:
   `apply_barrier` or `collect_garbage_barrier` — a barrier carries the collector
   lease deadline, not an epoch, so it cannot express "delete only epoch N".
   A remote collector cannot be fenced by any of this yet.
-* There is no pin table, so a target can still only answer "which epoch does this
-  fragment belong to?", not "is this epoch still readable?".
+* The epoch alone cannot answer "is this epoch still readable?", and the pin
+  table that now can (see "What the pin table now establishes") has no client:
+  no reader takes a pin and no collector checks one.
 * No collector advances an epoch, and GC enablement is still refused. Until the
   delete RPC is replaced, nothing forces the collector path to use
   `delete_fenced` at all; the unfenced `delete` is still callable.
@@ -156,6 +159,60 @@ alone delete one — but it means a rollback after an upgrade requires restoring
 volume from a backup taken before it, not just swapping the binary back. Plan the
 upgrade as irreversible per volume, and do not mix binaries across a rollback of
 the same directory.
+
+## What the pin table now establishes
+
+The second increment of item 3 is in place, and again only the durable,
+single-target half, in `crates/yadb-blob` (`VolumeStore`). Nothing crosses a
+process boundary yet.
+
+What exists now:
+
+* A pin is a durable record (`REC_KIND_PIN`) carrying a pin id, the epoch it
+  names and `expires_at_ms`; a release is a second record (`REC_KIND_UNPIN`)
+  naming the id. Neither is rewritten in place. Recovery replays them in segment
+  order, so the later record wins, and drops the pins whose deadline has passed.
+  Compaction copies every unexpired pin into the replacement segment; expired
+  pins may be dropped.
+* `pin(epoch, ttl_ms)` refuses any epoch but the current one
+  (`PinEpochNotCurrent`, naming both), refuses `ttl_ms == 0`, and refuses a TTL
+  above `MAX_PIN_TTL_MS` (five minutes) rather than clamping it. The deadline it
+  returns is the target's own clock plus the TTL.
+* `unpin(pin_id)` is idempotent and one-directional: `Ok(true)` only when a live
+  pin was removed, `Ok(false)` for an unknown or already expired id, and never a
+  resurrection or an extension.
+* `advance_epoch` keeps its expected-epoch refusal and additionally refuses while
+  any unexpired pin exists, with `EpochPinned`, which names the epoch and the
+  number of pins. Both are stop-the-pass.
+* `delete_collectable(id, collector_epoch)` implements "fragment epoch <
+  collector epoch, and no unexpired pin names the fragment's epoch". A fragment
+  that is not older is refused with `FragmentNotOlder`; one whose epoch is pinned
+  is refused with `FragmentPinned`; both name the fragment's epoch and the
+  collector's, and both happen before any record is appended. `delete_fenced` is
+  unchanged: still the strict equality primitive, still documented as such.
+* Liveness is `now < expires_at_ms` through one helper for every caller, and an
+  unreadable clock refuses (`PinClockUnreadable`) instead of reading as zero -
+  the same failure direction as the barrier clock.
+
+What it does **not** establish, and why the invariant still does not hold:
+
+* Nothing carries a pin over the wire. There is no `/internal/pin` route, no
+  `x-yadb-fence-*` header, and no change to `BarrierRequest`, `apply_barrier`,
+  `collect_garbage_barrier`, `PoolSlot::delete` or the daemon.
+* No reader takes a pin before a fetch, and no reader path fails closed when a
+  pin is refused. The pin table has no client.
+* No collector advances an epoch, re-reads the pin set, or calls
+  `delete_collectable`. Nothing forces the collector path to use it, and the
+  unfenced `delete` is still callable.
+* GC enablement is still refused (`409` on `/v1/pools/gc` and `/v1/pools/scrub`),
+  and none of the four live drills in "What would prove it" has run.
+
+The lock-then-read ordering the collector protocol depends on is therefore not
+established here either: it is a property of the caller holding the volume's
+directory lock across "read the pin set" and "advance the epoch". What the target
+provides is the two operations the caller must bracket, plus the guarantee that a
+pin which lands between them is either seen (the advance refuses) or lands after
+the advance (and then names the new epoch).
 
 ## Invariant to establish
 
@@ -272,7 +329,7 @@ concurrently either lands before the check (pass aborts) or after the advance
 | --- | --- |
 | `crates/yadb-metakv/src/gc.rs` | Keep the admission CAS and the provenance check, but demote the lease to an optimisation: correctness no longer depends on it |
 | `crates/yadbd/src/gc.rs` | Sweep only with a fence epoch obtained per target; treat `stale fence` as "stop this pass", never as retryable |
-| storage target (blob volume + the daemon's fragment endpoint) | Durable epoch (done for the volume, see above), pin table with expiry, versioned delete RPC, signed fence token |
+| storage target (blob volume + the daemon's fragment endpoint) | Durable epoch and pin table with expiry (both done for the volume, see above), versioned delete RPC, signed fence token |
 | reader path (S3/DB/iSCSI fragment fetch) | Pin before fetch, unpin after; fail closed when a pin is refused |
 | `crates/yadb-metakv/src/openraft_transport.rs` | Sign the fence token with the existing per-node key; do not invent a second identity |
 | `tests/protocols.py` | A live drill: start a pass, hold a read open, assert the fragment survives; then assert it is collected after the pin is released |
