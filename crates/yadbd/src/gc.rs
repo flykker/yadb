@@ -17,9 +17,10 @@
 //! 3. **Collector lease.** Publish a durable collector record so a second pass
 //!    cannot interleave its mark and sweep phases with this one, and so no new
 //!    reader or writer can be admitted until the pass is done. The record is
-//!    renewed before each deletion batch: a pass that stalls past its lease stops
-//!    deleting instead of continuing without a fence, and its release is
-//!    ownership-guarded so it can never delete a successor's record.
+//!    renewed before the first deletion, before each barrier group and every
+//!    [`FENCE_CHECK_INTERVAL`] exact tombstones: a pass that stalls past its
+//!    lease stops deleting instead of continuing without a fence, and its
+//!    release is ownership-guarded so it can never delete a successor's record.
 //! 4. **Enumerate.** Ask every slot of every mounted pool which physical fragment
 //!    ids it holds. A slot that cannot answer makes that pool unprovable: refuse
 //!    that pool, sweep no part of it.
@@ -69,6 +70,17 @@ const LIVE_PREFIXES: [&str; 4] = ["/db/", "/s3/", "/s3-intent/", "/block/"];
 /// Lease lifetime for a collection pass. The pass re-checks the fence mid-way, so
 /// this only has to cover one pass, not an arbitrary stall.
 const COLLECTOR_LEASE_MS: u64 = 120_000;
+
+/// How many exact tombstones may be issued between collector-lease checks.
+///
+/// A check is a metadata CAS, i.e. one Raft round trip on a real cluster, so
+/// checking before every fragment would add a transaction per delete. Checking
+/// only once per pool is the window this constant exists to close: a pass that
+/// stalled after the per-pool renew could tombstone an unbounded number of
+/// fragments with no fence. Thirty-two bounds the overshoot to a few dozen
+/// tombstones (at most 96 physical parts for a three-replica pool) while
+/// amortizing the check over enough work that it does not dominate a sweep.
+const FENCE_CHECK_INTERVAL: usize = 32;
 
 /// Channels whose `(project, owner, generation)` space comes from a monotonic
 /// per-project allocation counter, so a pair is never handed out twice.
@@ -298,7 +310,17 @@ fn sweep_legacy(
         if dead.is_empty() {
             continue;
         }
-        sweep_pool(striper, pool_name, &dead, live, &mut outcome);
+        let mut fence = || {
+            collector
+                .renew(COLLECTOR_LEASE_MS)
+                .map_err(|error| error.to_string())
+        };
+        if sweep_pool(striper, pool_name, &dead, live, &mut fence, &mut outcome).is_err() {
+            // The collector record no longer proves the fence, so admission can be
+            // open again. `outcome.errors` already names the stop; nothing else in
+            // this pass may delete.
+            break;
+        }
     }
 
     // Step 7: compact, so the bytes the barriers and tombstones freed are actually
@@ -521,7 +543,16 @@ fn sweep_group(
         if dead.is_empty() {
             continue;
         }
-        sweep_pool(striper, pool_name, &dead, live, outcome);
+        let mut fence = || {
+            collector
+                .renew(COLLECTOR_LEASE_MS)
+                .map_err(|error| error.to_string())
+        };
+        if sweep_pool(striper, pool_name, &dead, live, &mut fence, outcome).is_err() {
+            // Same contract as a failed renew before a pool: the reason is in
+            // `outcome.errors` and no later pool of this group deletes.
+            break;
+        }
     }
 
     if let Err(error) = collector.release() {
@@ -620,6 +651,12 @@ fn group_by_pool(mark: &MarkSet) -> BTreeMap<String, BTreeSet<BlobId>> {
 /// references. Otherwise each dead fragment gets an exact tombstone, which is
 /// narrower and always safe.
 ///
+/// `fence` proves the collector record still holds. It is called before the
+/// first deletion, before every barrier group (one barrier can evict a whole
+/// generation range) and every [`FENCE_CHECK_INTERVAL`] exact tombstones. A
+/// failed check stops the pool immediately: no fragment after it is deleted,
+/// because from that point admission is open again.
+///
 /// An allocation that is still in flight cannot be fenced by a barrier here. A
 /// reservation writes no fragment, so it is never part of the dead set (and a
 /// fresh generation is the newest in its group, above every `up_to` this pass can
@@ -633,8 +670,13 @@ fn sweep_pool(
     pool_name: &str,
     dead: &BTreeSet<BlobId>,
     live: &BTreeSet<BlobId>,
+    fence: &mut dyn FnMut() -> Result<(), String>,
     outcome: &mut SweepOutcome,
-) {
+) -> Result<(), String> {
+    // Nothing below may delete under an expired fence. The caller renewed before
+    // entering the pool, but the mark and the grouping above take time.
+    check_fence(fence, pool_name, "before the first deletion", outcome)?;
+
     let mut dead_groups: BTreeMap<(u32, u32, u8), u32> = BTreeMap::new();
     for id in dead {
         let entry = dead_groups
@@ -668,6 +710,14 @@ fn sweep_pool(
             );
             continue;
         }
+        // A barrier evicts every fragment in the range in one durable record, so
+        // it is checked like a deletion batch even though it is not a tombstone.
+        check_fence(
+            fence,
+            pool_name,
+            &format!("before barrier {project}/{owner}/ch{channel}<={up_to}"),
+            outcome,
+        )?;
         let mut barrier_ok = true;
         for slot in striper.slots() {
             match slot.apply_barrier(project, owner, channel, up_to, false) {
@@ -686,7 +736,17 @@ fn sweep_pool(
         }
     }
 
+    let mut deleted_since_check = 0usize;
     for id in exact {
+        if deleted_since_check >= FENCE_CHECK_INTERVAL {
+            check_fence(
+                fence,
+                pool_name,
+                &format!("after {deleted_since_check} exact deletion(s)"),
+                outcome,
+            )?;
+            deleted_since_check = 0;
+        }
         // Deleting every part is what makes the tombstone meaningful: a fragment
         // that survives on one slot would be readable again after reconstruction.
         match striper.delete(id) {
@@ -696,7 +756,29 @@ fn sweep_pool(
                 "pool `{pool_name}`: tombstone for {id} failed: {error}"
             )),
         }
+        deleted_since_check += 1;
     }
+    Ok(())
+}
+
+/// Runs the caller's fence check and records a failure in `outcome.errors`.
+///
+/// The returned reason is what makes the caller stop: a pass that can no longer
+/// prove it owns the collector record must not delete another fragment, and the
+/// pool loop must not continue as if this pool finished.
+fn check_fence(
+    fence: &mut dyn FnMut() -> Result<(), String>,
+    pool_name: &str,
+    when: &str,
+    outcome: &mut SweepOutcome,
+) -> Result<(), String> {
+    fence().map_err(|error| {
+        let reason = format!(
+            "pool `{pool_name}`: collector fence lost {when}: {error}; no further fragment was deleted"
+        );
+        outcome.errors.push(reason.clone());
+        reason
+    })
 }
 
 /// One snapshot of every manifest that can name a fragment.
@@ -1274,6 +1356,155 @@ mod tests {
             .read_at(1, "disk", POOL, 1 << 20, 0, b"first-block".len())
             .unwrap();
         assert_eq!(read, b"first-block");
+    }
+
+    /// A channel outside `BARRIER_SAFE_CHANNELS`, so `sweep_pool` takes the
+    /// exact-tombstone path and the in-pool check interval is exercised one
+    /// deletion at a time.
+    const EXACT_ONLY_CHANNEL: u8 = 6;
+
+    /// Writes `count` unreferenced fragments and returns their logical ids.
+    fn seed_exact_dead(f: &Fixture, count: u32) -> BTreeSet<BlobId> {
+        let mut dead = BTreeSet::new();
+        for generation in 0..count {
+            let id = BlobId::new(1, 1, generation, 0, EXACT_ONLY_CHANNEL, 0);
+            f.pool.put_blob(id, b"garbage").unwrap();
+            dead.insert(id);
+        }
+        dead
+    }
+
+    /// Whether any slot still holds a part of `id`.
+    fn fragment_present(f: &Fixture, id: BlobId) -> bool {
+        f.pool.slots().iter().any(|slot| {
+            slot.local_store()
+                .unwrap()
+                .live_ids()
+                .iter()
+                .any(|present| present.with_part(0) == id)
+        })
+    }
+
+    #[test]
+    fn the_fence_is_checked_before_the_first_deletion_and_every_interval() {
+        let f = Fixture::new("fence-interval");
+        let dead = seed_exact_dead(&f, 2 * FENCE_CHECK_INTERVAL as u32 + 1);
+        let calls = std::cell::Cell::new(0usize);
+        let first_call_saw_everything = std::cell::Cell::new(false);
+        let mut fence = || {
+            if calls.get() == 0 {
+                // The closure can see the pool, so this proves the check really
+                // runs before the first tombstone rather than after a batch.
+                first_call_saw_everything.set(dead.iter().all(|id| fragment_present(&f, *id)));
+            }
+            calls.set(calls.get() + 1);
+            Ok(())
+        };
+
+        let mut outcome = SweepOutcome::default();
+        sweep_pool(
+            &f.pool,
+            POOL,
+            &dead,
+            &BTreeSet::new(),
+            &mut fence,
+            &mut outcome,
+        )
+        .unwrap();
+
+        // One check before the first tombstone, then one before deletion
+        // `FENCE_CHECK_INTERVAL + 1` and one before `2 * FENCE_CHECK_INTERVAL + 1`.
+        assert_eq!(calls.get(), 3, "{outcome:?}");
+        assert!(
+            first_call_saw_everything.get(),
+            "the first check must run before any fragment is deleted"
+        );
+        assert_eq!(
+            outcome.fragments_deleted,
+            dead.len() * f.pool.scheme().total_parts(),
+            "{outcome:?}"
+        );
+        assert!(outcome.errors.is_empty(), "{outcome:?}");
+        assert!(
+            dead.iter().all(|id| !fragment_present(&f, *id)),
+            "a clean check must not stop the sweep: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn a_failed_check_mid_sweep_stops_further_deletions() {
+        let f = Fixture::new("fence-fail-mid");
+        let dead = seed_exact_dead(&f, 2 * FENCE_CHECK_INTERVAL as u32 + 1);
+        let calls = std::cell::Cell::new(0usize);
+        let mut fence = || {
+            calls.set(calls.get() + 1);
+            if calls.get() == 2 {
+                Err("injected fence loss".to_string())
+            } else {
+                Ok(())
+            }
+        };
+
+        let mut outcome = SweepOutcome::default();
+        let error = sweep_pool(
+            &f.pool,
+            POOL,
+            &dead,
+            &BTreeSet::new(),
+            &mut fence,
+            &mut outcome,
+        )
+        .expect_err("a failed check must stop the pool");
+
+        assert!(error.contains("collector fence lost"), "{error}");
+        assert!(error.contains("injected fence loss"), "{error}");
+        assert!(error.contains(POOL), "{error}");
+        assert_eq!(calls.get(), 2, "no check may run after the failure");
+        assert_eq!(
+            outcome.fragments_deleted,
+            FENCE_CHECK_INTERVAL * f.pool.scheme().total_parts(),
+            "only deletions before the failed check may run: {outcome:?}"
+        );
+        assert_eq!(outcome.errors.len(), 1, "{outcome:?}");
+        assert!(
+            outcome.errors[0].contains("injected fence loss"),
+            "{outcome:?}"
+        );
+
+        let (deleted, survivors): (Vec<_>, Vec<_>) = dead
+            .iter()
+            .copied()
+            .enumerate()
+            .partition(|(index, _)| *index < FENCE_CHECK_INTERVAL);
+        assert!(
+            deleted.iter().all(|(_, id)| !fragment_present(&f, *id)),
+            "fragments before the failure were deleted: {outcome:?}"
+        );
+        assert!(
+            survivors.iter().all(|(_, id)| fragment_present(&f, *id)),
+            "fragments after the failure must still be present: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn a_pass_without_a_failed_check_still_deletes_every_dead_fragment() {
+        let f = Fixture::new("fence-no-failure");
+        let dead = seed_exact_dead(&f, 2 * FENCE_CHECK_INTERVAL as u32 + 1);
+
+        // The real legacy pass, so the closure is wired to the live collector
+        // record rather than a test stub.
+        let outcome = f.sweep();
+        assert!(outcome.refusal.is_none(), "{outcome:?}");
+        assert!(outcome.errors.is_empty(), "{outcome:?}");
+        assert_eq!(
+            outcome.fragments_deleted,
+            dead.len() * f.pool.scheme().total_parts(),
+            "{outcome:?}"
+        );
+        assert!(
+            dead.iter().all(|id| !fragment_present(&f, *id)),
+            "a pass whose checks all succeed must delete every dead fragment: {outcome:?}"
+        );
     }
 
     /// Multi-Raft passes: one leader-only, quorum-confirmed sweep per data
