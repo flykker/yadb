@@ -21,11 +21,16 @@ than the project-group leader can therefore lag a commit; assertions that need
 read-your-writes poll with `eventually` instead of racing the apply loop.
 
 Unavailable capabilities are reported as `SKIP <scenario>: <reason>` instead
-of being turned into a pass: reader leases are legacy-gated, Multi-Raft repair
-and collection are disabled, and cross-process `InstallSnapshot` has no live
-run here. The disabled GC and scrub routes are tested for refusal and fragment
-preservation, not collection. A skipped scenario is still a non-zero exit if
-anything else fails.
+of being turned into a pass: reader leases are legacy-gated, and Multi-Raft
+repair and collection are disabled. A live cross-process `InstallSnapshot` at
+the HTTP level is opt-in through `--install-snapshot-live`: reaching the
+daemon's shipped snapshot trigger costs a burst of committed entries measured in
+hours on this host, so the default run reports a SKIP naming that cost, and an
+unfinished burst reports a SKIP with the entries it did commit. The install path
+itself is proven by the crate-level process test
+`three_process_mtls_failover_and_quorum_loss`. The disabled GC and scrub routes
+are tested for refusal and fragment preservation, not collection. A skipped
+scenario is still a non-zero exit if anything else fails.
 """
 import argparse
 import datetime
@@ -37,6 +42,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import select
 import socket
 import socketserver
@@ -77,6 +83,43 @@ CONTROL_GROUP = 1
 PROJECT_GROUPS = {"1": 2, "2": 3}
 # billing is project id 1 and therefore owned by data group 2.
 BILLING_GROUP = PROJECT_GROUPS["1"]
+
+# Forcing a cross-process InstallSnapshot without a crates/ change relies on
+# openraft 0.9.25's defaults (Config::default in the daemon): snapshot_policy
+# `since_last:5000`, max_in_snapshot_log_to_keep 1000 and
+# replication_lag_threshold 5000. The policy triggers once the committed index
+# reaches `snapshot_last_log + 5000`, and this run has no snapshot in the billing
+# group yet, so the leader builds one at about log index 5000 and purges the
+# prefix below index 4000. A node stopped at index ~940 can then only be brought
+# up to date by a snapshot. The suite has already committed about 940 entries in
+# this group when the scenario starts, so 5000 more entries is the floor that
+# reaches the trigger: 5500 was not "1000 past the trigger", it was 500 past it.
+SNAPSHOT_BURST_ENTRIES = 5000
+# What that burst costs, measured on this build and repeated in the SKIP reason,
+# --help and the docs. The rate is not constant, and the decay is the point: on
+# one uninterrupted run the first 1254 entries took 519 s (2.4 entries/s), the
+# next 1253 took 2196 s (0.6 entries/s), and a direct probe of the leader's
+# last_log_index then measured 0.29 entries/s. Each applied entry persists a
+# state delta that grows with the log, so the tail is the expensive part and the
+# scenario cannot be timed from the head of the burst.
+SNAPSHOT_BURST_COST = (
+    "2.4 entries/s for the first 1250 entries, 0.6 for the next 1250, and 0.29 "
+    "measured after that, as the persisted state delta grows: 59 min for 2507 "
+    "entries and hours for the tail")
+# The scenario's own output says where the install path is really proven, so a
+# reader does not mistake this for the primary evidence.
+INSTALL_PROOF_ELSEWHERE = (
+    "the install path itself is proven by the crate-level process test "
+    "three_process_mtls_failover_and_quorum_loss in yadb-metakv, which drives "
+    "three child processes over mTLS, calls raft.trigger().snapshot(), waits for "
+    "the leader to purge past the offline node's index and then asserts that "
+    "node's snapshot count and every value after restart; this scenario would "
+    "add HTTP-level coverage only, and no PASS of it has been observed on this "
+    "host")
+# The burst writes as the project member that examples/platform.yaml grants
+# ReadWrite on billing, because the daemon's query route refuses the admin
+# subject for data writes.
+BURST_SUBJECT = "sa:billing-backend"
 
 
 def http_port(node):
@@ -706,6 +749,183 @@ def eventually(read, check, label, timeout=15):
     raise AssertionError(f"{label}: not observed within {timeout}s; last={last!r}")
 
 
+def observation_index(text):
+    """The log index in the `last_applied` field of `/openraft/status`.
+
+    The daemon renders `last_applied` with `{:?}`, so it reads `Some(LogId {
+    leader_id: ..., index: N })`. Returns None when the node has applied nothing
+    yet (`last_applied` is `None`).
+    """
+    match = re.search(r"index: (\d+)", text or "")
+    return int(match.group(1)) if match else None
+
+
+def snapshot_meta_index(line):
+    """The last log index a snapshot covers, from an openraft INFO line.
+
+    `SnapshotMeta` renders as `{snapshot_id: ..., last_log:T1-N2-1234, ...}`:
+    `LogId` prints `T<term>-N<node>-<index>`, and the option around it is
+    printed through `DisplayOption`, which writes the inner value with no
+    `Some(...)` wrapper. The installer's `Done install complete snapshot, meta:
+    ...` line prints it that way. An empty snapshot prints `last_log:None` and
+    yields None.
+    """
+    match = re.search(r"last_log:(?:Some\()?(?:T\d+-N\d+-)?(\d+)", line)
+    return int(match.group(1)) if match else None
+
+
+def appended_lines(path, offset):
+    """Lines written to `path` after byte `offset`.
+
+    Reading the whole appended region once is cheap next to the burst that
+    produces it, and a torn final line cannot match an evidence marker.
+    """
+    with path.open("rb") as handle:
+        handle.seek(offset)
+        return handle.read().decode("utf-8", "replace").splitlines()
+
+
+def log_evidence(path, offset, marker, check, label, timeout=300):
+    """Wait for an appended line that contains `marker` and passes `check`.
+
+    The leader that streams a snapshot and the node that installs it both log at
+    INFO, so the proof is a process's own output rather than an inference from
+    state that happens to match.
+    """
+    deadline = time.monotonic()+timeout
+    while True:
+        matched = [line for line in appended_lines(path, offset)
+                   if marker in line and check(line)]
+        if matched:
+            return matched
+        assert time.monotonic() < deadline, (
+            f"{label}: no `{marker}` line in {path} after byte {offset} "
+            f"within {timeout}s")
+        time.sleep(.25)
+
+
+def burst_query(node, sql, local=False, timeout=180):
+    """Run one statement on `node` through the daemon's own SQL route.
+
+    The burst and its reads use this route rather than pgwire: measured back to
+    back with one node stopped, the same INSERT cost 614 ms here against 963 ms
+    through the pgwire bridge, and the burst is long enough that the difference
+    decides whether the opt-in scenario is practical. Both routes commit through
+    the same engine.
+
+    `local` leaves `force_leader` off, which serves a read from this node's own
+    applied state instead of forwarding it to the project-group leader. That is
+    the only way to prove a restarted node itself holds the burst rows: a
+    forwarded read would be answered by the leader either way.
+
+    A burst of thousands of commits is a load generator, so it retries the two
+    ways a loaded host can lose an answer: a transport error, and the 502/503/504
+    the daemon returns when its metadata bridge gave up after a fixed six-second
+    wait and the write's outcome is unknown. The burst writes with UPSERT, which
+    makes such a retry idempotent; every other refusal still fails the scenario,
+    and the row count is checked against the statements attempted, so a retry
+    that silently lost a row is caught rather than hidden. The wait is bounded by
+    `timeout` per statement and backs off, because on a loaded host the retry can
+    be answered by the same six-second budget while the earlier write is still
+    queued.
+    """
+    headers = {"Content-Type": "application/json",
+               **DEV.signed_headers(SUBJECT_SECRET, BURST_SUBJECT)}
+    body = json.dumps({"sql": sql, "force_leader": not local}).encode()
+    deadline = time.monotonic()+timeout
+    attempt = 0
+    while True:
+        try:
+            status, _, out = request(http_port(node), "POST", "/db/billing/ledger/query",
+                                     body, headers, timeout=120)
+        except OSError as error:
+            last = f"{type(error).__name__}: {error}"
+        else:
+            if status == 200:
+                return json.loads(out)
+            last = (status, out[:200])
+            if status not in (502, 503, 504):
+                break
+        assert time.monotonic() < deadline, (sql, last)
+        time.sleep(min(2**attempt, 10))
+        attempt += 1
+    raise AssertionError((sql, last))
+
+
+def burst_rows(node, local=False):
+    """The burst table's count, id bounds and checksum, as pgwire-style strings.
+
+    Stringified so the leader's answer and a restarted node's local answer
+    compare equal without depending on which protocol produced them.
+    """
+    result = burst_query(
+        node, "SELECT COUNT(*), MIN(id), MAX(id), SUM(balance) FROM snapshot_burst;",
+        local=local)
+    return [[None if value is None else str(value) for value in row]
+            for row in result["rows"]]
+
+
+class BurstTimeout(RuntimeError):
+    """The burst did not reach its entry target inside its own deadline.
+
+    Distinct from an assertion failure so the opt-in scenario can report an
+    unfinished burst as a SKIP with the numbers it did reach, instead of failing
+    the suite: on a loaded host this is the expected outcome, and it is evidence
+    about cost, not about correctness.
+    """
+
+    def __init__(self, written, entries, seconds):
+        super().__init__(
+            f"burst stopped at {entries} entries after {written} statements "
+            f"in {seconds:.0f}s")
+        self.written = written
+        self.entries = entries
+        self.seconds = seconds
+
+
+def burst_commits(leader, target_entries, timeout=7200):
+    """Commit one-row UPSERTs until the billing group's log grew by `target_entries`.
+
+    A one-row auto-commit statement costs about five Raft entries (the row, its
+    keys and the group's revision bookkeeping each append), so the burst is
+    counted in entries read from `last_log_index` and never in statements. The
+    wall time returned is what this build actually paid.
+
+    Rows are what grows the log, not row payload: one statement carrying a
+    hundred rows still appended only eight entries, measured on this build, so
+    wider statements would make the burst slower, not shorter. `UPSERT` rather
+    than `INSERT` is what lets `burst_query` retry an unknown outcome; ids stay
+    unique, so the resulting rows are identical to the inserts.
+
+    Progress is printed every 500 entries with the rate and the remaining time at
+    that rate: the burst runs for tens of minutes, and its rate falls as the
+    persisted state delta grows, so a silent log would hide both a stall and the
+    fact that the estimate has moved.
+    """
+    before = group_observation(leader, BILLING_GROUP)["last_log_index"]
+    assert isinstance(before, int), before
+    started = time.monotonic()
+    written = 0
+    reported = 0
+    while True:
+        for _ in range(250):
+            written += 1
+            burst_query(leader, f"UPSERT INTO snapshot_burst VALUES ({written},{written});")
+        delta = group_observation(leader, BILLING_GROUP)["last_log_index"] - before
+        if delta >= target_entries:
+            return written, delta, time.monotonic()-started
+        if delta >= reported+500:
+            reported = delta
+            elapsed = time.monotonic()-started
+            rate = delta/elapsed
+            print(f"  burst: {delta}/{target_entries} entries, {written} statements, "
+                  f"{elapsed:.0f}s, {rate:.1f} entries/s, "
+                  f"~{(target_entries-delta)/rate/60:.0f} min left at that rate",
+                  flush=True)
+        if time.monotonic() >= started+timeout:
+            raise BurstTimeout(written, delta, time.monotonic()-started)
+
+
 def s3_visible(port, key, body, extra=None, timeout=15):
     """Default S3 GET on a possibly-lagging follower, until `body` is applied."""
     return eventually(lambda: signed(port, "GET", key, extra=extra),
@@ -945,7 +1165,8 @@ def launch_node(root, node, env):
         log.close()
 
 
-def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
+def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None,
+        install_snapshot_live=False):
     global SECRET, RAFT_TOKEN, SUBJECT_SECRET
     base = "/data/data/com.foxdebug.acodefree/cache/opencode"
     with tempfile.TemporaryDirectory(prefix="yadb-protocols-", dir=base) as temp:
@@ -1568,9 +1789,124 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
                     assert time.monotonic() < deadline, "control cache not recovered"
                     time.sleep(.05)
             wait_all_leaders()
-            skip("cross-process InstallSnapshot",
-                 "a full-cluster restart re-elects and replays from the local WAL; no "
-                 "scenario forces one node to install a snapshot from another process")
+            if not install_snapshot_live:
+                skip("cross-process InstallSnapshot",
+                     "not run by default: reaching the daemon's shipped "
+                     "snapshot trigger (Config::default, since_last:5000) needs "
+                     f"a burst of {SNAPSHOT_BURST_ENTRIES} committed entries, "
+                     f"measured at {SNAPSHOT_BURST_COST}, so this scenario is "
+                     f"opt-in through --install-snapshot-live; {INSTALL_PROOF_ELSEWHERE}. "
+                     "Without it a full-cluster restart only re-elects and "
+                     "replays every node's local WAL")
+            else:
+                # Only one node is stopped. The restarted node must install the
+                # leader's snapshot: its own log ends before the entries the
+                # leader purged, so replaying that WAL cannot produce the state.
+                #
+                # Say where the install path is actually proven before spending
+                # hours on it. The crate-level process test drives three child
+                # processes over mTLS and calls `raft.trigger().snapshot()`
+                # directly; this scenario can only reach the same trigger through
+                # the shipped `Config::default()` policy, which is why it is
+                # expensive, and it adds no evidence beyond the HTTP level.
+                print(f"  live install attempt: {INSTALL_PROOF_ELSEWHERE}; this "
+                      f"scenario spends a {SNAPSHOT_BURST_ENTRIES}-entry burst "
+                      f"({SNAPSHOT_BURST_COST}) to reach the daemon's default "
+                      "snapshot trigger", flush=True)
+                leader = wait_group_leader(BILLING_GROUP)
+                control_leader = wait_group_leader(CONTROL_GROUP)
+                # Keep both the billing and control leaders alive: the burst
+                # needs the billing leader to commit, and the control lease for
+                # every request. Either other node follows both groups.
+                candidates = [i for i in NODES if i not in (leader, control_leader)]
+                stopped = (candidates or [i for i in NODES if i != leader])[0]
+                assert stopped not in (leader, control_leader), (stopped, leader, control_leader)
+                stopped_index = group_observation(stopped, BILLING_GROUP)["last_log_index"]
+                assert isinstance(stopped_index, int), stopped_index
+                node_log = temp / "logs" / f"node-{stopped}.log"
+                nodes[stopped-1].kill()
+                nodes[stopped-1].wait(timeout=10)
+                burst_query(leader,
+                            "CREATE TABLE snapshot_burst (id INT PRIMARY KEY, balance INT);")
+                try:
+                    statements, entries, burst_seconds = burst_commits(
+                        leader, SNAPSHOT_BURST_ENTRIES)
+                except BurstTimeout as timeout_error:
+                    # Report the unfinished burst as a SKIP with its numbers, not
+                    # as a pass and not as a suite failure: on this host it is the
+                    # expected outcome, and it says something about cost only.
+                    # Bring the stopped node back first, so the scenarios after
+                    # this one see a full cluster and the run continues.
+                    DEV.sync_replica_modes(temp)
+                    nodes[stopped-1] = launch_node(temp, stopped, env)
+                    wait(http_port(stopped))
+                    skip("cross-process InstallSnapshot (attempted)",
+                         f"the burst did not reach the daemon's default snapshot "
+                         f"trigger in {timeout_error.seconds:.0f}s: it committed "
+                         f"{timeout_error.entries} of {SNAPSHOT_BURST_ENTRIES} "
+                         f"entries from {timeout_error.written} statements, and "
+                         f"node {stopped} was restarted so the rest of the run "
+                         f"could continue; no install was attempted, and no PASS "
+                         f"is claimed. {INSTALL_PROOF_ELSEWHERE}")
+                else:
+                    target = eventually(
+                        lambda: group_observation(leader, BILLING_GROUP),
+                        lambda o: (observation_index(o["last_applied"]) or -1)
+                                  >= o["last_log_index"],
+                        f"leader {leader} applied every burst entry", timeout=120)
+                    target_applied = observation_index(target["last_applied"])
+                    assert target_applied > stopped_index, (target_applied, stopped_index)
+                    leader_rows = burst_rows(leader)
+                    assert leader_rows and int(leader_rows[0][0]) == statements, (
+                        leader_rows, statements)
+                    # Restart only this node, and instrument only this node. The
+                    # install proof is a line in its own log; enabling openraft's
+                    # INFO filter cluster-wide costs this debug build roughly a
+                    # factor of ten in commit throughput, which the burst cannot
+                    # pay. The scan starts at the current end of the file, so a
+                    # line from an earlier scenario cannot satisfy it.
+                    node_offset = node_log.stat().st_size
+                    evidence_env = dict(env, RUST_LOG="openraft=info")
+                    DEV.sync_replica_modes(temp)
+                    nodes[stopped-1] = launch_node(temp, stopped, evidence_env)
+                    restarted_pid = nodes[stopped-1].pid
+                    wait(http_port(stopped))
+                    deadline = time.monotonic()+300
+                    while True:
+                        try:
+                            applied = observation_index(
+                                group_observation(stopped, BILLING_GROUP)["last_applied"])
+                        except (OSError, RuntimeError):
+                            applied = None
+                        if applied is not None and applied >= target_applied:
+                            break
+                        assert time.monotonic() < deadline, (
+                            f"node {stopped} did not apply through index {target_applied}")
+                        time.sleep(.05)
+                    installs = log_evidence(
+                        node_log, node_offset, "Done install complete snapshot",
+                        lambda line: (snapshot_meta_index(line) or 0) > stopped_index,
+                        f"node {stopped} completed a snapshot install")
+                    # Both routes forward a data write to the billing leader, so
+                    # the rows below prove the cluster still serves the burst; the
+                    # proof that this node itself holds the state is its own
+                    # applied index, the completed-install line above, and this
+                    # local read, which `force_leader: false` serves from its own
+                    # applied state.
+                    restored_rows = burst_rows(stopped, local=True)
+                    assert restored_rows == leader_rows, (restored_rows, leader_rows)
+                    print(f"PASS cross-process InstallSnapshot: node {stopped} (pid "
+                          f"{restarted_pid}) stopped at log index {stopped_index}; "
+                          f"{statements} statements made {entries} entries in "
+                          f"{burst_seconds:.1f}s; restarted alone, it applied through "
+                          f"index {target_applied} only by installing a snapshot "
+                          f"(installed meta index "
+                          f"{max(snapshot_meta_index(line) for line in installs)}, "
+                          f"past the index it stopped at) and its own local read "
+                          f"returns all {leader_rows[0][0]} burst rows; this is "
+                          f"HTTP-level coverage only, the install path itself is "
+                          f"proven by the crate test "
+                          f"three_process_mtls_failover_and_quorum_loss")
             restored = Pg(pg_port(2))
             assert restored.rows("SELECT balance FROM wire WHERE id=1;") == [["90"]]
             assert restored.rows("SELECT id FROM wire WHERE balance=90;") == [["1"]]
@@ -1964,6 +2300,14 @@ if __name__ == "__main__":
     parser.add_argument("--native-clients", action="store_true", help="also require psql and AWS CLI")
     parser.add_argument("--libiscsi-dir", help="directory containing libiscsi utilities")
     parser.add_argument("--libiscsi-probe", help="compiled tests/libiscsi_probe.c (temporary volume only)")
+    parser.add_argument("--install-snapshot-live", action="store_true",
+                        help="attempt the opt-in cross-process InstallSnapshot scenario: "
+                             f"a burst of {SNAPSHOT_BURST_ENTRIES} committed entries, "
+                             f"measured at {SNAPSHOT_BURST_COST}. Off by default because "
+                             f"that burst takes hours on this host; "
+                             f"{INSTALL_PROOF_ELSEWHERE}. An unfinished burst is "
+                             f"reported as a SKIP with its numbers, never as a pass")
     args = parser.parse_args()
     run(native_clients=args.native_clients, libiscsi_dir=args.libiscsi_dir,
-        libiscsi_probe=args.libiscsi_probe)
+        libiscsi_probe=args.libiscsi_probe,
+        install_snapshot_live=args.install_snapshot_live)

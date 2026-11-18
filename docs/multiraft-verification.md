@@ -2455,3 +2455,202 @@ exceeded the 250 ms heartbeat budget, and OpenRaft reports a timed-out heartbeat
 as a progress error that resets nothing, so nothing retried it. The status fields
 are what made the shape visible before the tracing subscriber was installed, and
 they remain the cheapest first look at any future stall.
+
+## Forcing a cross-process InstallSnapshot (2026-11-18)
+
+Every restart in `tests/protocols.py` used to restart the whole cluster, so each
+node replayed its own WAL and no node ever installed a snapshot from another
+process. That gap is now covered at the HTTP level by an opt-in scenario,
+`--install-snapshot-live`. The install path itself was never unproven: the
+crate-level process test `three_process_mtls_failover_and_quorum_loss` in
+`yadb-metakv` drives three real child processes over mTLS, calls
+`raft.trigger().snapshot()` directly, waits until the leader has purged past the
+offline node's last log index, restarts that node and asserts `snapshots > 0`
+plus every value. What that test does not cover is a *daemon* reaching the
+trigger through its own configuration, because the daemon exposes no admin route
+for it.
+
+It is opt-in because reaching the trigger through the shipped configuration is
+expensive. openraft 0.9.25's defaults — `snapshot_policy since_last:5000` and
+`max_in_snapshot_log_to_keep 1000` — make the leader build a snapshot once its
+committed index reaches `snapshot_last_log + 5000`, then purge everything below
+`snapshot_last_log - 1000`. This run has no earlier snapshot in the billing
+group, and the suite has already committed about 940 entries in it, so **5000
+more entries is the floor** that reaches the trigger; the purge point then lands
+around index 4000, far above the stopped node's ~940. (An earlier draft used
+5500 and described it as "about 1000 past the trigger". That was wrong twice:
+the trigger is at 5000 and 5500 is 500 past it.)
+
+Wider statements do not shorten it. A Raft entry carries a whole statement's
+changes, so one statement with a hundred rows still appended eight entries,
+measured on this build: the log grows with statements, not with rows. The burst
+therefore writes one row per statement, which was also the fastest shape per
+entry (5.0 entries/s against 4.0 for twenty rows per statement).
+
+Without the flag nothing else changes: the scenario prints a SKIP naming that
+cost, and the `RUST_LOG=openraft=info` filter the evidence needs is set only on
+the one node that is restarted, so a normal run's output and timing are
+untouched. Enabling that filter on the whole cluster was measured to cost about
+a factor of ten in commit throughput, which is why only the restarted node is
+instrumented.
+
+### What the scenario does
+
+1. Prints, before spending anything, that the install path is proven by
+   `three_process_mtls_failover_and_quorum_loss` and that this scenario adds
+   HTTP-level coverage only.
+2. Reads the billing-group and control-group leaders and stops a node that is
+   neither, so both groups keep a quorum and exactly one process is stopped.
+3. Records that node's last log index, then commits the burst against the
+   billing leader, counting Raft entries from `last_log_index` instead of
+   assuming the entry-per-statement ratio.
+4. Waits for the leader to apply every burst entry, restarts only the stopped
+   node, and waits for that node's own applied index to reach the leader's.
+5. If the burst does not reach the trigger, restarts the stopped node, so the
+   rest of the run sees a full cluster, and reports a SKIP with the entries it
+   did commit. A timeout is never reported as a pass.
+
+### Evidence, and how strong it is
+
+| Evidence | What it proves | Strength |
+| --- | --- | --- |
+| Restarted node log, after a byte offset taken before the restart: `Done install complete snapshot, meta: {... last_log:T?-N?-N ...}` with a meta index above the stopped node's last index | Its state machine installed a snapshot that covers entries it never held | library INFO line from `openraft::core::sm::worker`, printed only after `install_snapshot` returned `Ok` |
+| The restarted node's own `last_applied` reaches the leader's | It holds the same state | `/openraft/status` read from that node |
+| Local read (`force_leader: false`) of `COUNT(*), MIN(id), MAX(id), SUM(balance)` over the burst table matches the leader's | Its own applied state contains every burst row | the daemon serves default reads from local applied state, so this is that node's state, not a forwarded answer |
+
+`Done install complete snapshot` is emitted only for an `InstallFullSnapshot`
+command, and openraft issues that command only from
+`RaftMsg::InstallFullSnapshot`, which the daemon reaches only through
+`Raft::install_full_snapshot` on an inbound `InstallSnapshot` RPC. A local
+restart does not print it: startup loads an existing snapshot through
+`get_current_snapshot` instead. So the line names a snapshot that another
+process sent.
+
+The WAL argument is what makes this an install and not a replay. The stopped
+node's log ends at index S; the leader purges everything below its snapshot's
+last index minus 1000, and that purge point is above S. Entries after S are gone
+from the leader's log, so log replication cannot bring the node up to date and
+openraft has to stream a snapshot. The installed snapshot's meta index is
+asserted above S, so the snapshot covers entries that node never held.
+
+Limits, stated plainly: the evidence is openraft's own INFO output, not a
+capture of the transport frames, so it does not show how many chunks crossed the
+wire or which peer sent them. openraft retries a failed install and prints the
+completed line only on success, so the line proves a success happened, not that
+it happened once.
+
+The timeout branch was exercised on purpose (a 60 s burst deadline, scratch
+harness, not committed) and it behaves as described: the SKIP carries the
+entries committed, the stopped node is restarted, and the following scenarios
+run. It also showed a side effect worth knowing: an attempted-but-unfinished
+burst leaves the billing group carrying 1254 extra rows, and in both such runs a
+later partition scenario failed on the daemon's fixed six-second commit budget
+(`OpenRaft write outcome unknown: metadata bridge response timed out or stopped`)
+— a different scenario each time, so it is a budget under a heavier state rather
+than one specific assertion. The default run does not take this branch; an
+opt-in run that times out can therefore end non-zero after printing its SKIP,
+and that failure is the pre-existing budget, not a claim about the install.
+
+The purge point itself is not asserted, because `/openraft/status` reports
+`last_log_index`, `last_applied` and replication but not `RaftMetrics.snapshot`
+or `.purged`; the daemon builds that payload in `crates/yadbd/src/openraft.rs`.
+The scenario therefore relies on the 5000-entry burst leaving the log at or past
+the trigger with the purge point around index 4000, and it fails loudly rather
+than quietly if the node catches up by log replication instead. Exposing
+`snapshot` and `purged` in that payload is the second `crates/` change this
+scenario would benefit from; like the first, it was not made here.
+
+### Measured cost
+
+The rate decays within a single uninterrupted burst, which is the number that
+decides whether this can be a gate. Measured on this host, one run:
+
+| Window | Entries | Seconds | Entries/s |
+| --- | --- | --- | --- |
+| first | 1254 | 519 | 2.4 |
+| next | 1253 | 2196 | 0.6 |
+| after that, direct probe of `last_log_index` | 26 | 90 | 0.29 |
+
+So 2507 entries cost 59 minutes, and the remaining half of a 5000-entry burst is
+extrapolated in hours at 0.29 entries/s. Each applied entry persists a state
+delta that grows with the log, so the tail is inherently the expensive part; a
+quiet host reaches 8.5 entries/s over a short burst, which is why short probes
+understate the total. **No PASS of this scenario has been observed on this
+host.** The scenario reports an unfinished burst as a SKIP carrying the entries
+it did commit, so a timeout is visible and is never counted as success.
+
+Short-burst measurements, for the record:
+
+| Cluster state | Client path | Statements | Raft entries | Seconds | Entries/s |
+| --- | --- | --- | --- | --- | --- |
+| one node stopped | pgwire | 100 | 504 | 155.5 | 3.2 |
+| one node stopped | pgwire | 20 | 100 | 19.3 | 5.2 |
+| one node stopped | `/db/<project>/<database>/query` | 20 | 104 | 12.3 | 8.5 |
+
+The same INSERT cost 614 ms through the daemon's own query route against 963 ms
+through the pgwire bridge, measured back to back on one cluster with a node
+stopped, which is why the burst uses the query route. The entry count is five
+per statement either way, and it is read from `last_log_index` rather than
+assumed. Concurrency does not help: the metadata bridge dispatches
+`client_write` without waiting so that the runtime can batch, but measured with
+the burst's own UPSERT path, four concurrent writers managed 805 entries in
+537 s (1.5 entries/s) against 204 entries in 42 s (4.9 entries/s) for one
+writer on the same cluster, because concurrent proposals raise each statement's
+latency past the bridge's fixed six-second budget and the retries then dominate.
+The burst therefore stays single-writer.
+
+Rows per statement, measured the same way on one cluster with a node stopped:
+
+| Shape | Statements | Rows | Entries | Entries/statement | Seconds | Entries/s |
+| --- | --- | --- | --- | --- | --- | --- |
+| one row per statement | 20 | 20 | 104 | 5.2 | 20.9 | 5.0 |
+| twenty rows per statement | 5 | 100 | 40 | 8.0 | 9.9 | 4.0 |
+| a hundred rows per statement | 2 | 200 | 16 | 8.0 | 3.8 | 4.2 |
+| one row per statement, repeated | 20 | 20 | 100 | 5.0 | 28.3 | 3.5 |
+
+The burst writes with `UPSERT`, not `INSERT`, so that a retried statement is
+idempotent: a loaded host can answer with the daemon's 503 `OpenRaft write
+outcome unknown: metadata bridge response timed out or stopped`, which is the
+fixed six-second wait in `crates/yadb-metakv/src/openraft_client.rs` giving up
+on a write that may still commit. The burst retries that, a transport error and
+502/504, with a backoff bounded by a per-statement deadline; a retry of a
+write whose outcome was unknown re-queues the same id, so the committed rows are
+the same as for `INSERT`. The scenario still asserts that the table holds
+exactly the number of rows it attempted, which is what keeps a lost retry from
+passing silently. Earlier flagged runs on a host loaded by other work stopped
+this way at 1254 entries; the bounded retry is the fix for that, not a
+change to what the scenario proves.
+
+Making the burst cheaper would need a knob the daemon does not expose:
+`snapshot_policy` and `max_in_snapshot_log_to_keep` are openraft `Config` fields
+that `crates/yadbd/src/openraft.rs` leaves at their defaults, since it overrides
+only `heartbeat_interval` and `election_timeout_min`/`_max`. Lowering the
+trigger there would shrink the burst by an order of magnitude, but the scenario
+exists to prove the shipped configuration, so no `crates/` change was made. The
+exact change, if it is ever wanted: a config field for `snapshot_policy` (or a
+test-only override) next to the heartbeat overrides in that file, plus
+`max_in_snapshot_log_to_keep` if the purge point needs to move as well.
+
+### Gates
+
+* `python3 tests/protocols.py` — 20 PASS / 4 SKIP, exit 0; the SKIP reads
+  `cross-process InstallSnapshot: not run by default: reaching the daemon's
+  shipped snapshot trigger (Config::default, since_last:5000) needs a burst of
+  5000 committed entries, measured at 2.4 entries/s for the first 1250 entries,
+  0.6 for the next 1250, and 0.29 measured after that, as the persisted state
+  delta grows: 59 min for 2507 entries and hours for the tail, so this scenario
+  is opt-in through --install-snapshot-live; the install path itself is proven by
+  the crate-level process test three_process_mtls_failover_and_quorum_loss in
+  yadb-metakv, which drives three child processes over mTLS, calls
+  raft.trigger().snapshot(), waits for the leader to purge past the offline
+  node's index and then asserts that node's snapshot count and every value after
+  restart; this scenario would add HTTP-level coverage only, and no PASS of it
+  has been observed on this host. Without it a full-cluster restart only
+  re-elects and replays every node's local WAL`.
+* `python3 tests/protocols.py --install-snapshot-live` — opt-in, not part of the
+  gate on this host. It has not passed here: the burst reached 2507 of 5000
+  entries in 59 minutes at a decaying rate and was stopped. When it does
+  complete, the scenario prints a PASS naming the installed snapshot's meta index
+  and states that the install path itself is proven by
+  `three_process_mtls_failover_and_quorum_loss`; when it does not complete, it
+  prints a SKIP with the entries it committed.
