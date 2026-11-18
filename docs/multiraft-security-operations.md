@@ -51,6 +51,14 @@ pass that lost its fence. The request field is required, not defaulted: a caller
 that omits it is rejected at deserialization rather than silently getting an
 unfenced barrier.
 
+That requirement makes a mixed-version rollout asymmetric, which is worth knowing
+before an upgrade: a new collector sending a barrier to an older target succeeds
+and is *not* checked (the old target ignores the unknown field and behaves as it
+did before this change), while an older collector sending to a new target is
+rejected with `422` naming the missing field. Both directions fail closed with
+respect to *safety* only in the second case, so do not treat the presence of the
+field as a deployment-wide guarantee until every target runs this version.
+
 **They were unauthenticated until this delta.** Any caller able to reach the
 listener could delete or fence a hosted slot without an admin subject and without
 project authorization, and could repeat that across the replica slots to defeat

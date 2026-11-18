@@ -1479,14 +1479,35 @@ mod tests {
         let owner = prepared.provision_client_root(&root, &peers).unwrap();
         let mut running = prepared.start().await.unwrap();
         let meta = running.metadata(peers.clone()).unwrap();
+        // Waiting for leadership must tolerate the states a starting group
+        // actually passes through: `role_info_for_key` can fail outright while the
+        // group is still coming up, and that used to panic *inside* the wait loop,
+        // turning "not ready yet" into a confusing unwrap failure. Record the last
+        // observation and assert it, so a slow start fails here with the state that
+        // was seen rather than three statements later.
+        let mut last = String::from("no observation");
+        let mut both_leading = false;
         for _ in 0..100 {
-            if meta.role_info_for_key("/db/1/").unwrap().1 == yadb_metakv::RoleState::Leader
-                && meta.role_info_for_key("/db/2/").unwrap().1 == yadb_metakv::RoleState::Leader
-            {
+            last = match (
+                meta.role_info_for_key("/db/1/"),
+                meta.role_info_for_key("/db/2/"),
+            ) {
+                (Ok((_, one, ..)), Ok((_, two, ..))) => {
+                    both_leading = one == yadb_metakv::RoleState::Leader
+                        && two == yadb_metakv::RoleState::Leader;
+                    format!("/db/1/={one:?} /db/2/={two:?}")
+                }
+                (one, two) => format!("role info unavailable: /db/1/={one:?} /db/2/={two:?}"),
+            };
+            if both_leading {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
+        assert!(
+            both_leading,
+            "both data groups must elect a leader before the write; last observation: {last}"
+        );
         for key in ["/db/1/value", "/db/2/value"] {
             let m = meta.clone();
             let key = key.to_string();
@@ -1520,8 +1541,44 @@ mod tests {
         let owner = prepared.provision_client_root(&root, &peers).unwrap();
         let mut running = prepared.start().await.unwrap();
         let meta = running.metadata(peers.clone()).unwrap();
-        assert_eq!(meta.get("/db/1/value").unwrap().value, b"ok");
-        assert_eq!(meta.get("/db/2/value").unwrap().value, b"ok");
+        // A reopened group is readable only once it has applied its log and
+        // answered a quorum read. `LocalMetaKv::get` *panics* when that snapshot is
+        // unavailable, which is what turned a slow reopen into an unwrap failure
+        // with no cause; use `try_snapshot` so the reason is available and the
+        // wait can be bounded. The assertion still fails on a lost value. One key
+        // at a time: a snapshot spanning two groups is refused by design.
+        let keys = ["/db/1/value", "/db/2/value"];
+        let mut last = String::from("no read attempted");
+        let mut values: Vec<Vec<u8>> = Vec::new();
+        for _ in 0..100 {
+            let mut read = Vec::new();
+            let mut failure = None;
+            for key in keys {
+                match meta.try_snapshot(&[key.to_string()], &[]) {
+                    Ok(snapshot) => match snapshot.get(key) {
+                        Some(kv) => read.push(kv.value),
+                        None => failure = Some(format!("{key} is absent")),
+                    },
+                    Err(error) => failure = Some(format!("{key}: {error}")),
+                }
+            }
+            match failure {
+                Some(reason) => last = reason,
+                None => {
+                    values = read;
+                    last.clear();
+                    if values == vec![b"ok".to_vec(), b"ok".to_vec()] {
+                        break;
+                    }
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            values,
+            vec![b"ok".to_vec(), b"ok".to_vec()],
+            "both groups must serve the value they committed before the restart; {last}"
+        );
         drop(meta);
         running.shutdown().await.unwrap();
         drop(running);
