@@ -658,10 +658,17 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   collector pass is in flight, and collector RPCs can continue past lease
   expiry, so a reader lease alone is not a sufficient fence. Storage-side
   fencing (a per-target epoch and a versioned RPC) is designed only conceptually
-  and is not implemented. One narrow piece of it does exist: a barrier carries the
+  and is not implemented. Two narrow pieces of it do exist. A barrier carries the
   collector lease deadline and the target refuses an expired one with `409`
   (`BlobError::BarrierLeaseExpired`), which bounds the barrier path to the target's
-  own write-and-fsync window plus clock skew instead of leaving it unchecked.
+  own write-and-fsync window plus clock skew instead of leaving it unchecked; an
+  unreadable target clock refuses with `409` too (`BarrierClockUnreadable`)
+  instead of defaulting to the epoch. And a volume now keeps a durable, monotonic
+  epoch (`VolumeStore::epoch`, advanced only by `advance_epoch`) and stamps every
+  fragment with the epoch it was written under, so `delete_fenced(id, epoch)`
+  refuses to unlink a fragment from another epoch. Neither piece establishes the
+  invariant: nothing carries the epoch over the wire, `PoolSlot::delete` is still
+  unfenced, there is no pin table, and no collector advances an epoch.
   That does not establish the invariant, so collection stays refused. Garbage
   therefore accumulates and can fill the disk;
   this is a knowingly accepted temporary measure. The repair (orphan) scan is

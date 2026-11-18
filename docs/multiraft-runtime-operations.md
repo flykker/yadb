@@ -219,11 +219,15 @@ flight, and collector RPCs can continue past lease expiry, so a reader lease
 alone is not a sufficient fence. Storage-side fencing (an epoch on every target
 and a versioned RPC) is designed only conceptually and is not implemented; the
 plan, including the invariant it has to establish and the drill that would prove
-it, is in `multiraft-gc-fencing-plan.md`. One narrow piece is implemented: a
+it, is in `multiraft-gc-fencing-plan.md`. Two narrow pieces are implemented: a
 barrier carries the collector lease deadline, and a target refuses an expired one
 with `409` instead of evicting a whole generation range for a pass that lost its
-fence. That narrows the barrier window to the target's own write-and-fsync plus
-clock skew; it does not make collection safe.
+fence (an unreadable target clock refuses the same way); and a volume keeps a
+durable epoch and stamps each fragment with the epoch it was written under, so a
+fenced delete can refuse a fragment from another epoch. Neither crosses a process
+boundary yet — no RPC carries the epoch, the delete path is still unfenced, and no
+collector advances an epoch — so they narrow the window without making collection
+safe.
 
 The metadata half of the lease is now stricter than the paragraph above
 suggests, and the difference matters when reading the plan. `ensure_live` refuses
@@ -240,7 +244,9 @@ until the record expires on its own. A reader or writer therefore cannot
 act under a lease the collector already considers dead, and `begin_read_lease`
 publishes a fresh record instead of reusing a dead one. What remains unproven is
 exactly item 3 of the plan: the record lives in metadata, the deletion happens on
-a storage target that never sees it.
+a storage target that never sees it. The durable target epoch above is a
+target-side fact, not a lease the target can evaluate; it only says which epoch a
+fragment belongs to.
 Manual GC and scrub return `409`, report zero deletions and zero reclaimed
 bytes, and leave fragments intact; the periodic task logs the refusal. Garbage
 therefore accumulates and can exhaust disk space. This change does not cancel
