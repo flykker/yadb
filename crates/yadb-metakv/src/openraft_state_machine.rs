@@ -510,8 +510,22 @@ fn persist_locked(inner: &mut Inner) -> Result<(), StorageError<u32>> {
         ));
     }
     let image = image_from_inner(inner, &inner.group, inner.node_id);
-    let bytes = image_bytes(&image)
-        .map_err(|e| storage_error(ErrorSubject::StateMachine, ErrorVerb::Write, e))?;
+    // Serialization is the other way this function fails without touching the
+    // disk, and it must poison too. The fold that called us cannot publish a
+    // checkpoint, the next attempt fails the same way, and leaving `failed`
+    // clear would repeat the fold's log line forever while applies kept
+    // answering from an image that can never be written.
+    let bytes = match image_bytes(&image) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            inner.failed = true;
+            return Err(storage_error(
+                ErrorSubject::StateMachine,
+                ErrorVerb::Write,
+                error,
+            ));
+        }
+    };
     let temp = inner.dir.join("state.json.tmp");
     let path = inner.dir.join("state.json");
     let fault = inner.fault.take();

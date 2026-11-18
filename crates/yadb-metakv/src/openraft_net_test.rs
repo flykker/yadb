@@ -318,10 +318,15 @@ async fn server_rejects_unknown_address_and_forged_sender() {
             result.is_err(),
             "server accepted a message signed by a different key"
         );
-        // The counter is process-wide and other tests run concurrently, so
-        // assert only that this rejection was counted. Without it the counter
-        // could stay at zero and report a clean transport while refusing
-        // frames, which is exactly the silence it exists to remove.
+        // `envelopes_rejected` is process-wide, so this proves that a rejection
+        // was counted while this request was refused — not that this exact
+        // request produced that increment. Without it the counter could stay at
+        // zero and report a clean transport while refusing frames, which is the
+        // silence it exists to remove; with it, a counter that cannot move is
+        // caught. This is currently the only test that forges an envelope, so
+        // the delta is exact; if another test starts forging one concurrently,
+        // this assertion needs its own counter or a serialization guard rather
+        // than a looser comparison.
         let after = rejected_envelopes();
         assert!(
             after > before,
@@ -330,6 +335,53 @@ async fn server_rejects_unknown_address_and_forged_sender() {
     })
     .await
     .expect("rejection test timed out");
+}
+
+/// Reads the process-wide outgoing-RPC failure counter.
+fn outgoing_rpc_failures() -> u64 {
+    transport_counters()["outgoing_rpc_failures"]
+        .as_u64()
+        .expect("outgoing_rpc_failures is a number")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cancelled_rpc_is_counted() {
+    // OpenRaft wraps `append_entries` in `C::timeout(heartbeat_interval, ...)`,
+    // so on a miss it drops the transport future mid-flight and no statement
+    // after the `await` ever runs. A counter incremented only after the `await`
+    // therefore never sees the append timeout it exists to expose — the exact
+    // blind spot this guard closes. The listener below accepts the TCP
+    // connection and then says nothing, which produces the same shape: the
+    // exchange is in flight when the caller's deadline drops it.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let silent = listener.local_addr().unwrap();
+    let node = 1u32;
+    let key = Arc::new(seed(node));
+    let registry =
+        Arc::new(PeerKeyRegistry::new(BTreeMap::from([(node, key.public_key())])).unwrap());
+    let config = TransportConfig::new(identity(node), key, BTreeMap::from([(2, silent)]), registry);
+    let mut factory = AuthenticatedTcpNetworkFactory::new(config);
+    let mut client = factory.new_client(2, &BasicNode::new("node-2")).await;
+    let request = WireRequest::Vote(Box::new(VoteRequest {
+        vote: openraft::Vote::new(1, 1),
+        last_log_id: None,
+    }));
+    let before = outgoing_rpc_failures();
+    // The transport's own TTL is five seconds, so it is still waiting when the
+    // outer deadline fires. That cancellation, not an error return, is what has
+    // to be counted.
+    let cancelled = tokio::time::timeout(
+        Duration::from_millis(200),
+        client.call_for_test(request, Duration::from_secs(5)),
+    )
+    .await;
+    assert!(cancelled.is_err(), "a silent peer should not answer");
+    let after = outgoing_rpc_failures();
+    assert!(
+        after > before,
+        "a cancelled RPC was not counted ({before} -> {after})"
+    );
+    drop(listener);
 }
 
 #[tokio::test]

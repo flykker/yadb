@@ -690,11 +690,13 @@ pub fn prepare(path: &Path) -> io::Result<Prepared> {
     // `rpc_ttl_floor` raises this transport's own deadline, but it cannot raise
     // OpenRaft's: 0.9.25 wraps `append_entries` in
     // `C::timeout(heartbeat_interval, ...)` (replication/mod.rs) and reports a
-    // miss as `RPCError::Timeout`, which it does **not** retry — the replication
-    // session for that peer ends. The floor is therefore only effective for RPC
-    // types OpenRaft does not wrap; an append is bounded by `heartbeat_ms`. The
-    // timing is validated below to keep `heartbeat_ms` above the transport's
-    // worst-case handshake, which is what actually makes appends survivable.
+    // miss as `RPCError::Timeout`, which it does **not** retry — a timed-out
+    // heartbeat resets no inflight state, so nothing is retried until the next
+    // event. The floor is therefore only effective for the RPC types OpenRaft
+    // does not wrap; an append is bounded by `heartbeat_ms`. Nothing here
+    // enforces a minimum heartbeat: the launchers provision 750 ms and the
+    // timing check below only requires `election_min_ms >= 3 x heartbeat_ms`,
+    // which bounds the heartbeat from above.
     let mut transport = transport;
     transport.rpc_ttl_floor = Some(Duration::from_millis(raft_config.election_timeout_min));
     Ok(Prepared {
@@ -721,12 +723,14 @@ impl Status {
     pub fn snapshot(&self) -> serde_json::Value {
         let groups = self.groups.iter().map(|(id, (raft, preferred))| { let m = raft.metrics().borrow().clone();
             // `last_applied` alone cannot say where a stalled write went. If
-            // `last_log_index` is ahead of it, the entry is in this node's log
-            // and the apply loop is the part not moving; if they match, the
-            // entry never arrived. `replication` (leader only) names the log id
-            // each peer has acknowledged, which is what decides whether an
-            // entry could have been committed at all. Reporting all three turns
-            // "write outcome unknown" into an answerable question.
+            // `last_log_index` is ahead of it, this node holds entries it has
+            // not applied; if they match, nothing is pending here and the stall
+            // is upstream. That is a direction, not an attribution: the endpoint
+            // does not know which index a given client write received, so it
+            // cannot prove that write is the one waiting. `replication` (leader
+            // only) names the log id each peer has acknowledged, which is the
+            // shape a lost or timed-out append leaves behind. Reporting all
+            // three turns "write outcome unknown" into a narrower question.
             let replication = m.replication.as_ref().map(|r| r.iter().map(|(peer, matched)| (*peer, format!("{matched:?}"))).collect::<BTreeMap<u32, String>>());
             serde_json::json!({"group": id, "node_id": m.id, "state": format!("{:?}", m.state), "term": m.current_term, "leader_id": m.current_leader, "preferred_leader": preferred, "preference_met": preferred.zip(m.current_leader).map(|(want, actual)| want == actual), "last_log_index": m.last_log_index, "last_applied": format!("{:?}", m.last_applied), "replication": replication, "millis_since_quorum_ack": m.millis_since_quorum_ack, "running_state": format!("{:?}", m.running_state)}) }).collect::<Vec<_>>();
         serde_json::json!({"enabled": true, "client_traffic": if self.client_mode { "multiraft" } else { "single-group" }, "production_ready": false, "limitation": "dedicated listener per group; reads are local-applied", "local_observations": groups})

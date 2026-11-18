@@ -158,15 +158,25 @@ reports `production_ready: false`; `client_traffic` is `multiraft` for the
 multi-group owner and `single-group` for a single-group one. Group node/state/term/
 leader are cached local observations, alongside `last_log_index`,
 `last_applied`, `millis_since_quorum_ack` and (on a leader) `replication`, which
-maps each peer to the highest log id it has acknowledged. Comparing
-`last_log_index` with `last_applied` says whether an uncommitted write reached the
-log or stalled in the apply loop; a peer whose `replication` entry is `None` has
-not acknowledged anything in the current term. The `transport` object reports
+maps each peer to the highest log id it has acknowledged. These narrow a stalled
+write; they do not attribute one. `last_log_index` ahead of `last_applied` means
+this node holds entries it has not applied, and equality means nothing is pending
+locally, so the stall is upstream — but the endpoint does not know which index a
+given client write received, so it cannot prove that *that* write is the one
+waiting. A peer whose `replication` entry is `None` has not acknowledged anything
+in the current term, which is the shape a lost or timed-out append leaves behind.
+The `transport` object reports
 process-wide counters for events that otherwise leave no trace — connections
 dropped because all handler slots were busy (`connections_cap_dropped`),
 connections that ended before dispatch (`connections_failed`), envelopes rejected
 by decode, signature or challenge (`envelopes_rejected`), and outgoing RPCs that
-failed before a verified reply (`outgoing_rpc_failures`). They are monotonic
+ended without a verified reply (`outgoing_rpc_failures`). The last one counts a
+cancelled RPC too: OpenRaft's own heartbeat deadline drops the future mid-flight,
+which is precisely the append timeout worth seeing. Coverage is deliberately
+partial and documented as such: a snapshot manifest or chunk that fails
+verification is reported through the snapshot failure path, not through
+`envelopes_rejected` or `connections_failed`, and a request frame that cannot be
+read is closed without a counter. They are monotonic
 since process start and are not a health verdict: a nonzero `outgoing_rpc_failures`
 is expected under churn, while a nonzero `connections_cap_dropped` means the
 64-handler cap was reached and a peer was refused rather than delayed. Metrics,
@@ -373,12 +383,14 @@ writers and are set explicitly rather than inherited:
   `heartbeat_interval`, and 0.9.25 wraps the call in
   `C::timeout(heartbeat_interval, ...)` itself, so the transport's own deadline
   cannot extend an append: a miss becomes `RPCError::Timeout`, which is not
-  retried, and the replication session for that peer ends. `heartbeat_ms` is
+  retried. OpenRaft reports it as a progress error, and for a heartbeat request
+  that error resets nothing, so no retry follows until a later event. `heartbeat_ms` is
   therefore the real append budget and must be sized above the transport's
-  worst-case handshake; the dev timing uses 750 ms against a measured 1.8 ms
+  worst-case handshake; both launchers use 750 ms against a measured 1.8 ms
   median / 2.4 ms max proxied round trip, with election timeouts at
   2250/3000/3500 ms (the validator requires
-  `election_min_ms >= 3 x heartbeat_ms`). `TransportConfig::rpc_ttl_floor`
+  `election_min_ms >= 3 x heartbeat_ms`, which bounds the heartbeat from above,
+  not below). `TransportConfig::rpc_ttl_floor`
   raises the deadline for the RPC types OpenRaft does not wrap, and the daemon
   sets it to one `election_timeout_min`. `None` keeps OpenRaft's own deadline,
   which the in-process test transports rely on.

@@ -2157,28 +2157,35 @@ let res = C::timeout(the_timeout, self.network.append_entries(payload, option)).
 ```
 
 — so an append is bounded by `heartbeat_ms` no matter what the transport's own
-deadline is, and a miss becomes `RPCError::Timeout`, which
-`replication/mod.rs` does **not** retry: the replication session for that peer
-ends and `matched` stays at its old value until the next event. A tracing run
-with the debug subscriber enabled recorded exactly this: 668 `timeout after 250ms
-when AppendEntries 2->1`, and a leader whose follower held every entry up to
-index 290 while `replication[1]` was still `None`.
+deadline is, and a miss becomes `RPCError::Timeout`, which `replication/mod.rs`
+does **not** retry. It calls `send_progress_error` instead
+(`replication/mod.rs:286-287, 308-312`), and the replication task keeps draining
+events rather than exiting. What makes a timeout durable is on the receiving side:
+`update_progress` resets `inflight` so the next round retries for an ordinary
+request, but for `RequestId::HeartBeat` it only logs and leaves inflight
+untouched (`engine/handler/replication_handler/mod.rs:293-294`). A timed-out
+heartbeat therefore retries nothing until some later event arrives, and `matched`
+stays at its old value. A tracing run with the debug subscriber enabled recorded
+exactly this: 668 `timeout after 250ms when AppendEntries 2->1`, and a leader
+whose follower held every entry up to index 290 while `replication[1]` was still
+`None`.
 
 The floor is retained because it is correct for the RPC types OpenRaft does not
-wrap, but the append budget is now the configured heartbeat: the dev timing uses
-`heartbeat_ms: 750` (election 2250/3000/3500) so the budget is far above the
-measured 1.8 ms median / 2.4 ms max proxied handshake instead of roughly equal to
-it. The validation rule `election_min_ms >= 3 x heartbeat_ms` already forbids
-setting the heartbeat below the election window, so this is a config change, not
-a new invariant.
+wrap, but the append budget is now the configured heartbeat: both launchers use
+`heartbeat_ms: 750` (election 2250/3000/3500), which is orders of magnitude above
+the measured 1.8 ms median / 2.4 ms max proxied handshake. The 960 ms tail quoted
+above was measured through the same proxy under suite load and is not a bound on
+either value; the point is only that a 250 ms budget sits inside that spread while
+750 ms does not. The validation rule `election_min_ms >= 3 x heartbeat_ms`
+constrains the heartbeat from above, not from below, so it does not by itself
+guarantee a usable append budget.
 
-That is also its limit: the fix lives in the dev launcher
-(`scripts/yadb-openraft-dev.py`), not in the daemon. An operator who supplies
-`heartbeat_ms: 250` through `--openraft-config` will reproduce the stall, because
-nothing in `prepare` rejects a heartbeat that is too short for the transport.
-Making this structural would mean deriving a minimum heartbeat from the
-transport's worst-case handshake and rejecting a config below it; that is not
-implemented, and the requirement is recorded in
+That is also the limit: the fix lives in the two launchers, not in the daemon. An
+operator who supplies `heartbeat_ms: 250` through `--openraft-config` can
+reproduce the stall, because nothing in `prepare` rejects a heartbeat that is too
+short for the transport. Making this structural would mean deriving a minimum
+heartbeat from the transport's worst-case handshake and rejecting a config below
+it; that is not implemented, and the requirement is recorded in
 `docs/multiraft-runtime-operations.md` instead. Verification after the change:
 `tests/protocols.py` 3/3 consecutive clean runs, each 20 PASS / 4 SKIP, with zero
 `timeout after` lines in any daemon log (previously 668+ per run on the billing
@@ -2351,10 +2358,11 @@ OpenRaft's own `ERROR ... RPCError` lines were discarded; installing an
 
 `250ms` is `heartbeat_interval` from the dev timing. OpenRaft 0.9.25 wraps every
 append in `C::timeout(heartbeat_interval, ...)` and maps a miss to
-`RPCError::Timeout`, which `replication/mod.rs` does **not** retry: the
-replication session for that peer ends, `matched` stays put, and the commit index
-stops advancing even though the follower already holds the entries. A status
-snapshot taken during one failure shows exactly that shape:
+`RPCError::Timeout`, which `replication/mod.rs` does **not** retry; it reports a
+progress error, and for a heartbeat that error leaves `inflight` untouched, so
+`matched` stays put and the commit index stops advancing even though the follower
+already holds the entries. A status snapshot taken during one failure shows
+exactly that shape:
 
 ```
 node 2 (leader): last_log=290  applied=283  replication={1: None, 3: None}
@@ -2423,7 +2431,7 @@ the only visible symptom was `503 ... write outcome unknown`, which reads exactl
 like a slow machine.
 
 That diagnosis led to the root cause above: the reply was lost because the append
-exceeded the 250 ms heartbeat budget and OpenRaft ended the replication session
-instead of retrying. The status fields are what made the shape visible before the
-tracing subscriber was installed, and they remain the cheapest first look at any
-future stall.
+exceeded the 250 ms heartbeat budget, and OpenRaft reports a timed-out heartbeat
+as a progress error that resets nothing, so nothing retried it. The status fields
+are what made the shape visible before the tracing subscriber was installed, and
+they remain the cheapest first look at any future stall.

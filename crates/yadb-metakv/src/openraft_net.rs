@@ -83,7 +83,8 @@ struct TransportCounters {
     failed: AtomicU64,
     /// Envelopes rejected by decoding, signature or challenge verification.
     rejected: AtomicU64,
-    /// Outgoing RPCs that failed before a reply was verified.
+    /// Outgoing RPCs that ended without a verified reply, including the ones
+    /// cancelled by a caller's own deadline.
     rpc_failed: AtomicU64,
 }
 
@@ -102,6 +103,38 @@ pub fn transport_counters() -> serde_json::Value {
         "envelopes_rejected": TRANSPORT.rejected.load(Ordering::Relaxed),
         "outgoing_rpc_failures": TRANSPORT.rpc_failed.load(Ordering::Relaxed),
     })
+}
+
+/// Counts an outgoing RPC that ends without a verified reply.
+///
+/// The increment cannot live after the `await`. OpenRaft wraps
+/// `append_entries` in its own `C::timeout(heartbeat_interval, ...)`, and when
+/// that outer deadline fires it drops this future at the await point, so no
+/// statement after the `await` ever runs. Counting only the errors that return
+/// therefore missed the append timeouts this instrumentation exists to expose —
+/// exactly the events that were invisible before. A drop guard observes both
+/// endings: an error return, and cancellation while still in flight.
+struct RpcOutcome {
+    armed: bool,
+}
+
+impl RpcOutcome {
+    fn new() -> Self {
+        Self { armed: true }
+    }
+
+    /// The caller got a reply it verified, so this is not a failure.
+    fn verified(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for RpcOutcome {
+    fn drop(&mut self) {
+        if self.armed {
+            TRANSPORT.rpc_failed.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 }
 
 /// Count one connection dropped by the handler cap, logging the first few.
@@ -495,15 +528,16 @@ impl AuthenticatedTcpNetwork {
             verify_reply(&body, &self.config, self.target, sequence, nonce)
         };
 
+        // Armed before the exchange and disarmed only on a verified reply. If
+        // the caller cancels us (OpenRaft's own heartbeat deadline does), the
+        // guard is dropped while armed and the failure is still counted.
+        let mut outcome = RpcOutcome::new();
         let result = match tokio::time::timeout(ttl, exchange).await {
             Ok(result) => result,
             Err(_) => Err(TransportError::InvalidInput("request timeout")),
         };
-        if result.is_err() {
-            // The peer sees the same event from its own side, but only this
-            // counter says the failure was ours to observe: a refused connect,
-            // a handshake the peer closed, or an RPC that outlived its TTL.
-            TRANSPORT.rpc_failed.fetch_add(1, Ordering::Relaxed);
+        if result.is_ok() {
+            outcome.verified();
         }
         if is_snapshot {
             if let Err(error) = &result {
