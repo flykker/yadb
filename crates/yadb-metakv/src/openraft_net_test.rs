@@ -245,6 +245,84 @@ fn rejected_envelopes() -> u64 {
         .expect("envelopes_rejected is a number")
 }
 
+/// Reads the process-wide failed-connection counter.
+fn connections_failed() -> u64 {
+    transport_counters()["connections_failed"]
+        .as_u64()
+        .expect("connections_failed is a number")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_connection_that_closes_before_its_frame_is_counted() {
+    // The handler reads the request frame before it knows who the peer is. A
+    // socket that takes the challenge and then closes used to return `Ok(())`
+    // with no counter and no log, which is indistinguishable from a peer that
+    // connected and had nothing to say - the silence this instrumentation
+    // exists to remove.
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let node = 1u32;
+        let key = Arc::new(seed(node));
+        let registry =
+            Arc::new(PeerKeyRegistry::new(BTreeMap::from([(node, key.public_key())])).unwrap());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = RaftPeerServer::from_listener(
+            listener,
+            TransportConfig::new(
+                identity(node),
+                key,
+                BTreeMap::from([(node, addr)]),
+                registry,
+            ),
+            Arc::new(|_request| Box::pin(async { unreachable!("no request is expected") })),
+        );
+        let task = tokio::spawn(server.serve());
+
+        let before = connections_failed();
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        // The server writes the challenge frame (5-byte header plus a 32-byte
+        // body) and only then reads a request frame. Consuming all of it proves
+        // the server reached the frame read rather than still handshaking.
+        let mut challenge = [0u8; 5 + 32];
+        let mut read = 0;
+        while read < challenge.len() {
+            let n = tokio::io::AsyncReadExt::read(&mut stream, &mut challenge[read..])
+                .await
+                .unwrap();
+            assert!(n > 0, "server closed before sending the challenge");
+            read += n;
+        }
+        // Close without sending a frame: the server sees EOF at the frame read.
+        drop(stream);
+
+        // The counter moves on the server task, so give it a bounded window
+        // rather than assuming the accept loop has already observed the close.
+        let mut after = connections_failed();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while after == before && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            after = connections_failed();
+        }
+        assert!(
+            after > before,
+            "a connection closed before its frame was not counted ({before} -> {after})"
+        );
+        task.abort();
+        let _ = task.await;
+    })
+    .await
+    .expect("frame-read counter test timed out");
+}
+
+#[test]
+fn transport_counters_report_snapshot_failures() {
+    // `snapshot_failure` has always incremented its own counter; the status
+    // object did not publish it, so snapshot verification failures were visible
+    // only in the log. Assert the field is present and numeric so removing it
+    // fails here rather than silently dropping the evidence again.
+    assert!(transport_counters()["snapshot_failures"].is_u64());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn server_rejects_unknown_address_and_forged_sender() {
     tokio::time::timeout(Duration::from_secs(30), async {

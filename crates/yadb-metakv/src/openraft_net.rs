@@ -79,7 +79,7 @@ static SNAPSHOT_FAILURES: AtomicU64 = AtomicU64::new(0);
 struct TransportCounters {
     /// Accepted connections dropped because every handler slot was busy.
     cap_dropped: AtomicU64,
-    /// Dispatched connections that ended in an I/O or TLS error.
+    /// Dispatched connections that ended in an I/O, TLS or frame-read error.
     failed: AtomicU64,
     /// Envelopes rejected by decoding, signature or challenge verification.
     rejected: AtomicU64,
@@ -102,6 +102,7 @@ pub fn transport_counters() -> serde_json::Value {
         "connections_failed": TRANSPORT.failed.load(Ordering::Relaxed),
         "envelopes_rejected": TRANSPORT.rejected.load(Ordering::Relaxed),
         "outgoing_rpc_failures": TRANSPORT.rpc_failed.load(Ordering::Relaxed),
+        "snapshot_failures": SNAPSHOT_FAILURES.load(Ordering::Relaxed),
     })
 }
 
@@ -171,6 +172,26 @@ fn snapshot_failure(node: u32, group: u64, peer: Option<u32>, phase: &str, reaso
     let n = SNAPSHOT_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
     if n <= 8 || n.is_power_of_two() {
         eprintln!("openraft snapshot transport node={node} group={group} peer={peer:?} phase={phase} reason={reason} occurrence={n}");
+    }
+}
+
+/// Count one connection whose request frame could not be read.
+///
+/// This is the frame read *before* any envelope is decoded, so the peer never
+/// said who it was: a truncated length prefix, a frame that overran the
+/// reservation, or a socket closed after the challenge. The handler used to
+/// return `Ok(())` here, which is right for control flow — there is nothing to
+/// answer — but left the event completely uncounted, so it looked identical to
+/// a peer that connected and said nothing. It is counted as a failed connection
+/// because that is what it is: a dispatched connection that ended in an I/O
+/// error before dispatch.
+fn request_frame_unreadable(node: u32, group: u64, peer: Option<u32>, error: &io::Error) {
+    let n = TRANSPORT.failed.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 8 || n.is_power_of_two() {
+        eprintln!(
+            "openraft transport node={node} group={group} peer={peer:?} request frame unreadable: \
+             {error} occurrence={n}"
+        );
     }
 }
 
@@ -933,7 +954,18 @@ async fn serve_connection(
     let (kind, body, bytes_permit) =
         match read_request_frame(&mut stream, request_bytes.clone()).await {
             Ok(value) => value,
-            Err(_) => return Ok(()),
+            Err(error) => {
+                // Counted before the return: the peer is gone and nothing can
+                // answer it, but a frame that never decoded is still an event
+                // this process observed and previously did not report.
+                request_frame_unreadable(
+                    config.identity.node(),
+                    config.identity.group().group,
+                    node_id,
+                    &error,
+                );
+                return Ok(());
+            }
         };
     if kind == SNAPSHOT_MANIFEST {
         phase.store(1, Ordering::Relaxed);

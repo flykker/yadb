@@ -168,15 +168,16 @@ in the current term, which is the shape a lost or timed-out append leaves behind
 The `transport` object reports
 process-wide counters for events that otherwise leave no trace — connections
 dropped because all handler slots were busy (`connections_cap_dropped`),
-connections that ended before dispatch (`connections_failed`), envelopes rejected
-by decode, signature or challenge (`envelopes_rejected`), and outgoing RPCs that
-ended without a verified reply (`outgoing_rpc_failures`). The last one counts a
-cancelled RPC too: OpenRaft's own heartbeat deadline drops the future mid-flight,
-which is precisely the append timeout worth seeing. Coverage is deliberately
-partial and documented as such: a snapshot manifest or chunk that fails
-verification is reported through the snapshot failure path, not through
-`envelopes_rejected` or `connections_failed`, and a request frame that cannot be
-read is closed without a counter. They are monotonic
+connections that ended before dispatch or while reading the request frame
+(`connections_failed`), envelopes rejected by decode, signature or challenge
+(`envelopes_rejected`), outgoing RPCs that ended without a verified reply
+(`outgoing_rpc_failures`), and snapshot transfers that failed validation or
+timed out (`snapshot_failures`). `outgoing_rpc_failures` counts a cancelled RPC
+too: OpenRaft's own heartbeat deadline drops the future mid-flight, which is
+precisely the append timeout worth seeing. A snapshot failure is counted once, in
+`snapshot_failures`, and not a second time in `envelopes_rejected` or
+`connections_failed`, so the two numbers can be added without double counting.
+They are monotonic
 since process start and are not a health verdict: a nonzero `outgoing_rpc_failures`
 is expected under churn, while a nonzero `connections_cap_dropped` means the
 64-handler cap was reached and a peer was refused rather than delayed. Metrics,
