@@ -217,6 +217,39 @@ Pins must be taken before the fragment is fetched and released after the last
 byte is handed to the client. A read that cannot take a pin fails closed with the
 existing "reader lease unavailable" class of error rather than reading unfenced.
 
+#### Exact semantics the target must implement
+
+These are the decisions that a later increment must not improvise; they follow from
+the ordering above and from the same fail-closed rule the barrier uses.
+
+* **Pins are durable, not in-memory.** A pin record is appended and synced like
+  any other record. If the target forgets a pin across a restart, a collector can
+  advance past a reader that is still holding bytes — the one direction that must
+  not happen. A pin that outlives its reader only blocks collection until its TTL
+  runs out, which is the safe direction.
+* **A pin names one epoch, and it must be the current one.** A pin for an older
+  epoch is refused: the reader would be pinning an epoch the collector may already
+  have advanced past, so the pin would prove nothing. A pin for a newer epoch is
+  also refused — that epoch does not exist yet.
+* **`advance_epoch` refuses while any unexpired pin exists**, with a distinct
+  error, in addition to the existing expected-epoch check. Both refusals are "stop
+  this pass", never retryable.
+* **Liveness is `now < expires_at_ms`, and an unreadable clock refuses.** The
+  comparison must not default to `0`: that would make every pin look expired and
+  let the advance through. This is the same failure direction as the barrier clock.
+* **TTL is bounded.** `ttl_ms` of zero is refused, and a TTL above a documented
+  maximum is clamped or refused rather than honoured, so one buggy reader cannot
+  hold collection off indefinitely.
+* **The delete rule becomes "older, and unpinned"**: a collector at epoch `C` may
+  delete a fragment of epoch `f` only when `f < C` and no unexpired pin names `f`.
+  This is the step that makes the epoch useful at all — the equality rule now in
+  `delete_fenced` refuses everything older, so a collector using it would delete
+  nothing. Keep `delete_fenced` as the strict, equality-checked primitive and add
+  the collectable form next to it rather than loosening it.
+* **Compaction keeps unexpired pins and may drop expired ones.** Dropping a live
+  pin while rewriting a segment would be the same loss as forgetting it on restart.
+* **Recovery drops expired pins and keeps the rest**, and never invents a pin.
+
 ## Epoch advance protocol (collector)
 
 1. Read the group's applied index and the target list.
