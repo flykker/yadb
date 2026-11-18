@@ -454,8 +454,10 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   path, even when it is still present and still carries the holder's token,
   because the collector is entitled to treat it as dead at that moment and has
   not necessarily reaped it yet. A pass renews its own collector record before the
-  watermark, before the first deletion and before each pool, and stops deleting
-  if a renewal loses. A write joins its lease's guard to the transaction that
+  watermark, before the first deletion and before each pool, re-checks it while a
+  pool deletes — before the first deletion, before every barrier group and every
+  32 exact tombstones — and stops deleting if a check loses. A write joins its
+  lease's guard to the transaction that
   publishes the map or manifest, so a writer that stalled past its lease is
   refused instead of publishing fragments a pass has already reclaimed; a read
   verifies its lease after fetching and answers `503` if it did not survive the

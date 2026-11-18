@@ -35,10 +35,19 @@ renewal paths refuse to extend an expired record rather than resurrecting it
 collector already considers dead, and `begin_read_lease` publishes a fresh record
 instead of reusing a dead one.
 
-Item 1 is unchanged in this document's scope: a collector pass renews before the
-watermark, before its first deletion and before each pool, but the deletion loop
-inside a pool is the subject of a separate change. Until that lands, treat a long
-sweep of one pool as able to outlive its lease.
+Item 1 is partly closed. A collector pass now re-proves the fence *while* it
+deletes: `sweep_pool` checks before its first deletion, before every barrier
+group and every 32 exact tombstones, and stops the pool and the pass on a failed
+check. The overshoot after expiry is therefore bounded to a few dozen tombstones
+per pool instead of the whole dead set.
+
+Two parts of item 1 remain open, and neither is closed by the above:
+
+- a barrier that is already in flight can still evict its entire dead generation
+  range after the record expired;
+- `renew` tests liveness and then performs its CAS, so a lease that expires
+  between those two steps is renewed successfully and the pass believes it holds
+  the fence until the next interval check.
 
 The fix does not reduce the weight of item 3. The remaining gap is unchanged:
 metadata can be airtight and the target still deletes bytes a reader is holding.
