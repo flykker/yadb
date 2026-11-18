@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, RwLock};
 
 use serde::{Deserialize, Serialize};
@@ -7,11 +8,29 @@ use yadb_io::{StorageFs, VirtualFile};
 use crate::{BlobError, BlobId};
 
 const VOLUME_MAGIC: &[u8; 8] = b"YADBVOL1";
-const RECORD_MAGIC: u32 = 0x5942_5243; // "YBRC"
+/// The original record header: 33 bytes, no epoch. Still read, so a volume
+/// written before target epochs existed keeps opening; every such record belongs
+/// to epoch 0, which is the epoch a fresh volume starts at.
+const RECORD_MAGIC_V1: u32 = 0x5942_5243; // "YBRC"
+/// The current record header: 41 bytes, carrying the epoch the record was
+/// written under. The first 29 bytes mean exactly what they meant in V1, so the
+/// two layouts differ only in what follows the data CRC.
+const RECORD_MAGIC_V2: u32 = 0x5942_5244; // "YBRD"
 const REC_KIND_PUT: u8 = 1;
 const REC_KIND_BARRIER: u8 = 2;
 const REC_KIND_TOMBSTONE: u8 = 3;
-const RECORD_HEADER_LEN: usize = 33;
+/// Records the durable target epoch. Appended, never overwritten in place: the
+/// value recovery derives is the maximum over every record in the volume, so a
+/// torn append can only fail to raise the epoch, never lower it.
+const REC_KIND_EPOCH: u8 = 4;
+const RECORD_HEADER_LEN_V1: usize = 33;
+pub(crate) const RECORD_HEADER_LEN: usize = 41;
+/// `BlobId` field of an epoch record. An epoch record names no fragment, so the
+/// id is unused; it is written as the all-zero id so the record is obviously not
+/// a fragment.
+fn epoch_record_id() -> BlobId {
+    BlobId::new(0, 0, 0, 0, 0, 0)
+}
 
 /// A mostly-garbage active segment is sealed even when small, because rolling it
 /// is the only way `compact_sealed_segments` can reclaim its dead records. A
@@ -46,6 +65,9 @@ struct IndexEntry {
     data_offset: u64,
     data_len: u32,
     data_crc: u32,
+    /// Target epoch this fragment was written under, recovered from its PUT
+    /// record. A fenced delete compares it with the epoch the delete names.
+    epoch: u64,
 }
 
 struct ActiveSegment<F: VirtualFile> {
@@ -87,6 +109,11 @@ pub struct VolumeStats {
 /// Packs immutable blobs into segment files (`vol_00000001.dat`), verifies CRC32 checksums on read,
 /// supports sub-range reads (`get_slice`), truncates torn crash tails on recovery, and executes
 /// YDB-style generation barrier garbage collection + background segment compaction.
+///
+/// It also keeps a durable, monotonic **target epoch** (see [`VolumeStore::advance_epoch`]) and
+/// stamps every fragment with the epoch it was written under, so a delete can be refused when the
+/// fragment belongs to a different epoch than the one the collector names
+/// ([`VolumeStore::delete_fenced`]).
 pub struct VolumeStore<FS: StorageFs> {
     fs: FS,
     dir: String,
@@ -96,6 +123,9 @@ pub struct VolumeStore<FS: StorageFs> {
     tombstones: RwLock<BTreeSet<BlobId>>,
     segments: RwLock<BTreeMap<u32, FS::File>>,
     writer: Mutex<ActiveSegment<FS::File>>,
+    /// Current durable target epoch. Only [`VolumeStore::advance_epoch`] raises
+    /// it, and only after the record that carries the new value is synced.
+    epoch: AtomicU64,
 }
 
 impl<FS: StorageFs> VolumeStore<FS> {
@@ -108,6 +138,10 @@ impl<FS: StorageFs> VolumeStore<FS> {
         let mut tombstones: BTreeSet<BlobId> = BTreeSet::new();
         let mut segments = BTreeMap::new();
         let mut max_seg_id = 0u32;
+        // The epoch is derived from what is on disk, never invented. Recovery
+        // only ever raises this value: it is the maximum over every record, and
+        // opening a volume is not an epoch advance.
+        let mut epoch = 0u64;
 
         for name in fs.list_files(&dir)? {
             // Clean up leftover temporary compaction files after crash
@@ -119,7 +153,14 @@ impl<FS: StorageFs> VolumeStore<FS> {
                 max_seg_id = max_seg_id.max(seg_id);
                 let path = segment_path(&dir, seg_id);
                 let file = fs.open_rw(&path, false)?;
-                recover_segment(&file, seg_id, &mut index, &mut barriers, &mut tombstones)?;
+                recover_segment(
+                    &file,
+                    seg_id,
+                    &mut index,
+                    &mut barriers,
+                    &mut tombstones,
+                    &mut epoch,
+                )?;
                 // Recovery can see unsynced page-cache records after a process
                 // restart. Sync before serving idempotent PUT/DELETE acks or
                 // relying on recovered fences, even on bulk-load volumes.
@@ -155,11 +196,85 @@ impl<FS: StorageFs> VolumeStore<FS> {
                 write_pos,
                 failed: false,
             }),
+            epoch: AtomicU64::new(epoch),
         })
+    }
+
+    /// The durable target epoch this volume is currently at.
+    ///
+    /// A fragment written now is stamped with this value; a delete that names a
+    /// different one is refused (see [`Self::delete_fenced`]).
+    pub fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::SeqCst)
+    }
+
+    /// The epoch the fragment `id` was written under, or `None` if the volume
+    /// does not hold it. The value is recovered from the fragment's own record,
+    /// so it is stable across reopen and compaction.
+    pub fn fragment_epoch(&self, id: BlobId) -> Option<u64> {
+        self.index.read().unwrap().get(&id).map(|entry| entry.epoch)
+    }
+
+    /// The collector's epoch step: raises the durable epoch by one, from exactly
+    /// `expected_epoch`, and returns the new value.
+    ///
+    /// This is the *only* way the epoch moves. It is never raised by `open`,
+    /// by recovery, by a put, a delete, a barrier or a compaction, because an
+    /// epoch advance is the one event that makes every older collector's fence
+    /// stale: doing it implicitly would revoke a pass that is still entitled to
+    /// delete.
+    ///
+    /// `expected_epoch` must be the value the caller read and fenced its pass
+    /// with. A target that is no longer at that epoch refuses with
+    /// [`BlobError::EpochMismatch`] instead of advancing: a superseded collector
+    /// must not be able to move the epoch past a newer one.
+    ///
+    /// Durability: the new epoch is appended as a record and synced before the
+    /// call returns, and before the in-memory value is published. A failed sync
+    /// leaves the store refusing further mutations ([`BlobError::StorageUnavailable`])
+    /// rather than retrying an append whose outcome is unknown; the epoch the
+    /// caller was told is therefore always one that survived. If the sync failed
+    /// *after* persisting, recovery may find the higher epoch even though this
+    /// call reported an error - the epoch can only over-advance, never go
+    /// backwards, and a collector that was refused must stop rather than retry.
+    pub fn advance_epoch(&self, expected_epoch: u64) -> Result<u64, BlobError> {
+        let mut writer = self.writer.lock().unwrap();
+        writer.ensure_healthy()?;
+        let current = self.epoch.load(Ordering::SeqCst);
+        if current != expected_epoch {
+            return Err(BlobError::EpochMismatch {
+                expected_epoch,
+                actual_epoch: current,
+            });
+        }
+        let next = current.checked_add(1).ok_or(BlobError::EpochExhausted)?;
+        let hdr = encode_record_header(REC_KIND_EPOCH, epoch_record_id(), 0, 0, next);
+        let pos = writer.write_pos;
+        if let Err(error) = writer.file.write_at(pos, &hdr) {
+            // Same rule as a PUT: roll back a torn tail so the next append stays
+            // aligned. A rollback that fails marks the volume unhealthy.
+            if writer.file.set_len(pos).is_err() {
+                writer.failed = true;
+            }
+            return Err(error.into());
+        }
+        // Deletion fencing must survive restart even for bulk-load volumes, and
+        // the epoch is fencing state, so this sync is unconditional.
+        writer.sync_data()?;
+        writer.write_pos += RECORD_HEADER_LEN as u64;
+        // Published only now: a value that is not proven durable must not be
+        // visible to a fragment write or a fenced delete.
+        self.epoch.store(next, Ordering::SeqCst);
+        Ok(next)
     }
 
     /// Writes an immutable blob. Idempotent if the same id and bytes already exist;
     /// rejects conflicting writes to an existing `BlobId` or writes older than a GC barrier.
+    ///
+    /// The record carries the current target epoch ([`Self::epoch`]) durably, so a
+    /// later fenced delete can tell which epoch this fragment belongs to. A
+    /// rewrite after bit-rot is a fresh write and takes the epoch current at that
+    /// moment, which can only make an older delete fence refuse, never pass.
     pub fn put(&self, id: BlobId, data: &[u8]) -> Result<(), BlobError> {
         if data.len() > self.cfg.max_blob_bytes {
             return Err(BlobError::BlobTooLarge {
@@ -235,7 +350,11 @@ impl<FS: StorageFs> VolumeStore<FS> {
             };
         }
 
-        let hdr = encode_record_header(REC_KIND_PUT, id, data.len() as u32, data_crc);
+        // Read once, under the append lock: an epoch advance also takes this
+        // lock, so the value stamped in the record and in the index entry below
+        // are the same one.
+        let epoch = self.epoch.load(Ordering::SeqCst);
+        let hdr = encode_record_header(REC_KIND_PUT, id, data.len() as u32, data_crc, epoch);
         let mut frame = Vec::with_capacity(RECORD_HEADER_LEN + data.len());
         frame.extend_from_slice(&hdr);
         frame.extend_from_slice(data);
@@ -265,6 +384,7 @@ impl<FS: StorageFs> VolumeStore<FS> {
                 data_offset,
                 data_len: data.len() as u32,
                 data_crc,
+                epoch,
             },
         );
         drop(writer);
@@ -274,13 +394,61 @@ impl<FS: StorageFs> VolumeStore<FS> {
     /// Durably removes one immutable blob and fences the exact id forever.
     /// This is intentionally narrower than a generation barrier and is used
     /// by the S3 orphan collector after metadata reachability has been proven.
+    ///
+    /// **Unfenced.** This does not consult the target epoch: it unlinks a
+    /// fragment regardless of the epoch it was written under. It is kept for
+    /// callers whose safety argument does not involve a collector epoch. A
+    /// collector deleting under a fence epoch must use [`Self::delete_fenced`].
     pub fn delete(&self, id: BlobId) -> Result<bool, BlobError> {
+        self.delete_inner(id, None)
+    }
+
+    /// Durably removes one immutable blob, but only if the volume holds it
+    /// under `expected_epoch`.
+    ///
+    /// The recorded epoch is the one the fragment's own PUT record carries
+    /// ([`Self::fragment_epoch`]), so the comparison is against durable state,
+    /// not against a value the caller supplied earlier. A fragment from any
+    /// other epoch is left untouched and reported with
+    /// [`BlobError::FencedByEpoch`], which names both epochs. That refusal is a
+    /// "stop, do not retry" answer: retrying with the recorded epoch would be a
+    /// delete the caller did not prove it was entitled to.
+    ///
+    /// The check is equality, the strict form. "Older than the epoch I hold" is
+    /// only sound once readers pin the epoch they read, because until then
+    /// nothing on the target says whether an older fragment is still referenced;
+    /// relaxing this belongs to the increment that adds pins.
+    ///
+    /// A fragment that is already absent (or already tombstoned) answers
+    /// `Ok(false)`, like [`Self::delete`], and the id is tombstoned so a late
+    /// PUT cannot resurrect it. There is no epoch to compare in that case, and
+    /// nothing to unlink, so no fence is bypassed.
+    pub fn delete_fenced(&self, id: BlobId, expected_epoch: u64) -> Result<bool, BlobError> {
+        self.delete_inner(id, Some(expected_epoch))
+    }
+
+    fn delete_inner(&self, id: BlobId, fence: Option<u64>) -> Result<bool, BlobError> {
         let mut writer = self.writer.lock().unwrap();
         writer.ensure_healthy()?;
         if self.tombstones.read().unwrap().contains(&id) {
             return Ok(false);
         }
-        let hdr = encode_record_header(REC_KIND_TOMBSTONE, id, 0, 0);
+        if let Some(expected_epoch) = fence {
+            let recorded_epoch = self.index.read().unwrap().get(&id).map(|entry| entry.epoch);
+            if let Some(recorded_epoch) = recorded_epoch {
+                if recorded_epoch != expected_epoch {
+                    // Checked before anything is appended: a refused delete must
+                    // not leave a tombstone behind, because that is a permanent
+                    // fence on an id this caller was not entitled to delete.
+                    return Err(BlobError::FencedByEpoch {
+                        id,
+                        recorded_epoch,
+                        expected_epoch,
+                    });
+                }
+            }
+        }
+        let hdr = encode_record_header(REC_KIND_TOMBSTONE, id, 0, 0, 0);
         let pos = writer.write_pos;
         if let Err(error) = writer.file.write_at(pos, &hdr) {
             if writer.file.set_len(pos).is_err() {
@@ -388,7 +556,9 @@ impl<FS: StorageFs> VolumeStore<FS> {
         let marker_id = BlobId::new(project_id, owner_id, up_to_generation, 0, channel, 0);
         let mut writer = self.writer.lock().unwrap();
         writer.ensure_healthy()?;
-        let hdr = encode_record_header(REC_KIND_BARRIER, marker_id, 0, 0);
+        // A barrier names a generation range, not an epoch, so its record carries
+        // no epoch. It neither raises nor consumes the target epoch.
+        let hdr = encode_record_header(REC_KIND_BARRIER, marker_id, 0, 0, 0);
         let pos = writer.write_pos;
         if let Err(error) = writer.file.write_at(pos, &hdr) {
             if writer.file.set_len(pos).is_err() {
@@ -468,7 +638,12 @@ impl<FS: StorageFs> VolumeStore<FS> {
             .saturating_sub(VOLUME_MAGIC.len() as u64)
             .saturating_sub(live_in_active)
             .saturating_sub(
-                (self.barriers.read().unwrap().len() + self.tombstones.read().unwrap().len())
+                // Barriers and tombstones are live markers. So is exactly one
+                // epoch record: every older one in the segment is dead, because
+                // recovery only reads the maximum. Counting one as live keeps an
+                // idle volume that has advanced its epoch a few times from
+                // sealing a segment holding nothing but superseded epoch records.
+                (self.barriers.read().unwrap().len() + self.tombstones.read().unwrap().len() + 1)
                     as u64
                     * RECORD_HEADER_LEN as u64,
             );
@@ -563,6 +738,10 @@ impl<FS: StorageFs> VolumeStore<FS> {
             .collect();
         let tombstone_markers: Vec<BlobId> =
             self.tombstones.read().unwrap().iter().copied().collect();
+        // The epoch is durable state of its own. A replacement segment must carry
+        // it, or compacting away the segment that held the last epoch record
+        // would lower the epoch on the next open.
+        let epoch = self.epoch.load(Ordering::SeqCst);
 
         let tmp_path = format!("{}.compact", segment_path(&self.dir, seg_id));
         let final_path = segment_path(&self.dir, seg_id);
@@ -574,7 +753,16 @@ impl<FS: StorageFs> VolumeStore<FS> {
         let mut new_offsets: Vec<(BlobId, IndexEntry)> = Vec::with_capacity(live_items.len());
         for (id, entry) in live_items {
             let payload = self.get(id)?;
-            let hdr = encode_record_header(REC_KIND_PUT, id, payload.len() as u32, entry.data_crc);
+            // Keep the fragment's own epoch: compaction rewrites bytes, it does
+            // not create a new fragment, so a fenced delete must still see the
+            // epoch the fragment was originally written under.
+            let hdr = encode_record_header(
+                REC_KIND_PUT,
+                id,
+                payload.len() as u32,
+                entry.data_crc,
+                entry.epoch,
+            );
             tmp_file.write_at(pos, &hdr)?;
             let data_offset = pos + RECORD_HEADER_LEN as u64;
             tmp_file.write_at(data_offset, &payload)?;
@@ -586,21 +774,26 @@ impl<FS: StorageFs> VolumeStore<FS> {
                     data_offset,
                     data_len: entry.data_len,
                     data_crc: entry.data_crc,
+                    epoch: entry.epoch,
                 },
             ));
         }
 
         for marker_id in barrier_markers {
-            let hdr = encode_record_header(REC_KIND_BARRIER, marker_id, 0, 0);
+            let hdr = encode_record_header(REC_KIND_BARRIER, marker_id, 0, 0, 0);
             tmp_file.write_at(pos, &hdr)?;
             pos += RECORD_HEADER_LEN as u64;
         }
 
         for marker_id in tombstone_markers {
-            let hdr = encode_record_header(REC_KIND_TOMBSTONE, marker_id, 0, 0);
+            let hdr = encode_record_header(REC_KIND_TOMBSTONE, marker_id, 0, 0, 0);
             tmp_file.write_at(pos, &hdr)?;
             pos += RECORD_HEADER_LEN as u64;
         }
+
+        let hdr = encode_record_header(REC_KIND_EPOCH, epoch_record_id(), 0, 0, epoch);
+        tmp_file.write_at(pos, &hdr)?;
+        pos += RECORD_HEADER_LEN as u64;
 
         tmp_file.sync_data()?;
         drop(tmp_file);
@@ -726,20 +919,27 @@ fn init_new_segment<FS: StorageFs>(fs: &FS, dir: &str, seg_id: u32) -> Result<FS
     Ok(file)
 }
 
+/// Encodes the current (V2) record header.
+///
+/// `epoch` is the target epoch the record was written under. It is meaningful for
+/// `REC_KIND_PUT` and `REC_KIND_EPOCH`; a barrier and a tombstone name no
+/// fragment and pass `0`.
 fn encode_record_header(
     kind: u8,
     id: BlobId,
     data_len: u32,
     data_crc: u32,
+    epoch: u64,
 ) -> [u8; RECORD_HEADER_LEN] {
     let mut hdr = [0u8; RECORD_HEADER_LEN];
-    hdr[0..4].copy_from_slice(&RECORD_MAGIC.to_le_bytes());
+    hdr[0..4].copy_from_slice(&RECORD_MAGIC_V2.to_le_bytes());
     hdr[4] = kind;
     hdr[5..21].copy_from_slice(&id.to_be_bytes());
     hdr[21..25].copy_from_slice(&data_len.to_le_bytes());
     hdr[25..29].copy_from_slice(&data_crc.to_le_bytes());
-    let hdr_crc = crc32fast::hash(&hdr[0..29]);
-    hdr[29..33].copy_from_slice(&hdr_crc.to_le_bytes());
+    hdr[29..37].copy_from_slice(&epoch.to_le_bytes());
+    let hdr_crc = crc32fast::hash(&hdr[0..37]);
+    hdr[37..41].copy_from_slice(&hdr_crc.to_le_bytes());
     hdr
 }
 
@@ -749,6 +949,7 @@ fn recover_segment<F: VirtualFile>(
     index: &mut BTreeMap<BlobId, IndexEntry>,
     barriers: &mut BTreeMap<(u32, u32, u8), u32>,
     tombstones: &mut BTreeSet<BlobId>,
+    epoch: &mut u64,
 ) -> Result<(), BlobError> {
     let file_len = file.len()?;
     if file_len < VOLUME_MAGIC.len() as u64 {
@@ -766,28 +967,57 @@ fn recover_segment<F: VirtualFile>(
     let mut hdr = [0u8; RECORD_HEADER_LEN];
 
     while pos < file_len {
-        if pos + RECORD_HEADER_LEN as u64 > file_len {
+        let remaining = file_len - pos;
+        if remaining < RECORD_HEADER_LEN_V1 as u64 {
             // Torn header at tail after power cut -> truncate cleanly!
             file.set_len(pos)?;
             file.sync_data()?;
             break;
         }
-        let n = file.read_at(pos, &mut hdr)?;
-        if n < RECORD_HEADER_LEN {
+        // Read as much of a current header as the file still holds, so a torn
+        // tail of a V2 header is distinguishable from a damaged one.
+        let want = remaining.min(RECORD_HEADER_LEN as u64) as usize;
+        let n = file.read_at(pos, &mut hdr[..want])?;
+        if n < want {
             file.set_len(pos)?;
             file.sync_data()?;
             break;
         }
 
         let rec_magic = u32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
-        let expected_hdr_crc = u32::from_le_bytes([hdr[29], hdr[30], hdr[31], hdr[32]]);
-        let actual_hdr_crc = crc32fast::hash(&hdr[0..29]);
-        if rec_magic != RECORD_MAGIC || expected_hdr_crc != actual_hdr_crc {
+        // The first 29 bytes mean the same thing in both layouts; the epoch and
+        // the header CRC follow. A V1 record has no epoch and belongs to epoch 0,
+        // the epoch every volume starts at.
+        let hdr_len = match rec_magic {
+            RECORD_MAGIC_V1 => RECORD_HEADER_LEN_V1,
+            RECORD_MAGIC_V2 => {
+                if want < RECORD_HEADER_LEN {
+                    // A complete V2 magic but an incomplete header: the tail of a
+                    // torn append, which was never acknowledged.
+                    file.set_len(pos)?;
+                    file.sync_data()?;
+                    break;
+                }
+                RECORD_HEADER_LEN
+            }
+            _ => {
+                return Err(BlobError::InvalidSegment("corrupt record header"));
+            }
+        };
+        let crc_at = hdr_len - 4;
+        let expected_hdr_crc = u32::from_le_bytes([
+            hdr[crc_at],
+            hdr[crc_at + 1],
+            hdr[crc_at + 2],
+            hdr[crc_at + 3],
+        ]);
+        let actual_hdr_crc = crc32fast::hash(&hdr[0..crc_at]);
+        if expected_hdr_crc != actual_hdr_crc {
             // A complete header is present, so this is damage to a record that
             // may be followed by durable TOMBSTONE/BARRIER records. Truncating
             // here would drop those markers and could resurrect deleted blobs,
             // so refuse to open instead. A torn header write leaves fewer than
-            // RECORD_HEADER_LEN bytes and is handled above.
+            // the header's bytes and is handled above.
             return Err(BlobError::InvalidSegment("corrupt record header"));
         }
 
@@ -797,8 +1027,20 @@ fn recover_segment<F: VirtualFile>(
         let id = BlobId::from_be_bytes(id_bytes);
         let data_len = u32::from_le_bytes([hdr[21], hdr[22], hdr[23], hdr[24]]);
         let data_crc = u32::from_le_bytes([hdr[25], hdr[26], hdr[27], hdr[28]]);
+        let record_epoch = if hdr_len == RECORD_HEADER_LEN {
+            u64::from_le_bytes([
+                hdr[29], hdr[30], hdr[31], hdr[32], hdr[33], hdr[34], hdr[35], hdr[36],
+            ])
+        } else {
+            0
+        };
+        // Any record that names an epoch is proof the volume reached it: a
+        // fragment cannot have been written under an epoch the target had not
+        // reached. Recovery therefore takes the maximum, which is what makes a
+        // torn epoch append unable to lower the value.
+        *epoch = (*epoch).max(record_epoch);
 
-        let data_offset = pos + RECORD_HEADER_LEN as u64;
+        let data_offset = pos + hdr_len as u64;
         let next_pos = data_offset + data_len as u64;
         if next_pos > file_len {
             // Torn payload write -> truncate back to `pos`!
@@ -825,9 +1067,13 @@ fn recover_segment<F: VirtualFile>(
                             data_offset,
                             data_len,
                             data_crc,
+                            epoch: record_epoch,
                         },
                     );
                 }
+            }
+            REC_KIND_EPOCH => {
+                // No index effect: the maximum above is the whole of its meaning.
             }
             REC_KIND_BARRIER => {
                 let b_gen = id.generation();

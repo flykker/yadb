@@ -61,6 +61,28 @@ pub enum BlobError {
         reason: String,
     },
 
+    #[error(
+        "fenced delete of {id} refused: the fragment was written under target epoch \
+         {recorded_epoch}, but the delete names epoch {expected_epoch}"
+    )]
+    FencedByEpoch {
+        id: BlobId,
+        recorded_epoch: u64,
+        expected_epoch: u64,
+    },
+
+    #[error(
+        "epoch advance refused: the caller fenced its pass at epoch {expected_epoch}, but this \
+         target is at epoch {actual_epoch}"
+    )]
+    EpochMismatch {
+        expected_epoch: u64,
+        actual_epoch: u64,
+    },
+
+    #[error("epoch advance refused: the target epoch is already u64::MAX and cannot advance")]
+    EpochExhausted,
+
     #[error("blob size {size} exceeds max {max}")]
     BlobTooLarge { size: usize, max: usize },
 
@@ -106,7 +128,9 @@ impl BlobError {
     /// state and must never be bypassed by writing the part elsewhere:
     /// `ImmutableConflict` (the id already holds different bytes),
     /// `FencedByBarrier` and `Tombstoned` are fences that a handoff would
-    /// silently defeat, and `StorageUnavailable` means the slot's outcome is
+    /// silently defeat, `FencedByEpoch` says the fragment belongs to a different
+    /// collector epoch and must not be deleted at all, and `StorageUnavailable`
+    /// means the slot's outcome is
     /// unknown until it is recovered, so acknowledging the write somewhere else
     /// would hide a fault an operator has to see. If in doubt, this is `false`.
     pub fn is_unavailable(&self) -> bool {
@@ -594,6 +618,437 @@ mod tests {
         ));
     }
 
+    // ---------------------------------------------------------------------
+    // Target epochs: the durable, storage-side half of the GC fence.
+    //
+    // These cover only what a single target can prove by itself. They say
+    // nothing about the RPC that carries the epoch to a remote target, about
+    // reader pins, or about the collector that chooses when to advance - none of
+    // which exists yet.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn the_epoch_advances_only_through_the_explicit_step() {
+        let fs = SimFs::new(8001);
+        let cfg = VolumeConfig::default();
+        let id = BlobId::new(20, 1, 1, 1, 2, 0);
+        let store = VolumeStore::open(fs.clone(), "epoch_step", cfg).unwrap();
+        assert_eq!(store.epoch(), 0, "a fresh volume starts at epoch 0");
+
+        // No other operation may move it. Every one of these is a mutation, and
+        // an implicit advance would revoke a pass that is still entitled to
+        // delete.
+        store.put(id, b"payload").unwrap();
+        let other = BlobId::new(20, 1, 2, 1, 2, 0);
+        store.put(other, b"other").unwrap();
+        store.delete(other).unwrap();
+        store
+            .collect_garbage_barrier(20, 1, 2, 1, u64::MAX)
+            .unwrap();
+        store.seal_and_compact().unwrap();
+        assert_eq!(
+            store.epoch(),
+            0,
+            "no write, delete, barrier or compaction may advance the epoch"
+        );
+
+        // Opening is not an advance either, including after a power cut.
+        drop(store);
+        fs.simulate_power_cut();
+        let reopened = VolumeStore::open(fs.clone(), "epoch_step", cfg).unwrap();
+        assert_eq!(reopened.epoch(), 0, "open must not advance the epoch");
+
+        // The one explicit step, and it is durable.
+        assert_eq!(reopened.advance_epoch(0).unwrap(), 1);
+        assert_eq!(reopened.epoch(), 1);
+        let next = BlobId::new(20, 1, 3, 1, 2, 0);
+        reopened.put(next, b"next").unwrap();
+        assert_eq!(reopened.epoch(), 1, "a write does not advance the epoch");
+        drop(reopened);
+        fs.simulate_power_cut();
+        let again = VolumeStore::open(fs, "epoch_step", cfg).unwrap();
+        assert_eq!(again.epoch(), 1, "the advanced epoch is durable");
+        assert_eq!(again.get(next).unwrap(), b"next");
+    }
+
+    #[test]
+    fn each_fragment_records_the_epoch_it_was_written_under() {
+        let fs = SimFs::new(8002);
+        let cfg = VolumeConfig::default();
+        let store = VolumeStore::open(fs.clone(), "frag_epoch", cfg).unwrap();
+        let first = BlobId::new(21, 1, 1, 1, 2, 0);
+        let second = BlobId::new(21, 1, 1, 2, 2, 0);
+        let third = BlobId::new(21, 1, 1, 3, 2, 0);
+        store.put(first, b"first").unwrap();
+        assert_eq!(store.fragment_epoch(first), Some(0));
+        store.advance_epoch(0).unwrap();
+        store.put(second, b"second").unwrap();
+        store.advance_epoch(1).unwrap();
+        store.put(third, b"third").unwrap();
+        assert_eq!(store.fragment_epoch(second), Some(1));
+        assert_eq!(store.fragment_epoch(third), Some(2));
+        assert_eq!(
+            store.fragment_epoch(BlobId::new(21, 9, 9, 9, 2, 0)),
+            None,
+            "a fragment the volume does not hold has no epoch"
+        );
+
+        // The stamp is on disk, not an in-memory counter: it is read back from
+        // each fragment's own record.
+        drop(store);
+        fs.simulate_power_cut();
+        let reopened = VolumeStore::open(fs, "frag_epoch", cfg).unwrap();
+        assert_eq!(reopened.epoch(), 2);
+        assert_eq!(reopened.fragment_epoch(first), Some(0));
+        assert_eq!(reopened.fragment_epoch(second), Some(1));
+        assert_eq!(reopened.fragment_epoch(third), Some(2));
+        assert_eq!(reopened.get(third).unwrap(), b"third");
+    }
+
+    #[test]
+    fn a_fenced_delete_refuses_a_fragment_from_another_epoch() {
+        let fs = SimFs::new(8003);
+        let cfg = VolumeConfig::default();
+        let store = VolumeStore::open(fs.clone(), "fenced_delete", cfg).unwrap();
+        let old = BlobId::new(22, 1, 1, 1, 2, 0);
+        let new = BlobId::new(22, 1, 1, 2, 2, 0);
+        store.put(old, b"old").unwrap();
+        store.advance_epoch(0).unwrap();
+        store.put(new, b"new").unwrap();
+
+        // A delete carrying the new epoch must not unlink the older fragment.
+        match store.delete_fenced(old, 1) {
+            Err(BlobError::FencedByEpoch {
+                id,
+                recorded_epoch,
+                expected_epoch,
+            }) => {
+                assert_eq!(id, old);
+                assert_eq!(recorded_epoch, 0);
+                assert_eq!(expected_epoch, 1);
+            }
+            other => panic!("expected FencedByEpoch, got {other:?}"),
+        }
+        assert_eq!(
+            store.get(old).unwrap(),
+            b"old",
+            "a refused delete unlinks nothing"
+        );
+        // And the fence is equality, not "older is collectable": a stale epoch
+        // must not unlink a fragment written under a newer one.
+        assert!(matches!(
+            store.delete_fenced(new, 0),
+            Err(BlobError::FencedByEpoch {
+                recorded_epoch: 1,
+                expected_epoch: 0,
+                ..
+            })
+        ));
+        assert_eq!(store.get(new).unwrap(), b"new");
+
+        // The epoch each fragment records is the one that deletes it.
+        assert!(store.delete_fenced(new, 1).unwrap());
+        assert!(!store.contains(new));
+        assert!(store.delete_fenced(old, 0).unwrap());
+        assert!(!store.contains(old));
+        // Idempotent, like the unfenced delete.
+        assert!(!store.delete_fenced(old, 0).unwrap());
+    }
+
+    #[test]
+    fn a_refused_fenced_delete_leaves_no_durable_tombstone() {
+        let fs = SimFs::new(8004);
+        let cfg = VolumeConfig::default();
+        let store = VolumeStore::open(fs.clone(), "refused_delete", cfg).unwrap();
+        let id = BlobId::new(23, 1, 1, 1, 2, 0);
+        store.put(id, b"keep").unwrap();
+        store.advance_epoch(0).unwrap(); // the target is at 1, the fragment at 0
+
+        assert!(matches!(
+            store.delete_fenced(id, 1),
+            Err(BlobError::FencedByEpoch { .. })
+        ));
+        // A refused delete must not install its permanent fence: the id is still
+        // writable, so no tombstone was appended for a delete that was not
+        // entitled to happen.
+        store.put(id, b"keep").unwrap();
+
+        drop(store);
+        fs.simulate_power_cut();
+        let reopened = VolumeStore::open(fs.clone(), "refused_delete", cfg).unwrap();
+        assert_eq!(reopened.get(id).unwrap(), b"keep");
+        assert_eq!(reopened.fragment_epoch(id), Some(0));
+        assert_eq!(
+            reopened.epoch(),
+            1,
+            "a refused delete does not touch the epoch"
+        );
+        // The entitlement was what was missing, not the delete: with the recorded
+        // epoch the same fragment is removed, and that removal is durable.
+        assert!(reopened.delete_fenced(id, 0).unwrap());
+        drop(reopened);
+        fs.simulate_power_cut();
+        let durable = VolumeStore::open(fs, "refused_delete", cfg).unwrap();
+        assert!(!durable.contains(id));
+        assert!(matches!(
+            durable.put(id, b"keep"),
+            Err(BlobError::Tombstoned(_))
+        ));
+    }
+
+    #[test]
+    fn a_torn_epoch_advance_cannot_reset_the_durable_epoch() {
+        // The epoch is what a collector fences its pass with. Losing it during an
+        // update would silently re-open the epoch a superseded collector still
+        // holds. It is therefore never rewritten in place: an advance appends a
+        // record, and recovery takes the maximum over every record, so a torn
+        // append can only fail to raise the value.
+        let fs = SimFs::new(8005);
+        let cfg = VolumeConfig::default();
+        let store = VolumeStore::open(fs.clone(), "torn_epoch", cfg).unwrap();
+        let id = BlobId::new(24, 1, 1, 1, 2, 0);
+        store.put(id, b"epoch zero").unwrap();
+        assert_eq!(store.advance_epoch(0).unwrap(), 1);
+        // No fragment is written under epoch 1 or 2, so only the epoch records
+        // carry them. A recovery that ignores them, or that reinitialises the
+        // epoch, reports 0 below instead of 2.
+        assert_eq!(store.advance_epoch(1).unwrap(), 2);
+
+        fs.set_faults(FaultConfig {
+            seed: 31,
+            torn_write_prob: 1.0,
+            ..Default::default()
+        });
+        let error = store
+            .advance_epoch(2)
+            .expect_err("a torn epoch write must not be acknowledged");
+        assert!(matches!(error, BlobError::Io(_)), "got {error:?}");
+        // An epoch whose write was not proven is not published.
+        assert_eq!(store.epoch(), 2);
+        fs.set_faults(FaultConfig::default());
+
+        drop(store);
+        fs.simulate_power_cut();
+        let reopened = VolumeStore::open(fs.clone(), "torn_epoch", cfg).unwrap();
+        assert_eq!(
+            reopened.epoch(),
+            2,
+            "a torn advance must not lower the durable epoch"
+        );
+        assert_eq!(reopened.fragment_epoch(id), Some(0));
+        assert_eq!(reopened.get(id).unwrap(), b"epoch zero");
+        // The torn attempt left nothing usable behind, and the next step still
+        // starts from the value the volume actually holds.
+        assert_eq!(reopened.advance_epoch(2).unwrap(), 3);
+    }
+
+    #[test]
+    fn a_failed_epoch_sync_publishes_nothing_and_recovers_to_the_durable_value() {
+        for fault in [SyncFault::BeforePersist, SyncFault::AfterPersist] {
+            let fs = SimFs::new(8006);
+            let cfg = VolumeConfig::default();
+            let store = VolumeStore::open(fs.clone(), "epoch_sync", cfg).unwrap();
+            let id = BlobId::new(25, 1, 1, 1, 2, 0);
+            store.put(id, b"payload").unwrap();
+            assert_eq!(store.advance_epoch(0).unwrap(), 1);
+
+            fs.set_faults(FaultConfig {
+                sync_data_fault: fault,
+                ..Default::default()
+            });
+            assert!(matches!(store.advance_epoch(1), Err(BlobError::Io(_))));
+            // The caller is never told an epoch the target could not prove
+            // durable, and the volume does not build on the ambiguous append.
+            assert_eq!(store.epoch(), 1, "fault {fault:?}");
+            assert!(matches!(
+                store.advance_epoch(1),
+                Err(BlobError::StorageUnavailable)
+            ));
+            assert!(matches!(
+                store.put(BlobId::new(25, 1, 1, 2, 2, 0), b"x"),
+                Err(BlobError::StorageUnavailable)
+            ));
+            fs.set_faults(FaultConfig::default());
+            drop(store);
+            fs.simulate_power_cut();
+
+            let reopened = VolumeStore::open(fs, "epoch_sync", cfg).unwrap();
+            // The acknowledged epoch is never lost. A sync that failed after
+            // persisting leaves the higher value behind: that over-advances, so it
+            // fences more, never less, and the collector that was refused stops.
+            let expected = if fault == SyncFault::AfterPersist {
+                2
+            } else {
+                1
+            };
+            assert_eq!(reopened.epoch(), expected, "fault {fault:?}");
+            // Either way the fragment keeps its own epoch, so a delete carrying
+            // the epoch the failed advance tried to reach is refused.
+            assert_eq!(reopened.fragment_epoch(id), Some(0));
+            assert!(matches!(
+                reopened.delete_fenced(id, 1),
+                Err(BlobError::FencedByEpoch { .. })
+            ));
+            assert_eq!(reopened.get(id).unwrap(), b"payload");
+        }
+    }
+
+    #[test]
+    fn compaction_preserves_the_epoch_and_each_fragments_epoch() {
+        let fs = SimFs::new(8007);
+        let cfg = VolumeConfig {
+            max_segment_bytes: 160,
+            ..Default::default()
+        };
+        let store = VolumeStore::open(fs.clone(), "epoch_compact", cfg).unwrap();
+        let old = BlobId::new(26, 1, 1, 1, 2, 0);
+        let new = BlobId::new(26, 1, 1, 2, 2, 0);
+        store.put(old, &[b'o'; 60]).unwrap();
+        store.advance_epoch(0).unwrap();
+        store.put(new, &[b'n'; 60]).unwrap();
+        // Two advances with no fragment of their own: only an epoch record
+        // carries them, and the segment holding it is about to be rewritten.
+        store.advance_epoch(1).unwrap();
+        store.advance_epoch(2).unwrap();
+        // Roll the active segment so the fragments and epoch records above become
+        // sealed and are copied into replacement segments.
+        store
+            .put(BlobId::new(26, 1, 1, 3, 2, 0), &[b'z'; 60])
+            .unwrap();
+        assert!(store.compact_sealed_segments().unwrap() > 0);
+
+        assert_eq!(store.epoch(), 3);
+        assert_eq!(store.fragment_epoch(old), Some(0));
+        assert_eq!(store.fragment_epoch(new), Some(1));
+        // Compaction rewrites bytes; it does not create a new fragment, so the
+        // epoch a fenced delete compares against is unchanged.
+        assert!(matches!(
+            store.delete_fenced(old, 1),
+            Err(BlobError::FencedByEpoch { .. })
+        ));
+        drop(store);
+        fs.simulate_power_cut();
+        let reopened = VolumeStore::open(fs, "epoch_compact", cfg).unwrap();
+        assert_eq!(reopened.epoch(), 3, "compaction must not lower the epoch");
+        assert_eq!(reopened.fragment_epoch(old), Some(0));
+        assert_eq!(reopened.fragment_epoch(new), Some(1));
+        assert_eq!(reopened.get(old).unwrap(), vec![b'o'; 60]);
+        assert!(reopened.delete_fenced(old, 0).unwrap());
+    }
+
+    #[test]
+    fn sealing_and_compacting_away_the_last_epoch_record_keeps_the_epoch() {
+        // A volume whose last operation was an epoch advance has no fragment
+        // carrying that epoch: the epoch record is the only copy. Sealing the
+        // active segment and compacting it away must therefore rewrite the epoch,
+        // or the next open silently reports the epoch of the newest fragment
+        // instead - the reset this increment exists to prevent.
+        let fs = SimFs::new(8010);
+        let cfg = VolumeConfig::default();
+        let store = VolumeStore::open(fs.clone(), "epoch_seal", cfg).unwrap();
+        let id = BlobId::new(28, 1, 1, 1, 2, 0);
+        store.put(id, b"fragment at epoch zero").unwrap();
+        assert_eq!(store.advance_epoch(0).unwrap(), 1);
+        assert_eq!(store.advance_epoch(1).unwrap(), 2);
+        // The active segment now holds one fragment at epoch 0 and two epoch
+        // records. Sealing rolls it and compaction rewrites it, reclaiming the
+        // superseded epoch record.
+        assert!(store.seal_and_compact().unwrap() > 0);
+        assert_eq!(store.epoch(), 2);
+        drop(store);
+        fs.simulate_power_cut();
+        let reopened = VolumeStore::open(fs, "epoch_seal", cfg).unwrap();
+        assert_eq!(
+            reopened.epoch(),
+            2,
+            "compacting away the last epoch record must not lower the epoch"
+        );
+        assert_eq!(reopened.get(id).unwrap(), b"fragment at epoch zero");
+        assert_eq!(reopened.fragment_epoch(id), Some(0));
+    }
+
+    #[test]
+    fn a_legacy_record_without_an_epoch_is_readable_as_epoch_zero() {
+        // A volume written before target epochs existed has 33-byte headers. It
+        // must keep opening, and its fragments belong to epoch 0 - the epoch every
+        // volume starts at - not to an epoch nobody can name.
+        let fs = SimFs::new(8008);
+        let cfg = VolumeConfig::default();
+        let id = BlobId::new(27, 1, 1, 1, 2, 0);
+        let payload = b"written before epochs existed";
+        {
+            fs.create_dir_all("legacy_epoch").unwrap();
+            let file = fs.open_rw("legacy_epoch/vol_00000001.dat", true).unwrap();
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(b"YADBVOL1");
+            let mut hdr = [0u8; 33];
+            hdr[0..4].copy_from_slice(&0x5942_5243u32.to_le_bytes()); // V1 magic
+            hdr[4] = 1; // REC_KIND_PUT
+            hdr[5..21].copy_from_slice(&id.to_be_bytes());
+            hdr[21..25].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+            hdr[25..29].copy_from_slice(&crc32fast::hash(payload).to_le_bytes());
+            let hdr_crc = crc32fast::hash(&hdr[0..29]);
+            hdr[29..33].copy_from_slice(&hdr_crc.to_le_bytes());
+            bytes.extend_from_slice(&hdr);
+            bytes.extend_from_slice(payload);
+            file.write_at(0, &bytes).unwrap();
+            file.sync_data().unwrap();
+            fs.sync_dir("legacy_epoch").unwrap();
+        }
+
+        let store = VolumeStore::open(fs, "legacy_epoch", cfg).unwrap();
+        assert_eq!(store.epoch(), 0);
+        assert_eq!(store.get(id).unwrap(), payload);
+        assert_eq!(store.fragment_epoch(id), Some(0));
+        assert!(matches!(
+            store.delete_fenced(id, 1),
+            Err(BlobError::FencedByEpoch {
+                recorded_epoch: 0,
+                expected_epoch: 1,
+                ..
+            })
+        ));
+        assert_eq!(store.get(id).unwrap(), payload);
+        assert!(store.delete_fenced(id, 0).unwrap());
+    }
+
+    #[test]
+    fn an_epoch_advance_naming_a_stale_epoch_is_refused() {
+        let fs = SimFs::new(8009);
+        let cfg = VolumeConfig::default();
+        let store = VolumeStore::open(fs.clone(), "stale_advance", cfg).unwrap();
+        assert_eq!(store.advance_epoch(0).unwrap(), 1);
+        // A collector that fenced its pass at epoch 0 has been superseded: it must
+        // not move the epoch past the newer one.
+        match store.advance_epoch(0) {
+            Err(BlobError::EpochMismatch {
+                expected_epoch,
+                actual_epoch,
+            }) => assert_eq!((expected_epoch, actual_epoch), (0, 1)),
+            other => panic!("expected EpochMismatch, got {other:?}"),
+        }
+        assert_eq!(store.epoch(), 1);
+        // An advance ahead of the target is refused too: the step is exactly one,
+        // from the epoch the caller read.
+        assert!(matches!(
+            store.advance_epoch(5),
+            Err(BlobError::EpochMismatch {
+                expected_epoch: 5,
+                actual_epoch: 1
+            })
+        ));
+        assert_eq!(store.epoch(), 1);
+        drop(store);
+        fs.simulate_power_cut();
+        let reopened = VolumeStore::open(fs, "stale_advance", cfg).unwrap();
+        assert_eq!(reopened.epoch(), 1, "a refused advance wrote nothing");
+        assert!(
+            reopened.live_ids().is_empty(),
+            "an epoch record is not a fragment"
+        );
+        assert_eq!(reopened.advance_epoch(1).unwrap(), 2);
+    }
+
     #[test]
     fn concurrent_conflicting_puts_never_acknowledge_two_values() {
         let fs = SimFs::new(1240);
@@ -747,10 +1202,17 @@ mod tests {
         store.delete(dead).unwrap();
         store.put(live, b"durable").unwrap();
         store.put(corrupt, b"repair-me").unwrap();
-        fs.corrupt_byte("bitrot_recovery/vol_00000001.dat", 8 + 33)
+        // Record layout: PUT "deleted" (header + 7), TOMBSTONE, PUT "durable"
+        // (header + 7), PUT "repair-me" (header + 9). Damage the first byte of
+        // the first payload and of the last payload, never a header.
+        let hdr = crate::volume::RECORD_HEADER_LEN;
+        fs.corrupt_byte("bitrot_recovery/vol_00000001.dat", 8 + hdr)
             .unwrap();
-        fs.corrupt_byte("bitrot_recovery/vol_00000001.dat", 8 + 40 + 33 + 40 + 33)
-            .unwrap();
+        fs.corrupt_byte(
+            "bitrot_recovery/vol_00000001.dat",
+            8 + (hdr + 7) + hdr + (hdr + 7) + hdr,
+        )
+        .unwrap();
         drop(store);
         fs.simulate_power_cut();
         let recovered = VolumeStore::open(fs, "bitrot_recovery", cfg).unwrap();
@@ -783,9 +1245,10 @@ mod tests {
 
         // Damage the header of the second record. It is followed by the
         // tombstone for `dead`; truncating at the bad header would drop that
-        // tombstone and resurrect the deleted blob.
+        // tombstone and resurrect the deleted blob. Record 1 is a PUT of 7 bytes.
         let path = "hdr_bitrot/vol_00000001.dat";
-        fs.corrupt_byte(path, 8 + 40 + 4).unwrap();
+        fs.corrupt_byte(path, 8 + crate::volume::RECORD_HEADER_LEN + 7 + 4)
+            .unwrap();
         let damaged = {
             let file = fs.open_rw(path, false).unwrap();
             let mut bytes = vec![0u8; file.len().unwrap() as usize];
@@ -927,7 +1390,13 @@ mod tests {
         // Corrupt a byte on az0 AND wipe az3's segment completely!
         let files_az0 = fs.list_files("az0").unwrap();
         if let Some(seg) = files_az0.first() {
-            fs.corrupt_byte(&format!("az0/{seg}"), 45).unwrap();
+            // Inside the payload, not the header: a header byte would truncate
+            // the tail instead of corrupting a readable fragment.
+            fs.corrupt_byte(
+                &format!("az0/{seg}"),
+                8 + crate::volume::RECORD_HEADER_LEN + 4,
+            )
+            .unwrap();
         }
         let files_az3 = fs.list_files("az3").unwrap();
         for seg in files_az3 {
@@ -978,8 +1447,11 @@ mod tests {
         // Offset 45 lands inside the payload CRC region for a short fragment, the
         // same offset the bitrot test above uses; a header byte would truncate
         // instead of corrupting, which is a different finding.
-        fs.corrupt_byte(&format!("{domain}/{}", files[0]), 45)
-            .unwrap();
+        fs.corrupt_byte(
+            &format!("{domain}/{}", files[0]),
+            8 + crate::volume::RECORD_HEADER_LEN + 4,
+        )
+        .unwrap();
     }
 
     fn wipe_domain(fs: &SimFs, domain: &str) {
