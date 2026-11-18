@@ -23,6 +23,27 @@ const REC_KIND_TOMBSTONE: u8 = 3;
 /// value recovery derives is the maximum over every record in the volume, so a
 /// torn append can only fail to raise the epoch, never lower it.
 const REC_KIND_EPOCH: u8 = 4;
+/// Records a reader pin: its id and its deadline in the payload, the epoch it
+/// names in the header. Appended and synced like every other record, never
+/// rewritten in place, so replay order - not a mutable field - decides whether
+/// a pin is live.
+const REC_KIND_PIN: u8 = 5;
+/// Releases the pin named in its payload. A release is a record of its own so a
+/// pin is never rewritten in place: recovery sees PIN then UNPIN and the later
+/// record wins.
+const REC_KIND_UNPIN: u8 = 6;
+/// `pin_id: u64` + `expires_at_ms: u64`, little-endian, CRC32 in the header.
+const PIN_PAYLOAD_LEN: usize = 16;
+/// `pin_id: u64`, little-endian, CRC32 in the header.
+const UNPIN_PAYLOAD_LEN: usize = 8;
+/// The longest lifetime a pin may name.
+///
+/// A pin is held across one fragment fetch, so its bound is minutes rather than
+/// hours. Without a bound one buggy reader could hold collection off
+/// indefinitely; a TTL above this is refused rather than clamped, because
+/// silently shortening a lease the reader asked for would expire a pin under a
+/// read the reader believes it fenced.
+pub const MAX_PIN_TTL_MS: u64 = 300_000;
 const RECORD_HEADER_LEN_V1: usize = 33;
 pub(crate) const RECORD_HEADER_LEN: usize = 41;
 /// `BlobId` field of an epoch record. An epoch record names no fragment, so the
@@ -30,6 +51,96 @@ pub(crate) const RECORD_HEADER_LEN: usize = 41;
 /// a fragment.
 fn epoch_record_id() -> BlobId {
     BlobId::new(0, 0, 0, 0, 0, 0)
+}
+
+/// Identifies one reader pin.
+///
+/// Ids are drawn from the volume's own durable log (`max(id) + 1` over every
+/// PIN and UNPIN record), never from a counter that restarts with the process.
+/// An id is therefore not handed out again while any record naming it survives
+/// on disk, including across reopen, so a late `unpin` of an old id cannot
+/// release a newer pin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PinId(u64);
+
+impl PinId {
+    /// The numeric value, for the wire format the RPC will carry.
+    pub fn get(self) -> u64 {
+        self.0
+    }
+
+    /// Rebuilds an id from its wire value. An id this volume never issued is
+    /// simply unknown to [`VolumeStore::unpin`], which answers `Ok(false)`.
+    pub fn from_wire(value: u64) -> Self {
+        Self(value)
+    }
+}
+
+impl std::fmt::Display for PinId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "pin#{}", self.0)
+    }
+}
+
+/// What the volume remembers about one pin. Liveness is `now < expires_at_ms`
+/// and is decided at the point of use, never by a field that is flipped.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PinEntry {
+    /// The epoch the pin names. A pin is only ever taken on the epoch that was
+    /// current when it was taken.
+    pub(crate) epoch: u64,
+    pub(crate) expires_at_ms: u64,
+}
+
+/// One PIN or UNPIN record, in log order. Replayed by [`rebuild_pins`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum PinRecord {
+    Pin {
+        pin_id: PinId,
+        epoch: u64,
+        expires_at_ms: u64,
+    },
+    Unpin {
+        pin_id: PinId,
+    },
+}
+
+/// How [`VolumeStore::delete_inner`] is fenced. Three distinct rules, kept in one
+/// place so the difference between them is visible rather than implied:
+/// unfenced, exact-epoch, and older-and-unpinned.
+#[derive(Debug, Clone, Copy)]
+enum DeleteFence {
+    Unfenced,
+    Exact(u64),
+    Collectable(u64),
+}
+
+/// The target's answer to [`VolumeStore::pin`]: the id the reader must present
+/// to [`VolumeStore::unpin`], and the deadline the target recorded for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PinGrant {
+    pub pin_id: PinId,
+    pub epoch: u64,
+    pub expires_at_ms: u64,
+}
+
+/// One unexpired pin, as [`VolumeStore::live_pins`] reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PinView {
+    pub pin_id: PinId,
+    pub epoch: u64,
+    pub expires_at_ms: u64,
+}
+
+fn encode_pin_payload(pin_id: PinId, expires_at_ms: u64) -> [u8; PIN_PAYLOAD_LEN] {
+    let mut payload = [0u8; PIN_PAYLOAD_LEN];
+    payload[0..8].copy_from_slice(&pin_id.0.to_le_bytes());
+    payload[8..16].copy_from_slice(&expires_at_ms.to_le_bytes());
+    payload
+}
+
+fn encode_unpin_payload(pin_id: PinId) -> [u8; UNPIN_PAYLOAD_LEN] {
+    pin_id.0.to_le_bytes()
 }
 
 /// A mostly-garbage active segment is sealed even when small, because rolling it
@@ -96,6 +207,32 @@ impl<F: VirtualFile> ActiveSegment<F> {
     }
 }
 
+/// Appends one header-plus-payload record and syncs it, rolling back a torn tail
+/// so the next append stays aligned.
+///
+/// The sync is unconditional: a pin is fencing state, and deletion fencing has
+/// to survive restart even on a bulk-load volume. A failed sync marks the
+/// segment failed instead of retrying an append whose outcome is unknown.
+fn append_record<F: VirtualFile>(
+    writer: &mut ActiveSegment<F>,
+    hdr: &[u8],
+    payload: &[u8],
+) -> Result<(), BlobError> {
+    let pos = writer.write_pos;
+    let mut frame = Vec::with_capacity(hdr.len() + payload.len());
+    frame.extend_from_slice(hdr);
+    frame.extend_from_slice(payload);
+    if let Err(error) = writer.file.write_at(pos, &frame) {
+        if writer.file.set_len(pos).is_err() {
+            writer.failed = true;
+        }
+        return Err(error.into());
+    }
+    writer.sync_data()?;
+    writer.write_pos = pos + frame.len() as u64;
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct VolumeStats {
     pub live_blobs: usize,
@@ -114,6 +251,10 @@ pub struct VolumeStats {
 /// stamps every fragment with the epoch it was written under, so a delete can be refused when the
 /// fragment belongs to a different epoch than the one the collector names
 /// ([`VolumeStore::delete_fenced`]).
+///
+/// On top of the epoch it keeps a durable **pin table** (see [`VolumeStore::pin`]): readers pin the
+/// epoch they read, an epoch advance is refused while a pin on it is unexpired, and
+/// [`VolumeStore::delete_collectable`] refuses a fragment whose epoch a live pin still names.
 pub struct VolumeStore<FS: StorageFs> {
     fs: FS,
     dir: String,
@@ -126,6 +267,13 @@ pub struct VolumeStore<FS: StorageFs> {
     /// Current durable target epoch. Only [`VolumeStore::advance_epoch`] raises
     /// it, and only after the record that carries the new value is synced.
     epoch: AtomicU64,
+    /// The live pin set, rebuilt from the log on open and extended by
+    /// [`VolumeStore::pin`]. Holds expired pins too: liveness is decided by
+    /// comparing `expires_at_ms` with the clock, never by the entry's presence,
+    /// so a stale entry can only ever be forgotten, not believed.
+    pins: RwLock<BTreeMap<PinId, PinEntry>>,
+    /// The next pin id. Seeded from the log, so it survives reopen.
+    next_pin_id: AtomicU64,
 }
 
 impl<FS: StorageFs> VolumeStore<FS> {
@@ -138,6 +286,7 @@ impl<FS: StorageFs> VolumeStore<FS> {
         let mut tombstones: BTreeSet<BlobId> = BTreeSet::new();
         let mut segments = BTreeMap::new();
         let mut max_seg_id = 0u32;
+        let mut segment_ids: Vec<u32> = Vec::new();
         // The epoch is derived from what is on disk, never invented. Recovery
         // only ever raises this value: it is the maximum over every record, and
         // opening a volume is not an epoch advance.
@@ -150,24 +299,42 @@ impl<FS: StorageFs> VolumeStore<FS> {
                 continue;
             }
             if let Some(seg_id) = parse_segment_name(&name) {
-                max_seg_id = max_seg_id.max(seg_id);
-                let path = segment_path(&dir, seg_id);
-                let file = fs.open_rw(&path, false)?;
-                recover_segment(
-                    &file,
-                    seg_id,
-                    &mut index,
-                    &mut barriers,
-                    &mut tombstones,
-                    &mut epoch,
-                )?;
-                // Recovery can see unsynced page-cache records after a process
-                // restart. Sync before serving idempotent PUT/DELETE acks or
-                // relying on recovered fences, even on bulk-load volumes.
-                file.sync_data()?;
-                segments.insert(seg_id, file);
+                segment_ids.push(seg_id);
             }
         }
+        // Replay order is part of recovery: a pin and the unpin that releases it
+        // can live in different segments and the later record must win, so
+        // segments are replayed by ascending id. `list_files` order is not
+        // guaranteed by the operating system.
+        segment_ids.sort_unstable();
+        segment_ids.dedup();
+
+        let mut pin_records: Vec<PinRecord> = Vec::new();
+        for seg_id in segment_ids {
+            max_seg_id = max_seg_id.max(seg_id);
+            let path = segment_path(&dir, seg_id);
+            let file = fs.open_rw(&path, false)?;
+            recover_segment(
+                &file,
+                seg_id,
+                &mut index,
+                &mut barriers,
+                &mut tombstones,
+                &mut epoch,
+                &mut pin_records,
+            )?;
+            // Recovery can see unsynced page-cache records after a process
+            // restart. Sync before serving idempotent PUT/DELETE acks or
+            // relying on recovered fences, even on bulk-load volumes.
+            file.sync_data()?;
+            segments.insert(seg_id, file);
+        }
+
+        // Rebuilt from the records, never invented: a live pin is one whose PIN
+        // record was not followed by its UNPIN. Dropping an expired pin here is
+        // the only way a pin may disappear without a record saying so, and it is
+        // decided by the clock, not by a default.
+        let (pins, next_pin_id) = rebuild_pins(pin_records, &target_clock())?;
 
         let active_id = if max_seg_id == 0 { 1 } else { max_seg_id };
         let active_file = if segments.contains_key(&active_id) {
@@ -197,6 +364,8 @@ impl<FS: StorageFs> VolumeStore<FS> {
                 failed: false,
             }),
             epoch: AtomicU64::new(epoch),
+            pins: RwLock::new(pins),
+            next_pin_id: AtomicU64::new(next_pin_id),
         })
     }
 
@@ -215,6 +384,162 @@ impl<FS: StorageFs> VolumeStore<FS> {
         self.index.read().unwrap().get(&id).map(|entry| entry.epoch)
     }
 
+    /// Takes a reader pin on `epoch` for `ttl_ms`, and returns the id the reader
+    /// must present to [`Self::unpin`] together with the deadline the target
+    /// recorded.
+    ///
+    /// A pin is durable, not in-memory: the record is appended and synced before
+    /// this returns. A target that forgot a pin across a restart would let a
+    /// collector advance past a reader that is still holding bytes - the one
+    /// direction that must not happen - while a pin that outlives its reader
+    /// only blocks collection until its TTL runs out.
+    ///
+    /// `epoch` must be the target's current epoch. An older one names an epoch
+    /// the collector may already have advanced past, so the pin would prove
+    /// nothing; a newer one does not exist yet. Both are refused with
+    /// [`BlobError::PinEpochNotCurrent`], which names both epochs.
+    ///
+    /// `ttl_ms` of zero is refused, and a lifetime above [`MAX_PIN_TTL_MS`] is
+    /// refused rather than clamped: a pin that outlives the read it protects
+    /// blocks collection for nothing, and one that was silently shortened would
+    /// expire underneath a read the reader believes is fenced.
+    pub fn pin(&self, epoch: u64, ttl_ms: u64) -> Result<PinGrant, BlobError> {
+        if ttl_ms == 0 {
+            return Err(BlobError::PinTtlZero);
+        }
+        if ttl_ms > MAX_PIN_TTL_MS {
+            return Err(BlobError::PinTtlTooLong {
+                requested_ms: ttl_ms,
+                max_ms: MAX_PIN_TTL_MS,
+            });
+        }
+        let mut writer = self.writer.lock().unwrap();
+        writer.ensure_healthy()?;
+        // Checked under the append lock: an advance takes the same lock, so the
+        // epoch this pin names cannot move between the check and the record.
+        let current = self.epoch.load(Ordering::SeqCst);
+        if epoch != current {
+            return Err(BlobError::PinEpochNotCurrent {
+                requested_epoch: epoch,
+                actual_epoch: current,
+            });
+        }
+        // The deadline is the target's own clock plus the TTL. An unreadable
+        // clock refuses here too: a pin with no provable deadline is not a pin.
+        let now_ms = target_clock().map_err(|reason| BlobError::PinClockUnreadable { reason })?;
+        let expires_at_ms = now_ms.saturating_add(ttl_ms);
+        let pin_id = self.allocate_pin_id()?;
+        let payload = encode_pin_payload(pin_id, expires_at_ms);
+        let hdr = encode_record_header(
+            REC_KIND_PIN,
+            epoch_record_id(),
+            PIN_PAYLOAD_LEN as u32,
+            crc32fast::hash(&payload),
+            epoch,
+        );
+        append_record(&mut writer, &hdr, &payload)?;
+        // Published only after the record is durable: an id the caller was told
+        // about is always one recovery will find.
+        self.pins.write().unwrap().insert(
+            pin_id,
+            PinEntry {
+                epoch,
+                expires_at_ms,
+            },
+        );
+        Ok(PinGrant {
+            pin_id,
+            epoch,
+            expires_at_ms,
+        })
+    }
+
+    /// Releases `pin_id`.
+    ///
+    /// Idempotent and one-directional: `Ok(true)` means a live pin was removed,
+    /// `Ok(false)` means the id was unknown or had already expired. It never
+    /// extends a deadline, never re-creates a pin and never touches the epoch, so
+    /// releasing twice - or after the TTL ran out - cannot make a fragment
+    /// collectable that was not already.
+    pub fn unpin(&self, pin_id: PinId) -> Result<bool, BlobError> {
+        let mut writer = self.writer.lock().unwrap();
+        writer.ensure_healthy()?;
+        let Some(entry) = self.pins.read().unwrap().get(&pin_id).copied() else {
+            return Ok(false);
+        };
+        // An expired pin blocks nothing, so releasing it is a no-op rather than
+        // a record - and reporting `true` would claim a live pin was removed.
+        if !pin_is_live(entry.expires_at_ms, &target_clock())? {
+            return Ok(false);
+        }
+        let payload = encode_unpin_payload(pin_id);
+        let hdr = encode_record_header(
+            REC_KIND_UNPIN,
+            epoch_record_id(),
+            UNPIN_PAYLOAD_LEN as u32,
+            crc32fast::hash(&payload),
+            0,
+        );
+        append_record(&mut writer, &hdr, &payload)?;
+        // Removed only after the release is durable. A failed append leaves the
+        // pin in place, which blocks collection rather than admitting it.
+        self.pins.write().unwrap().remove(&pin_id);
+        Ok(true)
+    }
+
+    /// Every pin that is unexpired right now: the set the collector's
+    /// "re-read the pin set" step has to consult before advancing an epoch.
+    ///
+    /// An unreadable clock refuses with [`BlobError::PinClockUnreadable`] instead
+    /// of being read as zero, which would make every pin look expired.
+    pub fn live_pins(&self) -> Result<Vec<PinView>, BlobError> {
+        self.live_pins_on(None)
+    }
+
+    /// Unexpired pins, optionally restricted to one epoch.
+    fn live_pins_on(&self, epoch: Option<u64>) -> Result<Vec<PinView>, BlobError> {
+        let pins = self.pins.read().unwrap();
+        if pins.is_empty() {
+            // No pins: nothing to compare, so no clock is needed and a broken
+            // one cannot block an otherwise empty table.
+            return Ok(Vec::new());
+        }
+        let now = target_clock();
+        let mut live = Vec::new();
+        for (&pin_id, entry) in pins.iter() {
+            if epoch.is_some_and(|wanted| wanted != entry.epoch) {
+                continue;
+            }
+            if pin_is_live(entry.expires_at_ms, &now)? {
+                live.push(PinView {
+                    pin_id,
+                    epoch: entry.epoch,
+                    expires_at_ms: entry.expires_at_ms,
+                });
+            }
+        }
+        Ok(live)
+    }
+
+    fn allocate_pin_id(&self) -> Result<PinId, BlobError> {
+        // A compare-exchange loop rather than `fetch_add`: an id that wrapped
+        // would be one a surviving record may already name, and reissuing an id
+        // would let a stale unpin release a newer pin.
+        let mut next = self.next_pin_id.load(Ordering::SeqCst);
+        loop {
+            let following = next.checked_add(1).ok_or(BlobError::PinIdsExhausted)?;
+            match self.next_pin_id.compare_exchange(
+                next,
+                following,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return Ok(PinId(next)),
+                Err(observed) => next = observed,
+            }
+        }
+    }
+
     /// The collector's epoch step: raises the durable epoch by one, from exactly
     /// `expected_epoch`, and returns the new value.
     ///
@@ -228,6 +553,13 @@ impl<FS: StorageFs> VolumeStore<FS> {
     /// with. A target that is no longer at that epoch refuses with
     /// [`BlobError::EpochMismatch`] instead of advancing: a superseded collector
     /// must not be able to move the epoch past a newer one.
+    ///
+    /// An unexpired pin refuses the advance as well, with
+    /// [`BlobError::EpochPinned`], which names the epoch and how many pins
+    /// blocked it. A reader pins the epoch it is about to read, so advancing past
+    /// it is exactly the event that would let a pass delete bytes the reader still
+    /// holds. Both refusals are "stop this pass": neither is retryable, and
+    /// neither appends a record.
     ///
     /// Durability: the new epoch is appended as a record and synced before the
     /// call returns, and before the in-memory value is published. A failed sync
@@ -245,6 +577,16 @@ impl<FS: StorageFs> VolumeStore<FS> {
             return Err(BlobError::EpochMismatch {
                 expected_epoch,
                 actual_epoch: current,
+            });
+        }
+        // Checked before anything is appended, and under the same append lock a
+        // pin takes, so "no pins" and "epoch advanced" cannot interleave with a
+        // pin landing between them.
+        let live_pins = self.live_pins_on(None)?.len();
+        if live_pins > 0 {
+            return Err(BlobError::EpochPinned {
+                epoch: current,
+                live_pins,
             });
         }
         let next = current.checked_add(1).ok_or(BlobError::EpochExhausted)?;
@@ -398,9 +740,10 @@ impl<FS: StorageFs> VolumeStore<FS> {
     /// **Unfenced.** This does not consult the target epoch: it unlinks a
     /// fragment regardless of the epoch it was written under. It is kept for
     /// callers whose safety argument does not involve a collector epoch. A
-    /// collector deleting under a fence epoch must use [`Self::delete_fenced`].
+    /// collector deleting under a fence epoch must use [`Self::delete_fenced`]
+    /// (exactly this epoch) or [`Self::delete_collectable`] (older and unpinned).
     pub fn delete(&self, id: BlobId) -> Result<bool, BlobError> {
-        self.delete_inner(id, None)
+        self.delete_inner(id, DeleteFence::Unfenced)
     }
 
     /// Durably removes one immutable blob, but only if the volume holds it
@@ -414,37 +757,94 @@ impl<FS: StorageFs> VolumeStore<FS> {
     /// "stop, do not retry" answer: retrying with the recorded epoch would be a
     /// delete the caller did not prove it was entitled to.
     ///
-    /// The check is equality, the strict form. "Older than the epoch I hold" is
-    /// only sound once readers pin the epoch they read, because until then
-    /// nothing on the target says whether an older fragment is still referenced;
-    /// relaxing this belongs to the increment that adds pins.
+    /// The check is **equality**, the strict form, and it does not consult the
+    /// pin table: it answers "is this the epoch I named", not "is this epoch
+    /// still readable". A collector that has advanced an epoch therefore deletes
+    /// nothing through this method, which is why
+    /// [`Self::delete_collectable`] exists next to it rather than replacing it.
     ///
     /// A fragment that is already absent (or already tombstoned) answers
     /// `Ok(false)`, like [`Self::delete`], and the id is tombstoned so a late
     /// PUT cannot resurrect it. There is no epoch to compare in that case, and
     /// nothing to unlink, so no fence is bypassed.
     pub fn delete_fenced(&self, id: BlobId, expected_epoch: u64) -> Result<bool, BlobError> {
-        self.delete_inner(id, Some(expected_epoch))
+        self.delete_inner(id, DeleteFence::Exact(expected_epoch))
     }
 
-    fn delete_inner(&self, id: BlobId, fence: Option<u64>) -> Result<bool, BlobError> {
+    /// Durably removes one immutable blob that a collector at `collector_epoch`
+    /// is entitled to collect: its recorded epoch must be **older** than the
+    /// collector's, and no unexpired pin may name that epoch.
+    ///
+    /// This is the relaxed form the epoch exists for. It differs from
+    /// [`Self::delete_fenced`] in both directions:
+    ///
+    /// * the comparison is `fragment_epoch < collector_epoch`, not equality, so a
+    ///   collector that advanced past a fragment can still reclaim it;
+    /// * it refuses while a reader still pins the fragment's epoch, which
+    ///   equality alone could not express.
+    ///
+    /// A fragment that is not older is refused with
+    /// [`BlobError::FragmentNotOlder`]; one whose epoch is pinned is refused with
+    /// [`BlobError::FragmentPinned`]. Both name the fragment's epoch and the
+    /// collector's, both happen before any record is appended, and neither is
+    /// retryable: a pass that hits one stops instead of re-reading the pin table
+    /// until it can proceed.
+    ///
+    /// A fragment that is already absent (or already tombstoned) answers
+    /// `Ok(false)` and is tombstoned, exactly like [`Self::delete_fenced`]:
+    /// there is no epoch to compare and nothing to unlink.
+    pub fn delete_collectable(&self, id: BlobId, collector_epoch: u64) -> Result<bool, BlobError> {
+        self.delete_inner(id, DeleteFence::Collectable(collector_epoch))
+    }
+
+    fn delete_inner(&self, id: BlobId, fence: DeleteFence) -> Result<bool, BlobError> {
         let mut writer = self.writer.lock().unwrap();
         writer.ensure_healthy()?;
         if self.tombstones.read().unwrap().contains(&id) {
             return Ok(false);
         }
-        if let Some(expected_epoch) = fence {
-            let recorded_epoch = self.index.read().unwrap().get(&id).map(|entry| entry.epoch);
-            if let Some(recorded_epoch) = recorded_epoch {
-                if recorded_epoch != expected_epoch {
-                    // Checked before anything is appended: a refused delete must
-                    // not leave a tombstone behind, because that is a permanent
-                    // fence on an id this caller was not entitled to delete.
-                    return Err(BlobError::FencedByEpoch {
-                        id,
-                        recorded_epoch,
-                        expected_epoch,
-                    });
+        let recorded_epoch = self.index.read().unwrap().get(&id).map(|entry| entry.epoch);
+        match fence {
+            DeleteFence::Unfenced => {}
+            DeleteFence::Exact(expected_epoch) => {
+                if let Some(recorded_epoch) = recorded_epoch {
+                    if recorded_epoch != expected_epoch {
+                        // Checked before anything is appended: a refused delete
+                        // must not leave a tombstone behind, because that is a
+                        // permanent fence on an id this caller was not entitled
+                        // to delete.
+                        return Err(BlobError::FencedByEpoch {
+                            id,
+                            recorded_epoch,
+                            expected_epoch,
+                        });
+                    }
+                }
+            }
+            DeleteFence::Collectable(collector_epoch) => {
+                if let Some(fragment_epoch) = recorded_epoch {
+                    if fragment_epoch >= collector_epoch {
+                        // Equality is not collectable either: the collector has
+                        // not advanced past this fragment, so a reader may still
+                        // be reading it under an unexpired pin.
+                        return Err(BlobError::FragmentNotOlder {
+                            id,
+                            fragment_epoch,
+                            collector_epoch,
+                        });
+                    }
+                    // Read under the append lock a pin also takes, so a pin that
+                    // lands after this check is ordered after the tombstone, not
+                    // between the check and the unlink.
+                    let live_pins = self.live_pins_on(Some(fragment_epoch))?.len();
+                    if live_pins > 0 {
+                        return Err(BlobError::FragmentPinned {
+                            id,
+                            fragment_epoch,
+                            collector_epoch,
+                            live_pins,
+                        });
+                    }
                 }
             }
         }
@@ -638,13 +1038,16 @@ impl<FS: StorageFs> VolumeStore<FS> {
             .saturating_sub(VOLUME_MAGIC.len() as u64)
             .saturating_sub(live_in_active)
             .saturating_sub(
-                // Barriers and tombstones are live markers. So is exactly one
-                // epoch record: every older one in the segment is dead, because
-                // recovery only reads the maximum. Counting one as live keeps an
-                // idle volume that has advanced its epoch a few times from
-                // sealing a segment holding nothing but superseded epoch records.
-                (self.barriers.read().unwrap().len() + self.tombstones.read().unwrap().len() + 1)
-                    as u64
+                // Barriers, tombstones and pins are live markers. So is exactly
+                // one epoch record: every older one in the segment is dead,
+                // because recovery only reads the maximum. Counting one as live
+                // keeps an idle volume that has advanced its epoch a few times
+                // from sealing a segment holding nothing but superseded epoch
+                // records.
+                (self.barriers.read().unwrap().len()
+                    + self.tombstones.read().unwrap().len()
+                    + self.pins.read().unwrap().len()
+                    + 1) as u64
                     * RECORD_HEADER_LEN as u64,
             );
         if garbage == 0 {
@@ -738,6 +1141,28 @@ impl<FS: StorageFs> VolumeStore<FS> {
             .collect();
         let tombstone_markers: Vec<BlobId> =
             self.tombstones.read().unwrap().iter().copied().collect();
+        // Pins are durable state too, and dropping a live one while rewriting a
+        // segment would be the same loss as forgetting it on restart: the
+        // collector would be free to advance past a reader that still holds
+        // bytes. Unexpired pins are copied into every replacement segment, so a
+        // pin whose own segment is compacted away survives; the duplicates
+        // replay idempotently, exactly like barrier markers. Expired pins may be
+        // dropped, because they block nothing. An unreadable clock keeps every
+        // pin rather than guessing that it lapsed.
+        let pins_to_keep: Vec<(PinId, PinEntry)> = {
+            let pins = self.pins.read().unwrap();
+            match target_clock() {
+                Ok(now) => pins
+                    .iter()
+                    .filter(|(_, entry)| now < entry.expires_at_ms)
+                    .map(|(&pin_id, &entry)| (pin_id, entry))
+                    .collect(),
+                Err(_) => pins
+                    .iter()
+                    .map(|(&pin_id, &entry)| (pin_id, entry))
+                    .collect(),
+            }
+        };
         // The epoch is durable state of its own. A replacement segment must carry
         // it, or compacting away the segment that held the last epoch record
         // would lower the epoch on the next open.
@@ -789,6 +1214,20 @@ impl<FS: StorageFs> VolumeStore<FS> {
             let hdr = encode_record_header(REC_KIND_TOMBSTONE, marker_id, 0, 0, 0);
             tmp_file.write_at(pos, &hdr)?;
             pos += RECORD_HEADER_LEN as u64;
+        }
+
+        for (pin_id, entry) in pins_to_keep {
+            let payload = encode_pin_payload(pin_id, entry.expires_at_ms);
+            let hdr = encode_record_header(
+                REC_KIND_PIN,
+                epoch_record_id(),
+                PIN_PAYLOAD_LEN as u32,
+                crc32fast::hash(&payload),
+                entry.epoch,
+            );
+            tmp_file.write_at(pos, &hdr)?;
+            tmp_file.write_at(pos + RECORD_HEADER_LEN as u64, &payload)?;
+            pos += (RECORD_HEADER_LEN + PIN_PAYLOAD_LEN) as u64;
         }
 
         let hdr = encode_record_header(REC_KIND_EPOCH, epoch_record_id(), 0, 0, epoch);
@@ -889,6 +1328,81 @@ pub(crate) fn check_barrier_deadline(
     Ok(())
 }
 
+/// Liveness of a pin, as a pure decision so it can be tested with an injected
+/// clock and an injected clock *failure*.
+///
+/// `now < expires_at_ms`, and an unreadable clock refuses. The tempting default -
+/// substitute `0` for an unreadable clock - makes every pin look expired, which
+/// lets a collector advance past a reader that is still holding bytes. That is
+/// the same failure direction as the barrier clock, so the same rule applies
+/// here.
+pub(crate) fn pin_is_live(
+    expires_at_ms: u64,
+    now_ms: &Result<u64, String>,
+) -> Result<bool, BlobError> {
+    let now = now_ms
+        .as_ref()
+        .map_err(|reason| BlobError::PinClockUnreadable {
+            reason: reason.clone(),
+        })?;
+    Ok(*now < expires_at_ms)
+}
+
+/// Rebuilds the pin set from the PIN/UNPIN records recovery collected, in log
+/// order, and returns it with the next pin id to issue.
+///
+/// A pin is live when its PIN record was not followed by its UNPIN and its
+/// deadline has not passed; the second half is decided by [`pin_is_live`], so a
+/// broken clock refuses here instead of dropping every pin. Expired pins are
+/// dropped - the one place a pin may disappear without a record saying so - and
+/// no pin is ever invented: every entry comes from a record that is on disk.
+///
+/// The next id is `max(id) + 1` over every PIN and UNPIN record, including ones
+/// whose pin was released or had expired. An id is therefore never reissued while
+/// a record naming it survives, so a late `unpin` of an old id cannot release a
+/// newer pin.
+pub(crate) fn rebuild_pins(
+    records: Vec<PinRecord>,
+    now_ms: &Result<u64, String>,
+) -> Result<(BTreeMap<PinId, PinEntry>, u64), BlobError> {
+    let mut max_pin_id = 0u64;
+    let mut pins: BTreeMap<PinId, PinEntry> = BTreeMap::new();
+    for record in records {
+        match record {
+            PinRecord::Pin {
+                pin_id,
+                epoch,
+                expires_at_ms,
+            } => {
+                max_pin_id = max_pin_id.max(pin_id.0);
+                pins.insert(
+                    pin_id,
+                    PinEntry {
+                        epoch,
+                        expires_at_ms,
+                    },
+                );
+            }
+            PinRecord::Unpin { pin_id } => {
+                max_pin_id = max_pin_id.max(pin_id.0);
+                pins.remove(&pin_id);
+            }
+        }
+    }
+    if !pins.is_empty() {
+        let mut expired = Vec::new();
+        for (&pin_id, entry) in pins.iter() {
+            if !pin_is_live(entry.expires_at_ms, now_ms)? {
+                expired.push(pin_id);
+            }
+        }
+        for pin_id in expired {
+            pins.remove(&pin_id);
+        }
+    }
+    Ok((pins, max_pin_id.saturating_add(1)))
+}
+
 fn segment_path(dir: &str, seg_id: u32) -> String {
     join_path(dir, &format!("vol_{seg_id:08}.dat"))
 }
@@ -950,6 +1464,7 @@ fn recover_segment<F: VirtualFile>(
     barriers: &mut BTreeMap<(u32, u32, u8), u32>,
     tombstones: &mut BTreeSet<BlobId>,
     epoch: &mut u64,
+    pins: &mut Vec<PinRecord>,
 ) -> Result<(), BlobError> {
     let file_len = file.len()?;
     if file_len < VOLUME_MAGIC.len() as u64 {
@@ -1090,6 +1605,54 @@ fn recover_segment<F: VirtualFile>(
             REC_KIND_TOMBSTONE => {
                 tombstones.insert(id);
                 index.remove(&id);
+            }
+            REC_KIND_PIN => {
+                // A pin's payload is read at recovery time because recovery has
+                // to decide whether it is still live. Its CRC is therefore
+                // checked here, unlike a PUT payload which is verified on read.
+                let mut payload = [0u8; PIN_PAYLOAD_LEN];
+                if data_len as usize != PIN_PAYLOAD_LEN
+                    || file.read_at(data_offset, &mut payload)? != PIN_PAYLOAD_LEN
+                    || crc32fast::hash(&payload) != data_crc
+                {
+                    // A complete record with a valid header but a bad payload is
+                    // bit-rot, not a torn tail: the append was acknowledged, so
+                    // truncating here could discard a live pin (and every later
+                    // record). Refuse to open instead.
+                    return Err(BlobError::InvalidSegment("corrupt pin record"));
+                }
+                pins.push(PinRecord::Pin {
+                    pin_id: PinId(u64::from_le_bytes([
+                        payload[0], payload[1], payload[2], payload[3], payload[4], payload[5],
+                        payload[6], payload[7],
+                    ])),
+                    epoch: record_epoch,
+                    expires_at_ms: u64::from_le_bytes([
+                        payload[8],
+                        payload[9],
+                        payload[10],
+                        payload[11],
+                        payload[12],
+                        payload[13],
+                        payload[14],
+                        payload[15],
+                    ]),
+                });
+            }
+            REC_KIND_UNPIN => {
+                let mut payload = [0u8; UNPIN_PAYLOAD_LEN];
+                if data_len as usize != UNPIN_PAYLOAD_LEN
+                    || file.read_at(data_offset, &mut payload)? != UNPIN_PAYLOAD_LEN
+                    || crc32fast::hash(&payload) != data_crc
+                {
+                    return Err(BlobError::InvalidSegment("corrupt unpin record"));
+                }
+                pins.push(PinRecord::Unpin {
+                    pin_id: PinId(u64::from_le_bytes([
+                        payload[0], payload[1], payload[2], payload[3], payload[4], payload[5],
+                        payload[6], payload[7],
+                    ])),
+                });
             }
             _ => {
                 // The kind is covered by the header checksum, so this is a

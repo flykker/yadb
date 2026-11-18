@@ -9,7 +9,9 @@ pub use pool::{
     BarrierRequest, BarrierResponse, BlobIdList, CompactResponse, PoolHealthSnapshot,
     PoolHealthState, PoolSlot, PoolStriper, RepairReport, SlotHealthSnapshot,
 };
-pub use volume::{VolumeConfig, VolumeStats, VolumeStore};
+pub use volume::{
+    PinGrant, PinId, PinView, VolumeConfig, VolumeStats, VolumeStore, MAX_PIN_TTL_MS,
+};
 
 use thiserror::Error;
 
@@ -83,6 +85,64 @@ pub enum BlobError {
     #[error("epoch advance refused: the target epoch is already u64::MAX and cannot advance")]
     EpochExhausted,
 
+    #[error(
+        "pin refused: a pin must name the target's current epoch, but the caller named epoch \
+         {requested_epoch} while this target is at epoch {actual_epoch}"
+    )]
+    PinEpochNotCurrent {
+        requested_epoch: u64,
+        actual_epoch: u64,
+    },
+
+    #[error("pin refused: ttl_ms must be at least 1, so that every pin has a deadline")]
+    PinTtlZero,
+
+    #[error(
+        "pin refused: ttl_ms {requested_ms} exceeds the maximum pin lifetime of {max_ms} ms; a \
+         pin is held across one fragment fetch, so a longer one is a bug rather than a lease"
+    )]
+    PinTtlTooLong { requested_ms: u64, max_ms: u64 },
+
+    #[error(
+        "pin table refused: the target could not read its own clock ({reason}), so it cannot \
+         tell whether a pin has expired; no pin was released and nothing was collected"
+    )]
+    PinClockUnreadable { reason: String },
+
+    #[error(
+        "pin refused: the target's next pin id would exceed u64::MAX, so it cannot issue an id \
+         that is provably unused"
+    )]
+    PinIdsExhausted,
+
+    #[error(
+        "epoch advance refused: {live_pins} unexpired pin(s) still name epoch {epoch}, and a \
+         reader holding bytes of that epoch may not be fenced by an advance"
+    )]
+    EpochPinned { epoch: u64, live_pins: usize },
+
+    #[error(
+        "collectable delete of {id} refused: the fragment was written under epoch \
+         {fragment_epoch}, which is not older than the collector's epoch {collector_epoch}"
+    )]
+    FragmentNotOlder {
+        id: BlobId,
+        fragment_epoch: u64,
+        collector_epoch: u64,
+    },
+
+    #[error(
+        "collectable delete of {id} refused: the fragment was written under epoch \
+         {fragment_epoch}, which {live_pins} unexpired pin(s) still name; the collector's epoch \
+         {collector_epoch} does not fence those readers"
+    )]
+    FragmentPinned {
+        id: BlobId,
+        fragment_epoch: u64,
+        collector_epoch: u64,
+        live_pins: usize,
+    },
+
     #[error("blob size {size} exceeds max {max}")]
     BlobTooLarge { size: usize, max: usize },
 
@@ -133,6 +193,11 @@ impl BlobError {
     /// means the slot's outcome is
     /// unknown until it is recovered, so acknowledging the write somewhere else
     /// would hide a fault an operator has to see. If in doubt, this is `false`.
+    ///
+    /// The pin-table refusals (`EpochPinned`, `PinEpochNotCurrent`,
+    /// `FragmentPinned`, `FragmentNotOlder`, `PinClockUnreadable`) are also
+    /// `false`: each is a "stop this pass" answer about durable state, not a
+    /// statement that the slot could not answer.
     pub fn is_unavailable(&self) -> bool {
         matches!(self, BlobError::Io(_))
     }
@@ -1063,6 +1128,646 @@ mod tests {
             "an epoch record is not a fragment"
         );
         assert_eq!(reopened.advance_epoch(1).unwrap(), 2);
+    }
+
+    // ---------------------------------------------------------------------
+    // Reader pins: the target-side half of "no unexpired pin names the epoch".
+    //
+    // These cover only what a single target can prove by itself. There is no
+    // RPC that carries a pin, no reader that takes one before a fetch, and no
+    // collector that consults the table - none of that exists yet.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn a_pin_is_durable_and_names_the_current_epoch() {
+        let fs = SimFs::new(9001);
+        let cfg = VolumeConfig::default();
+        let store = VolumeStore::open(fs.clone(), "pin_durable", cfg).unwrap();
+        let before = store.epoch();
+        let grant = store.pin(before, 60_000).unwrap();
+        assert_eq!(grant.epoch, before);
+        assert!(
+            grant.expires_at_ms > 0,
+            "a pin always carries a real deadline"
+        );
+
+        let live = store.live_pins().unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].pin_id, grant.pin_id);
+        assert_eq!(live[0].epoch, before);
+        assert_eq!(live[0].expires_at_ms, grant.expires_at_ms);
+
+        // The pin is a record, not a field: a restart rebuilds it, with the same
+        // id, epoch and deadline, and it still stops an advance.
+        drop(store);
+        fs.simulate_power_cut();
+        let reopened = VolumeStore::open(fs, "pin_durable", cfg).unwrap();
+        let live = reopened.live_pins().unwrap();
+        assert_eq!(
+            live,
+            vec![PinView {
+                pin_id: grant.pin_id,
+                epoch: before,
+                expires_at_ms: grant.expires_at_ms,
+            }],
+            "a pin that was acknowledged must survive a power cut"
+        );
+        assert!(matches!(
+            reopened.advance_epoch(before),
+            Err(BlobError::EpochPinned { epoch, live_pins: 1 }) if epoch == before
+        ));
+    }
+
+    #[test]
+    fn a_pin_naming_any_epoch_but_the_current_one_is_refused() {
+        let fs = SimFs::new(9002);
+        let cfg = VolumeConfig::default();
+        let store = VolumeStore::open(fs.clone(), "pin_epoch", cfg).unwrap();
+
+        // A pin for a newer epoch names an epoch that does not exist yet.
+        match store.pin(1, 1000) {
+            Err(BlobError::PinEpochNotCurrent {
+                requested_epoch,
+                actual_epoch,
+            }) => assert_eq!((requested_epoch, actual_epoch), (1, 0)),
+            other => panic!("expected PinEpochNotCurrent, got {other:?}"),
+        }
+
+        store.advance_epoch(0).unwrap();
+        // A pin for an older epoch names an epoch the collector may already have
+        // advanced past, so it would prove nothing.
+        match store.pin(0, 1000) {
+            Err(BlobError::PinEpochNotCurrent {
+                requested_epoch,
+                actual_epoch,
+            }) => assert_eq!((requested_epoch, actual_epoch), (0, 1)),
+            other => panic!("expected PinEpochNotCurrent, got {other:?}"),
+        }
+        assert!(
+            store.live_pins().unwrap().is_empty(),
+            "a refused pin appends no record"
+        );
+        assert_eq!(store.epoch(), 1);
+
+        drop(store);
+        fs.simulate_power_cut();
+        let reopened = VolumeStore::open(fs, "pin_epoch", cfg).unwrap();
+        assert!(reopened.live_pins().unwrap().is_empty());
+        assert_eq!(reopened.epoch(), 1, "a refused pin does not move the epoch");
+        // The current epoch is the one that works, so the refusals above were
+        // about the epoch and not a blanket rejection.
+        assert_eq!(reopened.pin(1, 1000).unwrap().epoch, 1);
+    }
+
+    #[test]
+    fn a_pin_with_no_deadline_or_an_unbounded_one_is_refused() {
+        let fs = SimFs::new(9003);
+        let cfg = VolumeConfig::default();
+        let store = VolumeStore::open(fs.clone(), "pin_ttl", cfg).unwrap();
+
+        assert!(matches!(store.pin(0, 0), Err(BlobError::PinTtlZero)));
+        match store.pin(0, MAX_PIN_TTL_MS + 1) {
+            Err(BlobError::PinTtlTooLong {
+                requested_ms,
+                max_ms,
+            }) => {
+                assert_eq!(requested_ms, MAX_PIN_TTL_MS + 1);
+                assert_eq!(max_ms, MAX_PIN_TTL_MS);
+            }
+            other => panic!("expected PinTtlTooLong, got {other:?}"),
+        }
+        assert!(
+            store.live_pins().unwrap().is_empty(),
+            "a refused TTL appends no record"
+        );
+        // Nothing was left behind that could block a pass.
+        assert_eq!(store.advance_epoch(0).unwrap(), 1);
+
+        // The documented maximum itself is accepted: the bound is a limit, not a
+        // blanket refusal of long pins.
+        let grant = store.pin(1, MAX_PIN_TTL_MS).unwrap();
+        assert!(grant.expires_at_ms > 0);
+        assert_eq!(store.live_pins().unwrap().len(), 1);
+        assert!(store.unpin(grant.pin_id).unwrap());
+    }
+
+    #[test]
+    fn an_unexpired_pin_stops_the_epoch_advance_and_names_the_count() {
+        let fs = SimFs::new(9004);
+        let cfg = VolumeConfig::default();
+        let store = VolumeStore::open(fs.clone(), "pin_advance", cfg).unwrap();
+        let first = store.pin(0, 60_000).unwrap();
+        let second = store.pin(0, 60_000).unwrap();
+        assert_ne!(first.pin_id, second.pin_id);
+
+        match store.advance_epoch(0) {
+            Err(BlobError::EpochPinned { epoch, live_pins }) => {
+                assert_eq!(epoch, 0);
+                assert_eq!(live_pins, 2);
+            }
+            other => panic!("expected EpochPinned, got {other:?}"),
+        }
+        assert_eq!(store.epoch(), 0, "a refused advance writes nothing");
+
+        // The existing expected-epoch refusal is kept, and it is checked first: a
+        // superseded collector is told it is superseded, not that the target is
+        // pinned.
+        assert!(matches!(
+            store.advance_epoch(9),
+            Err(BlobError::EpochMismatch {
+                expected_epoch: 9,
+                actual_epoch: 0
+            })
+        ));
+
+        assert!(store.unpin(first.pin_id).unwrap());
+        // Releasing twice is a no-op, not a second release.
+        assert!(!store.unpin(first.pin_id).unwrap());
+        assert!(matches!(
+            store.advance_epoch(0),
+            Err(BlobError::EpochPinned { live_pins: 1, .. })
+        ));
+        assert!(store.unpin(second.pin_id).unwrap());
+        assert_eq!(store.advance_epoch(0).unwrap(), 1);
+
+        drop(store);
+        fs.simulate_power_cut();
+        let reopened = VolumeStore::open(fs, "pin_advance", cfg).unwrap();
+        assert_eq!(reopened.epoch(), 1);
+        assert!(
+            reopened.live_pins().unwrap().is_empty(),
+            "a released pin is not resurrected by recovery"
+        );
+    }
+
+    #[test]
+    fn an_unpin_of_an_unknown_or_expired_pin_releases_nothing() {
+        let fs = SimFs::new(9005);
+        let cfg = VolumeConfig::default();
+        let store = VolumeStore::open(fs.clone(), "pin_unpin", cfg).unwrap();
+
+        // Unknown ids are not errors: an unpin may arrive twice, or for a pin the
+        // target already forgot.
+        assert!(!store.unpin(PinId::from_wire(4242)).unwrap());
+
+        let grant = store.pin(0, 1).unwrap();
+        // One millisecond of lifetime, then wait it out. The pin is expired by the
+        // clock, not by an unpin.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert!(
+            store.live_pins().unwrap().is_empty(),
+            "an expired pin is not live"
+        );
+        assert!(
+            !store.unpin(grant.pin_id).unwrap(),
+            "releasing an expired pin removes nothing live"
+        );
+        // Nothing was extended or resurrected: the advance is admitted.
+        assert_eq!(store.advance_epoch(0).unwrap(), 1);
+
+        drop(store);
+        fs.simulate_power_cut();
+        let reopened = VolumeStore::open(fs, "pin_unpin", cfg).unwrap();
+        assert!(reopened.live_pins().unwrap().is_empty());
+        assert_eq!(reopened.epoch(), 1);
+    }
+
+    #[test]
+    fn pin_liveness_is_strictly_before_the_deadline_and_a_broken_clock_refuses() {
+        // Production used to compute `map_or(0, ...)`, i.e. a broken clock read as
+        // "now", which makes every pin look expired and lets a collector advance
+        // past a reader. That is the direction that deletes, so it is asserted
+        // against here.
+        assert!(volume::pin_is_live(1000, &Ok(999)).unwrap());
+        // Boundary: the deadline is exclusive. At the deadline the pin is gone.
+        assert!(!volume::pin_is_live(1000, &Ok(1000)).unwrap());
+        assert!(!volume::pin_is_live(1000, &Ok(1001)).unwrap());
+        match volume::pin_is_live(1000, &Err("clock stepped".into())) {
+            Err(BlobError::PinClockUnreadable { reason }) => {
+                assert!(reason.contains("clock stepped"), "{reason}");
+            }
+            other => panic!("an unreadable clock must refuse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn recovery_drops_expired_pins_and_keeps_the_rest_without_inventing_any() {
+        let records = vec![
+            volume::PinRecord::Pin {
+                pin_id: PinId::from_wire(3),
+                epoch: 1,
+                expires_at_ms: 500,
+            },
+            volume::PinRecord::Pin {
+                pin_id: PinId::from_wire(4),
+                epoch: 2,
+                expires_at_ms: 5000,
+            },
+            // Releasing 3 drops it from the live set, but its id is still spent:
+            // an id must not be reissued while a record naming it survives.
+            volume::PinRecord::Unpin {
+                pin_id: PinId::from_wire(3),
+            },
+            // An unpin for an id that never had a PIN invents nothing.
+            volume::PinRecord::Unpin {
+                pin_id: PinId::from_wire(9),
+            },
+        ];
+
+        let (pins, next) = volume::rebuild_pins(records.clone(), &Ok(100)).unwrap();
+        assert_eq!(pins.len(), 1, "only the unexpired, unreleased pin survives");
+        assert_eq!(pins.get(&PinId::from_wire(4)).unwrap().epoch, 2);
+        assert_eq!(pins.get(&PinId::from_wire(4)).unwrap().expires_at_ms, 5000);
+        assert_eq!(next, 10, "the next id is past every id in the log");
+
+        // At the deadline the remaining pin is dropped, and the id is still spent.
+        let (pins, next) = volume::rebuild_pins(records.clone(), &Ok(5000)).unwrap();
+        assert!(pins.is_empty(), "now == expires_at_ms is expired");
+        assert_eq!(next, 10);
+
+        // A broken clock refuses instead of dropping every pin.
+        assert!(matches!(
+            volume::rebuild_pins(records, &Err("clock stepped".into())),
+            Err(BlobError::PinClockUnreadable { .. })
+        ));
+    }
+
+    #[test]
+    fn a_torn_pin_write_never_becomes_a_live_pin() {
+        let fs = SimFs::new(9006);
+        let cfg = VolumeConfig::default();
+        let store = VolumeStore::open(fs.clone(), "pin_torn", cfg).unwrap();
+        let id = BlobId::new(30, 1, 1, 1, 2, 0);
+        store.put(id, b"reader bytes").unwrap();
+
+        fs.set_faults(FaultConfig {
+            seed: 41,
+            torn_write_prob: 1.0,
+            ..Default::default()
+        });
+        let error = store.pin(0, 60_000).expect_err("a torn pin must fail");
+        assert!(matches!(error, BlobError::Io(_)), "got {error:?}");
+        assert!(
+            store.live_pins().unwrap().is_empty(),
+            "a pin whose record was not written is not acknowledged"
+        );
+        fs.set_faults(FaultConfig::default());
+
+        drop(store);
+        fs.simulate_power_cut();
+        let reopened = VolumeStore::open(fs, "pin_torn", cfg).unwrap();
+        // The torn record is a tail, so recovery truncates it. A reader that got
+        // an error took no pin, and a half record must not be read as one with a
+        // garbage deadline.
+        assert!(reopened.live_pins().unwrap().is_empty());
+        assert_eq!(
+            reopened.advance_epoch(0).unwrap(),
+            1,
+            "a torn pin must not block the advance it never fenced"
+        );
+        assert_eq!(reopened.get(id).unwrap(), b"reader bytes");
+    }
+
+    #[test]
+    fn a_pin_is_acknowledged_only_after_its_record_is_durable() {
+        for fault in [SyncFault::BeforePersist, SyncFault::AfterPersist] {
+            let fs = SimFs::new(9007);
+            let cfg = VolumeConfig::default();
+            let store = VolumeStore::open(fs.clone(), "pin_sync", cfg).unwrap();
+            fs.set_faults(FaultConfig {
+                sync_data_fault: fault,
+                ..Default::default()
+            });
+            assert!(
+                matches!(store.pin(0, 60_000), Err(BlobError::Io(_))),
+                "fault {fault:?}"
+            );
+            // An ambiguous append is not built on: the volume refuses further
+            // mutations until it is reopened.
+            assert!(matches!(
+                store.pin(0, 60_000),
+                Err(BlobError::StorageUnavailable)
+            ));
+            fs.set_faults(FaultConfig::default());
+            drop(store);
+            fs.simulate_power_cut();
+
+            let reopened = VolumeStore::open(fs, "pin_sync", cfg).unwrap();
+            let live = reopened.live_pins().unwrap();
+            if fault == SyncFault::AfterPersist {
+                // The record reached the platter before the sync reported an
+                // error. Keeping it is the safe direction: it blocks collection
+                // until its TTL runs out, and the caller was told the pin failed.
+                assert_eq!(live.len(), 1, "fault {fault:?}");
+                assert!(matches!(
+                    reopened.advance_epoch(0),
+                    Err(BlobError::EpochPinned { live_pins: 1, .. })
+                ));
+            } else {
+                assert!(live.is_empty(), "fault {fault:?}");
+                assert_eq!(reopened.advance_epoch(0).unwrap(), 1, "fault {fault:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_live_pin_refuses_a_collectable_delete_of_its_epoch() {
+        let fs = SimFs::new(9008);
+        let cfg = VolumeConfig::default();
+        let store = VolumeStore::open(fs.clone(), "pin_delete", cfg).unwrap();
+        let id = BlobId::new(31, 1, 1, 1, 2, 0);
+        store.put(id, b"held by a reader").unwrap();
+        assert_eq!(store.fragment_epoch(id), Some(0));
+        let grant = store.pin(0, 60_000).unwrap();
+
+        match store.delete_collectable(id, 1) {
+            Err(BlobError::FragmentPinned {
+                id: named,
+                fragment_epoch,
+                collector_epoch,
+                live_pins,
+            }) => {
+                assert_eq!(named, id);
+                assert_eq!(fragment_epoch, 0);
+                assert_eq!(collector_epoch, 1);
+                assert_eq!(live_pins, 1);
+            }
+            other => panic!("expected FragmentPinned, got {other:?}"),
+        }
+        assert_eq!(store.get(id).unwrap(), b"held by a reader");
+        // The refusal happened before any record was appended, so the id is not
+        // tombstoned and a later write of the same bytes still works.
+        store.put(id, b"held by a reader").unwrap();
+
+        assert!(store.unpin(grant.pin_id).unwrap());
+        assert!(
+            store.delete_collectable(id, 1).unwrap(),
+            "with the pin released the older fragment is collectable"
+        );
+        assert!(!store.contains(id));
+        assert_eq!(store.fragment_epoch(id), None);
+        // Idempotent, like every other delete.
+        assert!(!store.delete_collectable(id, 1).unwrap());
+    }
+
+    #[test]
+    fn a_collectable_delete_needs_the_fragment_to_be_older_than_the_collector() {
+        let fs = SimFs::new(9009);
+        let cfg = VolumeConfig::default();
+        let store = VolumeStore::open(fs.clone(), "pin_older", cfg).unwrap();
+        let id = BlobId::new(32, 1, 1, 1, 2, 0);
+        store.advance_epoch(0).unwrap();
+        store.put(id, b"current epoch").unwrap();
+        assert_eq!(store.fragment_epoch(id), Some(1));
+
+        // Equality is not "older": a collector that has not advanced past this
+        // fragment may not collect it, pinned or not.
+        for collector_epoch in [1, 0] {
+            match store.delete_collectable(id, collector_epoch) {
+                Err(BlobError::FragmentNotOlder {
+                    id: named,
+                    fragment_epoch,
+                    collector_epoch: named_collector,
+                }) => {
+                    assert_eq!(named, id);
+                    assert_eq!(fragment_epoch, 1);
+                    assert_eq!(named_collector, collector_epoch);
+                }
+                other => panic!("expected FragmentNotOlder, got {other:?}"),
+            }
+        }
+        assert_eq!(store.get(id).unwrap(), b"current epoch");
+        // No tombstone was left by the refusals.
+        store.put(id, b"current epoch").unwrap();
+
+        // A fragment that is already absent is not an error and is tombstoned, so
+        // a late PUT cannot resurrect it.
+        let absent = BlobId::new(32, 1, 2, 1, 2, 0);
+        assert!(!store.delete_collectable(absent, 5).unwrap());
+
+        assert!(store.delete_collectable(id, 2).unwrap());
+        assert!(!store.contains(id));
+    }
+
+    #[test]
+    fn a_pin_only_fences_the_epoch_it_names() {
+        let fs = SimFs::new(9013);
+        let cfg = VolumeConfig::default();
+        let store = VolumeStore::open(fs.clone(), "pin_scope", cfg).unwrap();
+        let old = BlobId::new(35, 1, 1, 1, 2, 0);
+        store.put(old, b"epoch zero").unwrap();
+        store.advance_epoch(0).unwrap();
+        let current = BlobId::new(35, 1, 1, 2, 2, 0);
+        store.put(current, b"epoch one").unwrap();
+
+        // A pin names one epoch, so it must not block collection of another one.
+        // A collector at epoch 2 may reclaim the epoch-0 fragment while a reader
+        // still pins epoch 1.
+        let grant = store.pin(1, 60_000).unwrap();
+        assert!(
+            store.delete_collectable(old, 2).unwrap(),
+            "a pin on epoch 1 does not name the epoch-0 fragment"
+        );
+        // The pinned epoch itself is protected.
+        assert!(matches!(
+            store.delete_collectable(current, 2),
+            Err(BlobError::FragmentPinned {
+                fragment_epoch: 1,
+                collector_epoch: 2,
+                live_pins: 1,
+                ..
+            })
+        ));
+        assert_eq!(store.get(current).unwrap(), b"epoch one");
+        assert!(store.unpin(grant.pin_id).unwrap());
+        assert!(store.delete_collectable(current, 2).unwrap());
+    }
+
+    #[test]
+    fn delete_fenced_stays_strict_where_delete_collectable_is_older_and_unpinned() {
+        let fs = SimFs::new(9010);
+        let cfg = VolumeConfig::default();
+        let store = VolumeStore::open(fs.clone(), "pin_two_deletes", cfg).unwrap();
+        let old = BlobId::new(33, 1, 1, 1, 2, 0);
+        store.put(old, b"epoch zero").unwrap();
+        store.advance_epoch(0).unwrap();
+
+        // The same call that the strict form refuses, the collectable form admits.
+        // That difference is the whole point of the epoch relaxation.
+        assert!(matches!(
+            store.delete_fenced(old, 1),
+            Err(BlobError::FencedByEpoch {
+                recorded_epoch: 0,
+                expected_epoch: 1,
+                ..
+            })
+        ));
+        assert_eq!(store.get(old).unwrap(), b"epoch zero");
+        assert!(store.delete_collectable(old, 1).unwrap());
+        assert!(!store.contains(old));
+
+        // In the other direction, strict equality deletes a current fragment that
+        // the collectable form refuses.
+        let current = BlobId::new(33, 1, 1, 2, 2, 0);
+        store.put(current, b"epoch one").unwrap();
+        assert!(matches!(
+            store.delete_collectable(current, 1),
+            Err(BlobError::FragmentNotOlder {
+                fragment_epoch: 1,
+                collector_epoch: 1,
+                ..
+            })
+        ));
+        assert!(store.delete_fenced(current, 1).unwrap());
+        assert!(!store.contains(current));
+    }
+
+    #[test]
+    fn compaction_keeps_unexpired_pins_and_never_resurrects_an_expired_one() {
+        let fs = SimFs::new(9011);
+        let cfg = VolumeConfig {
+            max_segment_bytes: 300,
+            ..Default::default()
+        };
+        let store = VolumeStore::open(fs.clone(), "pin_compact", cfg).unwrap();
+        let grant = store.pin(0, 60_000).unwrap();
+        // One fragment that is deleted (so compaction has something to reclaim)
+        // and enough live ones to roll the segment that holds the pin record.
+        let dead = BlobId::new(34, 1, 1, 1, 2, 0);
+        store.put(dead, &[b'd'; 100]).unwrap();
+        store
+            .put(BlobId::new(34, 1, 1, 2, 2, 0), &[b'l'; 100])
+            .unwrap();
+        store.delete(dead).unwrap();
+        for step in 3..=4 {
+            store
+                .put(BlobId::new(34, 1, 1, step, 2, 0), &[b'l'; 100])
+                .unwrap();
+        }
+        assert!(
+            store.seal_and_compact().unwrap() > 0,
+            "the deleted fragment's bytes must be reclaimed, so the replacement \
+             really was rewritten"
+        );
+        assert_eq!(
+            store.live_pins().unwrap(),
+            vec![PinView {
+                pin_id: grant.pin_id,
+                epoch: 0,
+                expires_at_ms: grant.expires_at_ms,
+            }],
+            "compaction must not drop a live pin"
+        );
+        assert!(matches!(
+            store.advance_epoch(0),
+            Err(BlobError::EpochPinned { live_pins: 1, .. })
+        ));
+
+        drop(store);
+        fs.simulate_power_cut();
+        let reopened = VolumeStore::open(fs.clone(), "pin_compact", cfg).unwrap();
+        assert_eq!(
+            reopened.live_pins().unwrap().len(),
+            1,
+            "the replacement segment must carry the live pin"
+        );
+        assert!(matches!(
+            reopened.advance_epoch(0),
+            Err(BlobError::EpochPinned { live_pins: 1, .. })
+        ));
+
+        // An expired pin is dead weight: compaction may drop its record, and it
+        // must never be rewritten with a fresh deadline. Rolling the segment that
+        // holds it is what gives compaction the chance to get this wrong.
+        let short = reopened.pin(0, 1).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert!(!reopened.unpin(short.pin_id).unwrap());
+        for step in 5..=6 {
+            reopened
+                .put(BlobId::new(34, 1, 1, step, 2, 0), &[b'l'; 100])
+                .unwrap();
+        }
+        reopened.seal_and_compact().unwrap();
+        let live = reopened.live_pins().unwrap();
+        assert_eq!(live.len(), 1, "only the long pin is still live");
+        assert_eq!(live[0].pin_id, grant.pin_id);
+        assert!(
+            live.iter().all(|pin| pin.pin_id != short.pin_id),
+            "an expired pin must not be rewritten as a live one"
+        );
+
+        // The long pin from before is still live, so release it to reach the
+        // advance.
+        assert!(reopened.unpin(grant.pin_id).unwrap());
+        assert_eq!(reopened.advance_epoch(0).unwrap(), 1);
+        drop(reopened);
+        fs.simulate_power_cut();
+        let durable = VolumeStore::open(fs, "pin_compact", cfg).unwrap();
+        assert!(durable.live_pins().unwrap().is_empty());
+        assert_eq!(durable.epoch(), 1);
+    }
+
+    #[test]
+    fn pin_table_refusals_are_not_slot_unavailability() {
+        // Every one of these is a statement about durable state, not "this slot
+        // could not answer". A caller that treated one as unavailable would
+        // place the same write or delete on another slot and bypass the fence.
+        let id = BlobId::new(36, 1, 1, 1, 2, 0);
+        let errors = [
+            BlobError::EpochPinned {
+                epoch: 3,
+                live_pins: 2,
+            },
+            BlobError::PinEpochNotCurrent {
+                requested_epoch: 2,
+                actual_epoch: 3,
+            },
+            BlobError::FragmentPinned {
+                id,
+                fragment_epoch: 2,
+                collector_epoch: 3,
+                live_pins: 1,
+            },
+            BlobError::FragmentNotOlder {
+                id,
+                fragment_epoch: 3,
+                collector_epoch: 3,
+            },
+            BlobError::PinClockUnreadable {
+                reason: "clock stepped".into(),
+            },
+            BlobError::PinTtlZero,
+            BlobError::PinTtlTooLong {
+                requested_ms: 10,
+                max_ms: 5,
+            },
+        ];
+        for error in errors {
+            assert!(!error.is_unavailable(), "{error:?} must not be retryable");
+        }
+    }
+
+    #[test]
+    fn a_released_pin_id_is_not_handed_out_again_after_reopen() {
+        let fs = SimFs::new(9012);
+        let cfg = VolumeConfig::default();
+        let store = VolumeStore::open(fs.clone(), "pin_ids", cfg).unwrap();
+        let first = store.pin(0, 60_000).unwrap();
+        assert!(store.unpin(first.pin_id).unwrap());
+        drop(store);
+        fs.simulate_power_cut();
+
+        let reopened = VolumeStore::open(fs, "pin_ids", cfg).unwrap();
+        let second = reopened.pin(0, 60_000).unwrap();
+        assert!(
+            second.pin_id.get() > first.pin_id.get(),
+            "ids come from the durable log, so a reopened target cannot reissue one \
+             a live reader may still hold"
+        );
+        // A late release of the old id must not touch the new pin.
+        assert!(!reopened.unpin(first.pin_id).unwrap());
+        assert_eq!(reopened.live_pins().unwrap().len(), 1);
+        assert_eq!(reopened.live_pins().unwrap()[0].pin_id, second.pin_id);
     }
 
     #[test]
