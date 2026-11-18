@@ -342,11 +342,19 @@ fn kind_name(kind: LeaseKind) -> &'static str {
     }
 }
 
-/// True while this exact publication of the lease record is still in metadata.
+/// True while this exact publication of the lease record is still in metadata
+/// *and* has not run out.
 ///
 /// A reader calls this after fetching fragments: if its lease expired mid-read,
 /// a pass may have deleted what it just read, so the read is refused instead of
 /// returning a possibly incomplete answer.
+///
+/// Ownership and liveness are separate checks because the record outlives the
+/// lease: the collector only reaps an expired record on its next pass, so the
+/// record can still be present, with the holder's `mod_revision`, after the
+/// lease it encodes has stopped fencing anything. Reporting the two cases
+/// separately tells an operator whether the record was reaped or replaced, or
+/// merely outlived its TTL while nobody collected yet.
 pub fn ensure_live<FS: StorageFs>(
     meta: &LocalMetaKv<FS>,
     lease: &GcLease,
@@ -355,15 +363,22 @@ pub fn ensure_live<FS: StorageFs>(
     let owned = current
         .as_ref()
         .is_some_and(|kv| kv.mod_revision == lease.mod_revision && lease.mod_revision != 0);
-    if owned {
-        Ok(())
-    } else {
-        Err(MetaError::Routing(format!(
-            "gc {} lease {} was lost (expired or reaped) while it was in use; the operation is refused rather than completed under a fence that no longer holds",
+    if !owned {
+        return Err(MetaError::Routing(format!(
+            "gc {} lease {} was lost (reaped or replaced) while it was in use; the operation is refused rather than completed under a fence that no longer holds",
             kind_name(lease.kind),
             lease.id
-        )))
+        )));
     }
+    if !lease.is_live_at(now_ms()) {
+        return Err(MetaError::Routing(format!(
+            "gc {} lease {} expired at {} ms but its record is still present and unreaped; the operation is refused rather than completed under a fence that no longer holds",
+            kind_name(lease.kind),
+            lease.id,
+            lease.expires_at_ms
+        )));
+    }
+    Ok(())
 }
 
 /// The revision at which a pass may already have deleted fragments. Absent means
@@ -1148,6 +1163,80 @@ mod tests {
         let mut unpublished = renewed.clone();
         unpublished.mod_revision = 0;
         assert!(renew(&meta, &unpublished, DEFAULT_TTL_MS).is_err());
+    }
+
+    #[test]
+    fn an_expired_but_unreaped_lease_is_refused_by_ensure_live() {
+        let meta = meta();
+        let guard = acquire_writer(&meta, 1, 1, DEFAULT_TTL_MS).unwrap();
+        let key = guard.key().to_string();
+        let mut lease = guard.lease().clone();
+
+        // Rewrite the record in place with a past expiry through the same kv
+        // path a renewal uses. The transaction returns the record's new
+        // `mod_revision`, so the holder still owns it: only the clock moved.
+        lease.expires_at_ms = now_ms() - 1;
+        let revision = match meta
+            .execute(KvCommand::RevisionTxn {
+                guards: vec![RevisionGuard {
+                    key: key.clone(),
+                    expected_mod_revision: lease.mod_revision,
+                }],
+                ops: vec![TxnOp::Put {
+                    key: key.clone(),
+                    value: serde_json::to_vec(&lease).unwrap(),
+                }],
+            })
+            .unwrap()
+        {
+            KvResult::TxnOk { revision, .. } => revision,
+            other => panic!("the expired rewrite must commit, got {other:?}"),
+        };
+        lease.mod_revision = revision;
+
+        // The record is still present and still this holder's, but the lease it
+        // encodes no longer fences anything: a pass may delete the fragments
+        // this holder is reading before it reaps the record.
+        let stored = meta
+            .get(&key)
+            .expect("the expired record is not reaped yet");
+        assert_eq!(stored.mod_revision, lease.mod_revision);
+        assert!(!lease.is_live_at(now_ms()));
+
+        let error = ensure_live(&meta, &lease).unwrap_err().to_string();
+        assert!(error.contains("expired at"), "{error}");
+        assert!(
+            !error.contains("reaped or replaced"),
+            "an unreaped record must not be reported as lost: {error}"
+        );
+    }
+
+    #[test]
+    fn a_live_record_with_a_stale_revision_is_still_refused() {
+        let meta = meta();
+        let guard = acquire_reader(&meta, 1, 1, DEFAULT_TTL_MS).unwrap();
+        let stale = guard.lease().clone();
+        let renewed = renew(&meta, &stale, DEFAULT_TTL_MS).unwrap();
+        assert!(renewed.is_live_at(now_ms()));
+
+        // The record is live, but the old token no longer owns it.
+        let error = ensure_live(&meta, &stale).unwrap_err().to_string();
+        assert!(error.contains("reaped or replaced"), "{error}");
+        assert!(
+            !error.contains("expired at"),
+            "a live record must not be reported as expired: {error}"
+        );
+        assert!(ensure_live(&meta, &renewed).is_ok());
+    }
+
+    #[test]
+    fn a_live_owned_lease_is_accepted() {
+        let meta = meta();
+        let guard = acquire_reader(&meta, 3, 1, DEFAULT_TTL_MS).unwrap();
+        assert!(guard.ensure_live().is_ok());
+        let lease = guard.lease().clone();
+        assert!(lease.is_live_at(now_ms()));
+        assert!(ensure_live(&meta, &lease).is_ok());
     }
 
     #[test]
