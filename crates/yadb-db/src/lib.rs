@@ -3062,6 +3062,372 @@ mod tests {
         }
     }
 
+    /// Reopens the metadata store and pools after discarding every unsynced byte,
+    /// exactly like a process restart after a power cut.
+    fn reopen_after_power_cut(fs: &SimFs) -> (LocalMetaKv<SimFs>, DatabaseEngine<SimFs>) {
+        use yadb_io::FaultConfig;
+        fs.set_faults(FaultConfig::default());
+        fs.simulate_power_cut();
+        let meta = LocalMetaKv::open_single_node(fs, "meta", 1).unwrap();
+        let (wal, data) = make_pools(fs);
+        let engine = DatabaseEngine::new(meta.clone(), 1024);
+        engine.register_pool("wal", wal);
+        engine.register_pool("data", data);
+        (meta, engine)
+    }
+
+    /// Reconstructs the rows a recovered manifest describes using only that
+    /// manifest and the WAL fragments it references, never in-memory state.
+    fn rows_described_by_manifest(
+        meta: &LocalMetaKv<SimFs>,
+        wal_pool: &Arc<PoolStriper<SimFs>>,
+        key: &str,
+    ) -> (TabletManifest, Vec<Vec<SqlValue>>) {
+        use crate::tablet::{RowEntry, WalBatch};
+        let manifest: TabletManifest =
+            serde_json::from_slice(&meta.get(key).expect("recovered manifest is present").value)
+                .expect("recovered manifest is parseable");
+        assert!(
+            manifest.sst_blobs.is_empty(),
+            "fixture keeps every row in WAL fragments"
+        );
+        let mut merged: BTreeMap<Vec<u8>, RowEntry> = BTreeMap::new();
+        for &wal_id in &manifest.wal_blobs {
+            let raw = wal_pool.get_blob(wal_id).unwrap();
+            let batch: WalBatch = serde_json::from_slice(&raw).unwrap();
+            for (pk, entry) in batch.mutations {
+                merged.insert(pk, entry);
+            }
+        }
+        let rows = merged
+            .into_values()
+            .filter_map(|entry| match entry {
+                RowEntry::Present { values, .. } => Some(values),
+                RowEntry::Tombstone { .. } => None,
+            })
+            .collect();
+        (manifest, rows)
+    }
+
+    fn publication_fixture(seed: u64) -> (SimFs, LocalMetaKv<SimFs>, DatabaseEngine<SimFs>) {
+        let fs = SimFs::new(seed);
+        let meta = LocalMetaKv::open_single_node(&fs, "meta", 1).unwrap();
+        let (wal, data) = make_pools(&fs);
+        let engine = DatabaseEngine::new(meta.clone(), 1024);
+        engine.register_pool("wal", wal);
+        engine.register_pool("data", data);
+        (fs, meta, engine)
+    }
+
+    fn update_tx(id: i64, from: i64, to: i64) -> TxBuffer {
+        let mut tx = TxBuffer::default();
+        tx.record_mutation(
+            "t",
+            SqlValue::Int(id).encode_order_preserving_key().unwrap(),
+            Some(vec![SqlValue::Int(id), SqlValue::Int(from)]),
+            Some(vec![SqlValue::Int(id), SqlValue::Int(to)]),
+        );
+        tx
+    }
+
+    // The shard publication boundary is `publish_prepared`: it commits the
+    // manifest naming the WAL fragment, and only then may the caller mutate the
+    // MemTable. A sync failure before persistence must therefore leave both the
+    // durable manifest and the MemTable at the pre-batch state.
+    #[test]
+    fn shard_publication_before_persist_failure_never_claims_the_batch() {
+        use yadb_io::{FaultConfig, SyncFault};
+        let (fs, meta, engine) = publication_fixture(9405);
+        let run = |engine: &DatabaseEngine<SimFs>, sql: &str| {
+            engine.execute_sql(1, "db", "wal", "data", 1, sql).unwrap()
+        };
+        run(
+            &engine,
+            "CREATE TABLE t (id INT PRIMARY KEY, v INT); INSERT INTO t VALUES (1,10);",
+        );
+        let key = DatabaseEngine::<SimFs>::shard_meta_key(1, "db", "t", 0);
+        let before = meta.get(&key).unwrap();
+        let pk = SqlValue::Int(1).encode_order_preserving_key().unwrap();
+
+        let result = engine.commit_tx_buffer_at_boundaries(
+            1,
+            "db",
+            update_tx(1, 10, 11),
+            || {},
+            || {
+                fs.set_faults(FaultConfig {
+                    sync_data_fault: SyncFault::BeforePersist,
+                    ..Default::default()
+                })
+            },
+        );
+        assert!(
+            matches!(result, Err(DbError::Meta(_))),
+            "a publication sync failure must be reported: {result:?}"
+        );
+
+        // The MemTable is mutated only after publication returns, so the cached
+        // tablet must still hold the pre-batch row.
+        let cached = engine
+            .shards
+            .lock()
+            .unwrap()
+            .get(&key)
+            .cloned()
+            .expect("the shard was opened by the initial insert");
+        assert_eq!(
+            cached.lock().unwrap().get_row(&pk).unwrap(),
+            Some(vec![SqlValue::Int(1), SqlValue::Int(10)])
+        );
+        drop(cached);
+        // The metadata state machine was not updated either: no torn manifest.
+        assert_eq!(meta.get(&key).unwrap().value, before.value);
+
+        drop(engine);
+        drop(meta);
+        let (meta, engine) = reopen_after_power_cut(&fs);
+        assert_eq!(
+            meta.get(&key).unwrap().value,
+            before.value,
+            "recovery must observe the pre-batch manifest"
+        );
+        assert_eq!(
+            run(&engine, "SELECT * FROM t ORDER BY id;").rows,
+            vec![vec![SqlValue::Int(1), SqlValue::Int(10)]],
+            "the failed batch must read as if it never happened"
+        );
+    }
+
+    // A sync failure after persistence is ambiguous: the error is real, but the
+    // transaction may be durable. Recovery must land on exactly one consistent
+    // state, and reads must reflect the recovered manifest rather than any
+    // in-process MemTable that was never updated.
+    #[test]
+    fn shard_publication_after_persist_failure_recovers_committed_read_matches_manifest() {
+        use yadb_io::{FaultConfig, SyncFault};
+        let (fs, meta, engine) = publication_fixture(9406);
+        let run = |engine: &DatabaseEngine<SimFs>, sql: &str| {
+            engine.execute_sql(1, "db", "wal", "data", 1, sql).unwrap()
+        };
+        run(
+            &engine,
+            "CREATE TABLE t (id INT PRIMARY KEY, v INT); INSERT INTO t VALUES (1,10);",
+        );
+        let key = DatabaseEngine::<SimFs>::shard_meta_key(1, "db", "t", 0);
+        let before = meta.get(&key).unwrap();
+        let before_manifest: TabletManifest = serde_json::from_slice(&before.value).unwrap();
+
+        let result = engine.commit_tx_buffer_at_boundaries(
+            1,
+            "db",
+            update_tx(1, 10, 11),
+            || {},
+            || {
+                fs.set_faults(FaultConfig {
+                    sync_data_fault: SyncFault::AfterPersist,
+                    ..Default::default()
+                })
+            },
+        );
+        assert!(
+            matches!(result, Err(DbError::Meta(_))),
+            "the caller must see the sync failure: {result:?}"
+        );
+        // In this process the failed append was not applied to the local state
+        // machine, so the read still sees the old row. The durable outcome is
+        // unknown from here; only recovery decides which of the two it is.
+        assert_eq!(
+            run(&engine, "SELECT * FROM t ORDER BY id;").rows,
+            vec![vec![SqlValue::Int(1), SqlValue::Int(10)]]
+        );
+
+        drop(engine);
+        drop(meta);
+        let (meta, engine) = reopen_after_power_cut(&fs);
+        let wal_pool = engine.get_pool("wal").unwrap();
+        let (recovered, described) = rows_described_by_manifest(&meta, &wal_pool, &key);
+        // Observed outcome: committed. `AfterPersist` persisted the frame before
+        // returning the sync error, so recovery replays it. The other consistent
+        // outcome would be `described == [[1, 10]]` with the old manifest.
+        assert_eq!(
+            recovered.last_seq,
+            before_manifest.last_seq + 1,
+            "observed outcome: the batch is durable"
+        );
+        assert_eq!(
+            recovered.wal_blobs.len(),
+            before_manifest.wal_blobs.len() + 1
+        );
+        assert_eq!(
+            described,
+            vec![vec![SqlValue::Int(1), SqlValue::Int(11)]],
+            "observed outcome: committed despite the error"
+        );
+        assert_eq!(
+            run(&engine, "SELECT * FROM t ORDER BY id;").rows,
+            described,
+            "the recovered read must reflect exactly what the recovered manifest describes"
+        );
+    }
+
+    // A torn manifest frame must never be replayed as a half-written manifest
+    // and must never apply part of a multi-row batch.
+    #[test]
+    fn torn_shard_publication_recovers_old_or_new_manifest_never_partial_batch() {
+        use yadb_io::FaultConfig;
+        let (fs, meta, engine) = publication_fixture(9407);
+        let run = |engine: &DatabaseEngine<SimFs>, sql: &str| {
+            engine.execute_sql(1, "db", "wal", "data", 1, sql).unwrap()
+        };
+        run(
+            &engine,
+            "CREATE TABLE t (id INT PRIMARY KEY, v INT); INSERT INTO t VALUES (1,10),(2,20);",
+        );
+        let key = DatabaseEngine::<SimFs>::shard_meta_key(1, "db", "t", 0);
+        let before = meta.get(&key).unwrap();
+        let before_manifest: TabletManifest = serde_json::from_slice(&before.value).unwrap();
+
+        // Both rows live in the single shard, so one publication covers both.
+        let mut tx = TxBuffer::default();
+        for (id, from, to) in [(1, 10, 11), (2, 20, 21)] {
+            tx.record_mutation(
+                "t",
+                SqlValue::Int(id).encode_order_preserving_key().unwrap(),
+                Some(vec![SqlValue::Int(id), SqlValue::Int(from)]),
+                Some(vec![SqlValue::Int(id), SqlValue::Int(to)]),
+            );
+        }
+        let result = engine.commit_tx_buffer_at_boundaries(
+            1,
+            "db",
+            tx,
+            || {},
+            || {
+                fs.set_faults(FaultConfig {
+                    torn_write_prob: 1.0,
+                    ..Default::default()
+                })
+            },
+        );
+        assert!(
+            matches!(result, Err(DbError::Meta(_))),
+            "a torn publication frame must be reported: {result:?}"
+        );
+        // The failed append truncates the torn tail, so even this process still
+        // observes the old manifest.
+        assert_eq!(meta.get(&key).unwrap().value, before.value);
+
+        drop(engine);
+        drop(meta);
+        let (meta, engine) = reopen_after_power_cut(&fs);
+        let wal_pool = engine.get_pool("wal").unwrap();
+        let (recovered, described) = rows_described_by_manifest(&meta, &wal_pool, &key);
+        let old = vec![
+            vec![SqlValue::Int(1), SqlValue::Int(10)],
+            vec![SqlValue::Int(2), SqlValue::Int(20)],
+        ];
+        let new = vec![
+            vec![SqlValue::Int(1), SqlValue::Int(11)],
+            vec![SqlValue::Int(2), SqlValue::Int(21)],
+        ];
+        assert!(
+            described == old || described == new,
+            "a torn publication must not apply a batch partially: {described:?}"
+        );
+        // Observed in this deterministic simulator: the torn frame never reaches
+        // durable storage, so recovery sees the old manifest. The `new` branch is
+        // the other allowed outcome and would carry `last_seq + 2`.
+        assert_eq!(
+            described, old,
+            "observed outcome: old manifest; the torn frame was discarded"
+        );
+        assert_eq!(recovered.last_seq, before_manifest.last_seq);
+        assert_eq!(meta.get(&key).unwrap().value, before.value);
+        assert_eq!(run(&engine, "SELECT * FROM t ORDER BY id;").rows, old);
+    }
+
+    // `publish_prepared` can return an error for a transaction that committed.
+    // `commit_tx_buffer` does not retry; the failed WAL append fails the store
+    // closed, so an in-process retry is refused instead of double-applying. A
+    // retry after recovery is either a stale-base conflict or a no-op.
+    #[test]
+    fn ambiguous_shard_publication_error_is_not_retried_or_double_applied() {
+        use yadb_io::{FaultConfig, SyncFault};
+        let (fs, meta, engine) = publication_fixture(9408);
+        let run = |engine: &DatabaseEngine<SimFs>, sql: &str| {
+            engine.execute_sql(1, "db", "wal", "data", 1, sql).unwrap()
+        };
+        run(
+            &engine,
+            "CREATE TABLE t (id INT PRIMARY KEY, v INT); INSERT INTO t VALUES (1,10);",
+        );
+        let key = DatabaseEngine::<SimFs>::shard_meta_key(1, "db", "t", 0);
+
+        let result = engine.commit_tx_buffer_at_boundaries(
+            1,
+            "db",
+            update_tx(1, 10, 11),
+            || {},
+            || {
+                fs.set_faults(FaultConfig {
+                    sync_data_fault: SyncFault::AfterPersist,
+                    ..Default::default()
+                })
+            },
+        );
+        assert!(
+            matches!(result, Err(DbError::Meta(_))),
+            "the caller must see the ambiguous error: {result:?}"
+        );
+
+        // The caller sees exactly one error; there is no internal retry. A
+        // same-process retry cannot run at all because the WAL that failed its
+        // last sync refuses every later write until it is reopened.
+        let in_process_retry = engine.commit_tx_buffer(1, "db", update_tx(1, 10, 11));
+        assert!(
+            matches!(
+                in_process_retry,
+                Err(DbError::Meta(MetaError::StorageUnavailable))
+            ),
+            "in-process retry must be refused after an unknown sync outcome: {in_process_retry:?}"
+        );
+        assert_eq!(
+            run(&engine, "SELECT * FROM t ORDER BY id;").rows,
+            vec![vec![SqlValue::Int(1), SqlValue::Int(10)]]
+        );
+
+        drop(engine);
+        drop(meta);
+        let (meta, engine) = reopen_after_power_cut(&fs);
+        // Observed outcome: the update is durable (committed) despite the error.
+        assert_eq!(
+            run(&engine, "SELECT * FROM t ORDER BY id;").rows,
+            vec![vec![SqlValue::Int(1), SqlValue::Int(11)]]
+        );
+        let committed: TabletManifest =
+            serde_json::from_slice(&meta.get(&key).unwrap().value).unwrap();
+
+        // Retrying the original transaction with its stale base row is refused
+        // by the write-conflict check, so it cannot apply the update twice.
+        let stale_retry = engine.commit_tx_buffer(1, "db", update_tx(1, 10, 11));
+        assert!(
+            matches!(stale_retry, Err(DbError::InvalidQuery(_))),
+            "a stale-base retry must conflict instead of reapplying: {stale_retry:?}"
+        );
+        // A client retry of the same statement re-reads the committed row as its
+        // base, so it becomes a no-op rather than a second application.
+        run(&engine, "UPDATE t SET v=11 WHERE id=1;");
+        assert_eq!(
+            run(&engine, "SELECT * FROM t ORDER BY id;").rows,
+            vec![vec![SqlValue::Int(1), SqlValue::Int(11)]],
+            "the row must appear exactly once at its committed value"
+        );
+        let after_retry: TabletManifest =
+            serde_json::from_slice(&meta.get(&key).unwrap().value).unwrap();
+        assert_eq!(after_retry.last_seq, committed.last_seq);
+        assert_eq!(after_retry.wal_blobs.len(), committed.wal_blobs.len());
+    }
+
     #[test]
     fn index_backfill_rejects_manifest_and_schema_aba() {
         for target in ["manifest", "schema"] {
