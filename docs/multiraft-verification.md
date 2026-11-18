@@ -1126,8 +1126,9 @@ and then disabled for the same reason: `sweep` returns the refusal before
 `sweep_groups`, and `sweep_groups` carries
 `#[allow(dead_code)] // Retained temporarily, unreachable while Multi-Raft GC is
 disabled`, so the code exists but nothing calls it. Storage-side fencing is
-partial — a barrier carries the collector lease deadline and a volume keeps a
-durable epoch with a fenced delete — and neither crosses a process boundary, so
+partial — a barrier carries the collector lease deadline, a volume keeps a
+durable epoch with a fenced delete, and a volume keeps a durable pin table with
+expiry — and none of the three crosses a process boundary, so
 garbage accumulates. The legacy behaviour in this section is unchanged. A
 pass needs each node read-idle for one lease TTL (30 s), because a node keeps
 its reader lease for reuse instead of deleting it per statement; a

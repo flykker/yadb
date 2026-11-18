@@ -230,14 +230,17 @@ Multi-Raft mark-and-sweep is temporarily refused, both manually and by the
 periodic task. A writer lease can be renewed while a collector pass is in
 flight, and collector RPCs can continue past lease expiry, so a reader lease
 alone is not a sufficient fence. Storage-side fencing is partial: the versioned
-delete RPC and the reader pin table do not exist, and nothing carries an epoch
-over the wire. Two target-side pieces do exist. A barrier carries the collector
+delete RPC does not exist, and nothing carries an epoch or a pin over the wire.
+Three target-side pieces do exist. A barrier carries the collector
 lease deadline, and a target refuses an expired one with `409` instead of evicting
 a whole generation range for a pass that lost its fence (an unreadable target clock
-refuses the same way). And a volume keeps a durable epoch and stamps each fragment
+refuses the same way). A volume keeps a durable epoch and stamps each fragment
 with the epoch it was written under, so a fenced delete can refuse a fragment from
-another epoch. Neither crosses a process boundary yet — no RPC carries the epoch,
-the delete path is still unfenced, and no collector advances an epoch — so they
+another epoch. And a volume keeps a durable pin table, so an epoch advance refuses
+while an unexpired pin exists and a collectable delete refuses a fragment that is
+not older or whose epoch is still pinned. None of the three crosses a process
+boundary yet — no RPC carries the epoch or a pin, the delete path is still
+unfenced, the pin table has no client, and no collector advances an epoch — so they
 narrow the window without making collection safe. The plan, including the invariant
 it has to establish and the drill that would prove it, is in
 `multiraft-gc-fencing-plan.md`.
