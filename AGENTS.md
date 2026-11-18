@@ -3,8 +3,21 @@
 - Use GPT-6.1 Sol for orchestration and review.
 - Delegate coding and implementation tasks to GPT-6.1 Terra as a subagent to
   reduce cost. Preserve existing user changes and validate delegated changes.
-- Perform the final independent GPT-6.1 Sol review after implementation; do not
-  represent interim checks or the orchestrator's own inspection as that review.
+- Perform the final independent review after implementation; do not represent
+  interim checks or the orchestrator's own inspection as that review.
+
+## Review model
+
+- Preferred reviewer: `plusvibe/gpt-6.1-sol:purple#high`.
+- Sol has failed twice on this machine by returning an invalid tool call on
+  every route (once billed as an error, once cancelled mid-run) for long
+  read-only review prompts. When Sol cannot complete a review, run the same
+  independent review on `plusvibe/gpt-6.1-terra:purple#high` and record which
+  model produced the verdict. Do not describe an orchestrator self-check as a
+  review, and do not retry Sol more than twice for the same target.
+- Keep review prompts compact: state the commit range, the claims to verify,
+  the read-only rule, and the output shape. Long prompts with many permitted
+  commands correlate with the failed runs.
 
 ## Parallel execution
 
