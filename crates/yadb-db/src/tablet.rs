@@ -131,7 +131,7 @@ mod tests {
     fn stale_tablet_cannot_publish_after_manifest_delete_recreate() {
         let (_fs, meta, pool) = setup();
         let mut tablet = open(&meta, &pool, "shard");
-        let old = meta.get("shard").unwrap();
+        let old = meta.get_or_panic("shard").unwrap();
         meta.execute(KvCommand::Delete {
             key: "shard".into(),
         })
@@ -141,12 +141,12 @@ mod tests {
             value: old.value.clone(),
         })
         .unwrap();
-        assert_eq!(old.version, meta.get("shard").unwrap().version);
+        assert_eq!(old.version, meta.get_or_panic("shard").unwrap().version);
         assert!(matches!(
             tablet.apply_batch(row(1)),
             Err(DbError::StaleTabletGeneration { .. })
         ));
-        assert_eq!(meta.get("shard").unwrap().value, old.value);
+        assert_eq!(meta.get_or_panic("shard").unwrap().value, old.value);
     }
 
     #[test]
@@ -206,7 +206,7 @@ mod tests {
             Some(vec![SqlValue::Int(2)])
         );
         assert_eq!(
-            serde_json::from_slice::<u64>(&meta.get(&key).unwrap().value).unwrap(),
+            serde_json::from_slice::<u64>(&meta.get_or_panic(&key).unwrap().value).unwrap(),
             MAX_ALLOCATION
         );
         tablet.manifest.last_seq = u64::MAX;
@@ -303,13 +303,16 @@ mod tests {
         assert_eq!(tablet.scan_all_live_rows().unwrap().len(), 2);
         assert!(pool.get_blob(wal_id).is_ok());
         assert!(pool.get_blob(sst_id).is_ok());
-        let before =
-            serde_json::from_slice::<u64>(&meta.get("/sql-blob-sequence/1").unwrap().value)
-                .unwrap();
+        let before = serde_json::from_slice::<u64>(
+            &meta.get_or_panic("/sql-blob-sequence/1").unwrap().value,
+        )
+        .unwrap();
         tablet.prepare_batch(row(11)).unwrap();
         assert!(
-            serde_json::from_slice::<u64>(&meta.get("/sql-blob-sequence/1").unwrap().value)
-                .unwrap()
+            serde_json::from_slice::<u64>(
+                &meta.get_or_panic("/sql-blob-sequence/1").unwrap().value
+            )
+            .unwrap()
                 > before
         );
     }
@@ -564,7 +567,7 @@ impl<FS: StorageFs> DataShardTablet<FS> {
         data_striper: Arc<PoolStriper<FS>>,
         flush_threshold_rows: usize,
     ) -> Result<Self, DbError> {
-        if let Some(kv) = meta.get(&meta_key) {
+        if let Some(kv) = meta.try_get(&meta_key)? {
             let mut manifest: TabletManifest = serde_json::from_slice(&kv.value)?;
             // The revision, not the bounded legacy generation, fences publication.
             manifest.generation = manifest
@@ -677,7 +680,7 @@ impl<FS: StorageFs> DataShardTablet<FS> {
         wal_striper: Arc<PoolStriper<FS>>,
         data_striper: Arc<PoolStriper<FS>>,
     ) -> Result<Option<Self>, DbError> {
-        let Some(kv) = meta.get(&meta_key) else {
+        let Some(kv) = meta.try_get(&meta_key)? else {
             return Ok(None);
         };
         Ok(Some(Self::open_snapshot_value(
@@ -733,7 +736,7 @@ impl<FS: StorageFs> DataShardTablet<FS> {
     fn next_blob_id(&self, channel: u8) -> Result<BlobId, DbError> {
         let key = format!("/sql-blob-sequence/{}", self.manifest.project_id);
         for _ in 0..32 {
-            let current = self.meta.get(&key);
+            let current = self.meta.try_get(&key)?;
             let revision = current.as_ref().map_or(0, |v| v.mod_revision);
             let previous = match current {
                 Some(v) => serde_json::from_slice::<u64>(&v.value)?,

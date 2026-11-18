@@ -860,18 +860,30 @@ design; the removed draft is not kept in the tree.
 - [x] Test replication over a real TCP transport with authenticated envelopes
   and durable file stores (`openraft_net_test`), including rejection of unknown
   addresses and forged signatures.
-- [ ] Make an unavailable metadata read an answer instead of a panic.
-  `LocalMetaKv::get` (`crates/yadb-metakv/src/raft.rs`) is
-  `try_snapshot(...).expect("invalid or unavailable metadata read")`, so any
-  transient inability to serve a quorum snapshot - a group that has not yet
-  applied its log after a restart, for instance - aborts the calling task instead
-  of returning an error. Read paths reach it from request handlers, where the
-  caller sees a dropped connection rather than a `503`, and the distinction
-  between "the key is absent" and "the value cannot be read right now" is lost.
-  The fix is not a local one: `get` returns `Option`, and call sites across
-  `yadb-db`, `yadb-s3` and `yadbd` treat `None` as absence, so a fallible variant
-  has to be threaded through them. Until then, do not read a `None` from this
-  path as proof that a key was never written.
+- [x] Make an unavailable metadata read an answer instead of a panic.
+  `LocalMetaKv` now exposes `try_get`, `try_scan_prefix`, `try_revision` and
+  `try_snapshot`; each returns the `MetaError` instead of a default, so "cannot
+  be read right now" is never reported as "absent". The panicking forms are
+  renamed `get_or_panic`, `scan_prefix_or_panic`, `revision_or_panic` and
+  `snapshot_or_panic`, are implemented on top of the fallible forms, and are
+  used only by tests. Every production read in `yadb-db`, `yadb-s3`,
+  `yadb-block`, `yadb-metakv` and `yadbd` is converted: SQL and S3 reads
+  propagate the error, the GC pass refuses, the scrub/repair pass refuses
+  instead of building a partial live set, and `handle_health` answers `503`.
+  `meta_err_response` maps `MetaError::StorageUnavailable` - the "this state
+  machine needs recovery" error - to the existing `503` not-ready answer, so
+  the SQL, S3 and block/iSCSI handlers surface it through `DbError::Meta`,
+  `S3Error::Meta` and `BlockError::Meta` without a new mapping per protocol.
+  The inversion test
+  `unreadable_state_machine_errors_instead_of_reporting_absence` poisons a real
+  OpenRaft-backed state machine and asserts that `try_get` of a present key and
+  of an absent key both return `Err(StorageUnavailable)` rather than a value,
+  `None` or a panic; `unavailable_metadata_read_is_not_ready_503` pins the
+  handler mapping. The request path is not driven end to end from a poisoned
+  state machine: the test-only poison hook is not exported across the crate
+  boundary, so the error and its mapping are proven in adjacent tests rather
+  than in one HTTP test. `watch_prefix` still validates its scope with an
+  `expect`; it is a subscription-scope check, not a data read.
 - [ ] Test node shutdown/restart, partitions, leadership changes, quorum loss,
   delayed/duplicate messages, snapshots and catch-up with independent
   processes, real filesystems and TLS.

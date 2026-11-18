@@ -418,7 +418,7 @@ impl<FS: StorageFs> ObjectStoreEngine<FS> {
         }
         let key = format!("/s3-upload-sequence/{project_id}");
         for _ in 0..128 {
-            let current = self.meta.get(&key);
+            let current = self.meta.try_get(&key)?;
             let previous = match &current {
                 Some(v) => serde_json::from_slice::<u64>(&v.value)?,
                 None => 0,
@@ -645,7 +645,7 @@ impl<FS: StorageFs> ObjectStoreEngine<FS> {
         let intent_key = Self::intent_key(project_id, upload_id);
         let kv = self
             .meta
-            .get(&intent_key)
+            .try_get(&intent_key)?
             .ok_or_else(|| S3Error::MultipartUploadNotFound(upload_id.to_string()))?;
         let intent: UploadIntent = serde_json::from_slice(&kv.value)?;
         if !intent.multipart
@@ -753,7 +753,7 @@ impl<FS: StorageFs> ObjectStoreEngine<FS> {
         // lost part guard ends the call instead of being retried.
         let part_kv = self
             .meta
-            .get(&part_intent_key)
+            .try_get(&part_intent_key)?
             .filter(|kv| {
                 serde_json::from_slice::<UploadIntent>(&kv.value)
                     .is_ok_and(|intent| intent.state == UploadState::Prepared)
@@ -783,7 +783,7 @@ impl<FS: StorageFs> ObjectStoreEngine<FS> {
         for _ in 0..64 {
             let current = self
                 .meta
-                .get(upload_key)
+                .try_get(upload_key)?
                 .ok_or_else(|| S3Error::MultipartUploadNotFound(upload_id.to_string()))?;
             let mut record: UploadIntent = serde_json::from_slice(&current.value)?;
             if !record.multipart || record.state != UploadState::Prepared {
@@ -792,7 +792,7 @@ impl<FS: StorageFs> ObjectStoreEngine<FS> {
             // A concurrent collector may have aborted the part between the
             // caller's read and this attempt; re-check before building the
             // guard.
-            let live_part = self.meta.get(part_intent_key).filter(|kv| {
+            let live_part = self.meta.try_get(part_intent_key)?.filter(|kv| {
                 kv.mod_revision == part_kv.mod_revision
                     && serde_json::from_slice::<UploadIntent>(&kv.value)
                         .is_ok_and(|intent| intent.state == UploadState::Prepared)
@@ -928,7 +928,7 @@ impl<FS: StorageFs> ObjectStoreEngine<FS> {
             }
             let kv = self
                 .meta
-                .get(&part.intent_key)
+                .try_get(&part.intent_key)?
                 .ok_or_else(|| S3Error::InvalidPart {
                     part: *part_number,
                     reason: "part data was collected".into(),
@@ -995,7 +995,7 @@ impl<FS: StorageFs> ObjectStoreEngine<FS> {
             last_modified: unix_seconds(),
         };
         let mkey = Self::meta_key(project_id, store, bucket, key);
-        let previous = self.meta.get(&mkey);
+        let previous = self.meta.try_get(&mkey)?;
         if let Some(value) = &previous {
             let old: ObjectManifest = serde_json::from_slice(&value.value)?;
             ops.push(TxnOp::Put {
@@ -1037,7 +1037,7 @@ impl<FS: StorageFs> ObjectStoreEngine<FS> {
         }];
         let mut ops = vec![TxnOp::Delete { key: upload_key }];
         for part in &upload.parts {
-            let Some(kv) = self.meta.get(&part.intent_key) else {
+            let Some(kv) = self.meta.try_get(&part.intent_key)? else {
                 continue;
             };
             let mut intent: UploadIntent = serde_json::from_slice(&kv.value)?;
@@ -1089,7 +1089,7 @@ impl<FS: StorageFs> ObjectStoreEngine<FS> {
     ) -> Result<(), S3Error> {
         let mkey = Self::meta_key(project_id, store, &manifest.bucket, &manifest.key);
         // The previous manifest and its guard MUST come from the same read.
-        let previous = self.meta.get(&mkey);
+        let previous = self.meta.try_get(&mkey)?;
         let encoded = serde_json::to_vec(&manifest)?;
         // Publish the manifest and remove the intent in one Raft transaction.
         // Publication and abort guard the same intent revision: only one may
@@ -1118,7 +1118,7 @@ impl<FS: StorageFs> ObjectStoreEngine<FS> {
         }
         let current_intent = self
             .meta
-            .get(&intent_key)
+            .try_get(&intent_key)?
             .ok_or(S3Error::ConcurrentModification)?;
         let current_intent_state: UploadIntent = serde_json::from_slice(&current_intent.value)?;
         if current_intent_state.state != UploadState::Prepared
@@ -1161,7 +1161,7 @@ impl<FS: StorageFs> ObjectStoreEngine<FS> {
         let mkey = Self::meta_key(project_id, store, bucket, key);
         let kv = self
             .meta
-            .get(&mkey)
+            .try_get(&mkey)?
             .ok_or_else(|| S3Error::ObjectNotFound {
                 bucket: bucket.to_string(),
                 key: key.to_string(),
@@ -1306,7 +1306,7 @@ impl<FS: StorageFs> ObjectStoreEngine<FS> {
         F: FnMut(bool) -> Result<ObjectPublication, S3Error>,
     {
         let mkey = Self::meta_key(project_id, store, bucket, key);
-        let previous = self.meta.get(&mkey);
+        let previous = self.meta.try_get(&mkey)?;
         let existed = previous.is_some();
         let mut ops = vec![yadb_metakv::TxnOp::Delete { key: mkey.clone() }];
         if let Some(value) = &previous {
@@ -1338,7 +1338,9 @@ impl<FS: StorageFs> ObjectStoreEngine<FS> {
     }
 
     fn collect_orphans_at(&self, project_id: u32, now: u64) -> Result<usize, S3Error> {
-        let intents = self.meta.scan_prefix(&Self::intent_prefix(project_id));
+        let intents = self
+            .meta
+            .try_scan_prefix(&Self::intent_prefix(project_id))?;
         self.collect_orphans_from(project_id, now, intents)
     }
 
@@ -1399,8 +1401,9 @@ impl<FS: StorageFs> ObjectStoreEngine<FS> {
                 // it names now, so an older part that a registration just
                 // re-confirmed is not aborted on the strength of the old pin
                 // set. If the record is gone, its parts were deleted or
-                // aborted by the transaction that won.
-                if let Some(fresh) = self.meta.get(key) {
+                // aborted by the transaction that won. An unreadable record
+                // aborts the pass rather than leaving the pin set incomplete.
+                if let Some(fresh) = self.meta.try_get(key)? {
                     if let Ok(fresh) = serde_json::from_slice::<UploadIntent>(&fresh.value) {
                         pinned_parts.extend(fresh.parts.iter().map(|part| part.intent_key.clone()));
                     }
@@ -1495,7 +1498,7 @@ impl<FS: StorageFs> ObjectStoreEngine<FS> {
             format!("/s3/{project_id}/"),
             format!("/s3-retired/{project_id}/"),
         ] {
-            for (_, value) in self.meta.scan_prefix(&prefix) {
+            for (_, value) in self.meta.try_scan_prefix(&prefix)? {
                 let manifest: ObjectManifest = serde_json::from_slice(&value.value)?;
                 if manifest.pool == pool && manifest.chunks.iter().any(|c| c.blob_id == blob_id) {
                     return Ok(true);
@@ -1517,7 +1520,7 @@ impl<FS: StorageFs> ObjectStoreEngine<FS> {
         }
         let mut projects = std::collections::BTreeSet::new();
         for prefix in ["/s3/", "/s3-intent/", "/s3-retired/"] {
-            for (key, _) in self.meta.scan_prefix(prefix) {
+            for (key, _) in self.meta.try_scan_prefix(prefix)? {
                 if let Some(project) = key.strip_prefix(prefix).and_then(|v| v.split('/').next()) {
                     if let Ok(project_id) = project.parse::<u32>() {
                         projects.insert(project_id);
@@ -1541,7 +1544,7 @@ impl<FS: StorageFs> ObjectStoreEngine<FS> {
     ) -> Result<Vec<ObjectSummary>, S3Error> {
         let base = format!("/s3/{project_id}/{store}/{bucket}/");
         let full_prefix = Self::meta_prefix(project_id, store, bucket, prefix);
-        let rows = self.meta.scan_prefix(&full_prefix);
+        let rows = self.meta.try_scan_prefix(&full_prefix)?;
         let mut out = Vec::with_capacity(rows.len());
         for (full_key, kv) in rows {
             let obj_key = full_key
@@ -1600,7 +1603,7 @@ mod tests {
             let recovered = engine(&meta_fs, &disks);
             advance_revisions(&recovered);
             if fault == SyncFault::AfterPersist {
-                assert!(recovered.meta.get(&key).is_none());
+                assert!(recovered.meta.get_or_panic(&key).is_none());
                 assert_eq!(recovered.collect_orphans_at(1, 1001).unwrap(), 0);
                 assert_eq!(
                     recovered.get_object(1, "store", "bucket", "key").unwrap().1,
@@ -1609,7 +1612,7 @@ mod tests {
             } else {
                 assert!(recovered.head_object(1, "store", "bucket", "key").is_err());
                 assert_eq!(recovered.collect_orphans_at(1, 1001).unwrap(), 1);
-                assert!(recovered.meta.get(&key).is_none());
+                assert!(recovered.meta.get_or_panic(&key).is_none());
                 assert!(recovered
                     .get_pool("pool")
                     .unwrap()
@@ -1638,13 +1641,13 @@ mod tests {
             });
             assert!(s3.collect_orphans_at(1, 1001).is_err());
             let intent: UploadIntent =
-                serde_json::from_slice(&s3.meta.get(&key).unwrap().value).unwrap();
+                serde_json::from_slice(&s3.meta.get_or_panic(&key).unwrap().value).unwrap();
             assert_eq!(intent.state, UploadState::Aborted);
             disks[1].set_faults(FaultConfig::default());
             // Clearing injected EIO is not enough: target runtime state remains
             // suspect, and the collector must not forget an unconfirmed fence.
             assert!(s3.collect_orphans_at(1, 1001).is_err());
-            assert!(s3.meta.get(&key).is_some());
+            assert!(s3.meta.get_or_panic(&key).is_some());
             assert!(s3.publish_upload(1, "store", &manifest, &key).is_err());
             drop(s3);
             meta_fs.simulate_power_cut();
@@ -1660,7 +1663,7 @@ mod tests {
                     0
                 }
             );
-            assert!(recovered.meta.get(&key).is_none());
+            assert!(recovered.meta.get_or_panic(&key).is_none());
             assert!(recovered
                 .get_pool("pool")
                 .unwrap()
@@ -1710,8 +1713,8 @@ mod tests {
             pool: "pool".into(),
             chunks: chunks.clone(),
             state: UploadState::Prepared,
-            created_revision: s3.meta.revision(),
-            lease_until_revision: s3.meta.revision() + INTENT_GRACE_REVISIONS,
+            created_revision: s3.meta.revision_or_panic(),
+            lease_until_revision: s3.meta.revision_or_panic() + INTENT_GRACE_REVISIONS,
             lease_until_unix_secs: 1000,
             allocation_id: Some(allocation),
             ..UploadIntent::default()
@@ -1760,7 +1763,7 @@ mod tests {
         advance_revisions(&s3);
         assert_eq!(s3.collect_orphans_at(1, 999).unwrap(), 0); // revisions alone
         assert_eq!(s3.collect_orphans_at(1, 1001).unwrap(), 1);
-        assert!(s3.meta.get(&key).is_none());
+        assert!(s3.meta.get_or_panic(&key).is_none());
         assert!(matches!(
             s3.publish_upload(1, "store", &manifest, &key),
             Err(S3Error::ConcurrentModification)
@@ -1787,7 +1790,7 @@ mod tests {
         });
         assert!(s3.collect_orphans_at(1, 1001).is_err());
         let aborted: UploadIntent =
-            serde_json::from_slice(&s3.meta.get(&key).unwrap().value).unwrap();
+            serde_json::from_slice(&s3.meta.get_or_panic(&key).unwrap().value).unwrap();
         assert_eq!(aborted.state, UploadState::Aborted);
         drop(s3);
         disks[1].set_faults(FaultConfig::default());
@@ -1798,7 +1801,7 @@ mod tests {
         let recovered = engine(&meta_fs, &disks);
         // No live object in this project: discovery must use the intent namespace.
         assert_eq!(recovered.collect_orphans_all().unwrap(), 1);
-        assert!(recovered.meta.get(&key).is_none());
+        assert!(recovered.meta.get_or_panic(&key).is_none());
         assert!(recovered
             .get_pool("pool")
             .unwrap()
@@ -1927,7 +1930,7 @@ mod tests {
         // first id after a restart lies beyond every id handed out *and* beyond
         // the unused tails: reusing a tail would alias an upload that may still
         // exist, which is why the tail is skipped rather than reclaimed.
-        let stored = s3.meta.get("/s3-upload-sequence/1").unwrap();
+        let stored = s3.meta.get_or_panic("/s3-upload-sequence/1").unwrap();
         let counter: u64 = serde_json::from_slice(&stored.value).unwrap();
         assert_eq!(counter, 16 * ObjectStoreEngine::<SimFs>::ALLOCATION_BLOCK);
         drop(s3);
@@ -1951,7 +1954,10 @@ mod tests {
         block.sort_unstable();
         block.dedup();
         assert_eq!(block.len(), 16, "{block:?}");
-        let stored = recovered.meta.get("/s3-upload-sequence/1").unwrap();
+        let stored = recovered
+            .meta
+            .get_or_panic("/s3-upload-sequence/1")
+            .unwrap();
         let advanced: u64 = serde_json::from_slice(&stored.value).unwrap();
         assert_eq!(
             advanced,
@@ -2022,7 +2028,7 @@ mod tests {
             s3.collect_orphans_at(1, 1001),
             Err(S3Error::Json(_))
         ));
-        assert!(s3.meta.get(&key).is_some());
+        assert!(s3.meta.get_or_panic(&key).is_some());
         assert_eq!(
             s3.get_pool("pool").unwrap().get_blob(id).unwrap(),
             b"payload"
@@ -2078,8 +2084,8 @@ mod tests {
                 s3.publish_upload(1, "store", &manifest, &key),
                 Err(S3Error::Meta(_))
             ));
-            assert!(s3.meta.get(&manifest_key()).is_none());
-            assert!(s3.meta.get(&key).is_some());
+            assert!(s3.meta.get_or_panic(&manifest_key()).is_none());
+            assert!(s3.meta.get_or_panic(&key).is_some());
             drop(s3);
             meta_fs.set_faults(FaultConfig::default());
             meta_fs.simulate_power_cut();
@@ -2089,7 +2095,7 @@ mod tests {
             let recovered = engine(&meta_fs, &disks);
             advance_revisions(&recovered);
             assert_eq!(recovered.collect_orphans_at(1, 1001).unwrap(), 1);
-            assert!(recovered.meta.get(&key).is_none());
+            assert!(recovered.meta.get_or_panic(&key).is_none());
             assert!(recovered.head_object(1, "store", "bucket", "key").is_err());
         }
     }
@@ -2228,7 +2234,7 @@ mod tests {
                 ),
                 Err(S3Error::Blob(_))
             ));
-            let pending = s3.meta.scan_prefix("/s3-intent/1/");
+            let pending = s3.meta.scan_prefix_or_panic("/s3-intent/1/");
             assert_eq!(pending.len(), 1);
             let intent: UploadIntent = serde_json::from_slice(&pending[0].1.value).unwrap();
             drop(s3);
@@ -2630,9 +2636,9 @@ mod tests {
                 },
             )
             .unwrap();
-        let stored = s3.meta.get(&record).unwrap();
+        let stored = s3.meta.get_or_panic(&record).unwrap();
         let mkey = ObjectStoreEngine::<SimFs>::meta_key(1, "store", "bucket", "key");
-        let published = s3.meta.get(&mkey).unwrap();
+        let published = s3.meta.get_or_panic(&mkey).unwrap();
         assert_eq!(stored.value, b"done");
         assert_eq!(
             published.mod_revision, stored.mod_revision,
@@ -2681,7 +2687,7 @@ mod tests {
         );
         assert!(matches!(result, Err(S3Error::ConcurrentModification)));
         assert!(
-            s3.meta.get(&record).is_none(),
+            s3.meta.get_or_panic(&record).is_none(),
             "caller record leaked although the transaction never committed"
         );
         assert!(matches!(
@@ -2703,7 +2709,7 @@ mod tests {
             .unwrap();
         let record = "/s3-delete/1/store/bucket/key/op-1".to_string();
         let mkey = ObjectStoreEngine::<SimFs>::meta_key(1, "store", "bucket", "key");
-        let before = s3.meta.get(&mkey).unwrap();
+        let before = s3.meta.get_or_panic(&mkey).unwrap();
         let mut seen = None;
         let existed = s3
             .delete_object_with(1, "store", "bucket", "key", |existed| {
@@ -2722,9 +2728,9 @@ mod tests {
             .unwrap();
         assert!(existed);
         assert_eq!(seen, Some(true), "prepare must see the guarded existence");
-        let stored = s3.meta.get(&record).unwrap();
+        let stored = s3.meta.get_or_panic(&record).unwrap();
         assert!(
-            s3.meta.get(&mkey).is_none(),
+            s3.meta.get_or_panic(&mkey).is_none(),
             "manifest survived a committed delete"
         );
         assert!(matches!(
@@ -2741,7 +2747,7 @@ mod tests {
             before.mod_revision,
         );
         assert_eq!(
-            s3.meta.get(&retired).unwrap().mod_revision,
+            s3.meta.get_or_panic(&retired).unwrap().mod_revision,
             stored.mod_revision
         );
     }
@@ -2754,7 +2760,7 @@ mod tests {
         s3.put_object(1, "store", "pool", "bucket", "key", "text/plain", b"value")
             .unwrap();
         let mkey = ObjectStoreEngine::<SimFs>::meta_key(1, "store", "bucket", "key");
-        let before = s3.meta.get(&mkey).unwrap();
+        let before = s3.meta.get_or_panic(&mkey).unwrap();
         let record = "/s3-delete/1/store/bucket/key/never".to_string();
         let result = s3.delete_object_with(1, "store", "bucket", "key", |_| {
             Ok(ObjectPublication {
@@ -2769,9 +2775,9 @@ mod tests {
             })
         });
         assert!(matches!(result, Err(S3Error::ConcurrentModification)));
-        assert!(s3.meta.get(&record).is_none());
+        assert!(s3.meta.get_or_panic(&record).is_none());
         assert_eq!(
-            s3.meta.get(&mkey).unwrap().mod_revision,
+            s3.meta.get_or_panic(&mkey).unwrap().mod_revision,
             before.mod_revision
         );
         assert_eq!(
@@ -2872,7 +2878,7 @@ mod tests {
         .unwrap();
         let previous = s3
             .meta
-            .get(&ObjectStoreEngine::<SimFs>::meta_key(
+            .get_or_panic(&ObjectStoreEngine::<SimFs>::meta_key(
                 1, "store", "bucket", "key",
             ))
             .unwrap();
@@ -2927,10 +2933,10 @@ mod tests {
         // The upload record and every part intent are gone in the same
         // transaction that published the manifest.
         let upload_key = ObjectStoreEngine::<SimFs>::intent_key(1, &upload_id);
-        assert!(s3.meta.get(&upload_key).is_none());
+        assert!(s3.meta.get_or_panic(&upload_key).is_none());
         for (_, value) in s3
             .meta
-            .scan_prefix(&ObjectStoreEngine::<SimFs>::intent_prefix(1))
+            .scan_prefix_or_panic(&ObjectStoreEngine::<SimFs>::intent_prefix(1))
         {
             panic!(
                 "an intent survived completion: {}",
@@ -2940,7 +2946,7 @@ mod tests {
         // The replaced object is retained as a retirement record, not deleted.
         assert!(s3
             .meta
-            .get(&ObjectStoreEngine::<SimFs>::retired_key(
+            .get_or_panic(&ObjectStoreEngine::<SimFs>::retired_key(
                 1,
                 "store",
                 "bucket",
@@ -3010,7 +3016,7 @@ mod tests {
         // the size is re-derived from the durable part, not trusted from the
         // upload record.
         let upload_key = ObjectStoreEngine::<SimFs>::intent_key(1, &upload_id);
-        let kv = s3.meta.get(&upload_key).unwrap();
+        let kv = s3.meta.get_or_panic(&upload_key).unwrap();
         let mut record: UploadIntent = serde_json::from_slice(&kv.value).unwrap();
         record.parts[0].size += 1;
         s3.meta
@@ -3137,7 +3143,7 @@ mod tests {
             .upload_part(1, "store", "bucket", "key", &upload_id, 1, b"payload")
             .unwrap();
         let upload_key = ObjectStoreEngine::<SimFs>::intent_key(1, &upload_id);
-        let kv = s3.meta.get(&upload_key).unwrap();
+        let kv = s3.meta.get_or_panic(&upload_key).unwrap();
         let mut record: UploadIntent = serde_json::from_slice(&kv.value).unwrap();
         record.parts[0].size = 1;
         s3.meta
@@ -3157,7 +3163,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, S3Error::InvalidPart { part: 1, .. }), "{err}");
         assert!(s3.head_object(1, "store", "bucket", "key").is_err());
-        assert!(s3.meta.get(&upload_key).is_some());
+        assert!(s3.meta.get_or_panic(&upload_key).is_some());
     }
 
     #[test]
@@ -3169,10 +3175,10 @@ mod tests {
         s3.upload_part(1, "store", "bucket", "key", &upload_id, 1, &[1u8; 5000])
             .unwrap();
         let upload_key = ObjectStoreEngine::<SimFs>::intent_key(1, &upload_id);
-        assert!(s3.meta.get(&upload_key).is_some());
+        assert!(s3.meta.get_or_panic(&upload_key).is_some());
         s3.abort_multipart_upload(1, "store", "bucket", "key", &upload_id)
             .unwrap();
-        assert!(s3.meta.get(&upload_key).is_none());
+        assert!(s3.meta.get_or_panic(&upload_key).is_none());
         // The part intent is still present but marked Aborted, so the collector
         // reclaims its fragments without waiting for the lease.
         assert!(matches!(
@@ -3187,7 +3193,7 @@ mod tests {
         assert_eq!(s3.collect_orphans(1).unwrap(), 2);
         for (key, _) in s3
             .meta
-            .scan_prefix(&ObjectStoreEngine::<SimFs>::intent_prefix(1))
+            .scan_prefix_or_panic(&ObjectStoreEngine::<SimFs>::intent_prefix(1))
         {
             panic!("aborted part intent `{key}` survived collection");
         }
@@ -3205,17 +3211,17 @@ mod tests {
         let upload_key = ObjectStoreEngine::<SimFs>::intent_key(1, &upload_id);
         // Neither grace alone is enough.
         assert_eq!(s3.collect_orphans_at(1, 1).unwrap(), 0);
-        assert!(s3.meta.get(&upload_key).is_some());
+        assert!(s3.meta.get_or_panic(&upload_key).is_some());
         advance_revisions(&s3);
         assert_eq!(
             s3.collect_orphans_at(1, unix_seconds() + INTENT_GRACE_SECS + 1)
                 .unwrap(),
             2
         );
-        assert!(s3.meta.get(&upload_key).is_none());
+        assert!(s3.meta.get_or_panic(&upload_key).is_none());
         for (key, _) in s3
             .meta
-            .scan_prefix(&ObjectStoreEngine::<SimFs>::intent_prefix(1))
+            .scan_prefix_or_panic(&ObjectStoreEngine::<SimFs>::intent_prefix(1))
         {
             panic!("incomplete upload `{key}` leaked");
         }
@@ -3239,10 +3245,10 @@ mod tests {
         // Expire only the part intent: an upload that takes longer than the
         // part lease must still be completable.
         let upload_key = ObjectStoreEngine::<SimFs>::intent_key(1, &upload_id);
-        let kv = s3.meta.get(&upload_key).unwrap();
+        let kv = s3.meta.get_or_panic(&upload_key).unwrap();
         let record: UploadIntent = serde_json::from_slice(&kv.value).unwrap();
         let part_key = record.parts[0].intent_key.clone();
-        let part_kv = s3.meta.get(&part_key).unwrap();
+        let part_kv = s3.meta.get_or_panic(&part_key).unwrap();
         let mut part: UploadIntent = serde_json::from_slice(&part_kv.value).unwrap();
         part.lease_until_unix_secs = 0;
         part.lease_until_revision = 0;
@@ -3259,7 +3265,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(s3.collect_orphans_at(1, u64::MAX).unwrap(), 0);
-        assert!(s3.meta.get(&part_key).is_some());
+        assert!(s3.meta.get_or_panic(&part_key).is_some());
         let manifest = s3
             .complete_multipart_upload(1, "store", "bucket", "key", &upload_id, &[(1, etag)])
             .unwrap();
@@ -3280,7 +3286,7 @@ mod tests {
             .unwrap();
         let upload_key = ObjectStoreEngine::<SimFs>::intent_key(1, &upload_id);
         let record: UploadIntent =
-            serde_json::from_slice(&s3.meta.get(&upload_key).unwrap().value).unwrap();
+            serde_json::from_slice(&s3.meta.get_or_panic(&upload_key).unwrap().value).unwrap();
         let part = record.parts[0].clone();
         let part_key = part.intent_key.clone();
 
@@ -3288,7 +3294,7 @@ mod tests {
         // again. Registration must refresh that lease in the same transaction:
         // an acknowledged part must not stay collectable because the upload
         // call outlived the lease it was created with.
-        let kv = s3.meta.get(&part_key).unwrap();
+        let kv = s3.meta.get_or_panic(&part_key).unwrap();
         let mut intent: UploadIntent = serde_json::from_slice(&kv.value).unwrap();
         intent.lease_until_unix_secs = 0;
         intent.lease_until_revision = 0;
@@ -3304,11 +3310,11 @@ mod tests {
                 }],
             })
             .unwrap();
-        let stale = s3.meta.get(&part_key).unwrap();
+        let stale = s3.meta.get_or_panic(&part_key).unwrap();
         s3.register_multipart_part(&upload_key, &upload_id, &part, &stale)
             .unwrap();
         let refreshed: UploadIntent =
-            serde_json::from_slice(&s3.meta.get(&part_key).unwrap().value).unwrap();
+            serde_json::from_slice(&s3.meta.get_or_panic(&part_key).unwrap().value).unwrap();
         assert!(refreshed.lease_until_unix_secs > unix_seconds());
         assert!(refreshed.lease_until_revision > 0);
 
@@ -3317,7 +3323,7 @@ mod tests {
         // is the aborted record's own current revision, so the revision guard
         // matches and only the state check can refuse: otherwise the test would
         // pass on a stale revision alone and prove nothing about the state.
-        let kv = s3.meta.get(&part_key).unwrap();
+        let kv = s3.meta.get_or_panic(&part_key).unwrap();
         let mut aborted: UploadIntent = serde_json::from_slice(&kv.value).unwrap();
         aborted.state = UploadState::Aborted;
         s3.meta
@@ -3332,7 +3338,7 @@ mod tests {
                 }],
             })
             .unwrap();
-        let aborted_now = s3.meta.get(&part_key).unwrap();
+        let aborted_now = s3.meta.get_or_panic(&part_key).unwrap();
         let aborted_record: UploadIntent = serde_json::from_slice(&aborted_now.value).unwrap();
         assert_eq!(aborted_record.state, UploadState::Aborted);
         assert!(matches!(
@@ -3352,7 +3358,7 @@ mod tests {
         let upload_key = ObjectStoreEngine::<SimFs>::intent_key(1, &upload_id);
         let part_one = {
             let record: UploadIntent =
-                serde_json::from_slice(&s3.meta.get(&upload_key).unwrap().value).unwrap();
+                serde_json::from_slice(&s3.meta.get_or_panic(&upload_key).unwrap().value).unwrap();
             record.parts[0].intent_key.clone()
         };
 
@@ -3366,7 +3372,7 @@ mod tests {
         // revisions a second registration advances, and the collector would
         // retain it on that lease alone even without re-pinning the record it
         // just failed to delete — the test would pass with the branch removed.
-        let kv = s3.meta.get(&upload_key).unwrap();
+        let kv = s3.meta.get_or_panic(&upload_key).unwrap();
         let mut expired: UploadIntent = serde_json::from_slice(&kv.value).unwrap();
         expired.lease_until_unix_secs = 0;
         expired.lease_until_revision = 0;
@@ -3382,7 +3388,7 @@ mod tests {
                 }],
             })
             .unwrap();
-        let part_kv = s3.meta.get(&part_one).unwrap();
+        let part_kv = s3.meta.get_or_panic(&part_one).unwrap();
         let mut expired_part: UploadIntent = serde_json::from_slice(&part_kv.value).unwrap();
         expired_part.lease_until_unix_secs = 0;
         expired_part.lease_until_revision = 0;
@@ -3400,19 +3406,19 @@ mod tests {
             .unwrap();
         let stale = s3
             .meta
-            .scan_prefix(&ObjectStoreEngine::<SimFs>::intent_prefix(1));
+            .scan_prefix_or_panic(&ObjectStoreEngine::<SimFs>::intent_prefix(1));
         s3.upload_part(1, "store", "bucket", "key", &upload_id, 2, b"two")
             .unwrap();
 
         // The pass must not abort the parts it saw in the stale scan.
         assert_eq!(s3.collect_orphans_from(1, u64::MAX, stale).unwrap(), 0);
         for key in [&part_one, &upload_key] {
-            let kv = s3.meta.get(key).expect("record survives the pass");
+            let kv = s3.meta.get_or_panic(key).expect("record survives the pass");
             let record: UploadIntent = serde_json::from_slice(&kv.value).unwrap();
             assert_ne!(record.state, UploadState::Aborted, "{key}");
         }
         let record: UploadIntent =
-            serde_json::from_slice(&s3.meta.get(&upload_key).unwrap().value).unwrap();
+            serde_json::from_slice(&s3.meta.get_or_panic(&upload_key).unwrap().value).unwrap();
         assert_eq!(record.parts.len(), 2);
     }
 
@@ -3461,7 +3467,7 @@ mod tests {
     fn part_intents(s3: &ObjectStoreEngine<SimFs>, upload_id: &str) -> Vec<String> {
         let upload_key = ObjectStoreEngine::<SimFs>::intent_key(1, upload_id);
         let record: UploadIntent =
-            serde_json::from_slice(&s3.meta.get(&upload_key).unwrap().value).unwrap();
+            serde_json::from_slice(&s3.meta.get_or_panic(&upload_key).unwrap().value).unwrap();
         record
             .parts
             .iter()
@@ -3476,7 +3482,7 @@ mod tests {
             .iter()
             .flat_map(|key| {
                 let intent: UploadIntent =
-                    serde_json::from_slice(&s3.meta.get(key).unwrap().value).unwrap();
+                    serde_json::from_slice(&s3.meta.get_or_panic(key).unwrap().value).unwrap();
                 intent
                     .chunks
                     .iter()
@@ -3523,9 +3529,12 @@ mod tests {
         // The single transaction was not applied at all: no manifest, and the
         // record and part intents it would have deleted are still there.
         assert!(s3.head_object(1, "store", "bucket", "key").is_err());
-        assert!(s3.meta.get(&upload_key).is_some());
+        assert!(s3.meta.get_or_panic(&upload_key).is_some());
         for key in &part_keys {
-            assert!(s3.meta.get(key).is_some(), "part intent `{key}` vanished");
+            assert!(
+                s3.meta.get_or_panic(key).is_some(),
+                "part intent `{key}` vanished"
+            );
         }
         meta_fs.set_faults(FaultConfig::default());
 
@@ -3538,7 +3547,7 @@ mod tests {
         ));
         // The upload and every part survived intact and are still readable, so
         // nothing was leaked or silently lost.
-        assert!(recovered.meta.get(&upload_key).is_some());
+        assert!(recovered.meta.get_or_panic(&upload_key).is_some());
         assert_eq!(
             recovered
                 .list_multipart_parts(1, "store", "bucket", "key", &upload_id)
@@ -3566,10 +3575,10 @@ mod tests {
             fragments.len(),
             "the collector must reclaim every part fragment"
         );
-        assert!(recovered.meta.get(&upload_key).is_none());
+        assert!(recovered.meta.get_or_panic(&upload_key).is_none());
         for key in &part_keys {
             assert!(
-                recovered.meta.get(key).is_none(),
+                recovered.meta.get_or_panic(key).is_none(),
                 "aborted part intent `{key}` leaked"
             );
         }
@@ -3616,10 +3625,10 @@ mod tests {
                 assert_eq!(bytes, body, "a durable completion must publish every byte");
                 assert_eq!(manifest.size, body.len() as u64);
                 assert_eq!(manifest.etag, expected_multipart_etag(&parts));
-                assert!(recovered.meta.get(&upload_key).is_none());
+                assert!(recovered.meta.get_or_panic(&upload_key).is_none());
                 for key in &part_keys {
                     assert!(
-                        recovered.meta.get(key).is_none(),
+                        recovered.meta.get_or_panic(key).is_none(),
                         "part intent `{key}` survived"
                     );
                 }
@@ -3637,10 +3646,10 @@ mod tests {
             // The other legal outcome: the transaction did not survive. Then the
             // upload must still be whole and every part reclaimable.
             Err(S3Error::ObjectNotFound { .. }) => {
-                assert!(recovered.meta.get(&upload_key).is_some());
+                assert!(recovered.meta.get_or_panic(&upload_key).is_some());
                 for key in &part_keys {
                     assert!(
-                        recovered.meta.get(key).is_some(),
+                        recovered.meta.get_or_panic(key).is_some(),
                         "part intent `{key}` vanished"
                     );
                 }
@@ -3688,7 +3697,7 @@ mod tests {
         let mkey = ObjectStoreEngine::<SimFs>::meta_key(1, "store", "bucket", "key");
         let stored = recovered
             .meta
-            .get(&mkey)
+            .get_or_panic(&mkey)
             .expect("a manifest is present after recovery");
         // A torn frame must never leave a half-written JSON value behind.
         let manifest: ObjectManifest =
@@ -3703,10 +3712,10 @@ mod tests {
         if manifest.etag == previous.etag {
             // Old state: the torn frame was discarded as an unacknowledged tail.
             assert_eq!(bytes, b"previous");
-            assert!(recovered.meta.get(&upload_key).is_some());
+            assert!(recovered.meta.get_or_panic(&upload_key).is_some());
             for key in &part_keys {
                 assert!(
-                    recovered.meta.get(key).is_some(),
+                    recovered.meta.get_or_panic(key).is_some(),
                     "part intent `{key}` vanished"
                 );
             }
@@ -3724,10 +3733,10 @@ mod tests {
             // one and names only fragments that are present.
             assert_eq!(manifest.etag, expected_multipart_etag(&parts));
             assert_eq!(bytes, body);
-            assert!(recovered.meta.get(&upload_key).is_none());
+            assert!(recovered.meta.get_or_panic(&upload_key).is_none());
             for key in &part_keys {
                 assert!(
-                    recovered.meta.get(key).is_none(),
+                    recovered.meta.get_or_panic(key).is_none(),
                     "part intent `{key}` survived"
                 );
             }
@@ -3767,10 +3776,10 @@ mod tests {
         // so the part intents that would have been deleted in the same
         // transaction are all still there.
         assert!(recovered.head_object(1, "store", "bucket", "key").is_err());
-        assert!(recovered.meta.get(&upload_key).is_some());
+        assert!(recovered.meta.get_or_panic(&upload_key).is_some());
         for key in &part_keys {
             assert!(
-                recovered.meta.get(key).is_some(),
+                recovered.meta.get_or_panic(key).is_some(),
                 "completion deleted part intent `{key}` without publishing"
             );
         }
@@ -3785,10 +3794,10 @@ mod tests {
             recovered.get_object(1, "store", "bucket", "key").unwrap().1,
             body
         );
-        assert!(recovered.meta.get(&upload_key).is_none());
+        assert!(recovered.meta.get_or_panic(&upload_key).is_none());
         for key in &part_keys {
             assert!(
-                recovered.meta.get(key).is_none(),
+                recovered.meta.get_or_panic(key).is_none(),
                 "part intent `{key}` survived"
             );
         }

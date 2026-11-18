@@ -322,7 +322,7 @@ async fn multigroup_routing_body() {
         // routes to that one group, not through the cross-project fan-out.
         assert_eq!(
             routers[&node]
-                .scan_prefix(&namespace)
+                .scan_prefix_or_panic(&namespace)
                 .iter()
                 .map(|(k, _)| k.clone())
                 .collect::<Vec<_>>(),
@@ -335,7 +335,7 @@ async fn multigroup_routing_body() {
     // a cross-project scan must see every project's record on any node.
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
-        let seen = router.scan("/idempotency/").len();
+        let seen = router.try_scan("/idempotency/").unwrap().len();
         if seen == 2 {
             break;
         }
@@ -348,7 +348,7 @@ async fn multigroup_routing_body() {
     }
     // The same fan-out must be reachable through `LocalMetaKv::scan_prefix`, which
     // is the surface the daemon uses.
-    assert_eq!(routers[&1].scan_prefix("/idempotency/").len(), 2);
+    assert_eq!(routers[&1].scan_prefix_or_panic("/idempotency/").len(), 2);
     // A bare project prefix must still fail closed rather than silently scan one
     // group: `/idempotency/1` has no trailing separator, so it could otherwise
     // match `/idempotency/10/...` in a different group.
@@ -468,7 +468,7 @@ async fn multigroup_routing_body() {
             .unwrap();
         assert_eq!(
             routers[&node]
-                .scan_prefix(&namespace)
+                .scan_prefix_or_panic(&namespace)
                 .iter()
                 .map(|(k, _)| k.clone())
                 .collect::<Vec<_>>(),
@@ -481,7 +481,7 @@ async fn multigroup_routing_body() {
     // the groups a project maps to.
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
-        let seen = router.scan("/idempotency/g").len();
+        let seen = router.try_scan("/idempotency/g").unwrap().len();
         if seen == 2 {
             break;
         }
@@ -493,7 +493,7 @@ async fn multigroup_routing_body() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     // A specific group namespace routes to exactly one group, not the fan-out.
-    assert_eq!(router.scan("/idempotency/g2/").len(), 1);
+    assert_eq!(router.try_scan("/idempotency/g2/").unwrap().len(), 1);
     // A bare group prefix must fail closed rather than scan one arbitrary group.
     for prefix in ["/idempotency/g", "/idempotency/g2", "/idempotency/g1/"] {
         assert!(

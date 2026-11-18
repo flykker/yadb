@@ -274,7 +274,7 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
         let key = Self::schema_key(project_id, db, table);
         let kv = self
             .meta
-            .get(&key)
+            .try_get(&key)?
             .ok_or_else(|| DbError::TableNotFound(table.to_string()))?;
         Ok((serde_json::from_slice(&kv.value)?, kv.mod_revision))
     }
@@ -291,7 +291,11 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
         shard_idx: u32,
     ) -> Result<Arc<Mutex<DataShardTablet<FS>>>, DbError> {
         let mkey = Self::shard_meta_key(project_id, db, &schema.table, shard_idx);
-        let current_revision = self.meta.get(&mkey).map(|kv| kv.mod_revision).unwrap_or(0);
+        let current_revision = self
+            .meta
+            .try_get(&mkey)?
+            .map(|kv| kv.mod_revision)
+            .unwrap_or(0);
         {
             let map = self.shards.lock().unwrap();
             if let Some(existing) = map.get(&mkey) {
@@ -426,7 +430,11 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
     ) -> Result<Option<Vec<SqlValue>>, DbError> {
         let shard_idx = Self::route_shard(pk_bytes, schema.shards);
         let mkey = Self::shard_meta_key(project_id, db, &schema.table, shard_idx);
-        let revision = self.meta.get(&mkey).map(|kv| kv.mod_revision).unwrap_or(0);
+        let revision = self
+            .meta
+            .try_get(&mkey)?
+            .map(|kv| kv.mod_revision)
+            .unwrap_or(0);
         if revision == 0 {
             return Ok(None);
         }
@@ -461,7 +469,11 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
         shard_idx: u32,
     ) -> Result<(Vec<Vec<SqlValue>>, u64), DbError> {
         let mkey = Self::shard_meta_key(project_id, db, &schema.table, shard_idx);
-        let revision = self.meta.get(&mkey).map(|kv| kv.mod_revision).unwrap_or(0);
+        let revision = self
+            .meta
+            .try_get(&mkey)?
+            .map(|kv| kv.mod_revision)
+            .unwrap_or(0);
         if revision == 0 {
             return Ok((Vec::new(), 0));
         }
@@ -595,7 +607,7 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
         // Copy schema, shard references and candidate index entries under one local
         // Raft-apply mutex. Never hold that mutex across fragment/network reads.
         let (keys, prefixes) = Self::collection_scope(project_id, db, schema, resolved_preds, tx)?;
-        let snapshot = self.meta.snapshot(&keys, &prefixes);
+        let snapshot = self.meta.try_snapshot(&keys, &prefixes)?;
         self.collect_table_rows_from_scope_snapshot(
             project_id,
             db,
@@ -1398,7 +1410,7 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
 
             SqlStmt::ShowTables => {
                 let prefix = Self::schema_prefix(project_id, db);
-                let items = self.meta.scan_prefix(&prefix);
+                let items = self.meta.try_scan_prefix(&prefix)?;
                 let mut rows = Vec::with_capacity(items.len());
                 for (_, kv) in items {
                     let sc: TableSchema = serde_json::from_slice(&kv.value)?;
@@ -1540,7 +1552,7 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
                 };
                 let removed = schema.indexes.remove(pos);
                 let prefix = Self::index_prefix_all(project_id, db, &table, &removed.name);
-                let existing_keys = self.meta.scan_prefix(&prefix);
+                let existing_keys = self.meta.try_scan_prefix(&prefix)?;
                 let mut ops: Vec<TxnOp> = existing_keys
                     .into_iter()
                     .map(|(k, _)| TxnOp::Delete { key: k })
@@ -1846,7 +1858,7 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
 
                 for shard_idx in 0..schema.shards {
                     let mkey = Self::shard_meta_key(project_id, db, &table, shard_idx);
-                    if self.meta.get(&mkey).is_none()
+                    if self.meta.try_get(&mkey)?.is_none()
                         && !self.shards.lock().unwrap().contains_key(&mkey)
                     {
                         continue;
@@ -2587,12 +2599,12 @@ mod tests {
         let (a, b) = (id_in(0), id_in(3));
         run(&format!("CREATE TABLE t (id INT PRIMARY KEY, v INT); INSERT INTO t VALUES ({a},10); FLUSH TABLE t; CREATE INDEX by_v ON t (v);"));
         let schema = engine.load_schema(1, "db", "t").unwrap();
-        let snapshot = meta.snapshot(
+        let snapshot = meta.snapshot_or_panic(
             &[DatabaseEngine::<SimFs>::schema_key(1, "db", "t")],
             &["/db/1/db/shards/t/".into(), "/db/1/db/idx/t/".into()],
         );
         run(&format!("UPDATE t SET v=20 WHERE id={a}; INSERT INTO t VALUES ({b},30); COMPACT TABLE t; DROP INDEX by_v ON t;"));
-        let revision = meta.revision();
+        let revision = meta.revision_or_panic();
         for predicates in [
             vec![],
             vec![(
@@ -2675,7 +2687,7 @@ mod tests {
                 expected
             );
         }
-        assert_eq!(meta.revision(), revision);
+        assert_eq!(meta.revision_or_panic(), revision);
         assert_eq!(
             run(&format!("SELECT v FROM t WHERE id={a};")).rows,
             vec![vec![SqlValue::Int(20)]]
@@ -2752,10 +2764,10 @@ mod tests {
             );
             // Stable collection succeeds, even if the preceding write was to
             // unrelated metadata. No retries/hidden write side effects here.
-            let revision = meta.revision();
+            let revision = meta.revision_or_panic();
             let rows = run(&first, "SELECT id FROM t WHERE v>=10;").rows;
             assert_eq!(rows.len(), usize::from(change == "phantom"));
-            assert_eq!(meta.revision(), revision);
+            assert_eq!(meta.revision_or_panic(), revision);
             if change == "schema" {
                 // Predicates/column positions resolved with stale schema are
                 // rejected if schema changed before snapshot capture.
@@ -2892,7 +2904,7 @@ mod tests {
                 );
                 assert!(first.load_schema(1, "db", "t").unwrap().indexes.is_empty());
                 let prefix = DatabaseEngine::<SimFs>::index_prefix_all(1, "db", "t", "by_v");
-                assert!(meta.scan_prefix(&prefix).is_empty());
+                assert!(meta.scan_prefix_or_panic(&prefix).is_empty());
                 let rows = run(&second, "SELECT * FROM t ORDER BY id;").rows;
                 drop(first);
                 drop(second);
@@ -2910,7 +2922,7 @@ mod tests {
                     .unwrap()
                     .indexes
                     .is_empty());
-                assert!(meta.scan_prefix(&prefix).is_empty());
+                assert!(meta.scan_prefix_or_panic(&prefix).is_empty());
                 assert_eq!(run(&recovered, "SELECT * FROM t ORDER BY id;").rows, rows);
                 let result = run(&recovered, "CREATE INDEX by_v ON t (v);");
                 assert_eq!(result.rows_affected, rows.len() as u64);
@@ -2928,7 +2940,7 @@ mod tests {
                     })
                     .collect::<BTreeMap<_, _>>();
                 let actual = meta
-                    .scan_prefix(&prefix)
+                    .scan_prefix_or_panic(&prefix)
                     .into_iter()
                     .map(|(key, value)| (key, value.value))
                     .collect::<BTreeMap<_, _>>();
@@ -2961,7 +2973,7 @@ mod tests {
                     1
                 );
                 assert_eq!(
-                    meta.scan_prefix(&prefix)
+                    meta.scan_prefix_or_panic(&prefix)
                         .into_iter()
                         .map(|(key, value)| (key, value.value))
                         .collect::<BTreeMap<_, _>>(),
@@ -3037,7 +3049,7 @@ mod tests {
                 );
                 let prefix = DatabaseEngine::<SimFs>::index_prefix_all(1, "db", "t", "by_v");
                 assert_eq!(
-                    meta.scan_prefix(&prefix).len(),
+                    meta.scan_prefix_or_panic(&prefix).len(),
                     if committed && !empty { 2 } else { 0 }
                 );
                 // Retry is allowed only after inspecting recovered schema. An
@@ -3057,7 +3069,10 @@ mod tests {
                         .rows,
                     vec![vec![SqlValue::Int(3)]]
                 );
-                assert_eq!(meta.scan_prefix(&prefix).len(), if empty { 1 } else { 3 });
+                assert_eq!(
+                    meta.scan_prefix_or_panic(&prefix).len(),
+                    if empty { 1 } else { 3 }
+                );
             }
         }
     }
@@ -3084,9 +3099,13 @@ mod tests {
         key: &str,
     ) -> (TabletManifest, Vec<Vec<SqlValue>>) {
         use crate::tablet::{RowEntry, WalBatch};
-        let manifest: TabletManifest =
-            serde_json::from_slice(&meta.get(key).expect("recovered manifest is present").value)
-                .expect("recovered manifest is parseable");
+        let manifest: TabletManifest = serde_json::from_slice(
+            &meta
+                .get_or_panic(key)
+                .expect("recovered manifest is present")
+                .value,
+        )
+        .expect("recovered manifest is parseable");
         assert!(
             manifest.sst_blobs.is_empty(),
             "fixture keeps every row in WAL fragments"
@@ -3146,7 +3165,7 @@ mod tests {
             "CREATE TABLE t (id INT PRIMARY KEY, v INT); INSERT INTO t VALUES (1,10);",
         );
         let key = DatabaseEngine::<SimFs>::shard_meta_key(1, "db", "t", 0);
-        let before = meta.get(&key).unwrap();
+        let before = meta.get_or_panic(&key).unwrap();
         let pk = SqlValue::Int(1).encode_order_preserving_key().unwrap();
 
         let result = engine.commit_tx_buffer_at_boundaries(
@@ -3181,13 +3200,13 @@ mod tests {
         );
         drop(cached);
         // The metadata state machine was not updated either: no torn manifest.
-        assert_eq!(meta.get(&key).unwrap().value, before.value);
+        assert_eq!(meta.get_or_panic(&key).unwrap().value, before.value);
 
         drop(engine);
         drop(meta);
         let (meta, engine) = reopen_after_power_cut(&fs);
         assert_eq!(
-            meta.get(&key).unwrap().value,
+            meta.get_or_panic(&key).unwrap().value,
             before.value,
             "recovery must observe the pre-batch manifest"
         );
@@ -3214,7 +3233,7 @@ mod tests {
             "CREATE TABLE t (id INT PRIMARY KEY, v INT); INSERT INTO t VALUES (1,10);",
         );
         let key = DatabaseEngine::<SimFs>::shard_meta_key(1, "db", "t", 0);
-        let before = meta.get(&key).unwrap();
+        let before = meta.get_or_panic(&key).unwrap();
         let before_manifest: TabletManifest = serde_json::from_slice(&before.value).unwrap();
 
         let result = engine.commit_tx_buffer_at_boundaries(
@@ -3284,7 +3303,7 @@ mod tests {
             "CREATE TABLE t (id INT PRIMARY KEY, v INT); INSERT INTO t VALUES (1,10),(2,20);",
         );
         let key = DatabaseEngine::<SimFs>::shard_meta_key(1, "db", "t", 0);
-        let before = meta.get(&key).unwrap();
+        let before = meta.get_or_panic(&key).unwrap();
         let before_manifest: TabletManifest = serde_json::from_slice(&before.value).unwrap();
 
         // Both rows live in the single shard, so one publication covers both.
@@ -3315,7 +3334,7 @@ mod tests {
         );
         // The failed append truncates the torn tail, so even this process still
         // observes the old manifest.
-        assert_eq!(meta.get(&key).unwrap().value, before.value);
+        assert_eq!(meta.get_or_panic(&key).unwrap().value, before.value);
 
         drop(engine);
         drop(meta);
@@ -3342,7 +3361,7 @@ mod tests {
             "observed outcome: old manifest; the torn frame was discarded"
         );
         assert_eq!(recovered.last_seq, before_manifest.last_seq);
-        assert_eq!(meta.get(&key).unwrap().value, before.value);
+        assert_eq!(meta.get_or_panic(&key).unwrap().value, before.value);
         assert_eq!(run(&engine, "SELECT * FROM t ORDER BY id;").rows, old);
     }
 
@@ -3405,7 +3424,7 @@ mod tests {
             vec![vec![SqlValue::Int(1), SqlValue::Int(11)]]
         );
         let committed: TabletManifest =
-            serde_json::from_slice(&meta.get(&key).unwrap().value).unwrap();
+            serde_json::from_slice(&meta.get_or_panic(&key).unwrap().value).unwrap();
 
         // Retrying the original transaction with its stale base row is refused
         // by the write-conflict check, so it cannot apply the update twice.
@@ -3423,7 +3442,7 @@ mod tests {
             "the row must appear exactly once at its committed value"
         );
         let after_retry: TabletManifest =
-            serde_json::from_slice(&meta.get(&key).unwrap().value).unwrap();
+            serde_json::from_slice(&meta.get_or_panic(&key).unwrap().value).unwrap();
         assert_eq!(after_retry.last_seq, committed.last_seq);
         assert_eq!(after_retry.wal_blobs.len(), committed.wal_blobs.len());
     }
@@ -3452,7 +3471,7 @@ mod tests {
             } else {
                 DatabaseEngine::<SimFs>::schema_key(1, "db", "t")
             };
-            let old = meta.get(&key).unwrap();
+            let old = meta.get_or_panic(&key).unwrap();
             let result = engine.create_index_at_boundaries(
                 1,
                 "db",
@@ -3471,8 +3490,11 @@ mod tests {
                         })
                         .unwrap();
                     }
-                    assert_eq!(meta.get(&key).unwrap().version, old.version);
-                    assert_ne!(meta.get(&key).unwrap().mod_revision, old.mod_revision);
+                    assert_eq!(meta.get_or_panic(&key).unwrap().version, old.version);
+                    assert_ne!(
+                        meta.get_or_panic(&key).unwrap().mod_revision,
+                        old.mod_revision
+                    );
                 },
             );
             assert!(
@@ -3481,11 +3503,11 @@ mod tests {
             );
             assert!(engine.load_schema(1, "db", "t").unwrap().indexes.is_empty());
             let prefix = DatabaseEngine::<SimFs>::index_prefix_all(1, "db", "t", "by_v");
-            assert!(meta.scan_prefix(&prefix).is_empty());
+            assert!(meta.scan_prefix_or_panic(&prefix).is_empty());
             engine
                 .execute_sql(1, "db", "wal", "data", 1, "CREATE INDEX by_v ON t (v);")
                 .unwrap();
-            assert_eq!(meta.scan_prefix(&prefix).len(), 1);
+            assert_eq!(meta.scan_prefix_or_panic(&prefix).len(), 1);
         }
     }
 
@@ -3536,7 +3558,7 @@ mod tests {
         );
         assert!(run(&second, "SELECT id FROM t WHERE v=10;").rows.is_empty());
         let prefix = DatabaseEngine::<SimFs>::index_prefix_all(1, "db", "t", "by_v");
-        assert_eq!(meta.scan_prefix(&prefix).len(), 1);
+        assert_eq!(meta.scan_prefix_or_panic(&prefix).len(), 1);
     }
 
     #[test]
@@ -3586,7 +3608,7 @@ mod tests {
         );
         assert!(run(&first, "SELECT id FROM t WHERE v=10;").rows.is_empty());
         let prefix = DatabaseEngine::<SimFs>::index_prefix_all(1, "db", "t", "by_v");
-        assert_eq!(meta.scan_prefix(&prefix).len(), 1);
+        assert_eq!(meta.scan_prefix_or_panic(&prefix).len(), 1);
     }
 
     #[test]
@@ -3699,7 +3721,7 @@ mod tests {
                 let schema = second.load_schema(1, "db", "t").unwrap();
                 let prefix = DatabaseEngine::<SimFs>::index_prefix_all(1, "db", "t", "by_v");
                 let actual = meta
-                    .scan_prefix(&prefix)
+                    .scan_prefix_or_panic(&prefix)
                     .into_iter()
                     .map(|(key, _)| key)
                     .collect::<BTreeSet<_>>();
@@ -3745,7 +3767,7 @@ mod tests {
                 );
                 assert_eq!(
                     recovered_meta
-                        .scan_prefix(&prefix)
+                        .scan_prefix_or_panic(&prefix)
                         .into_iter()
                         .map(|(key, _)| key)
                         .collect::<BTreeSet<_>>(),
@@ -3779,7 +3801,7 @@ mod tests {
                 .unwrap();
             run(&format!("CREATE TABLE t (id INT PRIMARY KEY, v INT); INSERT INTO t VALUES ({a},10),({b},100); CREATE INDEX by_v ON t (v);"));
             let key = DatabaseEngine::<SimFs>::shard_meta_key(1, "db", "t", shard_a);
-            let before = meta.get(&key).unwrap();
+            let before = meta.get_or_panic(&key).unwrap();
             let mut tx = TxBuffer::default();
             let row_a = Some(vec![SqlValue::Int(a), SqlValue::Int(10)]);
             tx.record_mutation("t", pk(a), row_a.clone(), row_a);
@@ -3804,25 +3826,27 @@ mod tests {
             );
             assert!(run("SELECT id FROM t WHERE v=100;").rows.is_empty());
             if shards > 1 {
-                let after = meta.get(&key).unwrap();
+                let after = meta.get_or_panic(&key).unwrap();
                 assert_eq!(after.mod_revision, before.mod_revision);
                 assert_eq!(after.value, before.value);
             }
             // A successful no-op-only commit checks guards but allocates no WAL
             // and must not replace the cached tablet's manifest revision.
-            let before_noop = meta.get(&key).unwrap();
-            let allocation = meta.get("/sql-blob-sequence/1").unwrap();
+            let before_noop = meta.get_or_panic(&key).unwrap();
+            let allocation = meta.get_or_panic("/sql-blob-sequence/1").unwrap();
             let row_a = Some(vec![SqlValue::Int(a), SqlValue::Int(10)]);
             let mut noop = TxBuffer::default();
             noop.record_mutation("t", pk(a), row_a.clone(), row_a);
             engine.commit_tx_buffer(1, "db", noop).unwrap();
             assert_eq!(
-                meta.get(&key).unwrap().mod_revision,
+                meta.get_or_panic(&key).unwrap().mod_revision,
                 before_noop.mod_revision
             );
-            assert_eq!(meta.get(&key).unwrap().value, before_noop.value);
+            assert_eq!(meta.get_or_panic(&key).unwrap().value, before_noop.value);
             assert_eq!(
-                meta.get("/sql-blob-sequence/1").unwrap().mod_revision,
+                meta.get_or_panic("/sql-blob-sequence/1")
+                    .unwrap()
+                    .mod_revision,
                 allocation.mod_revision
             );
         }
@@ -3897,7 +3921,7 @@ mod tests {
         )
         .unwrap();
         let key = DatabaseEngine::<SimFs>::shard_meta_key(1, "db", "t", 0);
-        let old = meta.get(&key).unwrap();
+        let old = meta.get_or_panic(&key).unwrap();
         let mut replacement: TabletManifest = serde_json::from_slice(&old.value).unwrap();
         replacement.wal_blobs.clear();
         replacement.sst_blobs.clear();
@@ -3910,8 +3934,11 @@ mod tests {
             })
             .unwrap();
         }
-        assert_eq!(meta.get(&key).unwrap().version, old.version);
-        assert_ne!(meta.get(&key).unwrap().mod_revision, old.mod_revision);
+        assert_eq!(meta.get_or_panic(&key).unwrap().version, old.version);
+        assert_ne!(
+            meta.get_or_panic(&key).unwrap().mod_revision,
+            old.mod_revision
+        );
         let schema = db.load_schema(1, "db", "t").unwrap();
         let pk = SqlValue::Int(1).encode_order_preserving_key().unwrap();
         assert!(db
@@ -4425,7 +4452,7 @@ mod tests {
             )
             .unwrap();
 
-        let captured = meta.snapshot(&[], &["/db/1/main/".to_string()]);
+        let captured = meta.snapshot_or_panic(&[], &["/db/1/main/".to_string()]);
 
         // Advance the local applied state and the engine's shard cache.
         engine
@@ -4466,7 +4493,7 @@ mod tests {
     #[test]
     fn snapshot_read_of_an_empty_namespace_is_empty_not_an_error() {
         let (_fs, meta, engine) = consistent_engine();
-        let empty = meta.snapshot(&[], &["/db/1/main/".to_string()]);
+        let empty = meta.snapshot_or_panic(&[], &["/db/1/main/".to_string()]);
 
         let shown = engine
             .execute_read_from_snapshot(1, "main", &empty, SqlStmt::ShowTables)

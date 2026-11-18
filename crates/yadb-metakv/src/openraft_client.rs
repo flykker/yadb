@@ -472,18 +472,21 @@ impl GroupRouter {
             .expect("invalid watch scope")
             .watch_prefix(prefix)
     }
-    pub(crate) fn revision(&self) -> u64 {
-        assert!(
-            self.singleton,
-            "multi-group metadata has no global revision"
-        );
-        self.groups[&self.control]
+    pub(crate) fn try_revision(&self) -> Result<u64, MetaError> {
+        if !self.singleton {
+            return Err(MetaError::Routing(
+                "multi-group metadata has no global revision".into(),
+            ));
+        }
+        Ok(self.groups[&self.control]
             .state
-            .try_snapshot(&[], &[])
-            .expect("state unavailable")
-            .revision()
+            .try_snapshot(&[], &[])?
+            .revision())
     }
-    pub(crate) fn scan(&self, prefix: &str) -> Vec<(String, crate::KvValue)> {
+    pub(crate) fn try_scan(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<(String, crate::KvValue)>, MetaError> {
         if !self.singleton
             && [
                 "/db/",
@@ -498,12 +501,12 @@ impl GroupRouter {
                 // same fan-out as the data namespaces. Without this entry
                 // `scan("/idempotency/")` falls through to `try_snapshot`, whose
                 // single-group routing rejects a bare project prefix, and the
-                // `expect` below turns that into a panic.
+                // `?` below would turn that into an error rather than a fan-out.
                 "/idempotency/",
                 // A bare group prefix spans every data group for the same reason.
                 // Without this entry `scan("/idempotency/g")` reaches
                 // `try_snapshot`, whose separator rule rejects the bare prefix,
-                // and the `expect` below panics.
+                // and the read fails instead of covering every group.
                 GROUP_IDEMPOTENCY_NAMESPACE,
             ]
             .contains(&prefix)
@@ -528,16 +531,15 @@ impl GroupRouter {
                 values.extend(
                     self.groups[&id]
                         .state
-                        .try_snapshot(&[], &[prefix.to_owned()])
-                        .expect("state unavailable")
+                        .try_snapshot(&[], &[prefix.to_owned()])?
                         .scan_prefix(prefix),
                 );
             }
-            return values.into_iter().collect();
+            return Ok(values.into_iter().collect());
         }
-        self.try_snapshot(&[], &[prefix.to_owned()])
-            .expect("invalid or unavailable scan")
-            .scan_prefix(prefix)
+        Ok(self
+            .try_snapshot(&[], &[prefix.to_owned()])?
+            .scan_prefix(prefix))
     }
 }
 
@@ -692,7 +694,7 @@ mod tests {
         })
         .join()
         .unwrap();
-        assert!(meta.get("must-not-submit").is_none());
+        assert!(meta.get_or_panic("must-not-submit").is_none());
         let worker = meta.clone();
         tokio::task::spawn_blocking(move || {
             let watch = worker.watch_prefix("k");
@@ -707,7 +709,7 @@ mod tests {
                 KvResult::CasOk { .. }
             ));
             assert!(watch.recv_timeout(Duration::from_secs(2)).is_ok());
-            let old = worker.get("k").unwrap();
+            let old = worker.get_or_panic("k").unwrap();
             worker
                 .execute(KvCommand::Delete { key: "k".into() })
                 .unwrap();
@@ -744,9 +746,9 @@ mod tests {
                     ],
                 })
                 .unwrap();
-            let snapshot = worker.snapshot(&["k".into()], &["p/".into()]);
+            let snapshot = worker.snapshot_or_panic(&["k".into()], &["p/".into()]);
             assert_eq!(snapshot.scan_prefix("p/").len(), 2);
-            assert_eq!(snapshot.revision(), worker.revision());
+            assert_eq!(snapshot.revision(), worker.revision_or_panic());
         })
         .await
         .unwrap();
@@ -764,7 +766,96 @@ mod tests {
             BTreeMap::new(),
             tokio::runtime::Handle::current(),
         );
-        assert_eq!(meta.get("k").unwrap().value, b"two");
+        assert_eq!(meta.get_or_panic("k").unwrap().value, b"two");
+        drop(meta);
+        raft.shutdown().await.unwrap();
+        drop(raft);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A snapshot the local state machine cannot serve is an error, not a panic
+    /// and not "the key is absent".
+    ///
+    /// This is the inversion for `try_get`. Implemented as the old panicking
+    /// read, it aborts this test task. Implemented as `try_snapshot(..).ok()`,
+    /// it reports `Ok(None)` both for a key that is present and for one that is
+    /// absent, so both assertions below fail: "could not read" would become
+    /// "not found" and the caller would answer 404 for a key it never saw.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unreadable_state_machine_errors_instead_of_reporting_absence() {
+        let dir = std::env::temp_dir().join(format!(
+            "yadb-unreadable-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let id = ReplicaIdentity::new(
+            GroupIdentity {
+                cluster: [45; 16],
+                group: 1,
+                incarnation: 1,
+            },
+            1,
+            vec![1],
+        )
+        .unwrap();
+        let log = DurableOpenRaftLog::create(dir.join("log"), &id).unwrap();
+        let state = DurableMetaStateMachine::create(dir.join("state"), &id).unwrap();
+        let config = Arc::new(openraft::Config::default().validate().unwrap());
+        let raft = YadbRaft::new(1, config, NoNetwork, log, state.clone())
+            .await
+            .unwrap();
+        raft.initialize(BTreeMap::from([(1, BasicNode::new("one"))]))
+            .await
+            .unwrap();
+        raft.wait(Some(Duration::from_secs(5)))
+            .current_leader(1, "leader")
+            .await
+            .unwrap();
+        let meta: LocalMetaKv<SimFs> = LocalMetaKv::from_openraft(
+            raft.clone(),
+            state.clone(),
+            BTreeMap::new(),
+            tokio::runtime::Handle::current(),
+        );
+        meta.execute(KvCommand::Put {
+            key: "present".into(),
+            value: b"value".to_vec(),
+        })
+        .unwrap();
+        // Before the fault, presence and absence are distinguishable.
+        assert_eq!(
+            meta.try_get("present").unwrap().unwrap().value,
+            b"value".to_vec()
+        );
+        assert!(meta.try_get("absent").unwrap().is_none());
+
+        // The state a failed durable apply leaves behind: every read of the
+        // applied snapshot is refused until this node is recovered.
+        state.poison_for_test();
+
+        for key in ["present", "absent"] {
+            assert!(
+                matches!(meta.try_get(key), Err(MetaError::StorageUnavailable)),
+                "try_get({key}) must report the unreadable snapshot, not a value or absence"
+            );
+        }
+        assert!(matches!(
+            meta.try_scan_prefix(""),
+            Err(MetaError::StorageUnavailable)
+        ));
+        assert!(matches!(
+            meta.try_revision(),
+            Err(MetaError::StorageUnavailable)
+        ));
+        assert!(matches!(
+            meta.try_snapshot(&["present".into()], &[]),
+            Err(MetaError::StorageUnavailable)
+        ));
+
         drop(meta);
         raft.shutdown().await.unwrap();
         drop(raft);
@@ -866,7 +957,7 @@ mod tests {
         assert!(meta.try_snapshot(&[], &["/sys/".into()]).is_ok());
         assert_eq!(meta.revision_for_key("/db/1/a").unwrap(), rev1);
         assert_eq!(meta.revision_for_key("/db/2/a").unwrap(), rev2);
-        assert_eq!(meta.scan_prefix("/db/").len(), 2);
+        assert_eq!(meta.scan_prefix_or_panic("/db/").len(), 2);
         assert!(matches!(
             meta.execute(KvCommand::Delete {
                 key: "/db/3/a".into()
@@ -908,8 +999,8 @@ mod tests {
             tokio::runtime::Handle::current(),
         )
         .unwrap();
-        assert_eq!(meta.get("/db/1/a").unwrap().value, b"/db/1/a");
-        assert_eq!(meta.get("/db/2/a").unwrap().value, b"/db/2/a");
+        assert_eq!(meta.get_or_panic("/db/1/a").unwrap().value, b"/db/1/a");
+        assert_eq!(meta.get_or_panic("/db/2/a").unwrap().value, b"/db/2/a");
         drop(meta);
         for raft in &rafts {
             raft.shutdown().await.unwrap();

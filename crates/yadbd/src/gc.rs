@@ -196,7 +196,14 @@ fn sweep_legacy(
                 lease.expires_at_ms
             ))
         }
-        None => meta.get(gc::COLLECTOR_KEY).map_or(0, |kv| kv.mod_revision),
+        None => match meta.try_get(gc::COLLECTOR_KEY) {
+            Ok(current) => current.map_or(0, |kv| kv.mod_revision),
+            Err(error) => {
+                return SweepOutcome::refuse(format!(
+                    "garbage collection refused: collector lease record cannot be read: {error}"
+                ))
+            }
+        },
     };
     let mut collector = match gc::acquire_collector(meta, collector_revision, COLLECTOR_LEASE_MS) {
         Ok(guard) => guard,
@@ -226,7 +233,14 @@ fn sweep_legacy(
             "garbage collection refused: {error}; no fragment was deleted"
         ));
     }
-    let swept_up_to = meta.revision();
+    let swept_up_to = match meta.try_revision() {
+        Ok(revision) => revision,
+        Err(error) => {
+            return SweepOutcome::refuse(format!(
+                "garbage collection refused: applied revision cannot be read: {error}; no fragment was deleted"
+            ))
+        }
+    };
     if let Err(error) = gc::publish_watermark(meta, swept_up_to) {
         let _ = collector.release();
         return SweepOutcome::refuse(format!(
@@ -1266,7 +1280,8 @@ mod tests {
                 .unwrap();
         }
         let before = f.disk_bytes();
-        let lease = yadb_metakv::gc::acquire_reader(&f.meta, 1, f.meta.revision(), 30_000).unwrap();
+        let lease = yadb_metakv::gc::acquire_reader(&f.meta, 1, f.meta.revision_or_panic(), 30_000)
+            .unwrap();
         let outcome = f.sweep();
         let reason = outcome.refusal.clone().expect("a live lease must refuse");
         assert!(reason.contains("live lease"), "{reason}");
@@ -1334,7 +1349,7 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(yadb_metakv::gc::watermark(&f.meta).unwrap(), 0);
-        let before_sweep = f.meta.revision();
+        let before_sweep = f.meta.revision_or_panic();
         let outcome = f.sweep();
         assert!(outcome.refusal.is_none(), "{outcome:?}");
         let mark = yadb_metakv::gc::watermark(&f.meta).unwrap();
@@ -2300,7 +2315,7 @@ mod tests {
                     "{failed:?}"
                 );
 
-                let intents = f.meta.scan_prefix("/s3-intent/1/");
+                let intents = f.meta.scan_prefix_or_panic("/s3-intent/1/");
                 assert_eq!(intents.len(), 1, "{intents:?}");
                 let (intent_key, intent_value) = &intents[0];
                 let chunks: BTreeSet<BlobId> = yadb_s3::intent_chunk_ids(&intent_value.value)

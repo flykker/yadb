@@ -134,7 +134,7 @@ impl<FS: StorageFs> BlockVolumeEngine<FS> {
         volume: &str,
     ) -> Result<(u64, VolumeExtentMap), BlockError> {
         let key = Self::meta_key(project_id, volume);
-        match self.meta.get(&key) {
+        match self.meta.try_get(&key)? {
             Some(kv) => Ok((kv.mod_revision, serde_json::from_slice(&kv.value)?)),
             None => Ok((
                 0,
@@ -379,7 +379,7 @@ impl<FS: StorageFs> BlockVolumeEngine<FS> {
     fn reserve_allocation(&self, pid: u32) -> Result<u64, BlockError> {
         let key = format!("/block-write-sequence/{pid}");
         for _ in 0..32 {
-            let cur = self.meta.get(&key);
+            let cur = self.meta.try_get(&key)?;
             let revision = cur.as_ref().map_or(0, |v| v.mod_revision);
             let prev = match cur {
                 Some(v) => serde_json::from_slice::<u64>(&v.value)?,
@@ -756,7 +756,7 @@ mod tests {
             value: serde_json::to_vec(&old).unwrap(),
         })
         .unwrap();
-        let observed = meta.get(&key).unwrap();
+        let observed = meta.get_or_panic(&key).unwrap();
         assert_eq!(observed.version, observed.mod_revision);
         meta.execute(KvCommand::Delete { key: key.clone() })
             .unwrap();
@@ -767,7 +767,7 @@ mod tests {
             value: serde_json::to_vec(&replacement).unwrap(),
         })
         .unwrap();
-        assert_eq!(meta.get(&key).unwrap().version, observed.version);
+        assert_eq!(meta.get_or_panic(&key).unwrap().version, observed.version);
         // Both stale RMW and stale UNMAP must fail, even if the per-key version repeats.
         assert!(!engine
             .publish_map(key.clone(), observed.mod_revision, &old)
@@ -821,7 +821,7 @@ mod tests {
             b"last"
         );
         assert_eq!(
-            serde_json::from_slice::<u64>(&meta.get(&key).unwrap().value).unwrap(),
+            serde_json::from_slice::<u64>(&meta.get_or_panic(&key).unwrap().value).unwrap(),
             MAX_ALLOCATION
         );
         assert!(matches!(
@@ -900,11 +900,13 @@ mod tests {
             .write_at(1, "disk", "data", 8192, 0, b"failed")
             .is_err());
         assert!(meta
-            .get(&BlockVolumeEngine::<SimFs>::meta_key(1, "disk"))
+            .get_or_panic(&BlockVolumeEngine::<SimFs>::meta_key(1, "disk"))
             .is_none());
         assert_eq!(
-            serde_json::from_slice::<u64>(&meta.get("/block-write-sequence/1").unwrap().value)
-                .unwrap(),
+            serde_json::from_slice::<u64>(
+                &meta.get_or_panic("/block-write-sequence/1").unwrap().value
+            )
+            .unwrap(),
             1
         );
         data_fs.set_faults(FaultConfig::default());
@@ -1211,8 +1213,8 @@ mod tests {
             })
             .unwrap();
 
-        let after = meta.get(&map_key).unwrap();
-        let stored = meta.get(&record).unwrap();
+        let after = meta.get_or_panic(&map_key).unwrap();
+        let stored = meta.get_or_panic(&record).unwrap();
         assert_eq!(stored.value, b"done");
         assert_eq!(
             after.mod_revision, stored.mod_revision,
@@ -1242,7 +1244,7 @@ mod tests {
             .write_at(1, "disk", "data", 16384, 0, &vec![4u8; 12288])
             .unwrap();
         let map_key = BlockVolumeEngine::<SimFs>::meta_key(1, "disk");
-        let before = meta.get(&map_key).unwrap();
+        let before = meta.get_or_panic(&map_key).unwrap();
         let record = "/block-unmap/1/disk/never".to_string();
         let result = engine.unmap_at_with(1, "disk", 16384, 0, 8192, |_| {
             Ok(MapPublication {
@@ -1261,10 +1263,10 @@ mod tests {
             "a never-satisfiable caller guard must end in a definite non-commit, got {result:?}"
         );
         assert!(
-            meta.get(&record).is_none(),
+            meta.get_or_panic(&record).is_none(),
             "caller record leaked although the transaction never committed"
         );
-        let after = meta.get(&map_key).unwrap();
+        let after = meta.get_or_panic(&map_key).unwrap();
         assert_eq!(
             after.mod_revision, before.mod_revision,
             "map advanced although the caller's guard failed"
@@ -1331,7 +1333,7 @@ mod tests {
             attempts, 2,
             "a caller-guard conflict must be retried with a fresh prepare call"
         );
-        assert_eq!(meta.get(&record).unwrap().value, b"second");
+        assert_eq!(meta.get_or_panic(&record).unwrap().value, b"second");
         let map = engine.load_map(1, "disk").unwrap();
         assert_eq!(map.blocks.keys().copied().collect::<Vec<_>>(), vec![1, 2]);
     }
@@ -1349,7 +1351,7 @@ mod tests {
             .write_at(1, "disk", "data", 16384, 0, &vec![6u8; 12288])
             .unwrap();
         let map_key = BlockVolumeEngine::<SimFs>::meta_key(1, "disk");
-        let before = meta.get(&map_key).unwrap();
+        let before = meta.get_or_panic(&map_key).unwrap();
         let mut attempts = 0u32;
         let result = engine.unmap_at_with(1, "disk", 16384, 0, 8192, |_| {
             attempts += 1;
@@ -1363,7 +1365,7 @@ mod tests {
             attempts, 1,
             "a refusal is a definite non-commit, not a conflict to retry"
         );
-        let after = meta.get(&map_key).unwrap();
+        let after = meta.get_or_panic(&map_key).unwrap();
         assert_eq!(
             after.mod_revision, before.mod_revision,
             "map advanced although the caller refused"
@@ -1403,10 +1405,10 @@ mod tests {
         assert_eq!(legacy.to_string(), entry.to_string());
         assert_eq!(prepared, 0, "prepare ran for a request that cannot publish");
         assert!(
-            meta.get(&key).is_none(),
+            meta.get_or_panic(&key).is_none(),
             "a rejected request must not build or commit a transaction"
         );
-        assert!(meta.get("/block-write-sequence/1").is_none());
+        assert!(meta.get_or_panic("/block-write-sequence/1").is_none());
     }
 
     // The write analogue of `satisfied_caller_guard_commits_map_and_record_in_one_transaction`:
@@ -1442,8 +1444,8 @@ mod tests {
             })
             .unwrap();
         assert_eq!(written, 5);
-        let after = meta.get(&map_key).unwrap();
-        let stored = meta.get(&record).unwrap();
+        let after = meta.get_or_panic(&map_key).unwrap();
+        let stored = meta.get_or_panic(&record).unwrap();
         assert_eq!(stored.value, b"done");
         assert_eq!(
             after.mod_revision, stored.mod_revision,
@@ -1473,7 +1475,7 @@ mod tests {
             .write_at(1, "disk", "data", 16384, 0, &vec![8u8; 4096])
             .unwrap();
         let map_key = BlockVolumeEngine::<SimFs>::meta_key(1, "disk");
-        let before = meta.get(&map_key).unwrap();
+        let before = meta.get_or_panic(&map_key).unwrap();
         let record = "/block-write/1/disk/never".to_string();
         let result = engine.write_at_with(1, "disk", "data", 16384, 4096, b"refused", |_| {
             Ok(MapPublication {
@@ -1492,10 +1494,10 @@ mod tests {
             "a never-satisfiable caller guard must end in a definite non-commit, got {result:?}"
         );
         assert!(
-            meta.get(&record).is_none(),
+            meta.get_or_panic(&record).is_none(),
             "caller record leaked although the transaction never committed"
         );
-        let after = meta.get(&map_key).unwrap();
+        let after = meta.get_or_panic(&map_key).unwrap();
         assert_eq!(
             after.mod_revision, before.mod_revision,
             "map advanced although the caller's guard failed"
@@ -1528,7 +1530,7 @@ mod tests {
         );
         assert_eq!(attempts, 1, "a refusal must not be retried");
         assert!(
-            meta.get(&map_key).is_none(),
+            meta.get_or_panic(&map_key).is_none(),
             "map published although the caller refused"
         );
     }
@@ -1549,7 +1551,7 @@ mod tests {
             0
         );
         assert!(
-            meta.get(&map_key).is_none(),
+            meta.get_or_panic(&map_key).is_none(),
             "legacy empty write must not touch metadata"
         );
         assert_eq!(
@@ -1569,10 +1571,10 @@ mod tests {
                 .unwrap(),
             0
         );
-        assert_eq!(meta.get(&record).unwrap().value, b"done");
+        assert_eq!(meta.get_or_panic(&record).unwrap().value, b"done");
         assert_eq!(
-            meta.get(&map_key).unwrap().mod_revision,
-            meta.get(&record).unwrap().mod_revision
+            meta.get_or_panic(&map_key).unwrap().mod_revision,
+            meta.get_or_panic(&record).unwrap().mod_revision
         );
     }
 
@@ -1589,14 +1591,14 @@ mod tests {
             .write_at(1, "disk", "data", 8192, 0, b"before")
             .unwrap();
         let map_before = meta
-            .get(&BlockVolumeEngine::<SimFs>::meta_key(1, "disk"))
+            .get_or_panic(&BlockVolumeEngine::<SimFs>::meta_key(1, "disk"))
             .unwrap();
 
         // Simulate the collector reaping an expired writer lease between the
         // fragment append and the publication: every writer record disappears.
         let mut reaped = 0;
         let result = engine.write_at_with(1, "disk", "data", 8192, 0, b"after", |_| {
-            for (key, _) in meta.scan_prefix(yadb_metakv::gc::LEASE_PREFIX) {
+            for (key, _) in meta.scan_prefix_or_panic(yadb_metakv::gc::LEASE_PREFIX) {
                 if key.contains("/writer/") {
                     meta.execute(KvCommand::Delete { key }).unwrap();
                     reaped += 1;
@@ -1615,7 +1617,7 @@ mod tests {
             "the refusal must name the lost fence: {error}"
         );
         let map_after = meta
-            .get(&BlockVolumeEngine::<SimFs>::meta_key(1, "disk"))
+            .get_or_panic(&BlockVolumeEngine::<SimFs>::meta_key(1, "disk"))
             .unwrap();
         assert_eq!(
             map_after.mod_revision, map_before.mod_revision,

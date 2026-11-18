@@ -283,10 +283,12 @@ impl<FS: StorageFs> LocalMetaKv<FS> {
     /// Explicit immutable project routing; groups must contain a separate
     /// control group and at least two distinct mapped data groups.
     /// The owner must persist and verify the mapping and bind each supplied
-    /// Raft handle to its matching state machine and group identity. Infallible
-    /// read methods panic on invalid scope or unavailable state; use
-    /// `try_snapshot` where errors must be handled. Namespace-wide scans merge
-    /// local views without an atomic cross-group revision.
+    /// Raft handle to its matching state machine and group identity. Read
+    /// methods named `*_or_panic` panic on invalid scope or unavailable state
+    /// and exist only for tests; production callers use `try_get`,
+    /// `try_scan_prefix`, `try_revision` and `try_snapshot`, which return the
+    /// error instead of a default. Namespace-wide scans merge local views
+    /// without an atomic cross-group revision.
     pub fn from_openraft_groups(
         control: u64,
         groups: BTreeMap<
@@ -376,7 +378,7 @@ impl<FS: StorageFs> LocalMetaKv<FS> {
             return router.revision_for_key(key);
         }
         let _ = key;
-        Ok(self.revision())
+        self.try_revision()
     }
 
     /// Return the locally observed role of the group owning this key; it is
@@ -458,20 +460,34 @@ impl<FS: StorageFs> LocalMetaKv<FS> {
         self.legacy().lock().unwrap().propose(cmd)
     }
 
-    pub fn get(&self, key: &str) -> Option<KvValue> {
+    /// Read one key. `Ok(None)` means the key is absent; `Err` means it could
+    /// not be read and says nothing about presence.
+    ///
+    /// This is the production read path. A group that cannot serve its local
+    /// applied snapshot — a reopened group before it has applied its log, or a
+    /// state machine that requires recovery — returns the error so a request
+    /// handler can answer "not ready" instead of aborting the task.
+    pub fn try_get(&self, key: &str) -> Result<Option<KvValue>, MetaError> {
         if let Some(client) = &self.openraft {
-            return client
-                .try_snapshot(&[key.to_owned()], &[])
-                .expect("invalid or unavailable metadata read")
-                .get(key);
+            return Ok(client.try_snapshot(&[key.to_owned()], &[])?.get(key));
         }
-        self.legacy().lock().unwrap().get(key)
+        Ok(self.legacy().lock().unwrap().get(key))
+    }
+
+    /// Panicking read for tests and fixtures. Production callers must use
+    /// [`Self::try_get`]: this cannot distinguish "absent" from "unavailable"
+    /// and aborts the calling task when the snapshot cannot be served.
+    pub fn get_or_panic(&self, key: &str) -> Option<KvValue> {
+        self.try_get(key)
+            .expect("invalid or unavailable metadata read")
     }
 
     /// Copies selected keys/ranges while holding the same lock as apply.
     /// Release it before reading blobs/network I/O; later writes cannot change
     /// the owned values. Unselected keys are not available in this snapshot.
-    pub fn snapshot(&self, keys: &[String], prefixes: &[String]) -> MetaSnapshot {
+    ///
+    /// Panicking form, for tests only. Use [`Self::try_snapshot`] in production.
+    pub fn snapshot_or_panic(&self, keys: &[String], prefixes: &[String]) -> MetaSnapshot {
         self.try_snapshot(keys, prefixes)
             .expect("invalid or unavailable metadata snapshot")
     }
@@ -557,27 +573,44 @@ impl<FS: StorageFs> LocalMetaKv<FS> {
         ))
     }
 
-    pub fn scan_prefix(&self, prefix: &str) -> Vec<(String, KvValue)> {
+    /// Scan a prefix in the local applied state. `Ok` with an empty vector means
+    /// no key matched; `Err` means the range could not be read.
+    pub fn try_scan_prefix(&self, prefix: &str) -> Result<Vec<(String, KvValue)>, MetaError> {
         if let Some(client) = &self.openraft {
-            return client.scan(prefix);
+            return client.try_scan(prefix);
         }
-        self.legacy().lock().unwrap().scan_prefix(prefix)
+        Ok(self.legacy().lock().unwrap().scan_prefix(prefix))
     }
 
-    pub fn revision(&self) -> u64 {
+    /// Panicking scan, for tests only. Use [`Self::try_scan_prefix`] in
+    /// production: an unreadable range is not an empty one.
+    pub fn scan_prefix_or_panic(&self, prefix: &str) -> Vec<(String, KvValue)> {
+        self.try_scan_prefix(prefix)
+            .expect("invalid or unavailable metadata scan")
+    }
+
+    /// Locally applied revision, or an error when it cannot be read.
+    pub fn try_revision(&self) -> Result<u64, MetaError> {
         if let Some(client) = &self.openraft {
-            return client.revision();
+            return client.try_revision();
         }
-        self.legacy().lock().unwrap().revision()
+        Ok(self.legacy().lock().unwrap().revision())
+    }
+
+    /// Panicking revision read, for tests only. Use [`Self::try_revision`] in
+    /// production.
+    pub fn revision_or_panic(&self) -> u64 {
+        self.try_revision()
+            .expect("invalid or unavailable metadata revision")
     }
 
     /// Revision to stamp a single-node GC lease with, or `0` on OpenRaft.
     ///
-    /// Multi-Raft metadata has no global revision (`revision()` asserts that),
-    /// and a group-scoped lease does not use the value for anything: the
-    /// collector refuses on any live lease instead of reasoning about revisions.
-    /// Callers that pass a revision to `gc::acquire_writer_if_legacy` must use
-    /// this: evaluating `revision()` eagerly as an argument panics before the
+    /// Multi-Raft metadata has no global revision (`try_revision` refuses), and
+    /// a group-scoped lease does not use the value for anything: the collector
+    /// refuses on any live lease instead of reasoning about revisions. Callers
+    /// that pass a revision to `gc::acquire_writer_if_legacy` must use this:
+    /// evaluating a fallible read eagerly as an argument refuses before the
     /// per-group path can run.
     pub fn legacy_revision(&self) -> u64 {
         if self.is_openraft() {
@@ -688,8 +721,8 @@ mod tests {
             meta.execute(put(1)),
             Err(MetaError::NotLeader { leader: None })
         ));
-        assert!(meta.get("/k/001").is_none());
-        assert_eq!(meta.get("/k/000").unwrap().value, vec![0]);
+        assert!(meta.get_or_panic("/k/001").is_none());
+        assert_eq!(meta.get_or_panic("/k/000").unwrap().value, vec![0]);
     }
 
     #[test]

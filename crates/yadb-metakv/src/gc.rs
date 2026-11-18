@@ -345,7 +345,7 @@ pub fn ensure_live<FS: StorageFs>(
     meta: &LocalMetaKv<FS>,
     lease: &GcLease,
 ) -> Result<(), MetaError> {
-    let current = meta.get(&lease_key(lease));
+    let current = meta.try_get(&lease_key(lease))?;
     let owned = current
         .as_ref()
         .is_some_and(|kv| kv.mod_revision == lease.mod_revision && lease.mod_revision != 0);
@@ -370,7 +370,7 @@ pub fn ensure_live<FS: StorageFs>(
 /// The revision at which a pass may already have deleted fragments. Absent means
 /// no pass has ever run, so every applied revision is safe.
 pub fn watermark<FS: StorageFs>(meta: &LocalMetaKv<FS>) -> Result<u64, MetaError> {
-    match meta.get(WATERMARK_KEY) {
+    match meta.try_get(WATERMARK_KEY)? {
         None => Ok(0),
         Some(kv) => serde_json::from_slice::<u64>(&kv.value)
             .map_err(|e| MetaError::Routing(format!("gc watermark is unreadable: {e}"))),
@@ -389,7 +389,7 @@ pub fn publish_watermark<FS: StorageFs>(
     meta: &LocalMetaKv<FS>,
     revision: u64,
 ) -> Result<u64, MetaError> {
-    let (current, mod_revision) = match meta.get(WATERMARK_KEY) {
+    let (current, mod_revision) = match meta.try_get(WATERMARK_KEY)? {
         None => (0, 0),
         Some(kv) => (
             serde_json::from_slice::<u64>(&kv.value)
@@ -429,7 +429,7 @@ pub fn publish_watermark<FS: StorageFs>(
 /// necessarily applied a revision at least as new as the watermark.
 pub fn reader_is_safe<FS: StorageFs>(meta: &LocalMetaKv<FS>) -> Result<(), MetaError> {
     let mark = watermark(meta)?;
-    let applied = meta.revision();
+    let applied = meta.try_revision()?;
     if applied < mark {
         return Err(MetaError::Routing(format!(
             "this node applied revision {applied} but garbage collection has swept up to {mark}; refusing to read a manifest whose fragments may have been reclaimed"
@@ -542,7 +542,7 @@ fn put_lease_in<FS: StorageFs>(
                             .into(),
                     ));
                 }
-                reap_expired(meta, &scope.lease_prefix(), now_ms());
+                reap_expired(meta, &scope.lease_prefix(), now_ms())?;
             }
             other => {
                 return Err(MetaError::Routing(format!(
@@ -599,7 +599,7 @@ pub fn release<FS: StorageFs>(meta: &LocalMetaKv<FS>, lease: &GcLease) -> Result
         ));
     }
     let key = lease_key(lease);
-    match meta.get(&key) {
+    match meta.try_get(&key)? {
         None => return Ok(()),
         Some(kv) if kv.mod_revision != lease.mod_revision => return Ok(()),
         Some(_) => {}
@@ -841,7 +841,7 @@ impl<'a, FS: StorageFs> CollectorGuard<'a, FS> {
     }
 
     fn guarded_release(&self) -> Result<(), MetaError> {
-        match self.meta.get(&self.key) {
+        match self.meta.try_get(&self.key)? {
             None => Ok(()),
             Some(kv) if kv.mod_revision != self.lease.mod_revision => Err(MetaError::Routing(
                 "the collector lease is no longer held by this pass; leaving the record in place"
@@ -898,9 +898,13 @@ fn read_lease(key: &str, value: &[u8]) -> GcLease {
 
 /// Removes expired lease records. Best effort: a record that cannot be removed
 /// stays live (it is still counted) and the next pass tries again.
-fn reap_expired<FS: StorageFs>(meta: &LocalMetaKv<FS>, prefix: &str, now: u64) -> usize {
+fn reap_expired<FS: StorageFs>(
+    meta: &LocalMetaKv<FS>,
+    prefix: &str,
+    now: u64,
+) -> Result<usize, MetaError> {
     let mut reaped = 0usize;
-    for (key, value) in meta.scan_prefix(prefix) {
+    for (key, value) in meta.try_scan_prefix(prefix)? {
         let lease = read_lease(&key, &value.value);
         if lease.is_live_at(now) {
             continue;
@@ -918,7 +922,7 @@ fn reap_expired<FS: StorageFs>(meta: &LocalMetaKv<FS>, prefix: &str, now: u64) -
             reaped += 1;
         }
     }
-    reaped
+    Ok(reaped)
 }
 
 fn live_leases_in_scope<FS: StorageFs>(
@@ -926,12 +930,12 @@ fn live_leases_in_scope<FS: StorageFs>(
     scope: LeaseScope,
 ) -> Result<Vec<GcLease>, MetaError> {
     let now = now_ms();
-    reap_expired(meta, &scope.lease_prefix(), now);
+    reap_expired(meta, &scope.lease_prefix(), now)?;
     let mut live = Vec::new();
     let reader_prefix = scope.reader_prefix();
     let writer_prefix = scope.writer_prefix();
     for prefix in [&reader_prefix, &writer_prefix] {
-        for (key, value) in meta.scan_prefix(prefix) {
+        for (key, value) in meta.try_scan_prefix(prefix)? {
             let lease = read_lease(&key, &value.value);
             if lease.is_live_at(now) {
                 live.push(lease);
@@ -941,7 +945,7 @@ fn live_leases_in_scope<FS: StorageFs>(
     // Any record under the lease prefix that is neither a reader, a writer nor
     // the collector is unparseable or foreign; refuse rather than ignore it.
     let collector_key = scope.collector_key();
-    for (key, value) in meta.scan_prefix(&scope.lease_prefix()) {
+    for (key, value) in meta.try_scan_prefix(&scope.lease_prefix())? {
         if key == collector_key
             || key.starts_with(&reader_prefix)
             || key.starts_with(&writer_prefix)
@@ -1153,8 +1157,8 @@ mod tests {
             "{refused}"
         );
         assert!(
-            meta.scan_prefix(READER_PREFIX).is_empty()
-                && meta.scan_prefix(WRITER_PREFIX).is_empty(),
+            meta.scan_prefix_or_panic(READER_PREFIX).is_empty()
+                && meta.scan_prefix_or_panic(WRITER_PREFIX).is_empty(),
             "a refused admission must not leave a record behind"
         );
 
@@ -1198,15 +1202,15 @@ mod tests {
             .unwrap(),
             KvResult::CasConflict { .. }
         ));
-        assert!(meta.get("/db/1/proof").is_none());
+        assert!(meta.get_or_panic("/db/1/proof").is_none());
 
         // Releasing through the stale value is a no-op, not a deletion.
         assert!(release(&meta, &stale).is_ok());
-        assert!(meta.get(&key).is_some());
+        assert!(meta.get_or_panic(&key).is_some());
         // Dropping the guard must not delete the successor's record either.
         drop(lease);
         assert!(
-            meta.get(&key).is_some(),
+            meta.get_or_panic(&key).is_some(),
             "a lost lease must never delete the record that replaced it"
         );
     }
@@ -1271,7 +1275,7 @@ mod tests {
         // encodes no longer fences anything: a pass may delete the fragments
         // this holder is reading before it reaps the record.
         let stored = meta
-            .get(&key)
+            .get_or_panic(&key)
             .expect("the expired record is not reaped yet");
         assert_eq!(stored.mod_revision, lease.mod_revision);
         assert!(!lease.is_live_at(now_ms()));
@@ -1343,7 +1347,7 @@ mod tests {
         let guard = acquire_reader(&meta, 1, 1, DEFAULT_TTL_MS).unwrap();
         let mut lease = guard.lease().clone();
         expire_in_place(&meta, &mut lease);
-        let before = meta.get(&lease_key(&lease)).unwrap();
+        let before = meta.get_or_panic(&lease_key(&lease)).unwrap();
 
         let error = renew(&meta, &lease, DEFAULT_TTL_MS)
             .unwrap_err()
@@ -1355,7 +1359,7 @@ mod tests {
         );
         // A refusal must not rewrite the record: the deadline it carries is the
         // evidence that this lease had already stopped fencing.
-        let after = meta.get(&lease_key(&lease)).unwrap();
+        let after = meta.get_or_panic(&lease_key(&lease)).unwrap();
         assert_eq!(after.mod_revision, before.mod_revision);
         assert_eq!(after.value, before.value);
         assert_eq!(after.mod_revision, lease.mod_revision);
@@ -1413,7 +1417,7 @@ mod tests {
         // satisfied by a second pre-check, which would leave the original window
         // open; the record really does carry the extended deadline that the
         // holder is refusing to trust.
-        let stored = meta.get(&key).expect("the renewal was written");
+        let stored = meta.get_or_panic(&key).expect("the renewal was written");
         assert_ne!(stored.mod_revision, lease.mod_revision);
         let stored: GcLease = serde_json::from_slice(&stored.value).unwrap();
         assert!(stored.is_live_at(lease.expires_at_ms));
@@ -1492,7 +1496,7 @@ mod tests {
         );
         assert!(collector.release().is_err());
         assert!(
-            meta.get(COLLECTOR_KEY).is_some(),
+            meta.get_or_panic(COLLECTOR_KEY).is_some(),
             "the successor's record must survive the superseded pass"
         );
         // `release` consumed the guard only on success, so Drop runs too.
@@ -1519,7 +1523,10 @@ mod tests {
         })
         .unwrap();
         assert!(live_leases(&meta).unwrap().is_empty());
-        assert!(meta.get(&key).is_none(), "expired record must be reaped");
+        assert!(
+            meta.get_or_panic(&key).is_none(),
+            "expired record must be reaped"
+        );
 
         meta.execute(KvCommand::Put {
             key: format!("{READER_PREFIX}broken"),
@@ -1554,7 +1561,7 @@ mod tests {
         // would refuse every reader and writer, which are only admitted while
         // this key is absent. A fresh pass therefore takes it from the absent
         // state.
-        assert!(meta.get(COLLECTOR_KEY).is_none());
+        assert!(meta.get_or_panic(COLLECTOR_KEY).is_none());
         let third = acquire_collector(&meta, 0, DEFAULT_TTL_MS).unwrap();
         third.release().unwrap();
     }
@@ -1589,7 +1596,7 @@ mod tests {
 
         release(&meta, &writer).unwrap();
         assert!(live_leases_in(&meta, 2).unwrap().is_empty());
-        assert!(meta.get(&key).is_none());
+        assert!(meta.get_or_panic(&key).is_none());
     }
 
     #[test]
@@ -1695,7 +1702,7 @@ mod tests {
         assert_eq!(watermark(&meta).unwrap(), 0);
         assert!(reader_is_safe(&meta).is_ok());
 
-        let applied = meta.revision();
+        let applied = meta.revision_or_panic();
         assert_eq!(publish_watermark(&meta, applied).unwrap(), applied);
         assert!(
             reader_is_safe(&meta).is_ok(),

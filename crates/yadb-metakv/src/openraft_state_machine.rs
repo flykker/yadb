@@ -897,6 +897,14 @@ impl DurableMetaStateMachine {
     pub(crate) fn snapshot(&self) -> MetaSnapshot {
         self.inner.lock().unwrap().state.durable_snapshot()
     }
+
+    /// Test-only: put this handle into the state a failed durable apply leaves
+    /// it in. Read paths must fail closed in that state rather than panic or
+    /// report an absent key.
+    #[cfg(test)]
+    pub(crate) fn poison_for_test(&self) {
+        self.inner.lock().unwrap().failed = true;
+    }
 }
 
 impl RaftSnapshotBuilder<C> for DurableMetaStateMachine {

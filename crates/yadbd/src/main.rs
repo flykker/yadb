@@ -539,7 +539,7 @@ impl AppState {
             &self.meta,
             yadb_metakv::gc::LeaseKind::Reader,
             project_id,
-            self.meta.revision(),
+            self.meta.try_revision()?,
             yadb_metakv::gc::DEFAULT_TTL_MS,
         )?;
         // The lease makes a concurrent pass refuse, but it cannot make this
@@ -886,8 +886,33 @@ impl AppState {
         }
         let mut live_blobs: BTreeSet<(String, BlobId)> = BTreeSet::new();
 
+        // A failed read is not an empty range: the live set would be
+        // incomplete, so the pass refuses rather than repairing (or sweeping)
+        // against a view it could not read.
+        let read_prefix = |prefix: &str| match self.meta.try_scan_prefix(prefix) {
+            Ok(rows) => Ok(rows),
+            Err(error) => Err(ScrubSummary {
+                gc_refusal: Some(format!(
+                    "repair scan refused: live manifests under `{prefix}` cannot be read: {error}"
+                )),
+                gc_errors: vec![error.to_string()],
+                ..ScrubSummary::default()
+            }),
+        };
+
+        // Record the refusal so `/status` shows why the last pass did nothing,
+        // exactly like the Multi-Raft branch above.
+        let refuse_scrub = |summary: ScrubSummary| -> ScrubSummary {
+            *self.last_scrub.write().unwrap() = Some(summary.clone());
+            summary
+        };
+
         // 1. SQL DataShard Tablets (`/db/{pid}/{db}/shards/{table}/{idx}`)
-        for (k, kv) in self.meta.scan_prefix("/db/") {
+        let db_rows = match read_prefix("/db/") {
+            Ok(rows) => rows,
+            Err(summary) => return refuse_scrub(summary),
+        };
+        for (k, kv) in db_rows {
             if k.contains("/shards/") {
                 if let Ok(mf) = serde_json::from_slice::<TabletManifest>(&kv.value) {
                     for b in mf.wal_blobs {
@@ -901,7 +926,11 @@ impl AppState {
         }
 
         // 2. S3 ObjectStore manifests (`/s3/{pid}/{store}/{bucket}/{key}`)
-        for (_k, kv) in self.meta.scan_prefix("/s3/") {
+        let s3_rows = match read_prefix("/s3/") {
+            Ok(rows) => rows,
+            Err(summary) => return refuse_scrub(summary),
+        };
+        for (_k, kv) in s3_rows {
             if let Ok(mf) = serde_json::from_slice::<ObjectManifest>(&kv.value) {
                 for ch in mf.chunks {
                     live_blobs.insert((mf.pool.clone(), ch.blob_id));
@@ -922,7 +951,11 @@ impl AppState {
             }
             map
         };
-        for (k, kv) in self.meta.scan_prefix("/block/") {
+        let block_rows = match read_prefix("/block/") {
+            Ok(rows) => rows,
+            Err(summary) => return refuse_scrub(summary),
+        };
+        for (k, kv) in block_rows {
             let rest = k.strip_prefix("/block/").unwrap_or("");
             if let Some((pid_s, vol_name)) = rest.split_once('/') {
                 if let Ok(pid) = pid_s.parse::<u32>() {
@@ -1132,8 +1165,13 @@ fn meta_err_response(err: MetaError, peer_addr: impl FnOnce(u32) -> Option<Strin
     }
     match err {
         // The node has stopped accepting metadata work until it is restarted;
-        // another replica may still be able to serve the request.
-        MetaError::CompactionFailed(_) => api_err(StatusCode::SERVICE_UNAVAILABLE, err.to_string()),
+        // another replica may still be able to serve the request. A read of the
+        // local applied state that cannot be served is the same situation: the
+        // answer is "not ready", not "this key is absent" and not an internal
+        // error the client should interpret as a rejected request.
+        MetaError::CompactionFailed(_) | MetaError::StorageUnavailable => {
+            api_err(StatusCode::SERVICE_UNAVAILABLE, err.to_string())
+        }
         MetaError::NotLeader { leader } => {
             let leader_addr = leader.and_then(peer_addr);
             (
@@ -2331,7 +2369,16 @@ async fn handle_health(State(st): State<AppState>) -> impl IntoResponse {
     let rev = if st.meta.is_openraft() {
         None
     } else {
-        Some(st.meta.revision())
+        match st.meta.try_revision() {
+            Ok(revision) => Some(revision),
+            Err(error) => {
+                return api_err(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("metadata revision cannot be read: {error}"),
+                )
+                .into_response()
+            }
+        }
     };
     let (node_id, role, term, leader_id, commit_index) = st.meta.role_info();
     Json(serde_json::json!({
@@ -2347,6 +2394,7 @@ async fn handle_health(State(st): State<AppState>) -> impl IntoResponse {
         "generation": gen,
         "metakv_revision": rev
     }))
+    .into_response()
 }
 
 async fn handle_raft_status(State(st): State<AppState>) -> impl IntoResponse {
@@ -2586,7 +2634,10 @@ async fn idempotency_usage(st: &AppState) -> Result<(IdempotencyUsage, u64), Str
             .map_err(|e| e.to_string())?;
         match snapshot.get(IDEMPOTENCY_USAGE_KEY) {
             Some(kv) => Ok((decode_usage(&kv.value)?, kv.mod_revision)),
-            None => Ok((derive_idempotency_usage(&meta), 0)),
+            None => Ok((
+                derive_idempotency_usage(&meta).map_err(|e| e.to_string())?,
+                0,
+            )),
         }
     })
     .await
@@ -2627,7 +2678,10 @@ async fn read_apply_snapshot(st: &AppState) -> Result<ApplySnapshot, Response> {
         };
         let (usage, usage_revision) = match snapshot.get(IDEMPOTENCY_USAGE_KEY) {
             Some(kv) => (decode_usage(&kv.value)?, kv.mod_revision),
-            None => (derive_idempotency_usage(&meta), 0),
+            None => (
+                derive_idempotency_usage(&meta).map_err(|e| e.to_string())?,
+                0,
+            ),
         };
         Ok(ApplySnapshot {
             control,
@@ -2646,19 +2700,21 @@ fn decode_usage(value: &[u8]) -> Result<IdempotencyUsage, String> {
 }
 
 /// Counts the records that already exist when no counter is stored yet.
-fn derive_idempotency_usage(meta: &yadb_metakv::LocalMetaKv<OsFs>) -> IdempotencyUsage {
+fn derive_idempotency_usage(
+    meta: &yadb_metakv::LocalMetaKv<OsFs>,
+) -> Result<IdempotencyUsage, MetaError> {
     let mut usage = IdempotencyUsage {
         version: 1,
         ..IdempotencyUsage::default()
     };
-    for (key, kv) in meta.scan_prefix("/sys/idempotency/") {
+    for (key, kv) in meta.try_scan_prefix("/sys/idempotency/")? {
         if key == IDEMPOTENCY_USAGE_KEY {
             continue;
         }
         usage.records = usage.records.saturating_add(1);
         usage.bytes = usage.bytes.saturating_add(kv.value.len() as u64);
     }
-    usage
+    Ok(usage)
 }
 
 fn idempotency_quota_response() -> Response {
@@ -3591,10 +3647,22 @@ async fn handle_apply(
             if proxied.status().is_success() {
                 if st.meta.is_openraft() {
                     st.refresh_openraft_control_async().await;
-                } else if let Some(kv) = st.meta.get(CONTROL_STATE_KEY) {
-                    if let Ok(cp) = serde_json::from_slice::<ControlPlaneState>(&kv.value) {
-                        let _ = st.materialize_pools(&cp);
-                        *st.control.write().unwrap() = cp;
+                } else {
+                    match st.meta.try_get(CONTROL_STATE_KEY) {
+                        Ok(Some(kv)) => {
+                            if let Ok(cp) = serde_json::from_slice::<ControlPlaneState>(&kv.value) {
+                                let _ = st.materialize_pools(&cp);
+                                *st.control.write().unwrap() = cp;
+                            }
+                        }
+                        Ok(None) => {}
+                        // The proxy already answered; this only refreshes the
+                        // local cache. The legacy store cannot fail this read,
+                        // so a failure here is reported rather than mistaken
+                        // for an empty control plane.
+                        Err(error) => {
+                            eprintln!("local control state refresh after proxy failed: {error}")
+                        }
                     }
                 }
             }
@@ -7420,7 +7488,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Subscribe first so an apply concurrent with the initial read is queued.
     let watch_rx = meta.watch_prefix(CONTROL_STATE_KEY);
     // Recover persisted declarative ControlPlaneState from the selected backend.
-    let recovered_cp: ControlPlaneState = match meta.get(CONTROL_STATE_KEY) {
+    let recovered_cp: ControlPlaneState = match meta.try_get(CONTROL_STATE_KEY)? {
         Some(kv) => serde_json::from_slice(&kv.value)?,
         None => ControlPlaneState::new(),
     };
@@ -7822,6 +7890,19 @@ mod security_tests {
                 "a definite failure must not claim an unknown outcome"
             );
         }
+    }
+
+    // An unavailable metadata read is "not ready", not "not found" and not an
+    // internal error: the client should ask another replica, not conclude the
+    // key is absent or that its request was rejected.
+    #[test]
+    fn unavailable_metadata_read_is_not_ready_503() {
+        let mapped = meta_err_response(MetaError::StorageUnavailable, |_| None);
+        assert_eq!(mapped.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            !mapped.headers().contains_key("x-yadb-write-outcome"),
+            "a read failure is not an ambiguous write"
+        );
     }
 
     #[test]

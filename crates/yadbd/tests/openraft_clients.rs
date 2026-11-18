@@ -366,8 +366,8 @@ async fn multi_group_openraft_routes_clients_and_reopens() {
                 );
                 assert_eq!(meta.revision_for_key(&keys[0]).unwrap(), before1);
                 assert_eq!(meta.revision_for_key(&keys[1]).unwrap(), before2);
-                assert!(meta.get(&keys[0]).is_none());
-                assert!(meta.get(&keys[1]).is_none());
+                assert!(meta.get_or_panic(&keys[0]).is_none());
+                assert!(meta.get_or_panic(&keys[1]).is_none());
             })
             .await
             .unwrap();

@@ -148,9 +148,9 @@ mod tests {
         meta.execute(publish(0)).unwrap();
         let keys = vec!["schema".into(), "absent".into()];
         let prefixes = vec!["shards/".into(), "idx/".into(), "idx/".into()];
-        let initial_revision = meta.revision();
-        let pinned = meta.snapshot(&keys, &prefixes);
-        assert_eq!(meta.revision(), initial_revision);
+        let initial_revision = meta.revision_or_panic();
+        let pinned = meta.snapshot_or_panic(&keys, &prefixes);
+        assert_eq!(meta.revision_or_panic(), initial_revision);
         assert_eq!(pinned.revision(), initial_revision);
         let writer = meta.clone();
         let thread = std::thread::spawn(move || {
@@ -165,7 +165,7 @@ mod tests {
                 .unwrap();
         });
         for _ in 0..128 {
-            let snapshot = meta.snapshot(&keys, &prefixes);
+            let snapshot = meta.snapshot_or_panic(&keys, &prefixes);
             let schema = snapshot.get("schema").unwrap();
             for key in ["shards/a", "idx/a"] {
                 let row = snapshot.get(key).unwrap();
@@ -188,7 +188,7 @@ mod tests {
         let recovered = LocalMetaKv::open_single_node(&fs, "meta", 1).unwrap();
         assert_eq!(
             recovered
-                .snapshot(&keys, &prefixes)
+                .snapshot_or_panic(&keys, &prefixes)
                 .get("schema")
                 .unwrap()
                 .value,
@@ -217,12 +217,12 @@ mod tests {
                 meta.execute(cmd),
                 Err(MetaError::StorageUnavailable)
             ));
-            assert!(meta.get("key").is_none());
+            assert!(meta.get_or_panic("key").is_none());
             drop(meta);
             fs.simulate_power_cut();
             let recovered = LocalMetaKv::open_single_node(&fs, "meta", 1).unwrap();
             assert_eq!(
-                recovered.get("key").is_some(),
+                recovered.get_or_panic("key").is_some(),
                 fault == SyncFault::AfterPersist
             );
             recovered
@@ -243,7 +243,7 @@ mod tests {
             value: b"old".to_vec(),
         })
         .unwrap();
-        let old = meta.get("key").unwrap();
+        let old = meta.get_or_panic("key").unwrap();
         meta.execute(KvCommand::Delete { key: "key".into() })
             .unwrap();
         meta.execute(KvCommand::Put {
@@ -251,7 +251,7 @@ mod tests {
             value: b"new".to_vec(),
         })
         .unwrap();
-        let new = meta.get("key").unwrap();
+        let new = meta.get_or_panic("key").unwrap();
         assert_eq!(old.version, new.version); // ordinary version guards have ABA
         assert_ne!(old.mod_revision, new.mod_revision);
         drop(meta);
@@ -273,8 +273,8 @@ mod tests {
             })
             .unwrap();
         assert!(matches!(result, KvResult::CasConflict { .. }));
-        assert_eq!(meta.get("key").unwrap().value, b"new");
-        assert!(meta.get("retired").is_none());
+        assert_eq!(meta.get_or_panic("key").unwrap().value, b"new");
+        assert!(meta.get_or_panic("retired").is_none());
         assert!(matches!(
             meta.execute(KvCommand::RevisionTxn {
                 guards: vec![RevisionGuard {
@@ -312,7 +312,7 @@ mod tests {
         // Simulate power cut & reopen WAL -> lexicographical order preserved!
         fs.simulate_power_cut();
         let reopened = LocalMetaKv::open_single_node(&fs, "meta", 1).unwrap();
-        let items = reopened.scan_prefix("/s3/1/receipts/");
+        let items = reopened.scan_prefix_or_panic("/s3/1/receipts/");
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].0, "/s3/1/receipts/a.pdf");
         assert_eq!(items[1].0, "/s3/1/receipts/b.pdf");
