@@ -3415,4 +3415,392 @@ mod tests {
             serde_json::from_slice(&s3.meta.get(&upload_key).unwrap().value).unwrap();
         assert_eq!(record.parts.len(), 2);
     }
+
+    /// Filesystems kept alive so a test can inject faults and power-cycle them
+    /// after the engine has been dropped.
+    fn multipart_fixture(tag: u64) -> (SimFs, [SimFs; 3], ObjectStoreEngine<SimFs>) {
+        let meta_fs = SimFs::new(tag);
+        let disks = [
+            SimFs::new(tag + 1),
+            SimFs::new(tag + 2),
+            SimFs::new(tag + 3),
+        ];
+        let s3 = engine(&meta_fs, &disks);
+        (meta_fs, disks, s3)
+    }
+
+    /// Starts a multipart upload, uploads `parts`, and returns the upload id,
+    /// the completion list, and the body a correct completion must publish.
+    fn multipart_parts(
+        s3: &ObjectStoreEngine<SimFs>,
+        parts: &[&[u8]],
+    ) -> (String, Vec<(u32, String)>, Vec<u8>) {
+        let upload_id = s3
+            .create_multipart_upload(1, "store", "pool", "bucket", "key", "text/plain")
+            .unwrap();
+        let mut etags = Vec::with_capacity(parts.len());
+        for (index, part) in parts.iter().enumerate() {
+            let etag = s3
+                .upload_part(
+                    1,
+                    "store",
+                    "bucket",
+                    "key",
+                    &upload_id,
+                    index as u32 + 1,
+                    part,
+                )
+                .unwrap();
+            etags.push((index as u32 + 1, etag));
+        }
+        let body = parts.iter().flat_map(|part| part.iter().copied()).collect();
+        (upload_id, etags, body)
+    }
+
+    /// Part intent keys named by the upload record, in part order.
+    fn part_intents(s3: &ObjectStoreEngine<SimFs>, upload_id: &str) -> Vec<String> {
+        let upload_key = ObjectStoreEngine::<SimFs>::intent_key(1, upload_id);
+        let record: UploadIntent =
+            serde_json::from_slice(&s3.meta.get(&upload_key).unwrap().value).unwrap();
+        record
+            .parts
+            .iter()
+            .map(|part| part.intent_key.clone())
+            .collect()
+    }
+
+    /// Every fragment a part intent names, captured before a completion deletes
+    /// those intents.
+    fn part_fragments(s3: &ObjectStoreEngine<SimFs>, part_keys: &[String]) -> Vec<BlobId> {
+        part_keys
+            .iter()
+            .flat_map(|key| {
+                let intent: UploadIntent =
+                    serde_json::from_slice(&s3.meta.get(key).unwrap().value).unwrap();
+                intent
+                    .chunks
+                    .iter()
+                    .map(|chunk| chunk.blob_id)
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// Drops the engine, cuts power to every filesystem and reopens it, so the
+    /// assertions only see what survived on durable storage.
+    fn crash_and_reopen(
+        s3: ObjectStoreEngine<SimFs>,
+        meta_fs: &SimFs,
+        disks: &[SimFs],
+    ) -> ObjectStoreEngine<SimFs> {
+        drop(s3);
+        meta_fs.simulate_power_cut();
+        for disk in disks {
+            disk.simulate_power_cut();
+        }
+        engine(meta_fs, disks)
+    }
+
+    #[test]
+    fn multipart_completion_before_persist_failure_leaves_parts_reclaimable() {
+        let (meta_fs, disks, s3) = multipart_fixture(7300);
+        let parts: [&[u8]; 3] = [&[7u8; 5000], &[8u8; 4096], &[9u8; 100]];
+        let (upload_id, etags, _) = multipart_parts(&s3, &parts);
+        let upload_key = ObjectStoreEngine::<SimFs>::intent_key(1, &upload_id);
+        let part_keys = part_intents(&s3, &upload_id);
+        // 5000 bytes span two 4096-byte chunks, the other parts one each.
+        let fragments = part_fragments(&s3, &part_keys);
+        assert_eq!(fragments.len(), 4);
+
+        meta_fs.set_faults(FaultConfig {
+            sync_data_fault: SyncFault::BeforePersist,
+            ..Default::default()
+        });
+        assert!(matches!(
+            s3.complete_multipart_upload(1, "store", "bucket", "key", &upload_id, &etags),
+            Err(S3Error::Meta(MetaError::Io(_)))
+        ));
+        // The single transaction was not applied at all: no manifest, and the
+        // record and part intents it would have deleted are still there.
+        assert!(s3.head_object(1, "store", "bucket", "key").is_err());
+        assert!(s3.meta.get(&upload_key).is_some());
+        for key in &part_keys {
+            assert!(s3.meta.get(key).is_some(), "part intent `{key}` vanished");
+        }
+        meta_fs.set_faults(FaultConfig::default());
+
+        let recovered = crash_and_reopen(s3, &meta_fs, &disks);
+        // The unsynced completion is gone after the power cut: no object, so no
+        // manifest can name fragments that were reclaimed.
+        assert!(matches!(
+            recovered.head_object(1, "store", "bucket", "key"),
+            Err(S3Error::ObjectNotFound { .. })
+        ));
+        // The upload and every part survived intact and are still readable, so
+        // nothing was leaked or silently lost.
+        assert!(recovered.meta.get(&upload_key).is_some());
+        assert_eq!(
+            recovered
+                .list_multipart_parts(1, "store", "bucket", "key", &upload_id)
+                .unwrap()
+                .len(),
+            3
+        );
+        for blob_id in &fragments {
+            assert!(
+                recovered
+                    .get_pool("pool")
+                    .unwrap()
+                    .get_blob(*blob_id)
+                    .is_ok(),
+                "fragment {blob_id:?} was lost"
+            );
+        }
+        // And they are reclaimable: abort retires the record and the collector
+        // deletes every fragment and every part intent.
+        recovered
+            .abort_multipart_upload(1, "store", "bucket", "key", &upload_id)
+            .unwrap();
+        assert_eq!(
+            recovered.collect_orphans(1).unwrap(),
+            fragments.len(),
+            "the collector must reclaim every part fragment"
+        );
+        assert!(recovered.meta.get(&upload_key).is_none());
+        for key in &part_keys {
+            assert!(
+                recovered.meta.get(key).is_none(),
+                "aborted part intent `{key}` leaked"
+            );
+        }
+        for blob_id in &fragments {
+            assert!(recovered
+                .get_pool("pool")
+                .unwrap()
+                .get_blob(*blob_id)
+                .is_err());
+        }
+        assert!(recovered.head_object(1, "store", "bucket", "key").is_err());
+    }
+
+    #[test]
+    fn multipart_completion_after_persist_failure_is_durable_and_never_half_published() {
+        let (meta_fs, disks, s3) = multipart_fixture(7310);
+        let parts: [&[u8]; 3] = [&[3u8; 5000], &[4u8; 4096], &[5u8; 100]];
+        let (upload_id, etags, body) = multipart_parts(&s3, &parts);
+        let upload_key = ObjectStoreEngine::<SimFs>::intent_key(1, &upload_id);
+        let part_keys = part_intents(&s3, &upload_id);
+        let fragments = part_fragments(&s3, &part_keys);
+        assert_eq!(fragments.len(), 4);
+
+        meta_fs.set_faults(FaultConfig {
+            sync_data_fault: SyncFault::AfterPersist,
+            ..Default::default()
+        });
+        // The caller is told the outcome is unknown: the sync failed after the
+        // transaction reached the WAL.
+        assert!(matches!(
+            s3.complete_multipart_upload(1, "store", "bucket", "key", &upload_id, &etags),
+            Err(S3Error::Meta(MetaError::Io(_)))
+        ));
+        meta_fs.set_faults(FaultConfig::default());
+
+        let recovered = crash_and_reopen(s3, &meta_fs, &disks);
+        // Observed on this fixture: the whole transaction was durable and the
+        // `Ok` arm below is taken. The `Err` arm is still asserted because the
+        // invariant is "one of the two", not "published".
+        match recovered.get_object(1, "store", "bucket", "key") {
+            // The transaction was durable, so the object is complete and no part
+            // intent survived it.
+            Ok((manifest, bytes)) => {
+                assert_eq!(bytes, body, "a durable completion must publish every byte");
+                assert_eq!(manifest.size, body.len() as u64);
+                assert_eq!(manifest.etag, expected_multipart_etag(&parts));
+                assert!(recovered.meta.get(&upload_key).is_none());
+                for key in &part_keys {
+                    assert!(
+                        recovered.meta.get(key).is_none(),
+                        "part intent `{key}` survived"
+                    );
+                }
+                // The published manifest still names readable fragments, and a
+                // collector pass reclaims nothing it needs.
+                for chunk in &manifest.chunks {
+                    assert!(recovered
+                        .get_pool("pool")
+                        .unwrap()
+                        .get_blob(chunk.blob_id)
+                        .is_ok());
+                }
+                assert_eq!(recovered.collect_orphans_all().unwrap(), 0);
+            }
+            // The other legal outcome: the transaction did not survive. Then the
+            // upload must still be whole and every part reclaimable.
+            Err(S3Error::ObjectNotFound { .. }) => {
+                assert!(recovered.meta.get(&upload_key).is_some());
+                for key in &part_keys {
+                    assert!(
+                        recovered.meta.get(key).is_some(),
+                        "part intent `{key}` vanished"
+                    );
+                }
+                recovered
+                    .abort_multipart_upload(1, "store", "bucket", "key", &upload_id)
+                    .unwrap();
+                assert_eq!(recovered.collect_orphans(1).unwrap(), fragments.len());
+            }
+            // A manifest naming reclaimed fragments, or a partial body, is the
+            // in-between state this test exists to rule out.
+            Err(other) => panic!("recovered read is neither published nor absent: {other}"),
+        }
+    }
+
+    #[test]
+    fn multipart_completion_torn_write_recovers_old_or_new_manifest_never_garbage() {
+        let (meta_fs, disks, s3) = multipart_fixture(7320);
+        let previous = s3
+            .put_object(
+                1,
+                "store",
+                "pool",
+                "bucket",
+                "key",
+                "text/plain",
+                b"previous",
+            )
+            .unwrap();
+        let parts: [&[u8]; 2] = [&[1u8; 5000], &[2u8; 500]];
+        let (upload_id, etags, body) = multipart_parts(&s3, &parts);
+        let upload_key = ObjectStoreEngine::<SimFs>::intent_key(1, &upload_id);
+        let part_keys = part_intents(&s3, &upload_id);
+
+        meta_fs.set_faults(FaultConfig {
+            torn_write_prob: 1.0,
+            ..Default::default()
+        });
+        assert!(matches!(
+            s3.complete_multipart_upload(1, "store", "bucket", "key", &upload_id, &etags),
+            Err(S3Error::Meta(MetaError::Io(_)))
+        ));
+        meta_fs.set_faults(FaultConfig::default());
+
+        let recovered = crash_and_reopen(s3, &meta_fs, &disks);
+        let mkey = ObjectStoreEngine::<SimFs>::meta_key(1, "store", "bucket", "key");
+        let stored = recovered
+            .meta
+            .get(&mkey)
+            .expect("a manifest is present after recovery");
+        // A torn frame must never leave a half-written JSON value behind.
+        let manifest: ObjectManifest =
+            serde_json::from_slice(&stored.value).expect("the recovered manifest parses");
+        let (_, bytes) = recovered
+            .get_object(1, "store", "bucket", "key")
+            .expect("the recovered object reads back");
+        assert_eq!(manifest.size, bytes.len() as u64, "truncated body");
+        // Observed on this fixture: the `if` arm is taken, because a torn frame
+        // is never synced and the power cut discards it. The `else` arm is kept
+        // because recovery must accept either state.
+        if manifest.etag == previous.etag {
+            // Old state: the torn frame was discarded as an unacknowledged tail.
+            assert_eq!(bytes, b"previous");
+            assert!(recovered.meta.get(&upload_key).is_some());
+            for key in &part_keys {
+                assert!(
+                    recovered.meta.get(key).is_some(),
+                    "part intent `{key}` vanished"
+                );
+            }
+            // A retry after recovery publishes every part: the torn attempt
+            // never leaves a prefix of the body behind.
+            recovered
+                .complete_multipart_upload(1, "store", "bucket", "key", &upload_id, &etags)
+                .unwrap();
+            assert_eq!(
+                recovered.get_object(1, "store", "bucket", "key").unwrap().1,
+                body
+            );
+        } else {
+            // New state: the frame survived whole, so the manifest is the new
+            // one and names only fragments that are present.
+            assert_eq!(manifest.etag, expected_multipart_etag(&parts));
+            assert_eq!(bytes, body);
+            assert!(recovered.meta.get(&upload_key).is_none());
+            for key in &part_keys {
+                assert!(
+                    recovered.meta.get(key).is_none(),
+                    "part intent `{key}` survived"
+                );
+            }
+            assert_eq!(recovered.collect_orphans_all().unwrap(), 0);
+        }
+        // Every manifest in the namespace parses, so recovery did not keep a
+        // garbage value next to the good one.
+        assert_eq!(
+            recovered
+                .list_objects(1, "store", "bucket", "")
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn failed_multipart_completion_keeps_the_upload_completable_and_the_retry_is_whole() {
+        let (meta_fs, disks, s3) = multipart_fixture(7330);
+        let parts: [&[u8]; 3] = [&[1u8; 5000], &[2u8; 4096], &[3u8; 7]];
+        let (upload_id, etags, body) = multipart_parts(&s3, &parts);
+        let upload_key = ObjectStoreEngine::<SimFs>::intent_key(1, &upload_id);
+        let part_keys = part_intents(&s3, &upload_id);
+
+        meta_fs.set_faults(FaultConfig {
+            sync_data_fault: SyncFault::BeforePersist,
+            ..Default::default()
+        });
+        assert!(matches!(
+            s3.complete_multipart_upload(1, "store", "bucket", "key", &upload_id, &etags),
+            Err(S3Error::Meta(MetaError::Io(_)))
+        ));
+        meta_fs.set_faults(FaultConfig::default());
+
+        let recovered = crash_and_reopen(s3, &meta_fs, &disks);
+        // The failed completion deleted nothing: the manifest was not published,
+        // so the part intents that would have been deleted in the same
+        // transaction are all still there.
+        assert!(recovered.head_object(1, "store", "bucket", "key").is_err());
+        assert!(recovered.meta.get(&upload_key).is_some());
+        for key in &part_keys {
+            assert!(
+                recovered.meta.get(key).is_some(),
+                "completion deleted part intent `{key}` without publishing"
+            );
+        }
+        // Observed outcome: the upload is still completable (test 1 shows the
+        // abort branch), and the retry publishes the whole concatenation.
+        let manifest = recovered
+            .complete_multipart_upload(1, "store", "bucket", "key", &upload_id, &etags)
+            .unwrap();
+        assert_eq!(manifest.size, body.len() as u64);
+        assert_eq!(manifest.etag, expected_multipart_etag(&parts));
+        assert_eq!(
+            recovered.get_object(1, "store", "bucket", "key").unwrap().1,
+            body
+        );
+        assert!(recovered.meta.get(&upload_key).is_none());
+        for key in &part_keys {
+            assert!(
+                recovered.meta.get(key).is_none(),
+                "part intent `{key}` survived"
+            );
+        }
+        assert_eq!(recovered.collect_orphans_all().unwrap(), 0);
+        // A second completion cannot republish or truncate the body.
+        assert!(matches!(
+            recovered.complete_multipart_upload(1, "store", "bucket", "key", &upload_id, &etags),
+            Err(S3Error::MultipartUploadNotFound(_))
+        ));
+        assert_eq!(
+            recovered.get_object(1, "store", "bucket", "key").unwrap().1,
+            body
+        );
+    }
 }
