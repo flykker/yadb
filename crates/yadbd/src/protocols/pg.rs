@@ -1234,6 +1234,36 @@ fn db_error(e: yadb_db::DbError) -> PgError {
     }
 }
 
+/// The SQLSTATE for a non-200 answer from the gateway over the HTTP bridge.
+///
+/// The status alone is not enough. `503` is used both for "this node cannot
+/// serve the request yet, try again" (`MetaError::StorageUnavailable`, a pool
+/// that cannot reach redundancy, a stale control plane) and for "this write's
+/// outcome could not be determined". The second must never be reported as a
+/// retryable condition: the mutation may have committed, and the gateway marks
+/// it with `x-yadb-retry: do-not-retry`. So the headers decide, and the
+/// ambiguous case keeps `XX000`, which no driver treats as "retry".
+///
+/// `57P03` is the same code the session already uses for an unavailable
+/// control plane, so a client sees one consistent "not ready" answer.
+fn pg_sqlstate_for(code: u16, headers: &str) -> &'static str {
+    match code {
+        403 => "42501",
+        503 => {
+            let lower = headers.to_ascii_lowercase();
+            if lower.contains("x-yadb-retry: do-not-retry")
+                || lower.contains("x-yadb-write-outcome: unknown")
+            {
+                // Unknown outcome: not a syntax error and not a retry hint.
+                "XX000"
+            } else {
+                "57P03"
+            }
+        }
+        _ => "XX000",
+    }
+}
+
 fn report_name(name: &str) -> &str {
     match name {
         "datestyle" => "DateStyle",
@@ -2099,7 +2129,7 @@ fn exec_one(
         "require_transaction": tx.status == b'T' && !rollback,
     }))
     .map_err(io::Error::other)?;
-    let (code, body) = http(
+    let (code, headers, body) = http_with_headers(
         &cx.st.listen_addr,
         "POST",
         cx.path,
@@ -2112,7 +2142,7 @@ fn exec_one(
             tx.status = b'E';
         }
         return Ok(Err(PgError::new(
-            if code == 403 { "42501" } else { "XX000" },
+            pg_sqlstate_for(code, &headers),
             String::from_utf8_lossy(&body),
         )));
     }
@@ -3089,6 +3119,37 @@ fn split(sql: &str) -> Vec<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_not_ready_answer_is_retryable_and_an_unknown_outcome_is_not() {
+        // The gateway answers both of these with 503, so the status cannot be
+        // what distinguishes them. `x-yadb-retry: do-not-retry` is the marker
+        // `forward_error_response` adds for a write whose commit outcome the
+        // node could not determine.
+        let plain = "HTTP/1.1 503 Service Unavailable\r\ncontent-type: application/json\r\n";
+        assert_eq!(
+            pg_sqlstate_for(503, plain),
+            "57P03",
+            "a plain 503 is \"not ready\", so a client may retry"
+        );
+
+        let unknown = "HTTP/1.1 503 Service Unavailable\r\n\
+                       x-yadb-write-outcome: unknown\r\n\
+                       x-yadb-retry: do-not-retry\r\n";
+        assert_eq!(
+            pg_sqlstate_for(503, unknown),
+            "XX000",
+            "an unknown write outcome must not be reported as retryable"
+        );
+
+        // Header names arrive lowercased from axum, but the check must not
+        // depend on that: HTTP header names are case-insensitive.
+        let mixed = "HTTP/1.1 503 Service Unavailable\r\nX-Yadb-Retry: Do-Not-Retry\r\n";
+        assert_eq!(pg_sqlstate_for(503, mixed), "XX000");
+
+        assert_eq!(pg_sqlstate_for(403, plain), "42501");
+        assert_eq!(pg_sqlstate_for(400, plain), "XX000");
+    }
 
     fn values<'a>(items: &[Option<&'a str>]) -> Vec<Option<&'a str>> {
         items.to_vec()

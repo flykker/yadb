@@ -128,6 +128,11 @@ pub fn serve(
 /// already authenticated over the protocol. Without this, pgwire and iSCSI
 /// sessions would be authorized as `anonymous` on every OpenRaft daemon, where
 /// the subject secret is mandatory.
+///
+/// Returns the status and body only. A caller that has to distinguish two
+/// answers with the same status must use [`http_with_headers`]: the `503` for
+/// "not ready, retry" and the `503` for "this write's outcome is unknown, do not
+/// retry" differ only in headers.
 pub fn http(
     addr: &str,
     method: &str,
@@ -136,6 +141,20 @@ pub fn http(
     secret: Option<&str>,
     body: &[u8],
 ) -> io::Result<(u16, Vec<u8>)> {
+    let (code, _, body) = http_with_headers(addr, method, path, subject, secret, body)?;
+    Ok((code, body))
+}
+
+/// [`http`] plus the raw header block, for callers that must read
+/// `x-yadb-write-outcome` or `x-yadb-retry`.
+pub fn http_with_headers(
+    addr: &str,
+    method: &str,
+    path: &str,
+    subject: &str,
+    secret: Option<&str>,
+    body: &[u8],
+) -> io::Result<(u16, String, Vec<u8>)> {
     let addr = addr
         .replace("0.0.0.0", "127.0.0.1")
         .replace("[::]", "[::1]");
@@ -169,7 +188,7 @@ pub fn http(
         .windows(4)
         .position(|v| v == b"\r\n\r\n")
         .ok_or_else(|| io::Error::other("invalid gateway response"))?;
-    let headers = String::from_utf8_lossy(&raw[..split]);
+    let headers = String::from_utf8_lossy(&raw[..split]).into_owned();
     let code = headers
         .split_whitespace()
         .nth(1)
@@ -183,7 +202,7 @@ pub fn http(
     } else {
         raw[split + 4..].to_vec()
     };
-    Ok((code, body))
+    Ok((code, headers, body))
 }
 
 pub fn url(v: &str) -> String {

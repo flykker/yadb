@@ -666,27 +666,25 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   the same reason. The fence is not safe: a writer lease can be renewed while a
   collector pass is in flight, and collector RPCs can continue past lease
   expiry, so a reader lease alone is not a sufficient fence. Storage-side fencing
-  is partial: the versioned delete RPC does not exist, and
-  nothing carries an epoch or a pin over the wire. Three target-side pieces do
-  exist. A
-  barrier carries the collector lease deadline and the target refuses an expired
-  one with `409`
-  (`BlobError::BarrierLeaseExpired`), which bounds the barrier path to the target's
-  own write-and-fsync window plus clock skew instead of leaving it unchecked; an
-  unreadable target clock refuses with `409` too (`BarrierClockUnreadable`)
-  instead of defaulting to the epoch. A volume keeps a durable, monotonic
-  epoch (`VolumeStore::epoch`, advanced only by `advance_epoch`) and stamps every
-  fragment with the epoch it was written under, so `delete_fenced(id, epoch)`
-  refuses to unlink a fragment from another epoch. And a volume keeps a durable
-  pin table (`pin`, `unpin`, `live_pins`), so `advance_epoch` refuses while an
-  unexpired pin exists (`EpochPinned`) and `delete_collectable(id, epoch)` refuses
-  a fragment that is not older (`FragmentNotOlder`) or whose epoch is still pinned
-  (`FragmentPinned`). None of the three establishes the
-  invariant: nothing carries the epoch over the wire, `PoolSlot::delete` is still
-  unfenced, the pin table has no client (no reader takes a pin, no collector
-  checks one), and no collector advances an epoch.
-  That does not establish the invariant, so collection stays refused. Garbage
-  therefore accumulates and can fill the disk;
+  is partial: the versioned delete RPC does not exist, and nothing carries an
+  epoch or a pin over the wire. Three target-side pieces do exist. A barrier
+  carries the collector lease deadline and the target refuses an expired one with
+  `409` (`BlobError::BarrierLeaseExpired`), which bounds the barrier path to the
+  target's own write-and-fsync window plus clock skew instead of leaving it
+  unchecked; an unreadable target clock refuses with `409` too
+  (`BarrierClockUnreadable`) instead of defaulting to the epoch. A volume keeps a
+  durable, monotonic epoch (`VolumeStore::epoch`, advanced only by
+  `advance_epoch`) and stamps every fragment with the epoch it was written under,
+  so `delete_fenced(id, epoch)` refuses to unlink a fragment from another epoch.
+  And a volume keeps a durable pin table (`pin`, `unpin`, `live_pins`), so
+  `advance_epoch` refuses while an unexpired pin exists (`EpochPinned`) and
+  `delete_collectable(id, epoch)` refuses a fragment that is not older
+  (`FragmentNotOlder`) or whose epoch is still pinned (`FragmentPinned`). None of
+  the three establishes the invariant: nothing carries the epoch over the wire,
+  `PoolSlot::delete` is still unfenced, the pin table has no client (no reader
+  takes a pin before a fetch, no collector checks one), and no collector advances
+  an epoch. Collection therefore stays refused, and garbage accumulates and can
+  fill the disk;
   this is a knowingly accepted temporary measure. The repair (orphan) scan is
   also still refused, because it needs one whole-deployment view.
 
