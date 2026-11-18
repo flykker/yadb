@@ -28,8 +28,10 @@ opt-in fields are absent.
 miss. It reports a progress error instead, and for a heartbeat request that error
 leaves the inflight state untouched, so nothing is retried until the next event
 and the commit index can stall even though the follower already holds the
-entries. Keep it well above the cost of one TCP + mTLS handshake; the daemon
-requires `election_min_ms >= 3 x heartbeat_ms`.
+entries. Keep it well above the cost of one TCP + mTLS handshake: a new root
+(`mode: create`) is refused below 500 ms, an existing one starts with a warning,
+and the daemon also requires `election_min_ms >= 3 x heartbeat_ms`. Both
+launchers use 750 ms.
 
 For example, for group 2 on **all** its voters, add to the version-1 group
 config (choose preferred node 1 for group 1 and 3 for group 3):

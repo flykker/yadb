@@ -31,6 +31,41 @@ use yadb_metakv::{
     openraft_transport::{NodeSigningKey, PeerKeyRegistry},
 };
 
+/// Smallest append budget accepted for a new replica root.
+///
+/// `heartbeat_ms` is not a tuning knob: OpenRaft wraps `append_entries` in
+/// `C::timeout(heartbeat_interval, ...)` and does not retry a miss, so a budget
+/// shorter than one loopback mTLS handshake abandons appends the follower has
+/// already applied.
+///
+/// The value is anchored on the two measurements this project actually has, not
+/// on a derived worst case: at 250 ms a suite run recorded 668 abandoned
+/// `AppendEntries` and a leader stuck at `last_log=290 applied=283` while the
+/// follower held 290; at 750 ms three consecutive runs recorded none. The floor
+/// sits between them — twice the failing value, below the provisioned one — so
+/// a new root cannot be created with the configuration that was measured to
+/// fail, and the configuration measured to work is still accepted.
+///
+/// It is deliberately not derived from the 960 ms suite-load tail: that number
+/// was measured through the test proxy under load and does not bound a
+/// production handshake, and a floor above 750 ms would reject the value known
+/// to work. This rejects gross misconfiguration; it is not proof of adequacy.
+const MIN_HEARTBEAT_MS: u64 = 500;
+
+/// The message for an append budget below [`MIN_HEARTBEAT_MS`].
+///
+/// Split out of `prepare` so the wording is asserted by a test rather than
+/// captured from stderr.
+fn short_append_budget(heartbeat_ms: u64) -> Option<String> {
+    (heartbeat_ms < MIN_HEARTBEAT_MS).then(|| {
+        format!(
+            "heartbeat_ms {heartbeat_ms} is below the {MIN_HEARTBEAT_MS} ms minimum append \
+             budget; OpenRaft does not retry a timed-out append, so appends may be abandoned \
+             after the follower applied them"
+        )
+    })
+}
+
 const MAX_CONFIG: u64 = 256 * 1024;
 const MAX_DER: u64 = 1024 * 1024;
 const MAX_PEERS: usize = 32;
@@ -675,6 +710,18 @@ pub fn prepare(path: &Path) -> io::Result<Prepared> {
         {
             return Err(invalid("invalid raft timing bounds"));
         }
+        // The bounds above constrain the heartbeat from *above* only
+        // (`election_min_ms >= 3 x heartbeat_ms`), so a config can still be too
+        // short to survive one handshake. A new root is refused; an existing
+        // root is opened with a warning, because a documented live deployment
+        // may already carry a short value and refusing to start it would turn a
+        // tuning mistake into an outage.
+        if let Some(message) = short_append_budget(timing.heartbeat_ms) {
+            match config.mode {
+                Mode::Create => return Err(invalid(message)),
+                Mode::Open => eprintln!("openraft: {message}"),
+            }
+        }
         raft_config.heartbeat_interval = timing.heartbeat_ms;
         raft_config.election_timeout_min = if config.preferred_leader == Some(config.node) {
             timing.election_min_ms
@@ -693,10 +740,10 @@ pub fn prepare(path: &Path) -> io::Result<Prepared> {
     // miss as `RPCError::Timeout`, which it does **not** retry — a timed-out
     // heartbeat resets no inflight state, so nothing is retried until the next
     // event. The floor is therefore only effective for the RPC types OpenRaft
-    // does not wrap; an append is bounded by `heartbeat_ms`. Nothing here
-    // enforces a minimum heartbeat: the launchers provision 750 ms and the
-    // timing check below only requires `election_min_ms >= 3 x heartbeat_ms`,
-    // which bounds the heartbeat from above.
+    // does not wrap; an append is bounded by `heartbeat_ms`. That budget is
+    // guarded by `MIN_HEARTBEAT_MS` for a new root and warned about for an
+    // existing one; the relation `election_min_ms >= 3 x heartbeat_ms` bounds
+    // it from above, not from below.
     let mut transport = transport;
     transport.rpc_ttl_floor = Some(Duration::from_millis(raft_config.election_timeout_min));
     Ok(Prepared {
@@ -1312,11 +1359,11 @@ mod tests {
         config["preferred_leader"] = json!(1);
         std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
         assert!(prepare(&path).is_err());
-        config["raft_timing"] = json!({"heartbeat_ms":250,"election_min_ms":1500,"nonpreferred_election_min_ms":2750,"election_max_ms":3000});
+        config["raft_timing"] = json!({"heartbeat_ms":750,"election_min_ms":2250,"nonpreferred_election_min_ms":3000,"election_max_ms":3500});
         std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
         let preferred = prepare(&path).unwrap();
-        assert_eq!(preferred.raft_config.election_timeout_min, 1500);
-        assert_eq!(preferred.raft_config.election_timeout_max, 3000);
+        assert_eq!(preferred.raft_config.election_timeout_min, 2250);
+        assert_eq!(preferred.raft_config.election_timeout_max, 3500);
         config["preferred_leader"] = json!(2);
         std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
         assert!(prepare(&path).is_err());
@@ -1324,6 +1371,52 @@ mod tests {
         config["raft_timing"]["election_max_ms"] = json!(2600);
         std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
         assert!(prepare(&path).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_short_append_budget_is_refused_for_a_new_root_and_allowed_for_an_existing_one() {
+        let (dir, path, mut config) = fixture();
+        // `election_min_ms >= 3 x heartbeat_ms` holds, so the bounds check
+        // passes and only the append-budget floor can reject this.
+        assert_eq!(short_append_budget(750), None);
+        assert_eq!(short_append_budget(MIN_HEARTBEAT_MS), None);
+        let message = short_append_budget(250).expect("250 ms is below the floor");
+        assert!(
+            message.contains("500 ms minimum append budget"),
+            "the refusal must name the floor, got: {message}"
+        );
+        config["preferred_leader"] = json!(1);
+        config["raft_timing"] = json!({"heartbeat_ms":250,"election_min_ms":1500,"nonpreferred_election_min_ms":2750,"election_max_ms":3000});
+        std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+        let error = match prepare(&path) {
+            Ok(_) => panic!("a create with a 250 ms append budget must be refused"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("minimum append budget"),
+            "the create refusal must explain the budget, got: {error}"
+        );
+
+        // The same config on an existing root opens: a live deployment that
+        // already carries the short value is not turned into an outage. The
+        // warning goes to stderr and is covered by `short_append_budget`.
+        // `root` is the fixture's directory itself, and the replica path is
+        // `<root>/<cluster hex>-<group>-<incarnation>-<node>`.
+        std::fs::create_dir(dir.join(format!("{}-1-1-1", "01".repeat(16)))).unwrap();
+        config["mode"] = json!("open");
+        config["initialize"] = json!(false);
+        std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+        let opened = prepare(&path).unwrap();
+        assert_eq!(opened.raft_config.heartbeat_interval, 250);
+
+        // At the floor the config is accepted in create mode.
+        std::fs::remove_dir(dir.join(format!("{}-1-1-1", "01".repeat(16)))).unwrap();
+        config["mode"] = json!("create");
+        config["initialize"] = json!(true);
+        config["raft_timing"] = json!({"heartbeat_ms":500,"election_min_ms":1500,"nonpreferred_election_min_ms":2000,"election_max_ms":2500});
+        std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+        assert_eq!(prepare(&path).unwrap().raft_config.heartbeat_interval, 500);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

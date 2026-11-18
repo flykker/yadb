@@ -1031,7 +1031,7 @@ fn three_daemons_forward_http_to_different_group_leaders() {
             config(
                 &path,
                 &json!({"version":1,"root":metadata,"mode":"create","initialize":node==group,"cluster":vec![82;16],"group":group,"incarnation":1,"node":node,"listen":address,"signing_key_der":signing[node-1].0,
-                "preferred_leader":group,"raft_timing":{"heartbeat_ms":250,"election_min_ms":1500,"nonpreferred_election_min_ms":2750,"election_max_ms":3000},
+                "preferred_leader":group,"raft_timing":{"heartbeat_ms":750,"election_min_ms":2250,"nonpreferred_election_min_ms":3000,"election_max_ms":3500},
                 "tls":{"roots_der":[cert_dir.join("ca.der")],"chain_der":[cert_dir.join(format!("node-{node}.test.cert.der"))],"key_der":cert_dir.join(format!("node-{node}.test.key.der"))},"peers":peers}),
             );
             paths.push(path);
