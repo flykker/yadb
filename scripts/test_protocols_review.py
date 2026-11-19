@@ -242,6 +242,23 @@ class SqlNoAckTest(unittest.TestCase):
             protocols.assert_sql_no_ack([(b"Z", b"I")])
 
 
+class ReaderLeaseTtlTest(unittest.TestCase):
+    """The harness's wait must not fall behind the shipped lease lifetime.
+
+    `drain_reader_lease` sleeps for `READER_LEASE_TTL`, and the repair drill
+    relies on the leader's lease having lapsed by then. If the Rust constant
+    were raised, the wait would silently become too short and the drill would
+    flake instead of failing for a reason a reader can see.
+    """
+
+    def test_harness_ttl_matches_the_shipped_constant(self):
+        source = (REPO_ROOT / "crates" / "yadb-metakv" / "src" / "gc.rs").read_text()
+        match = re.search(r"DEFAULT_TTL_MS:\s*u64\s*=\s*([\d_]+)", source)
+        self.assertIsNotNone(match, "DEFAULT_TTL_MS is no longer a u64 literal")
+        shipped_ms = int(match.group(1).replace("_", ""))
+        self.assertEqual(int(protocols.READER_LEASE_TTL * 1000), shipped_ms)
+
+
 class SkipAnchorGuardTest(unittest.TestCase):
     """No SKIP remains; a reintroduced one is inventoried and still verifiable."""
 

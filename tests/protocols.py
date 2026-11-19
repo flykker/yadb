@@ -22,15 +22,16 @@ read-your-writes poll with `eventually` instead of racing the apply loop.
 
 No scenario is skipped. A Multi-Raft S3 GET publishes a per-group *metadata*
 reader lease, so collection refuses that project's group while the lease is
-live, and the drill waits out the lease TTL with no reads to prove the refusal
-lifts on its own; the read is also pinned at the storage target, and that pin
-has its own drill. Everything runs: the repair scan repairs one metadata group
-at a time and refuses only the groups the scanning node does not lead, garbage
-collection is driven through live drills, orphan blob collection is proved live
-because the harness shortens the upload-intent grace, and a cross-process
-`InstallSnapshot` is part of the normal run because the harness provisions the
-snapshot knobs instead of waiting for the 5000-entry default trigger. A failure
-anywhere is a non-zero exit.
+live; `assert_reader_lease_drill` proves the refusal and then waits out the
+lease TTL with no reads to prove it lifts on its own. The read is also pinned at
+the storage target, and `assert_reader_pin_drill` proves that pin separately.
+Everything runs: the repair scan repairs one metadata group at a time and
+refuses only the groups the scanning node does not lead, garbage collection is
+driven through live drills, orphan blob collection is proved live because the
+harness shortens the upload-intent grace, and a cross-process `InstallSnapshot`
+is part of the normal run because the harness provisions the snapshot knobs
+instead of waiting for the 5000-entry default trigger. A failure anywhere is a
+non-zero exit.
 """
 import argparse
 import datetime
@@ -370,6 +371,29 @@ def refused_group_names(text):
     return {int(group) for group in re.findall(r"group (\d+) refused:", text)}
 
 
+# The shipped reader-lease TTL (`crates/yadb-metakv/src/gc.rs:74`,
+# `DEFAULT_TTL_MS = 30_000`). A GET on a group's leader publishes a cached
+# record in that group and every read renews it, so the leader's own scrub
+# refuses the group it leads for the next TTL after the last read. That is the
+# fence working, not a spurious refusal, so a drill that asserts the sweep's
+# refused *set* must let it lapse first instead of weakening the comparison.
+READER_LEASE_TTL = 30.0
+
+
+def drain_reader_lease(last_read_at):
+    """Wait until the last read's cached lease has certainly lapsed.
+
+    Deliberately a sleep and not a polled scrub: a scrub that finally ran would
+    also repair the handoff parts, and the exact counters a drill asserts at
+    this point (for instance `blobs_repaired == 0` while the receiving slots are
+    down) are the thing under test. One extra second absorbs the gap between the
+    lease's publication and the timestamp the caller recorded after the read.
+    """
+    remaining = READER_LEASE_TTL + 1.0 - (time.monotonic() - last_read_at)
+    if remaining > 0:
+        time.sleep(remaining)
+
+
 def assert_multiraft_repair_scan(port, node, fragments=(), checked_at_least=0,
                                  live_nodes=NODES):
     """Scrub repairs per group and refuses only the groups this node does not lead.
@@ -682,6 +706,12 @@ def assert_multiraft_repair_drill(health, nodes, temp, env):
     leads neither the billing group nor the control group, so both metadata
     leaders stay in office and the scrub still runs on a group leader. Reads are
     local-applied, so every read below goes to the billing group's leader.
+
+    Every S3 `GET` now publishes a reader lease in the project's metadata group,
+    so after a read the leader's own sweep also refuses the group it *leads* for
+    the lease TTL; this drill waits that fence out before each scan rather than
+    treating it as a spurious refusal, because the scans below assert the
+    refused group set exactly.
     """
     pool = next(each for each in health["pools"] if each["pool_name"] == S3_POOL)
     node_of = {slot["slot_index"]: slot["node_id"] for slot in pool["slots"]}
@@ -708,6 +738,16 @@ def assert_multiraft_repair_drill(health, nodes, temp, env):
     before_body = b"p" * (1024 * 1024)
     assert signed(s3_port(leader), "PUT", before_key, before_body, timeout=120)[0] == 200
     s3_visible(s3_port(leader), before_key, before_body, timeout=120)
+    # The GET above (and any retry inside `s3_visible`) published a reader lease
+    # in the billing group on `leader`, and each read renews it. `sweep_group`
+    # refuses on any live lease, so the leader's own sweep would name the group
+    # it leads for the next TTL. The scans below assert the refused *set* is
+    # exactly the groups this node does not lead, so the fence has to be clear
+    # before each one. Only reads linger: a write's fence (the upload intent for
+    # an S3 PUT, a writer lease for SQL and block writes) is removed when the
+    # write completes, whereas `begin_read_lease` caches its record and the next
+    # read renews it, so the writes below do not move this timestamp.
+    last_read_at = time.monotonic()
 
     nodes[down-1].kill()
     nodes[down-1].wait(timeout=10)
@@ -720,6 +760,10 @@ def assert_multiraft_repair_drill(health, nodes, temp, env):
             assert status == 200, (key, status, response)
             during.append((key, body))
 
+        # The read before the outage left its lease live; let it lapse so this
+        # pass refuses only the groups this node does not lead. Polling a scrub
+        # instead would repair the handoff parts and break the exact counters.
+        drain_reader_lease(last_read_at)
         summary = assert_multiraft_repair_scan(
             http_port(leader), leader, live_nodes=[n for n in NODES if n != down])
         # Exact, and licensed by the baseline precondition above rather than by
@@ -737,6 +781,9 @@ def assert_multiraft_repair_drill(health, nodes, temp, env):
         assert summary["blobs_unrecoverable"] == base + 1, summary
         for key, body in during:
             s3_visible(s3_port(leader), key, body, timeout=120)
+        # These reads published (and renewed) the lease again, so the scan after
+        # the restart must wait from *this* read, not from the pre-outage one.
+        last_read_at = time.monotonic()
     finally:
         # The rest of the run needs all three nodes. Restart even when an
         # assertion above failed, then let the failure propagate.
@@ -747,6 +794,10 @@ def assert_multiraft_repair_drill(health, nodes, temp, env):
 
     wait_all_leaders()
     leader = wait_group_leader(BILLING_GROUP)
+    # Same fence, second read: the during-outage GETs renewed the lease. The
+    # record lives in the metadata group, not on the node that served the read,
+    # so a leader change across the restart does not clear it either.
+    drain_reader_lease(last_read_at)
     summary = assert_multiraft_repair_scan(http_port(leader), leader)
     # The same four blobs, now all readable: the pre-outage one is whole again,
     # and the handoff parts of the three written during the outage were moved to
@@ -765,13 +816,15 @@ def assert_multiraft_repair_drill(health, nodes, temp, env):
 def assert_reader_pin_drill(health):
     """Observe the target-side pin a real S3 GET takes, and its drain.
 
-    Multi-Raft has no *metadata* read lease, but the read is still fenced:
-    `read_part` pins the slot's current epoch before it fetches a fragment and
-    releases the pin as soon as the bytes are copied, and `delete_collectable`
-    refuses while any pin is live. This drill watches the shipped
-    `/internal/vdisk/{pool}/{slot}/pins` route from one thread per slot while a
-    12 MiB object is read. A 1 MiB object is one chunk and finishes inside a
-    single pin window, which is why the payload is large enough to stripe.
+    A read is fenced twice: the metadata reader lease (proved by
+    `assert_reader_lease_drill`) stops a collector in the project's group, and
+    at the storage target `read_part` pins the slot's current epoch before it
+    fetches a fragment and releases the pin as soon as the bytes are copied,
+    while `delete_collectable` refuses while any pin is live. This drill watches
+    the shipped `/internal/vdisk/{pool}/{slot}/pins` route from one thread per
+    slot while a 12 MiB object is read. A 1 MiB object is one chunk and finishes
+    inside a single pin window, which is why the payload is large enough to
+    stripe.
     """
     pool = next(each for each in health["pools"] if each["pool_name"] == S3_POOL)
     leader = wait_group_leader(BILLING_GROUP)
