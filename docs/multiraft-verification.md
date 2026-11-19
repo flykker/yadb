@@ -2703,21 +2703,25 @@ not through an admin route, and the install is still initiated by an inbound
 
 ### Gates
 
-* `python3 tests/protocols.py` — 23 PASS / 2 SKIP, exit 0 on 2026-11-19, the last
-  run before the two SKIP records changed. The `Multi-Raft repair scan` SKIP is
-  gone: the scenario now expects a per-group repair instead of a refusal. The
-  `reader lease` SKIP is narrowed to the metadata
+* `python3 tests/protocols.py` — **26 PASS / 1 SKIP**, exit 0 on 2026-11-19,
+  after the two SKIP records changed. The `Multi-Raft repair scan` SKIP is gone:
+  the scenario now asserts a per-group repair instead of a refusal, and prints
+  `PASS Multi-Raft repair scan repairs per group, refuses only groups this node
+  does not lead`. The `reader lease` SKIP is narrowed to the metadata
   mechanism that is genuinely absent — Multi-Raft has no metadata read lease,
-  because the fragment pin fences the read — and a positive drill observes a live
-  pin during an S3 `GET` and its drain afterwards. A live orphan-collection drill
-  sets the intent grace to 1 s and observes an abandoned intent survive a pass
-  inside the grace and be collected after it. No gate count for the changed suite
-  is claimed here; the next full run establishes it. The cross-process
-  InstallSnapshot scenario runs in this gate and prints a PASS naming the
-  installed snapshot's meta index; it is no longer a SKIP and the
-  `--install-snapshot-live` flag no longer exists.
-* The InstallSnapshot PASS from that run: node 3 was stopped at log index 301,
+  because the fragment pin fences the read — and a positive drill observes live
+  pins during a 12 MiB S3 `GET` and their drain afterwards. A live
+  orphan-collection drill sets the intent grace to 1 s and observes an abandoned
+  intent survive a pass inside the grace and be collected after it. The 26
+  counts the three new drills that report separately. The first run of this
+  suite failed in the orphan drill on a hex-vs-integer id mismatch
+  (`Unknown format code 'x'`), which the offline guards could not see; the
+  26/1 result is from the run after that fix. The cross-process InstallSnapshot
+  scenario runs in this gate and prints a PASS naming the installed snapshot's
+  meta index; it is no longer a SKIP and the `--install-snapshot-live` flag no
+  longer exists.
+* The InstallSnapshot PASS from that run: node 3 was stopped at log index 571,
   the leader purged past it under the provisioned 128-entry snapshot interval,
-  and the restarted node installed a snapshot at meta index 1550 and served its
+  and the restarted node installed a snapshot at meta index 1802 and served its
   own local read. The install path itself is also proven by the crate-level
   process test `three_process_mtls_failover_and_quorum_loss`.

@@ -20,30 +20,44 @@ implemented and what remains unproven.
    otherwise — the rule `/v1/pools/gc` already used. On a multi-node cluster a
    node leads only some groups, so its scrub is `409` while the groups it does
    lead are repaired; the refusal names the groups, not a missing capability.
-3. **Live repair drill and its inversion — exists; conditional on the harness
-   run.** The drill and the node-still-down inversion described below are in the
-   harness change. No run was observed from the worktree that wrote this record,
-   so no PASS is claimed here.
-4. **Intent grace knob and orphan drill — knob done; drill exists, conditional
-   on the harness run.** The grace is now the per-engine knob
-   `ObjectStoreEngine::set_intent_grace_secs`, default 300 s unchanged,
-   provisioned only by the harness (1 s), so the orphan-collection drill and its
-   inversion (same intent preserved at the default) are possible without
-   changing a shipped default.
+3. **Live repair drill and its inversion — done, observed.** The drill and the
+   node-still-down inversion described below ran in the full gate on
+   2026-11-19 and printed `PASS Multi-Raft repair scan repairs per group,
+   refuses only groups this node does not lead`. The gate reported 26 PASS / 1
+   SKIP.
+4. **Intent grace knob and orphan drill — done, observed.** The grace is now
+   the per-engine knob `ObjectStoreEngine::set_intent_grace_secs`, default 300 s
+   unchanged, provisioned only by the harness (1 s), so the orphan-collection
+   drill and its inversion (the same intent preserved inside its grace) are
+   possible without changing a shipped default. The drill printed
+   `PASS Multi-Raft orphan-blob collection keeps a live upload intent, then
+   collects its chunks once the grace lapses` in the same run.
 5. **Reader lease — not implemented; narrowed instead.** Multi-Raft has no
    *metadata* read lease by design: `read_part` pins the slot epoch at the point
    of use and `delete_collectable` refuses while any pin is live, so the fence
    is per fragment on the target rather than a record the target never sees. A
-   positive drill observes a live pin during an S3 `GET` and its drain;
-   conditional on the harness run. `feat/reader-lease` stays unmerged and option
-   B stays rejected.
-6. **Guards and docs.** The `tests/protocols.py` and
-   `scripts/test_protocols_review.py` edits belong to the harness change; this
-   record does not restate their result.
+   positive drill observed live pins during a 12 MiB S3 `GET` and their drain,
+   and printed `PASS Multi-Raft S3 GET pins the fragment at the target and the
+   pin drains`. `feat/reader-lease` stays unmerged and option B stays rejected.
+6. **Guards and docs — done.** `scripts/test_protocols_review.py` passes 21
+   tests, `scripts/test_doc_anchors.py` passes 9, and the offline refusal
+   contract in `tests/test_gc_refusal_protocol.py` passes 15, after the harness
+   change and the re-resolved citations.
 
-The gate counts are deliberately not restated as achieved. The projection in
-"Order taken, and the projected effect on the gate" is the argument for what the
-change should add, and the harness run is the record of what it did add.
+### The gate run (2026-11-19)
+
+`python3 tests/protocols.py` ran against the built daemon on the documented
+fixed bases and reported **26 PASS / 1 SKIP**. The projection below is what the
+change was expected to add; this is what it added. The three drills that report
+separately are the three new `PASS` lines, and the single remaining `SKIP` is
+the narrowed `reader lease` one, which now names the target-side pin and the
+drill that proves it instead of claiming the runtime has no fence at all.
+
+The run also found a defect the offline guards could not: the orphan drill
+passed the `/blobs` route's hex strings to a helper that formats an integer
+(`{blob:032x}`), so it died with `Unknown format code 'x'` before asserting
+anything. Fixed in the harness and re-run; the 26/1 result above is from the
+run after that fix.
 
 ## What this record still does not claim
 
@@ -166,9 +180,7 @@ in the repair path crosses groups.
    `multiraft-production-todo.md` and `multiraft-gc-fencing-plan.md` are updated
    to match, all in the same change set. Steps 1–3 are implemented. The unit
    tests and the live drills in step 4 belong to the implementation and harness
-   changes; none of them was observed running from the worktree that wrote this
-   record, so step 4 is conditional on that run. Step 5 is split across the
-   harness change and this documentation change.
+   changes; all four passed in the gate run recorded above.
 
 ### What this still does not prove
 
@@ -213,14 +225,15 @@ exists by design, because the fragment pin already fences the read, and cites
 the pin as the mechanism. The SKIP stays as the record that the metadata
 mechanism is absent.
 
-The positive drill was added rather than only a note: stall one slot's response
-through the harness transport proxy while an S3 `GET` is in flight, assert that
-the slot's `/pins` surface shows a live pin, then release the response and
-assert the pin drains and the object is intact. The proxy machinery and the
-`/pins` route both exist; `assert_vdisk_fence_rpc` already drives that route
-directly. The drill exists in the harness change; it has not been observed
-green from the worktree that wrote this record, so its PASS is conditional on
-that run.
+The positive drill was added rather than only a note, and it uses the shipped
+surfaces only: write a 12 MiB object (large enough to stripe, under the 16 MiB
+body cap), read it while one thread per slot polls
+`/internal/vdisk/{pool}/{slot}/pins` with the Raft token, assert at least one
+non-empty observation with integer `pin_id`/`epoch`/`expires_at_ms`, then assert
+every slot's pin list drains after the read. It does not stall a response
+through the transport proxy: the pin window is a few milliseconds per fragment,
+and a 12 MiB read widens it enough to observe without touching the proxy. The
+drill passed in the gate run recorded above.
 
 **B. Merge `feat/reader-lease` — rejected.**
 
@@ -242,10 +255,16 @@ Removing it would silently delete them, so both were handled:
    (`crates/yadb-s3/src/lib.rs:17`) and no run waits that long. Closed by making
    the grace a per-engine configuration value,
    `ObjectStoreEngine::set_intent_grace_secs`, whose default stays 300 s and
-   which is provisioned only from the test harness (1 s), plus a drill: with the
-   grace at one second, an abandoned intent is collected; with the default, the
-   same intent is preserved. The second half is the inversion that shows the
-   grace is what protects it. The drill is conditional on the harness run.
+   which is provisioned only from the test harness (1 s), plus a drill. The
+   drill's inversion is the same intent on the same deployment before and after
+   its grace lapses: the first pass runs inside the grace, collects nothing and
+   leaves every chunk of the abandoned part readable; the second runs after 40
+   commits in the project group (well past the 32-revision lease) and the wall
+   clock, and collects the intent and its chunks. It does **not** run a second
+   deployment at the 300 s default — that would cost five minutes of wall time —
+   so "the shipped default protects an intent for 300 s" rests on the knob's
+   unit test (`intent_grace_is_configurable_and_protects_a_fresh_intent_until_it_expires`)
+   and on the constant being unchanged, not on a live observation.
 2. **A scope with `project_ids == None` cannot be collected** — that is a
    single-group Multi-Raft deployment, where `collect_orphans_in_scopes_with`
    refuses with `NamespaceScanUnavailable` because the group covers every
@@ -281,7 +300,8 @@ already printed one, and its text changes from "refuses its repair half" to
 The floor is 23 PASS / 1 SKIP: the repair scan implemented, the `reader lease`
 SKIP narrowed, and no new drill. A drill that turns out not to be injectable is
 recorded as such here and in the SKIP reason; it is never counted as a PASS.
-Which rows the harness run actually reaches is not asserted by this record.
+Every row above was reached in the gate run recorded under "The gate run
+(2026-11-19)".
 
 ## What must not change
 
