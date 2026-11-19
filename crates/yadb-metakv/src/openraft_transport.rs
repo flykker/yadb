@@ -67,9 +67,19 @@ impl NodeSigningKey {
         self.inner.public_key().as_ref().to_vec()
     }
 
-    fn sign(&self, message: &[u8]) -> Vec<u8> {
+    /// Signs an arbitrary caller-supplied message. Callers must apply their
+    /// own domain separation; the transport and fence-token encodings do so
+    /// with different context prefixes.
+    pub(crate) fn sign(&self, message: &[u8]) -> Vec<u8> {
         self.inner.sign(message).as_ref().to_vec()
     }
+}
+
+/// Verifies an Ed25519 signature with a trusted public key.
+pub(crate) fn verify_signature(public_key: &[u8], message: &[u8], signature: &[u8]) -> bool {
+    UnparsedPublicKey::new(&ED25519, public_key)
+        .verify(message, signature)
+        .is_ok()
 }
 
 /// Trusted peer public keys, keyed by node id.
@@ -245,19 +255,20 @@ impl SignedRaftEnvelope {
         let public_key = registry
             .public_key(self.sender)
             .ok_or(TransportError::UnknownSender)?;
-        UnparsedPublicKey::new(&ED25519, public_key)
-            .verify(
-                &canonical_bytes(
-                    self.version,
-                    &self.group,
-                    self.sender,
-                    self.recipient,
-                    self.sequence,
-                    &self.payload,
-                ),
-                &self.signature,
-            )
-            .map_err(|_| TransportError::AuthenticationFailed)?;
+        if !verify_signature(
+            public_key,
+            &canonical_bytes(
+                self.version,
+                &self.group,
+                self.sender,
+                self.recipient,
+                self.sequence,
+                &self.payload,
+            ),
+            &self.signature,
+        ) {
+            return Err(TransportError::AuthenticationFailed);
+        }
         Ok(&self.payload)
     }
 
