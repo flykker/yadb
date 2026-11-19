@@ -364,6 +364,34 @@ fn sense(c: &mut TcpStream, s: &mut Session, p: &Pdu, key: u8, asc: u8) -> io::R
     s.sequence(&mut r, true);
     r.send(c)
 }
+
+/// The sense to report for a non-200 answer from the gateway.
+///
+/// Reads and mutations cannot share one answer. A failed read may be retried
+/// safely, so `2/0x08` (NOT READY, logical unit communication failure) is right
+/// for it. A failed *write* may have committed, and the gateway says so with
+/// `x-yadb-retry: do-not-retry`; reporting the same NOT READY for that invites
+/// the initiator to send the write again, which is how one write becomes two.
+/// The ambiguous case gets `0x0B/0x00` (ABORTED COMMAND) instead - the closest
+/// SCSI has to "this command's outcome is not known", and a weaker retry hint
+/// than NOT READY rather than an identical one.
+///
+/// Only the mutation call sites use the header-aware form; a read keeps
+/// `2/0x08` for every non-200.
+fn sense_for_write(code: u16, headers: &str) -> (u8, u8) {
+    if code == 200 {
+        return (0, 0);
+    }
+    let lower = headers.to_ascii_lowercase();
+    if lower.contains("x-yadb-retry: do-not-retry")
+        || lower.contains("x-yadb-write-outcome: unknown")
+    {
+        (0x0B, 0x00)
+    } else {
+        (2, 0x08)
+    }
+}
+
 fn good(c: &mut TcpStream, s: &mut Session, p: &Pdu) -> io::Result<()> {
     let mut r = Pdu::new(0x21, 0x80, &p.h[16..20]);
     s.sequence(&mut r, true);
@@ -599,7 +627,7 @@ fn command(c: &mut TcpStream, st: &AppState, s: &mut Session, p: Pdu) -> io::Res
             }
             if write {
                 let data = receive_data(c, s, &p, len as usize)?;
-                match http(
+                match http_with_headers(
                     &st.listen_addr,
                     "PUT",
                     &format!("{base}?offset={offset}"),
@@ -607,8 +635,14 @@ fn command(c: &mut TcpStream, st: &AppState, s: &mut Session, p: Pdu) -> io::Res
                     st.subject_secret.as_deref(),
                     &data,
                 ) {
-                    Ok((200, _)) => good(c, s, &p),
-                    _ => sense(c, s, &p, 2, 0x08),
+                    Ok((200, _, _)) => good(c, s, &p),
+                    Ok((code, headers, _)) => {
+                        let (key, asc) = sense_for_write(code, &headers);
+                        sense(c, s, &p, key, asc)
+                    }
+                    // The bridge itself failed: no answer reached us, so the
+                    // outcome is exactly as unknown as a marked 503.
+                    Err(_) => sense(c, s, &p, 0x0B, 0x00),
                 }
             } else {
                 match http(
@@ -651,7 +685,7 @@ fn command(c: &mut TcpStream, st: &AppState, s: &mut Session, p: Pdu) -> io::Res
                 return sense(c, s, &p, 5, 0x26);
             }
             let body = serde_json::to_vec(&serde_json::json!({"offset":offset,"len":len})).unwrap();
-            match http(
+            match http_with_headers(
                 &st.listen_addr,
                 "POST",
                 &format!("{base}/unmap"),
@@ -659,8 +693,14 @@ fn command(c: &mut TcpStream, st: &AppState, s: &mut Session, p: Pdu) -> io::Res
                 st.subject_secret.as_deref(),
                 &body,
             ) {
-                Ok((200, _)) => good(c, s, &p),
-                _ => sense(c, s, &p, 2, 0x08),
+                Ok((200, _, _)) => good(c, s, &p),
+                Ok((code, headers, _)) => {
+                    let (key, asc) = sense_for_write(code, &headers);
+                    sense(c, s, &p, key, asc)
+                }
+                // UNMAP is a mutation: an unreachable bridge is an unknown
+                // outcome, not a definite refusal.
+                Err(_) => sense(c, s, &p, 0x0B, 0x00),
             }
         }
         _ => sense(c, s, &p, 5, 0x20),
@@ -738,6 +778,37 @@ pub(super) fn md5(input: &[u8]) -> [u8; 16] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unknown_write_outcome_is_not_reported_as_not_ready() {
+        // The gateway answers "not ready" and "outcome unknown" with the same
+        // 503, so the status cannot distinguish them; only the marker header can.
+        let plain = "HTTP/1.1 503 Service Unavailable\r\ncontent-type: application/json\r\n";
+        assert_eq!(
+            sense_for_write(503, plain),
+            (2, 0x08),
+            "a plain 503 is NOT READY, which an initiator may retry"
+        );
+
+        let unknown = "HTTP/1.1 503 Service Unavailable\r\n\
+                       x-yadb-write-outcome: unknown\r\n\
+                       x-yadb-retry: do-not-retry\r\n";
+        assert_eq!(
+            sense_for_write(503, unknown),
+            (0x0B, 0x00),
+            "an unknown write outcome must not look retryable"
+        );
+
+        // Header names are case-insensitive.
+        let mixed = "HTTP/1.1 503 Service Unavailable\r\nX-Yadb-Retry: Do-Not-Retry\r\n";
+        assert_eq!(sense_for_write(503, mixed), (0x0B, 0x00));
+
+        // A 200 never reaches this function; the guard keeps it from being
+        // turned into a failure if a caller ever does.
+        assert_eq!(sense_for_write(200, plain), (0, 0));
+        assert_eq!(sense_for_write(403, plain), (2, 0x08));
+    }
+
     #[test]
     fn chap_vectors() {
         assert_eq!(hex(&md5(b"")), "d41d8cd98f00b204e9800998ecf8427e");

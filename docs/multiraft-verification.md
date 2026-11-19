@@ -107,11 +107,13 @@ Open findings from that review, not fixed in this delta:
   serialize on the refresh mutex and every expired-lease request can enqueue a
   blocking task.
 - Socket timeouts bound individual operations, not total elapsed refresh time.
-- iSCSI maps freshness failure to DATA PROTECT/WRITE PROTECTED sense, and maps
-  every other non-200 the same way; it has no "not ready" code distinct from
-  "this write's outcome is unknown". Established PG sessions distinguish the two:
-  a plain `503` is `57P03` and a `503` carrying `x-yadb-retry: do-not-retry` is
-  `XX000`. iSCSI still fails closed imprecisely.
+- iSCSI maps freshness failure to DATA PROTECT/WRITE PROTECTED sense, and
+  distinguishes a retryable `503` from an unknown write outcome: a plain `503` on
+  a mutation is `2/0x08` (NOT READY) and one carrying `x-yadb-retry:
+  do-not-retry` is `0x0B/0x00` (ABORTED COMMAND), so an initiator is not told to
+  resend a write that may have committed. A read still reports `2/0x08` for every
+  failure, which is safe because retrying a read cannot duplicate a mutation.
+  Established PG sessions make the same distinction with `57P03` and `XX000`.
 - The revocation regression asserts denial only through `public[0]`, not every
   protocol/endpoint or a post-rejection no-mutation check.
 - Port bind checks are pre-launch only and can race a concurrent starter.

@@ -222,6 +222,34 @@ provides is the two operations the caller must bracket, plus the guarantee that 
 pin which lands between them is either seen (the advance refuses) or lands after
 the advance (and then names the new epoch).
 
+### Why the reader lease is not the next increment
+
+There is a parked branch (`feat/reader-lease`, rebased onto `main` and building)
+that publishes a per-group reader lease on Multi-Raft: `reader_lease` becomes a
+map keyed by metadata group, the record carries the group's applied log index
+instead of a deployment-wide revision, and S3 and block reads forward to the
+group leader so they can publish one. It is not merged, and it should not be
+merged before the pin protocol exists.
+
+Two reasons, both from the design above:
+
+* **It is the mechanism this plan demotes, not the one it depends on.** The
+  component table demotes the lease to an optimisation once pins exist. Building
+  the lease client first puts the weaker mechanism in the hot path and leaves the
+  correctness mechanism still without a client.
+* **It costs a committed write per read and buys nothing yet.** `renew` is a CAS
+  through `extend`, so every fenced read is a Raft round trip; and every read is
+  forced onto the group leader, which is the read-scaling property Multi-Raft
+  exists to provide. The only consumer of a reader lease is `sweep_group`, and
+  `sweep` returns its refusal before reaching it, so on Multi-Raft the record is
+  published and never consulted.
+
+The branch is worth keeping for its per-group keying and its provenance check
+(`lease_belongs_to_group`), both of which the collector will need. It becomes
+mergeable when the collector exists to read the records, or when the lease is
+retired in favour of pins - whichever comes first.
+
+
 ## Invariant to establish
 
 > A fragment is deleted only if no reader can still hold a reference to it, and
