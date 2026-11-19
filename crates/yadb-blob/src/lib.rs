@@ -1556,8 +1556,16 @@ mod tests {
         assert!(!store.contains(id));
     }
 
+    /// A reader can only pin the target's *current* epoch, so that pin must
+    /// protect every fragment older than the collector, not just the fragments
+    /// written under the pinned epoch.
+    ///
+    /// The previous version of this test asserted the opposite - that a pin on
+    /// epoch 1 leaves the epoch-0 fragment collectable - and passed. That is the
+    /// hole: the reader pins epoch 1, then fetches a fragment written at epoch 0,
+    /// and the collector deletes it underneath the live pin.
     #[test]
-    fn a_pin_only_fences_the_epoch_it_names() {
+    fn a_live_pin_on_the_current_epoch_protects_every_older_fragment() {
         let fs = SimFs::new(9013);
         let cfg = VolumeConfig::default();
         let store = VolumeStore::open(fs.clone(), "pin_scope", cfg).unwrap();
@@ -1567,27 +1575,44 @@ mod tests {
         let current = BlobId::new(35, 1, 1, 2, 2, 0);
         store.put(current, b"epoch one").unwrap();
 
-        // A pin names one epoch, so it must not block collection of another one.
-        // A collector at epoch 2 may reclaim the epoch-0 fragment while a reader
-        // still pins epoch 1.
+        // The pin the read path can take: the epoch the target is on now.
         let grant = store.pin(1, 60_000).unwrap();
-        assert!(
-            store.delete_collectable(old, 2).unwrap(),
-            "a pin on epoch 1 does not name the epoch-0 fragment"
-        );
-        // The pinned epoch itself is protected.
+        // Pinning an older epoch is impossible, which is why the check below
+        // cannot be narrowed to "pins that name the fragment's epoch".
         assert!(matches!(
-            store.delete_collectable(current, 2),
-            Err(BlobError::FragmentPinned {
-                fragment_epoch: 1,
-                collector_epoch: 2,
-                live_pins: 1,
-                ..
+            store.pin(0, 60_000),
+            Err(BlobError::PinEpochNotCurrent {
+                requested_epoch: 0,
+                actual_epoch: 1,
             })
         ));
+
+        // Both the fragment written at the pinned epoch and the one written
+        // before it are protected by the same live pin.
+        for (id, fragment_epoch) in [(old, 0), (current, 1)] {
+            assert!(
+                matches!(
+                    store.delete_collectable(id, 2),
+                    Err(BlobError::FragmentPinned {
+                        fragment_epoch: named_fragment,
+                        collector_epoch: 2,
+                        live_pins: 1,
+                        ..
+                    }) if named_fragment == fragment_epoch
+                ),
+                "a live pin on the current epoch must protect the epoch-{fragment_epoch} fragment"
+            );
+        }
+        assert_eq!(store.get(old).unwrap(), b"epoch zero");
         assert_eq!(store.get(current).unwrap(), b"epoch one");
+
         assert!(store.unpin(grant.pin_id).unwrap());
+        // With no pin live, both are older than a collector at epoch 2 and both
+        // are collectable: the refusal above was the pin, not the epoch order.
+        assert!(store.delete_collectable(old, 2).unwrap());
         assert!(store.delete_collectable(current, 2).unwrap());
+        assert!(!store.contains(old));
+        assert!(!store.contains(current));
     }
 
     #[test]
@@ -2209,8 +2234,22 @@ mod tests {
         /// The other switches model an unreachable slot; this one models a slot
         /// that answers with a *permanent* refusal.
         put_status: Arc<std::sync::atomic::AtomicU16>,
+        /// HTTP status the pin route answers with while non-zero. Models a
+        /// target that refuses to be read: a read that ignored the refusal and
+        /// fetched anyway would report bytes the fence never admitted.
+        pin_status: Arc<std::sync::atomic::AtomicU16>,
         seen: Arc<std::sync::Mutex<Vec<String>>>,
         server: Option<std::thread::JoinHandle<()>>,
+    }
+
+    /// A minimal JSON response for the mock's fence routes.
+    fn json_response(body: &str) -> Vec<u8> {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .into_bytes()
     }
 
     impl MockVdisk {
@@ -2223,10 +2262,22 @@ mod tests {
             let fail_puts = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let fail_once = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let put_status = Arc::new(std::sync::atomic::AtomicU16::new(0));
+            let pin_status = Arc::new(std::sync::atomic::AtomicU16::new(0));
             let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            // The read path pins the target's epoch before every fetch, so the
+            // mock has to serve that surface or it models a target that refuses
+            // every read. Epoch 0 never advances here: these tests are about
+            // placement, not collection.
+            let next_pin = Arc::new(std::sync::atomic::AtomicU64::new(1));
+            let live_pins = Arc::new(std::sync::Mutex::new(
+                std::collections::BTreeSet::new(),
+            ));
             let (store_c, fail_c, seen_c) = (store.clone(), fail_puts.clone(), seen.clone());
             let fail_once_c = fail_once.clone();
             let put_status_c = put_status.clone();
+            let pin_status_c = pin_status.clone();
+            let next_pin_c = next_pin.clone();
+            let live_pins_c = live_pins.clone();
             let server = std::thread::spawn(move || loop {
                 let (mut stream, _) = match listener.accept() {
                     Ok(pair) => pair,
@@ -2282,6 +2333,38 @@ mod tests {
                         b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
                             .to_vec()
                     }
+                    "GET" if path.ends_with("/epoch") => json_response("{\"epoch\":0}"),
+                    "GET" if path.ends_with("/pins") => json_response("{\"pins\":[]}"),
+                    "POST" if path.ends_with("/pin") && pin_status_c.load(Ordering::Relaxed) != 0 => {
+                        let status = pin_status_c.load(Ordering::Relaxed);
+                        let body = "{\"error\":\"pin_epoch_not_current\",\"message\":\"mock refusal\"}";
+                        format!(
+                            "HTTP/1.1 {status} Refused\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        )
+                        .into_bytes()
+                    }
+                    "POST" if path.ends_with("/pin") => {
+                        let pin_id = next_pin_c.fetch_add(1, Ordering::Relaxed);
+                        live_pins_c.lock().unwrap().insert(pin_id);
+                        json_response(&format!(
+                            "{{\"pin_id\":{pin_id},\"epoch\":0,\"expires_at_ms\":{}}}",
+                            u64::MAX
+                        ))
+                    }
+                    "POST" if path.ends_with("/unpin") => {
+                        // `pin_id` is the only numeric field in the request body.
+                        let pin_id = body
+                            .split(|b| !b.is_ascii_digit())
+                            .filter(|part| !part.is_empty())
+                            .next()
+                            .and_then(|part| std::str::from_utf8(part).ok())
+                            .and_then(|text| text.parse::<u64>().ok());
+                        let released = pin_id
+                            .is_some_and(|pin_id| live_pins_c.lock().unwrap().remove(&pin_id));
+                        json_response(&format!("{{\"released\":{released}}}"))
+                    }
                     "GET" => match store_c.lock().unwrap().get(&path) {
                         Some(bytes) => {
                             let mut out = format!(
@@ -2317,6 +2400,7 @@ mod tests {
                 fail_puts,
                 fail_once,
                 put_status,
+                pin_status,
                 seen,
                 server: Some(server),
             }
@@ -3063,6 +3147,152 @@ mod tests {
             striper.repair_blob(id),
             Err(BlobError::CorruptData { .. })
         ));
+    }
+
+    /// A read takes a pin on every slot it fetches from and releases it before
+    /// it returns, so the fence covers the fetch and nothing after it.
+    #[test]
+    fn a_read_releases_its_pin_on_every_slot_it_touched() {
+        let scheme = ErasureScheme::ReedSolomon { k: 4, m: 2 };
+        let (stores, striper) = local_pool(3105, scheme, 0);
+        let id = BlobId::new(12, 43, 1, 1, 2, 0);
+        let payload = b"Multi-tenant erasure-coded tablet SSTable block #0003";
+
+        striper.put_blob(id, payload).unwrap();
+        assert_eq!(striper.get_blob(id).unwrap(), payload);
+
+        for (slot, store) in stores.iter().enumerate() {
+            // A 300 s pin would still be live here if it had not been released.
+            assert!(
+                store.live_pins().unwrap().is_empty(),
+                "slot {slot} kept a read pin after the fetch returned"
+            );
+            // The pin is gone, so a collector at the next epoch may now reclaim
+            // every fragment this slot holds. A leaked pin would refuse this.
+            for part in 1..=scheme.total_parts() as u8 {
+                let part_id = id.with_part(part);
+                if store.fragment_epoch(part_id).is_some() {
+                    assert!(
+                        store.delete_collectable(part_id, 1).unwrap(),
+                        "slot {slot} part {part} stayed protected after the read"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The pin is taken before the fragment is fetched, and released after it.
+    ///
+    /// `seen` records the request lines in the order the mock received them, so
+    /// this observes the wire order rather than the order of statements in
+    /// `read_part`. A delete admitted between the fetch and a later pin would
+    /// already have unlinked the bytes the pin was supposed to protect.
+    #[test]
+    fn a_read_pins_the_target_before_it_fetches_and_releases_it_after() {
+        let scheme = ErasureScheme::ReedSolomon { k: 4, m: 2 };
+        let (vdisks, striper) = remote_pool("pool", scheme, 0);
+        let id = BlobId::new(12, 44, 1, 1, 2, 0);
+        let payload = b"Multi-tenant erasure-coded tablet SSTable block #0004";
+
+        striper.put_blob(id, payload).unwrap();
+        for vdisk in &vdisks {
+            vdisk.seen.lock().unwrap().clear();
+        }
+        assert_eq!(striper.get_blob(id).unwrap(), payload);
+
+        for (slot, vdisk) in vdisks.iter().enumerate() {
+            let seen = vdisk.requests();
+            let index = |needle: &str| seen.iter().position(|line| line.contains(needle));
+            let epoch = index(&format!("/{slot}/epoch "));
+            let pin = index(&format!("/{slot}/pin "));
+            let fetch = index(&format!("/{slot}/blob/"));
+            let unpin = index(&format!("/{slot}/unpin "));
+            assert!(
+                epoch.is_some() && pin.is_some() && fetch.is_some() && unpin.is_some(),
+                "slot {slot} did not see epoch, pin, fetch and unpin: {seen:?}"
+            );
+            assert!(
+                epoch < pin,
+                "slot {slot} pinned before it knew the epoch: {seen:?}"
+            );
+            assert!(
+                pin < fetch,
+                "slot {slot} fetched before it pinned, so the fetch was unprotected: {seen:?}"
+            );
+            assert!(
+                fetch < unpin,
+                "slot {slot} released the pin before the bytes were copied: {seen:?}"
+            );
+        }
+    }
+
+    /// A refused pin is a refusal to read, not evidence that the bytes are gone.
+    ///
+    /// Every target refuses here, so no part can be read. Reporting
+    /// `NotFound`/`InsufficientFragments` would turn "the fence refused" into
+    /// "the data does not exist", and the second statement is not one the read
+    /// is entitled to make.
+    #[test]
+    fn a_refused_pin_fails_the_read_closed_instead_of_reporting_absence() {
+        let scheme = ErasureScheme::ReedSolomon { k: 4, m: 2 };
+        let (vdisks, striper) = remote_pool("pool", scheme, 0);
+        let id = BlobId::new(12, 45, 1, 1, 2, 0);
+        let payload = b"Multi-tenant erasure-coded tablet SSTable block #0005";
+
+        striper.put_blob(id, payload).unwrap();
+        for vdisk in &vdisks {
+            vdisk.pin_status.store(409, Ordering::Relaxed);
+        }
+        match striper.get_blob(id) {
+            Err(BlobError::RemoteFenceRefused { status, code, .. }) => {
+                assert_eq!(status, 409);
+                assert_eq!(code, "pin_epoch_not_current");
+            }
+            Err(BlobError::NotFound(_)) => {
+                panic!("a refused pin was reported as absence")
+            }
+            Err(BlobError::InsufficientFragments { .. }) => {
+                panic!("a refused pin was reported as a shortfall")
+            }
+            other => panic!("expected the refusal, got {other:?}"),
+        }
+        // The refusal consumed nothing: once the targets admit reads again, the
+        // payload is intact.
+        for vdisk in &vdisks {
+            vdisk.pin_status.store(0, Ordering::Relaxed);
+        }
+        assert_eq!(striper.get_blob(id).unwrap(), payload);
+    }
+
+    /// A repair stops when a target refuses to be pinned, instead of treating
+    /// the part as missing and rewriting a fragment a reader may be holding.
+    ///
+    /// Only one target refuses, and the other five are enough to reconstruct,
+    /// so "treat as missing" would silently succeed. The absence of any PUT is
+    /// what distinguishes stopping from repairing.
+    #[test]
+    fn a_repair_stops_when_a_target_refuses_to_be_pinned() {
+        let scheme = ErasureScheme::ReedSolomon { k: 4, m: 2 };
+        let (vdisks, striper) = remote_pool("pool", scheme, 0);
+        let id = BlobId::new(12, 46, 1, 1, 2, 0);
+        let payload = b"Multi-tenant erasure-coded tablet SSTable block #0006";
+
+        striper.put_blob(id, payload).unwrap();
+        vdisks[0].pin_status.store(409, Ordering::Relaxed);
+        for vdisk in &vdisks {
+            vdisk.seen.lock().unwrap().clear();
+        }
+        match striper.repair_blob(id) {
+            Err(BlobError::RemoteFenceRefused { status, .. }) => assert_eq!(status, 409),
+            other => panic!("a refused pin must stop the repair, got {other:?}"),
+        }
+        for (slot, vdisk) in vdisks.iter().enumerate() {
+            let seen = vdisk.requests();
+            assert!(
+                !seen.iter().any(|line| line.starts_with("PUT")),
+                "slot {slot} was rewritten although the repair could not prove the part missing: {seen:?}"
+            );
+        }
     }
 
     #[test]

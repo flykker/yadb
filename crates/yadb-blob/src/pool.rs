@@ -13,6 +13,51 @@ use crate::{
     VolumeStore,
 };
 
+/// Lifetime of the pin a read takes before fetching a fragment.
+///
+/// A fragment fetch is a local read or one bounded HTTP request, so this is far
+/// longer than any fetch it protects. It is deliberately the maximum the target
+/// accepts rather than a short guess: a pin that expires under a slow fetch
+/// stops protecting it, while a pin that outlives its reader only delays
+/// collection by at most this long.
+const READ_PIN_TTL_MS: u64 = crate::MAX_PIN_TTL_MS;
+
+/// Releases a read pin when the fetch scope ends, on every exit path.
+///
+/// `unpin` is idempotent and never extends a deadline, so an early return, a
+/// panic unwind and an explicit release are all safe. A release that fails
+/// leaves the pin live until its TTL, which blocks collection rather than
+/// admitting a delete - the safe direction, and not a reason to discard bytes
+/// the read has already copied.
+struct ReadPin<'a, FS: StorageFs> {
+    slot: &'a PoolSlot<FS>,
+    pin_id: PinId,
+}
+
+impl<FS: StorageFs> Drop for ReadPin<'_, FS> {
+    fn drop(&mut self) {
+        let _ = self.slot.unpin(self.pin_id);
+    }
+}
+
+/// Whether a failed pin means "the target refused to be read" rather than
+/// "the target did not answer".
+///
+/// The distinction decides what a read reports when no candidate supplied the
+/// part. A refusal is evidence about the fence and must not be flattened into
+/// `NotFound`; a transport failure is the same unavailability a down slot
+/// already produces, and the pool has always read around it.
+fn is_read_refusal(error: &BlobError) -> bool {
+    matches!(
+        error,
+        BlobError::PinEpochNotCurrent { .. }
+            | BlobError::PinClockUnreadable { .. }
+            | BlobError::PinIdsExhausted
+            | BlobError::StorageUnavailable
+            | BlobError::RemoteFenceRefused { .. }
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepairReport {
     /// Fragments readable after the repair, i.e. including the ones just rewritten.
@@ -1086,28 +1131,70 @@ impl<FS: StorageFs> PoolStriper<FS> {
         out
     }
 
-    /// Reads one part from wherever it actually lives. Returns the bytes and the
-    /// slot that supplied them, or `None` if no candidate had it.
+    /// Reads one part from wherever it actually lives, under a pin on the
+    /// target's current epoch.
+    ///
+    /// Returns the bytes and the slot that supplied them; `Ok(None)` means no
+    /// candidate held the part. `Err` means at least one candidate could not be
+    /// pinned and no other candidate supplied the part, so absence was never
+    /// proved - reporting that as `NotFound` would turn "the target refused to
+    /// be read" into "the bytes do not exist".
     ///
     /// A `CorruptData` answer is remembered but does not stop the search: a
     /// bit-rotted nominal copy must not hide a healthy handoff copy.
+    ///
+    /// The pin is taken before the fetch and released as soon as the bytes are
+    /// copied, on every exit path. It is what makes a concurrent
+    /// `delete_collectable` on the target refuse: the target consults any live
+    /// pin, not only one that names the fragment's own epoch, because the only
+    /// epoch a reader can pin is the current one.
     fn read_part(
         &self,
         logical_id: BlobId,
         part_index: usize,
         corruption: &mut Option<BlobError>,
-    ) -> Option<(Vec<u8>, usize)> {
+    ) -> Result<Option<(Vec<u8>, usize)>, BlobError> {
         let part_id = logical_id.with_part((part_index + 1) as u8);
+        let mut refusal: Option<BlobError> = None;
         for slot_idx in self.part_candidates(logical_id, part_index) {
-            match self.slots[slot_idx].get(part_id) {
-                Ok(bytes) => return Some((bytes, slot_idx)),
+            let slot = &self.slots[slot_idx];
+            // Two calls, not one: the epoch must be read before it is named, and
+            // a collector may advance in between. The pin then fails closed
+            // rather than pinning an epoch that is no longer current.
+            let grant = match slot
+                .epoch()
+                .and_then(|epoch| slot.pin(epoch, READ_PIN_TTL_MS))
+            {
+                Ok(grant) => grant,
+                Err(error) => {
+                    // Not "the fragment is absent": this candidate could not be
+                    // proved safe to read. Another candidate has its own epoch
+                    // and pin table, so it is still worth trying; the reason is
+                    // kept in case none of them supplies the part.
+                    //
+                    // Only a refusal is kept. A transport failure is the same
+                    // unavailability a down slot already produces, and turning
+                    // it into the read's result would report a network fault as
+                    // a statement about the fence.
+                    if is_read_refusal(&error) {
+                        refusal.get_or_insert(error);
+                    }
+                    continue;
+                }
+            };
+            let _pin = ReadPin { slot, pin_id: grant.pin_id };
+            match slot.get(part_id) {
+                Ok(bytes) => return Ok(Some((bytes, slot_idx))),
                 Err(e @ BlobError::CorruptData { .. }) => {
                     corruption.get_or_insert(e);
                 }
                 Err(_) => {}
             }
         }
-        None
+        match refusal {
+            Some(error) => Err(error),
+            None => Ok(None),
+        }
     }
 
     /// Encodes `payload` and writes fragments across failure-domain slots (in parallel over the network).
@@ -1428,20 +1515,34 @@ impl<FS: StorageFs> PoolStriper<FS> {
 
             let mut parts: Vec<Option<Vec<u8>>> = vec![None; total];
             let mut corruption: Option<BlobError> = None;
+            let mut refusal: Option<BlobError> = None;
             for idx in order {
-                if let Some((bytes, _)) = self.read_part(logical_id, idx, &mut corruption) {
-                    parts[idx] = Some(bytes);
-                    return self.codec.decode(&parts);
+                match self.read_part(logical_id, idx, &mut corruption) {
+                    Ok(Some((bytes, _))) => {
+                        parts[idx] = Some(bytes);
+                        return self.codec.decode(&parts);
+                    }
+                    // A refused copy does not make another replica unsafe to
+                    // read: the next candidate takes its own pin.
+                    Ok(None) => {}
+                    Err(error) => {
+                        refusal.get_or_insert(error);
+                    }
                 }
             }
-            return Err(corruption.unwrap_or(BlobError::NotFound(logical_id)));
+            // Observed damage first, then "a target refused to be read", then
+            // "nothing had it": the last answer must not hide the first two.
+            return Err(corruption
+                .or(refusal)
+                .unwrap_or(BlobError::NotFound(logical_id)));
         }
 
         // Reed-Solomon: fetch fragments concurrently across cluster nodes if remote slots exist
         let mut parts: Vec<Option<Vec<u8>>> = vec![None; total];
         let mut corruption: Option<BlobError> = None;
+        let mut refusal: Option<BlobError> = None;
         if self.has_remote {
-            let fetched: Vec<(Option<(Vec<u8>, usize)>, Option<BlobError>)> =
+            let fetched: Vec<(Result<Option<(Vec<u8>, usize)>, BlobError>, Option<BlobError>)> =
                 std::thread::scope(|s| {
                     let mut handles = Vec::with_capacity(total);
                     for idx in 0..total {
@@ -1456,12 +1557,16 @@ impl<FS: StorageFs> PoolStriper<FS> {
                         // A panicking fetch thread yields no fragment, which is what
                         // the old `join().ok().flatten()` did; treat it as unavailable
                         // rather than inventing an I/O cause.
-                        .map(|h| h.join().unwrap_or((None, None)))
+                        .map(|h| h.join().unwrap_or((Ok(None), None)))
                         .collect()
                 });
             for (idx, (found, corrupt)) in fetched.into_iter().enumerate() {
-                if let Some((bytes, _)) = found {
-                    parts[idx] = Some(bytes);
+                match found {
+                    Ok(Some((bytes, _))) => parts[idx] = Some(bytes),
+                    Ok(None) => {}
+                    Err(error) => {
+                        refusal.get_or_insert(error);
+                    }
                 }
                 if let Some(e) = corrupt {
                     corruption.get_or_insert(e);
@@ -1469,15 +1574,24 @@ impl<FS: StorageFs> PoolStriper<FS> {
             }
         } else {
             for idx in 0..total {
-                if let Some((bytes, _)) = self.read_part(logical_id, idx, &mut corruption) {
-                    parts[idx] = Some(bytes);
+                match self.read_part(logical_id, idx, &mut corruption) {
+                    Ok(Some((bytes, _))) => parts[idx] = Some(bytes),
+                    Ok(None) => {}
+                    Err(error) => {
+                        refusal.get_or_insert(error);
+                    }
                 }
             }
         }
 
         match self.codec.decode(&parts) {
+            // Every part that was used was read under its own pin, so a
+            // reconstruction that succeeds is safe even if another copy refused.
             Ok(payload) => Ok(payload),
-            Err(e) => Err(corruption.unwrap_or(e)),
+            // The payload could not be reconstructed. Observed damage and a
+            // target that refused to be read are both more informative than
+            // "not enough fragments", which would read as absence.
+            Err(e) => Err(corruption.or(refusal).unwrap_or(e)),
         }
     }
 
@@ -1497,7 +1611,7 @@ impl<FS: StorageFs> PoolStriper<FS> {
         let mut corruption: Option<BlobError> = None;
 
         if self.has_remote {
-            let fetched: Vec<(Option<(Vec<u8>, usize)>, Option<BlobError>)> =
+            let fetched: Vec<(Result<Option<(Vec<u8>, usize)>, BlobError>, Option<BlobError>)> =
                 std::thread::scope(|s| {
                     let mut handles = Vec::with_capacity(total);
                     for idx in 0..total {
@@ -1509,13 +1623,20 @@ impl<FS: StorageFs> PoolStriper<FS> {
                     }
                     handles
                         .into_iter()
-                        .map(|h| h.join().unwrap_or((None, None)))
+                        .map(|h| h.join().unwrap_or((Ok(None), None)))
                         .collect()
                 });
             for (idx, (found, corrupt)) in fetched.into_iter().enumerate() {
-                if let Some((bytes, slot)) = found {
-                    slots_data[idx] = Some(bytes);
-                    sources[idx] = Some(slot);
+                match found {
+                    Ok(Some((bytes, slot))) => {
+                        slots_data[idx] = Some(bytes);
+                        sources[idx] = Some(slot);
+                    }
+                    Ok(None) => {}
+                    // A part that could not be pinned is not a missing part.
+                    // Treating it as missing would reconstruct and rewrite a
+                    // fragment a reader may be holding, so the repair stops.
+                    Err(error) => return Err(error),
                 }
                 if let Some(e) = corrupt {
                     corruption.get_or_insert(e);
@@ -1523,9 +1644,13 @@ impl<FS: StorageFs> PoolStriper<FS> {
             }
         } else {
             for idx in 0..total {
-                if let Some((bytes, slot)) = self.read_part(logical_id, idx, &mut corruption) {
-                    slots_data[idx] = Some(bytes);
-                    sources[idx] = Some(slot);
+                match self.read_part(logical_id, idx, &mut corruption) {
+                    Ok(Some((bytes, slot))) => {
+                        slots_data[idx] = Some(bytes);
+                        sources[idx] = Some(slot);
+                    }
+                    Ok(None) => {}
+                    Err(error) => return Err(error),
                 }
             }
         }

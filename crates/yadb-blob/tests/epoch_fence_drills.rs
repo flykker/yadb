@@ -4,8 +4,9 @@
 //! [`VolumeStore`]'s public epoch, pin and delete primitives directly on a
 //! deterministic [`SimFs`], and prove only storage-side invariants:
 //!
-//! * a live reader pin blocks an epoch advance and a collectable delete of the
-//!   fragment that pin protects;
+//! * a live reader pin blocks an epoch advance and every collectable delete on
+//!   the slot, including fragments written under an older epoch than the pin
+//!   names, because a reader can only pin the current epoch;
 //! * a superseded collector's epoch is refused by both the advance and the
 //!   exact-epoch delete, and a refusal leaves the volume unchanged;
 //! * a collector pass stops at its first refusal and deletes nothing after it;
@@ -135,9 +136,17 @@ fn drill_two_a_superseded_collector_is_refused_by_every_primitive() {
     );
 }
 
-/// A pass deletes one collectable fragment, hits a pinned fragment, and stops.
-/// The remaining dead fragment is untouched, and the same refusal repeats if
-/// the caller retries the identical call.
+/// A pass collects an unpinned fragment, then a reader arrives, and the pass
+/// stops at its first refusal without deleting anything after it.
+///
+/// The ordering is the point. A pin is taken on the target's *current* epoch,
+/// so it cannot be taken before the fragment the reader will fetch is written.
+/// A collector therefore collects what is collectable while no pin is live, and
+/// from the moment a pin lands every remaining delete is refused - including
+/// fragments older than the pinned epoch. An earlier version of this drill
+/// pinned first and then expected the epoch-0 fragment to be collectable; that
+/// expectation was the hole, because the reader pinning epoch 1 may fetch a
+/// fragment written at epoch 0.
 #[test]
 fn drill_three_a_pass_stops_at_the_first_refusal_and_deletes_nothing_after_it() {
     let fs = SimFs::new(0xE3_0003);
@@ -147,20 +156,19 @@ fn drill_three_a_pass_stops_at_the_first_refusal_and_deletes_nothing_after_it() 
     let a = BlobId::new(43, 1, 1, 1, 2, 0);
     let b = BlobId::new(43, 1, 1, 2, 2, 0);
     let c = BlobId::new(43, 1, 1, 3, 2, 0);
-    let a_bytes = b"drill three: fragment A, collectable";
-    let b_bytes = b"drill three: fragment B, never attempted";
-    let c_bytes = b"drill three: fragment C, held by a reader";
+    let a_bytes = b"drill three: fragment A, collected before the pin";
+    let b_bytes = b"drill three: fragment B, older than the pin";
+    let c_bytes = b"drill three: fragment C, written at the pinned epoch";
 
     // A and B belong to epoch 0; C is written after the advance, at epoch 1.
     store.put(a, a_bytes).unwrap();
     store.put(b, b_bytes).unwrap();
     assert_eq!(store.advance_epoch(0).unwrap(), 1);
     store.put(c, c_bytes).unwrap();
-    let grant = store.pin(1, 60_000).unwrap();
-    assert_eq!(grant.epoch, 1);
 
     // Equality is not "older": a collector at C's own epoch may not collect C.
-    // This is the boundary the `>=` comparison in the Collectable arm enforces.
+    // This is the boundary the `>=` comparison in the Collectable arm enforces,
+    // and it holds whether or not a pin exists.
     match store.delete_collectable(c, 1) {
         Err(BlobError::FragmentNotOlder {
             id: named,
@@ -174,51 +182,86 @@ fn drill_three_a_pass_stops_at_the_first_refusal_and_deletes_nothing_after_it() 
         other => panic!("an equal-epoch fragment is not collectable, got {other:?}"),
     }
 
-    // The pass is fenced at the epoch it tried to advance to, 2. That advance
-    // was refused by the pin on epoch 1 (the refusal drill one asserts), and
-    // the same pin must refuse the collectable delete of C. A is older than the
-    // fence and unpinned, so the pass collects it first.
+    // No pin is live yet, so the pass collects A. This is the only delete the
+    // pass will make; everything after this point has to be refused.
     assert!(
         store.delete_collectable(a, 2).unwrap(),
-        "A is older than the fence and unpinned"
+        "A is older than the fence and no pin is live"
     );
+    assert!(matches!(store.get(a), Err(BlobError::NotFound(id)) if id == a));
 
-    let refuse_c = || match store.delete_collectable(c, 2) {
+    // A reader arrives and pins the epoch the target is on now, 1. It cannot
+    // pin epoch 0, where B was written - that is exactly why B still has to be
+    // protected by this pin.
+    let grant = store.pin(1, 60_000).unwrap();
+    assert_eq!(grant.epoch, 1);
+    assert!(matches!(
+        store.pin(0, 60_000),
+        Err(BlobError::PinEpochNotCurrent {
+            requested_epoch: 0,
+            actual_epoch: 1,
+        })
+    ));
+
+    // The pass reaches B first and is refused. B is an epoch-0 fragment and the
+    // pin names epoch 1: the refusal is not "this pin names this fragment", it
+    // is "a reader may still be holding a fragment on this slot".
+    let refuse_b = || match store.delete_collectable(b, 2) {
         Err(BlobError::FragmentPinned {
             id: named,
             fragment_epoch,
             collector_epoch,
             live_pins,
         }) => {
-            assert_eq!(named, c);
-            assert_eq!(fragment_epoch, 1);
+            assert_eq!(named, b);
+            assert_eq!(fragment_epoch, 0);
             assert_eq!(collector_epoch, 2);
             assert_eq!(live_pins, 1);
         }
-        other => panic!("the pinned epoch must refuse C, got {other:?}"),
+        other => panic!("a live pin must refuse the older fragment B, got {other:?}"),
     };
-    refuse_c();
+    refuse_b();
 
     // A real pass stops at the first refusal: it does not retry and does not
-    // continue to B. B is a dead epoch-0 fragment, but this caller leaves it
-    // intact because the pass refused at C. The primitive's repeated refusal
-    // is what makes "stop, do not retry" the only safe rule.
+    // continue to C. C is a dead epoch-1 fragment, but this caller leaves it
+    // intact because the pass refused at B.
     assert_eq!(
-        store.get(b).unwrap(),
-        b_bytes,
-        "B was never attempted and is still intact"
+        store.get(c).unwrap(),
+        c_bytes,
+        "C was never attempted and is still intact"
     );
-    assert_eq!(store.fragment_epoch(b), Some(0));
+    assert_eq!(store.fragment_epoch(c), Some(1));
+
+    // Continuing would not have helped: the same pin refuses C too. This is the
+    // pair that makes one pin a fence over every fragment on the slot.
+    assert!(matches!(
+        store.delete_collectable(c, 2),
+        Err(BlobError::FragmentPinned {
+            id: named,
+            fragment_epoch: 1,
+            collector_epoch: 2,
+            live_pins: 1,
+        }) if named == c
+    ));
 
     // The refusal is not retryable in shape: the identical call fails
     // identically while the pin is live.
-    refuse_c();
+    refuse_b();
     assert_eq!(store.get(b).unwrap(), b_bytes);
     assert_eq!(
         store.get(c).unwrap(),
         c_bytes,
         "C is still readable while its reader holds the pin"
     );
+
+    // Releasing the pin is what makes the rest collectable - the pass resumes
+    // only because the reader finished, never because it retried through the
+    // refusal.
+    assert!(store.unpin(grant.pin_id).unwrap());
+    assert!(store.delete_collectable(b, 2).unwrap());
+    assert!(store.delete_collectable(c, 2).unwrap());
+    assert!(matches!(store.get(b), Err(BlobError::NotFound(id)) if id == b));
+    assert!(matches!(store.get(c), Err(BlobError::NotFound(id)) if id == c));
 }
 
 /// A collected fragment's tombstone survives sealing, compaction and a

@@ -254,7 +254,9 @@ pub struct VolumeStats {
 ///
 /// On top of the epoch it keeps a durable **pin table** (see [`VolumeStore::pin`]): readers pin the
 /// epoch they read, an epoch advance is refused while a pin on it is unexpired, and
-/// [`VolumeStore::delete_collectable`] refuses a fragment whose epoch a live pin still names.
+/// [`VolumeStore::delete_collectable`] refuses every fragment older than the collector while *any*
+/// pin is live. The last rule is deliberately broader than "the fragment's own epoch", because a
+/// reader can only pin the current epoch and may fetch a fragment written under an older one.
 pub struct VolumeStore<FS: StorageFs> {
     fs: FS,
     dir: String,
@@ -780,12 +782,21 @@ impl<FS: StorageFs> VolumeStore<FS> {
     ///
     /// * the comparison is `fragment_epoch < collector_epoch`, not equality, so a
     ///   collector that advanced past a fragment can still reclaim it;
-    /// * it refuses while a reader still pins the fragment's epoch, which
-    ///   equality alone could not express.
+    /// * it refuses while any reader pin is live on the slot, which equality
+    ///   alone could not express.
+    ///
+    /// The pin rule is "any live pin", not "a pin that names this fragment's
+    /// epoch". A reader can only pin the target's *current* epoch
+    /// ([`Self::pin`] refuses anything else), while the fragment it fetches may
+    /// have been written under an older one. Consulting only pins that name the
+    /// fragment's epoch would therefore admit a delete of a fragment a reader is
+    /// holding - the exact loss the pin exists to prevent. The cost is
+    /// deliberate: one live pin pauses every collectable delete on the slot
+    /// until its TTL, which is the direction that deletes less.
     ///
     /// A fragment that is not older is refused with
-    /// [`BlobError::FragmentNotOlder`]; one whose epoch is pinned is refused with
-    /// [`BlobError::FragmentPinned`]. Both name the fragment's epoch and the
+    /// [`BlobError::FragmentNotOlder`]; one protected by a live pin is refused
+    /// with [`BlobError::FragmentPinned`]. Both name the fragment's epoch and the
     /// collector's, both happen before any record is appended, and neither is
     /// retryable: a pass that hits one stops instead of re-reading the pin table
     /// until it can proceed.
@@ -833,10 +844,17 @@ impl<FS: StorageFs> VolumeStore<FS> {
                             collector_epoch,
                         });
                     }
-                    // Read under the append lock a pin also takes, so a pin that
-                    // lands after this check is ordered after the tombstone, not
-                    // between the check and the unlink.
-                    let live_pins = self.live_pins_on(Some(fragment_epoch))?.len();
+                    // Any live pin, not only one that names `fragment_epoch`.
+                    // A reader cannot pin an older epoch - `pin` accepts only
+                    // the current one - so the pin that protects this fragment
+                    // is whichever pin is live now. Consulting the fragment's
+                    // own epoch would let a collector delete this fragment
+                    // under a reader's live pin on the current epoch.
+                    //
+                    // Read under the append lock a pin also takes, so a pin
+                    // that lands after this check is ordered after the
+                    // tombstone, not between the check and the unlink.
+                    let live_pins = self.live_pins_on(None)?.len();
                     if live_pins > 0 {
                         return Err(BlobError::FragmentPinned {
                             id,
