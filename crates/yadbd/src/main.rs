@@ -26,6 +26,7 @@ use yadb_metakv::{KvCommand, LocalMetaKv, MetaError, RoleState, WatchEvent};
 use yadb_s3::{ObjectManifest, ObjectStoreEngine, S3Error};
 
 mod gc;
+mod metrics;
 mod openraft;
 mod protocols;
 
@@ -8315,6 +8316,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/apply", post(apply_dispatch))
         .route("/v1/idempotency/resolve", post(handle_resolve))
         .route("/v1/pools/health", get(handle_pools_health))
+        .route("/metrics", get(metrics::handle_metrics))
         .route("/v1/pools/scrub", post(handle_pools_scrub))
         .route("/v1/pools/gc", post(handle_pools_gc))
         .route("/openraft/status", get(handle_openraft_status))
@@ -12414,6 +12416,99 @@ mod raft_status_tests {
         );
         // The groups still answer while collection is refused.
         assert_eq!(json["groups"].as_array().unwrap().len(), 3, "{json}");
+
+        drop(st);
+        for raft in rafts {
+            let _ = raft.shutdown().await;
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `GET /metrics` is the same health data in the Prometheus text format, and
+    /// reading it must not change what it observes: no lease taken, no pass run,
+    /// no counter moved.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn metrics_endpoint_serves_the_health_surface_as_prometheus_text() {
+        let (st, dir, rafts) = multigroup_state("metrics-endpoint").await;
+
+        let mut cp = ControlPlaneState::new();
+        cp.generation = 1;
+        st.meta
+            .execute(KvCommand::Put {
+                key: CONTROL_STATE_KEY.into(),
+                value: serde_json::to_vec(&cp).unwrap(),
+            })
+            .unwrap();
+
+        let outcome = st.gc_all_pools();
+        assert!(outcome.refusal.is_none(), "{outcome:?}");
+        let recorded = st.last_gc.read().unwrap().clone().expect("a pass was recorded");
+
+        let response = crate::metrics::handle_metrics(State(st.clone())).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let content_type = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            content_type.starts_with("text/plain") && content_type.contains("version=0.0.4"),
+            "the scrape must be the Prometheus text format, got {content_type:?}"
+        );
+        let body = String::from_utf8(response_bytes(response).await.to_vec())
+            .expect("the exposition is UTF-8");
+        println!("{body}");
+
+        // The node row and the recorded pass, not a fresh one.
+        assert!(
+            body.contains(&format!("yadb_node_info{{node_id=\"{}\"", st.meta.node_id())),
+            "{body}"
+        );
+        assert!(body.contains("yadb_gc_last_pass_present 1"), "{body}");
+        assert!(
+            body.contains(&format!("yadb_gc_blobs_live {}", recorded.blobs_live)),
+            "{body}"
+        );
+        // One row per configured group, all leaders in this fixture.
+        for group in [1u64, 2, 3] {
+            assert!(
+                body.contains(&format!("yadb_group_info{{group=\"{group}\"")),
+                "group {group} is missing from the exposition:\n{body}"
+            );
+            assert!(
+                body.contains(&format!("yadb_group_reader_leases_live{{group=\"{group}\"}} 0")),
+                "group {group} lease count is wrong:\n{body}"
+            );
+        }
+        // A scrape is not a pass: the recorded outcome and the lease cache are
+        // exactly what they were before it.
+        assert_eq!(
+            st.last_gc.read().unwrap().as_ref(),
+            Some(&recorded),
+            "the scrape replaced the recorded collection pass"
+        );
+        assert!(st.reader_lease.lock().unwrap().is_empty(), "the scrape took a lease");
+        assert_eq!(
+            yadb_metakv::gc::live_leases_in(&st.meta, 2).unwrap().len(),
+            0,
+            "the scrape published a lease it must not take"
+        );
+
+        // A refusal is a gauge, not a missing family: the next pass refuses and
+        // the scrape still parses.
+        st.meta
+            .execute(KvCommand::Delete {
+                key: CONTROL_STATE_KEY.into(),
+            })
+            .unwrap();
+        st.control_freshness.lock().unwrap().invalidate();
+        let refused = st.gc_all_pools();
+        assert!(refused.refusal.is_some(), "{refused:?}");
+        let response = crate::metrics::handle_metrics(State(st.clone())).await;
+        let body = String::from_utf8(response_bytes(response).await.to_vec()).unwrap();
+        assert!(body.contains("yadb_gc_refused 1"), "{body}");
+        assert!(body.contains("yadb_gc_last_pass_present 1"), "{body}");
 
         drop(st);
         for raft in rafts {
