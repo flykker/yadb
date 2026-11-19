@@ -295,22 +295,48 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   switch the append handle; failures poison until validated reopen. Temporary
   replacement can increase peak disk usage, and memory/CPU admission across
   groups, end-to-end snapshot capacity and real failure testing remain open.
-  Storage hardening's targeted run passed all 21 storage tests and the adapted
-  suite after rejecting disconnected prepends before I/O. Contiguous prepends
+  Storage hardening's targeted run passed its then 21 storage tests and the
+  adapted suite after rejecting disconnected prepends before I/O. Contiguous prepends
   survive checkpoint/reopen, and overlap comparison uses bounded serialization.
   These results do not clear the separate process catch-up regression.
   The subsequent purge/checkpoint mismatch is fixed: a purge marker leaving a
   gap before the retained suffix is rejected before I/O. The regression covers
   markers immediately before, within and beyond the suffix, conflicting identity,
   unchanged files after rejection and checkpoint/reopen of accepted states.
-  All 22 storage tests and the adapted suite passed after the fix; broader
-  storage-contract and combined-regression gates remain open.
+  All then 22 storage tests and the adapted suite passed after that fix (the
+  file now holds 36); broader storage-contract and combined-regression gates
+  remain open.
 - [ ] Ensure file and parent-directory durability for create, rename and reopen,
   including partial bootstrap, directory sync failures and unknown outcomes.
 - [ ] Make snapshot identity, membership, log pointers, concurrent build/install,
   watchers and recovery correct; explicitly test stale and conflicting snapshots.
-- [ ] Inject write, partial write, file sync, rename and directory sync faults via
-  an injectable filesystem; test every outcome and poisoned-handle recovery.
+- [x] Inject write, partial write, file sync, rename and directory sync faults for
+  every durable log operation — bootstrap create, append for vote, append,
+  truncate and purge, checkpoint rewrite and frame rotation, reopen — and assert
+  the outcome rather than only the error: the exact bytes left on disk, the
+  poisoned handle (reads, log state and further writes all refused), and a
+  reopen that either recovers the last durable state or refuses. A failed sync
+  keeps the complete frame, because a complete frame is never a torn record; a
+  failed or partial write is repaired as a tail only when it is the final frame,
+  and a length damaged upward is refused through the self-checking header
+  instead of being repaired. Bootstrap failures are classified by what they
+  publish: before the rename nothing `open` accepts and `create` is retried,
+  after the rename a complete log that `open` accepts and re-syncs. Evidence:
+  36 storage tests, of which
+  `append_path_faults_poison_and_reopen_to_a_complete_state`,
+  `checkpoint_faults_poison_and_recover_valid_primary`,
+  `bootstrap_faults_publish_nothing_or_a_reopenable_log` and
+  `reopen_faults_refuse_and_a_retry_recovers_the_repaired_log` cover the matrix;
+  the expected post-fault image comes from an unfaulted control store rather
+  than a hand-copied constant. Removing the poison flag, not poisoning a
+  half-published checkpoint, or skipping the durable tail truncation each fail
+  these tests.
+  Injection is a per-call fault point, not a pluggable filesystem.
+- [ ] Replace the per-call fault points with an injectable filesystem so lock
+  acquisition, a failed recovery read and cross-operation fault sequences can be
+  injected, and pair it with the separate-process crash/kill gate. Lock
+  acquisition lives in `yadb-io` and the recovery read walks frames inside
+  `open`, so neither is injectable today without changing those signatures.
 - [ ] Run separate-process crash/kill and OS/filesystem power-loss tests; document
   filesystem and hardware assumptions. In-process fault simulation is not proof.
 - [ ] Redundancy of acknowledged writes. `PoolStriper::put_blob` used to ack once
