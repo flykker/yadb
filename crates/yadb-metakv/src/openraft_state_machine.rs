@@ -176,20 +176,6 @@ fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
 
-/// A recovery read that ended before the bytes its header declared.
-///
-/// This is deliberately not [`io::ErrorKind::InvalidData`], which is the one
-/// kind [`load_image`] treats as corruption: a short read means the complete
-/// image was never observed, so the reader has no proof the bytes on disk are
-/// bad. Rebuilding would rename those bytes away and replace them with an
-/// empty image, destroying evidence that a transient short read may have
-/// hidden; a refusal keeps the file and asks for a retry. A file that really
-/// is truncated is refused for the same reason, and only a complete image that
-/// fails its own header, length or CRC checks is rebuilt.
-fn truncated(message: impl Into<String>) -> io::Error {
-    io::Error::new(io::ErrorKind::UnexpectedEof, message.into())
-}
-
 fn identity_header(identity: &ReplicaIdentity) -> (GroupIdentity, u32) {
     (identity.group().clone(), identity.node())
 }
@@ -232,8 +218,16 @@ fn snapshot_image_bytes(image: &SnapshotImage) -> io::Result<Vec<u8>> {
 
 fn decode_image(bytes: &[u8]) -> io::Result<Image> {
     const HEADER: usize = 8 + 4 + 8 + 4;
+    // A file shorter than its own header, or shorter than the length that
+    // header declares, is `InvalidData` like any other damage to a complete
+    // file: the truncation is a stable on-disk fact, not a fault at the read
+    // syscall. `load_image` may rebuild it, but only when the log coverage
+    // proves replaying from an empty image loses nothing. A *read* that stops
+    // early is a different thing entirely and never reaches this function;
+    // `read_image` surfaces that as `UnexpectedEof` and `load_image` refuses
+    // it, because the file's own length was never in question there.
     if bytes.len() < HEADER {
-        return Err(truncated("state-machine image is shorter than its header"));
+        return Err(invalid("state-machine image is shorter than its header"));
     }
     if &bytes[..8] != MAGIC {
         return Err(invalid("invalid state-machine image header"));
@@ -250,12 +244,8 @@ fn decode_image(bytes: &[u8]) -> io::Result<Image> {
     let end = HEADER
         .checked_add(len)
         .ok_or_else(|| invalid("image length overflow"))?;
-    // Fewer bytes than the header declared is a truncated file, not a
-    // corrupt-but-complete one: see `truncated`. More bytes than declared is a
-    // complete image followed by trailing bytes; that is still a length
-    // mismatch the bounded read always rejected, so it stays `InvalidData`.
     if bytes.len() < end {
-        return Err(truncated(
+        return Err(invalid(
             "state-machine image is shorter than its declared length",
         ));
     }
@@ -304,11 +294,20 @@ fn decode_snapshot_image(bytes: &[u8]) -> io::Result<SnapshotImage> {
 /// Read and validate the recovery image through the injectable `yadb-io` seam.
 ///
 /// The whole file is read with [`VirtualFile::read_exact_at`], so the read is a
-/// positional `sys::read_at` the test seam can fault. A legal short read is
-/// retried; a read that stops before the file ends returns `UnexpectedEof`,
-/// which stays distinct from `InvalidData` (see [`truncated`]) so a short read
-/// is refused rather than rebuilt. The size bound is checked before allocating,
-/// exactly as the previous bounded `take(...)` read enforced it.
+/// positional `sys::read_at` the test seam can fault. The buffer is sized from
+/// the file's own length, which is what separates the two failure modes:
+///
+/// * A read that stops before that length returns `UnexpectedEof` and is
+///   propagated unchanged. The file's length was not in question, so this is a
+///   fault at the syscall, not evidence about the bytes: [`load_image`] refuses
+///   it and never rebuilds.
+/// * A file that really is short is read in full without error and then fails
+///   in [`decode_image`] with `InvalidData`, exactly as before this seam
+///   existed, so it stays rebuildable under the same coverage gate as any other
+///   damaged image.
+///
+/// The size bound is checked before allocating, exactly as the previous bounded
+/// `take(...)` read enforced it.
 fn read_image(file: &OsFile) -> io::Result<Image> {
     let disk_len =
         usize::try_from(file.len()?).map_err(|_| invalid("state-machine image length overflow"))?;
@@ -714,14 +713,20 @@ fn publish_image(dir: &Path, image: &Image) -> io::Result<()> {
 /// Read `state.json`, or, when `rebuild_allowed`, replace an image that cannot
 /// be decoded with a fresh empty one.
 ///
-/// Only `InvalidData` from [`read_image`] counts as corruption. A missing file,
-/// an I/O error, a *short read* (a truncated file or a fault at the recovery
-/// syscall, which surfaces as `UnexpectedEof`), an identity mismatch and
-/// invalid nested snapshot metadata all keep failing: rebuilding them would
-/// either create state for a directory that never had any, adopt another
-/// replica's data, or destroy bytes that were never fully read. The returned
-/// handle is the published image, so the caller can re-sync it as `open`
-/// always has.
+/// Only `InvalidData` from [`read_image`] counts as corruption, and that now
+/// covers both kinds of damage: a complete image that fails its header, length
+/// or CRC checks, and a file that really is shorter than its header or declared
+/// length. Both are stable facts about the bytes on disk, so `rebuild_allowed`
+/// (the log replays from the first index with no purge marker) decides whether
+/// discarding them is lossless.
+///
+/// `UnexpectedEof` is deliberately *not* in that set. It can only come from
+/// [`VirtualFile::read_exact_at`], which sizes its buffer from the file's own
+/// length, so it means the read stopped before the length the filesystem
+/// reported: a fault at the syscall, not damage to the image. A missing file,
+/// an I/O error, that short read, an identity mismatch and invalid nested
+/// snapshot metadata all keep failing. The returned handle is the published
+/// image, so the caller can re-sync it as `open` always has.
 fn load_image(
     dir: &Path,
     identity: &ReplicaIdentity,
@@ -2320,40 +2325,143 @@ mod tests {
         assert_eq!(reopened.applied_state().await.unwrap().0.unwrap().index, 1);
     }
 
-    /// A file that really is shorter than its header declares is refused for
-    /// the same reason: the reader never saw a complete image, so there is no
-    /// proof of corruption to justify discarding it. An empty file, a partial
-    /// header and a cut inside the payload all take the same path.
-    #[test]
-    fn really_truncated_image_is_refused_not_rebuilt() {
+    /// A file that really is short on disk is ordinary damage, not a read
+    /// fault, so it keeps the pre-seam semantics: rebuilt when the coverage
+    /// proves that is lossless, refused with `InvalidData` when it does not.
+    ///
+    /// The three cuts are an empty file (the create-window shape), a partial
+    /// header and a cut inside the payload.
+    #[tokio::test]
+    async fn really_truncated_image_is_rebuilt_only_when_coverage_permits() {
         for which in 0..3 {
-            let dir = TempDir::new();
-            let sm = DurableMetaStateMachine::create(&dir.0, &identity()).unwrap();
-            drop(sm);
-            let path = dir.0.join("state.json");
-            let full = fs::read(&path).unwrap();
-            let cut = match which {
+            let cut_of = |full: usize| match which {
                 0 => 0,
                 1 => IMAGE_HEADER_LEN - 1,
-                _ => IMAGE_HEADER_LEN + (full.len() - IMAGE_HEADER_LEN) / 2,
+                _ => IMAGE_HEADER_LEN + (full - IMAGE_HEADER_LEN) / 2,
             };
+
+            // A log that replays from its first index makes an empty image
+            // equivalent to the lost one, so the damage is rebuilt and the
+            // bytes are preserved as evidence.
+            let dir = TempDir::new();
+            let before = applied_image(&dir).await;
+            let cut = cut_of(before.len());
+            assert!(cut < before.len());
+            let path = dir.0.join("state.json");
             let file = OpenOptions::new().write(true).open(&path).unwrap();
             file.set_len(cut as u64).unwrap();
             drop(file);
+            let truncated = fs::read(&path).unwrap();
+            assert_eq!(truncated.len(), cut);
 
-            let error =
+            let mut rebuilt =
                 DurableMetaStateMachine::open_or_rebuild(&dir.0, &identity(), rebuild_coverage())
-                    .err()
-                    .unwrap_or_else(|| panic!("a {cut}-byte image must be refused"));
+                    .unwrap_or_else(|e| panic!("a {cut}-byte image must be rebuilt, got {e}"));
+            let evidence = dir.0.join("state.json.corrupt");
             assert_eq!(
-                error.kind(),
-                io::ErrorKind::UnexpectedEof,
-                "a {cut}-byte image must be an end of file, not InvalidData"
+                rebuilt.rebuilt_image(),
+                Some(ImageRebuild {
+                    preserved_as: evidence.clone(),
+                    corrupt_bytes: cut as u64,
+                }),
+                "a {cut}-byte image must be preserved as evidence"
             );
-            assert_eq!(fs::metadata(&path).unwrap().len(), cut as u64);
+            assert_eq!(fs::read(&evidence).unwrap(), truncated);
+            assert_eq!(rebuilt.applied_state().await.unwrap().0, None);
+            assert_eq!(rebuilt.snapshot().revision(), 0);
+            drop(rebuilt);
+            assert_ne!(fs::read(&path).unwrap(), truncated);
+
+            // The same cut with a log that cannot replay from the start is a
+            // refusal: `InvalidData`, bytes untouched, no rebuild artifacts.
+            let dir = TempDir::new();
+            let before = applied_image(&dir).await;
+            let cut = cut_of(before.len());
+            let path = dir.0.join("state.json");
+            let file = OpenOptions::new().write(true).open(&path).unwrap();
+            file.set_len(cut as u64).unwrap();
+            drop(file);
+            let truncated = fs::read(&path).unwrap();
+
+            let error = DurableMetaStateMachine::open_or_rebuild(
+                &dir.0,
+                &identity(),
+                LogCoverage {
+                    last_purged: Some(LogId::new(CommittedLeaderId::new(1, 1), 1)),
+                    first_index: Some(2),
+                },
+            )
+            .err()
+            .unwrap_or_else(|| panic!("a {cut}-byte image must be refused without coverage"));
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(fs::read(&path).unwrap(), truncated);
             assert!(!dir.0.join("state.json.corrupt").exists());
             assert!(!dir.0.join("state.json.tmp").exists());
         }
+    }
+
+    /// The create-window brick, pinned exactly.
+    ///
+    /// `create` makes `state.json` with `create_new`, drops the handle, then
+    /// reopens with `truncate` and writes. A crash in between leaves a 0-byte
+    /// file in a root the admission check already considers non-empty, so
+    /// `create` cannot be retried. Recovery therefore depends entirely on the
+    /// coverage that `open_or_rebuild` is given:
+    ///
+    /// * A log holding entries from index 0 rebuilds, and nothing is lost.
+    /// * An **empty** log reports `first_index: None`, and
+    ///   `LogCoverage::replays_from_start` refuses that on purpose: an empty
+    ///   log is indistinguishable from a replica whose state came from a
+    ///   snapshot the log no longer repeats. The 0-byte image is then refused,
+    ///   which is the brick.
+    ///
+    /// This test pins the refusal and its cause rather than pretending the
+    /// empty-log case recovers. Making it recover needs a decision in
+    /// `LogCoverage`/the runtime admission path, not in this module.
+    #[test]
+    fn zero_byte_image_on_a_fresh_root_is_refused_because_the_log_is_empty() {
+        let dir = TempDir::new();
+        let sm = DurableMetaStateMachine::create(&dir.0, &identity()).unwrap();
+        drop(sm);
+        let path = dir.0.join("state.json");
+        let full = fs::read(&path).unwrap();
+        let file = OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_len(0).unwrap();
+        drop(file);
+        assert_eq!(fs::metadata(&path).unwrap().len(), 0);
+
+        // A freshly created log retains no entries: `first_index` is `None`,
+        // so `replays_from_start()` is false even though nothing was purged.
+        let empty_log = LogCoverage {
+            last_purged: None,
+            first_index: None,
+        };
+        assert!(!empty_log.replays_from_start());
+
+        let error = DurableMetaStateMachine::open_or_rebuild(&dir.0, &identity(), empty_log)
+            .err()
+            .expect("the empty-log coverage must refuse, not rebuild");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(fs::metadata(&path).unwrap().len(), 0);
+        assert!(!dir.0.join("state.json.corrupt").exists());
+
+        // The same 0-byte image recovers as soon as the log proves it replays
+        // from the start, which is the state a root reaches after its first
+        // append: the brick is the empty-log decision, not the truncation.
+        let rebuilt =
+            DurableMetaStateMachine::open_or_rebuild(&dir.0, &identity(), rebuild_coverage())
+                .unwrap();
+        assert_eq!(
+            rebuilt.rebuilt_image().map(|r| r.corrupt_bytes),
+            Some(0),
+            "the 0-byte image is preserved as evidence"
+        );
+        assert_eq!(fs::read(dir.0.join("state.json.corrupt")).unwrap(), b"");
+        assert_eq!(
+            fs::metadata(&path).unwrap().len(),
+            full.len() as u64,
+            "a complete empty image replaces the 0-byte one"
+        );
     }
 
     /// A plain I/O error at the recovery read is not corruption: it fails the
