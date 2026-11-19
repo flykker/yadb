@@ -336,6 +336,13 @@ struct AppState {
     #[allow(clippy::type_complexity)]
     local_vdisks: Arc<RwLock<BTreeMap<(String, usize), Arc<VolumeStore<OsFs>>>>>,
     last_scrub: Arc<RwLock<Option<ScrubSummary>>>,
+    /// The outcome of the most recent collection pass, including a pass that
+    /// refused before it scanned anything. `last_scrub` cannot answer this: a
+    /// repair scan runs every few seconds and skips collection most of the time,
+    /// so its summary would show a skip notice instead of the last real pass.
+    /// Recorded by every collection pass whether it was explicit
+    /// (`POST /v1/pools/gc`) or the periodic one.
+    last_gc: Arc<RwLock<Option<gc::SweepOutcome>>>,
     /// The reader leases this node currently holds for garbage-collection
     /// fencing, keyed by metadata group (`None` is the legacy namespace).
     /// Reused across statements: publishing a fresh record per read would put
@@ -923,11 +930,18 @@ impl AppState {
         let control = match self.control_for_collection() {
             Ok(control) => control,
             Err(reason) => {
-                return gc::SweepOutcome::refuse(format!("collection refused: {reason}"))
+                let outcome = gc::SweepOutcome::refuse(format!("collection refused: {reason}"));
+                // A refusal is the outcome of this pass, so it is recorded like
+                // any other: an operator polling the health surface must see the
+                // pass was refused, not that no pass has run.
+                *self.last_gc.write().unwrap() = Some(outcome.clone());
+                return outcome;
             }
         };
         let pools = self.pools.read().unwrap().clone();
-        gc::sweep(&self.meta, &pools, &control)
+        let outcome = gc::sweep(&self.meta, &pools, &control);
+        *self.last_gc.write().unwrap() = Some(outcome.clone());
+        outcome
     }
 
     /// Collects orphan S3 blobs one metadata group at a time.
@@ -991,6 +1005,15 @@ impl AppState {
                         ..ScrubSummary::default()
                     };
                     *self.last_scrub.write().unwrap() = Some(summary.clone());
+                    // The collection half of this pass refused for the same
+                    // reason, and the health surface reports collection
+                    // separately from repair.
+                    if sweep {
+                        *self.last_gc.write().unwrap() =
+                            Some(gc::SweepOutcome::refuse(format!(
+                                "collection refused: {reason}"
+                            )));
+                    }
                     return summary;
                 }
             };
@@ -1005,6 +1028,11 @@ impl AppState {
                     "collection skipped in this repair scan: it runs every five minutes and on POST /v1/pools/gc",
                 )
             };
+            // Only a pass that really ran collection is the "last collection
+            // pass"; the skipped placeholder above must not overwrite it.
+            if sweep {
+                *self.last_gc.write().unwrap() = Some(sweep_outcome.clone());
+            }
             // A blob the repair pass could not check (an unmounted pool) is
             // reported next to the sweep's failures, never folded into a count.
             let mut gc_errors = sweep_outcome.errors;
@@ -1171,7 +1199,7 @@ impl AppState {
         // Mark-and-sweep runs after the repair pass so fragments it just healed are
         // part of the live set. It takes its own snapshots and refuses on its own
         // terms; a refusal deletes nothing and is reported, never hidden.
-        let sweep = if sweep {
+        let sweep_outcome = if sweep {
             let control = self.control.read().unwrap().clone();
             let pools = self.pools.read().unwrap().clone();
             gc::sweep(&self.meta, &pools, &control)
@@ -1182,6 +1210,11 @@ impl AppState {
                 "collection skipped in this repair scan: it runs every five minutes and on POST /v1/pools/gc",
             )
         };
+        // Only a pass that really ran collection is the "last collection pass";
+        // the skipped placeholder above must not overwrite it.
+        if sweep {
+            *self.last_gc.write().unwrap() = Some(sweep_outcome.clone());
+        }
         let summary = ScrubSummary {
             pools_checked: pools_health.len(),
             blobs_checked,
@@ -1194,14 +1227,14 @@ impl AppState {
             orphan_blobs_collected,
             orphan_collection_error,
             repair_error: None,
-            blobs_live: sweep.blobs_live,
-            fragments_deleted: sweep.fragments_deleted,
-            bytes_reclaimed: sweep.bytes_reclaimed,
-            leases_live: sweep.leases_live,
-            gc_refusal: sweep.refusal,
-            gc_pools_refused: sweep.pools_refused,
-            gc_groups_refused: sweep.groups_refused,
-            gc_errors: sweep.errors,
+            blobs_live: sweep_outcome.blobs_live,
+            fragments_deleted: sweep_outcome.fragments_deleted,
+            bytes_reclaimed: sweep_outcome.bytes_reclaimed,
+            leases_live: sweep_outcome.leases_live,
+            gc_refusal: sweep_outcome.refusal,
+            gc_pools_refused: sweep_outcome.pools_refused,
+            gc_groups_refused: sweep_outcome.groups_refused,
+            gc_errors: sweep_outcome.errors,
             pools: pools_health,
         };
         *self.last_scrub.write().unwrap() = Some(summary.clone());
@@ -7701,16 +7734,72 @@ async fn handle_vdisk_compact(
     }
 }
 
+/// One row per configured metadata group for the read-only health surface.
+///
+/// Everything here is local: the role, term, leader, applied and commit index
+/// come from this node's own Raft handles, and the lease fields come from the
+/// in-memory `reader_lease` map. Reading them acquires nothing, renews nothing
+/// and fetches nothing from a peer. A cached record whose TTL has already
+/// passed is not a live lease, so it is not counted; the same predicate the
+/// collector uses decides that.
+///
+/// A group that cannot be described does not fail the response: its row carries
+/// the reason in `error` next to whatever this node still knows.
+async fn group_health_rows(st: &AppState) -> Vec<serde_json::Value> {
+    let observations = match st.meta.group_observations().await {
+        Ok(rows) => rows,
+        Err(error) => {
+            return vec![serde_json::json!({
+                "group": serde_json::Value::Null,
+                "error": format!("metadata groups cannot be enumerated: {error}"),
+            })]
+        }
+    };
+    let now_ms = yadb_metakv::gc::now_ms();
+    // One short lock, and no I/O while it is held. The map holds at most one
+    // cached record per group, so the count is 0 or 1: one record fences every
+    // read of that group on this node.
+    let leases: BTreeMap<Option<u64>, yadb_metakv::GcLease> =
+        st.reader_lease.lock().unwrap().clone();
+    observations
+        .into_iter()
+        .map(|observation| {
+            let live = leases
+                .get(&Some(observation.group))
+                .filter(|lease| lease.is_live_at(now_ms));
+            let mut row = serde_json::json!({
+                "group": observation.group,
+                "node_id": observation.node_id,
+                "role": format!("{:?}", observation.role),
+                "term": observation.term,
+                "leader_id": observation.leader_id,
+                "commit_index": observation.commit_index,
+                "applied_index": observation.applied_index,
+                "reader_leases_live": usize::from(live.is_some()),
+                "reader_lease_nearest_expiry_ms": live.map(|lease| lease.expires_at_ms),
+            });
+            if let Some(error) = observation.commit_error {
+                row["error"] = serde_json::Value::String(error);
+            }
+            row
+        })
+        .collect()
+}
+
 async fn handle_pools_health(State(st): State<AppState>) -> Response {
     let st_clone = st.clone();
     let res = tokio::task::spawn_blocking(move || st_clone.collect_pool_health(true)).await;
     match res {
         Ok(pools) => {
             let last_scrub = st.last_scrub.read().unwrap().clone();
+            let last_gc = st.last_gc.read().unwrap().clone();
+            let groups = group_health_rows(&st).await;
             Json(serde_json::json!({
                 "node_id": st.meta.node_id(),
                 "pools": pools,
                 "last_scrub": last_scrub,
+                "last_gc": last_gc,
+                "groups": groups,
             }))
             .into_response()
         }
@@ -7899,6 +7988,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         pools: Arc::new(RwLock::new(BTreeMap::new())),
         local_vdisks: Arc::new(RwLock::new(BTreeMap::new())),
         last_scrub: Arc::new(RwLock::new(None)),
+        last_gc: Arc::new(RwLock::new(None)),
         reader_lease: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
         reader_lease_ttl_ms: yadb_metakv::gc::DEFAULT_TTL_MS,
         s3,
@@ -8804,6 +8894,7 @@ mod security_tests {
             pools: Arc::new(RwLock::new(BTreeMap::new())),
             local_vdisks: Arc::new(RwLock::new(BTreeMap::new())),
             last_scrub: Arc::new(RwLock::new(None)),
+            last_gc: Arc::new(RwLock::new(None)),
             reader_lease: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             reader_lease_ttl_ms: yadb_metakv::gc::DEFAULT_TTL_MS,
             s3: ObjectStoreEngine::new(meta.clone(), 4096),
@@ -8958,6 +9049,7 @@ mod security_tests {
             pools: Arc::new(RwLock::new(BTreeMap::new())),
             local_vdisks: Arc::new(RwLock::new(BTreeMap::new())),
             last_scrub: Arc::new(RwLock::new(None)),
+            last_gc: Arc::new(RwLock::new(None)),
             reader_lease: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             reader_lease_ttl_ms: yadb_metakv::gc::DEFAULT_TTL_MS,
             s3: ObjectStoreEngine::new(meta.clone(), 4096),
@@ -9436,6 +9528,7 @@ mod security_tests {
             pools: Arc::new(RwLock::new(BTreeMap::from([("data".to_string(), pool)]))),
             local_vdisks: Arc::new(RwLock::new(BTreeMap::new())),
             last_scrub: Arc::new(RwLock::new(None)),
+            last_gc: Arc::new(RwLock::new(None)),
             reader_lease: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             reader_lease_ttl_ms: yadb_metakv::gc::DEFAULT_TTL_MS,
             s3: ObjectStoreEngine::new(meta.clone(), 4096),
@@ -10311,6 +10404,7 @@ mod security_tests {
             pools: Arc::new(RwLock::new(BTreeMap::new())),
             local_vdisks: Arc::new(RwLock::new(BTreeMap::new())),
             last_scrub: Arc::new(RwLock::new(None)),
+            last_gc: Arc::new(RwLock::new(None)),
             reader_lease: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             reader_lease_ttl_ms: yadb_metakv::gc::DEFAULT_TTL_MS,
             s3: ObjectStoreEngine::new(meta.clone(), 4096),
@@ -10763,6 +10857,7 @@ mod raft_status_tests {
             pools: Arc::new(RwLock::new(BTreeMap::new())),
             local_vdisks: Arc::new(RwLock::new(BTreeMap::new())),
             last_scrub: Arc::new(RwLock::new(None)),
+            last_gc: Arc::new(RwLock::new(None)),
             reader_lease: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             reader_lease_ttl_ms: yadb_metakv::gc::DEFAULT_TTL_MS,
             s3: ObjectStoreEngine::new(meta.clone(), 4096),
@@ -10882,6 +10977,7 @@ mod raft_status_tests {
             pools: Arc::new(RwLock::new(BTreeMap::new())),
             local_vdisks: Arc::new(RwLock::new(BTreeMap::new())),
             last_scrub: Arc::new(RwLock::new(None)),
+            last_gc: Arc::new(RwLock::new(None)),
             reader_lease: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             reader_lease_ttl_ms: yadb_metakv::gc::DEFAULT_TTL_MS,
             s3: ObjectStoreEngine::new(meta.clone(), 4096),
@@ -11230,6 +11326,188 @@ mod raft_status_tests {
             st.last_scrub.read().unwrap().is_some(),
             "a refused pass is recorded, not silently dropped"
         );
+
+        drop(st);
+        for raft in rafts {
+            let _ = raft.shutdown().await;
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The read-only health surface answers the two questions an operator has
+    /// after a collection pass: what did the pass do, and what is each metadata
+    /// group doing right now.
+    ///
+    /// Both halves are proved on the same multi-group fixture the reader-lease
+    /// and control-snapshot tests use. The first half also pins the shape of
+    /// `last_gc`: it is the last pass, with its counters, not a cached "all
+    /// good". The second half proves a refused pass replaces it, because a
+    /// refusal that left the previous success in place would read as "nothing to
+    /// collect".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pools_health_reports_the_last_collection_pass_and_every_group() {
+        let (st, dir, rafts) = multigroup_state("pools-health-groups").await;
+
+        // A pass runs only with a control image this node has proved against the
+        // control group's quorum; an empty image is "not ready", not a map.
+        let mut cp = ControlPlaneState::new();
+        cp.generation = 1;
+        st.meta
+            .execute(KvCommand::Put {
+                key: CONTROL_STATE_KEY.into(),
+                value: serde_json::to_vec(&cp).unwrap(),
+            })
+            .unwrap();
+
+        // One live blob in group 2 (project 1 is routed there), so `blobs_live`
+        // is a count a null `last_gc` could not be mistaken for.
+        let manifest = yadb_s3::ObjectManifest {
+            bucket: "bucket".into(),
+            key: "object".into(),
+            size: 4,
+            etag: "etag".into(),
+            content_type: "application/octet-stream".into(),
+            pool: "pool-a".into(),
+            chunks: vec![yadb_s3::ChunkRef {
+                blob_id: BlobId::new(1, 7, 1, 1, yadb_s3::S3_CHANNEL, 0),
+                offset: 0,
+                len: 4,
+            }],
+            last_modified: 0,
+        };
+        st.meta
+            .execute(KvCommand::Put {
+                key: "/s3/1/store/bucket/object".into(),
+                value: serde_json::to_vec(&manifest).unwrap(),
+            })
+            .unwrap();
+
+        let outcome = st.gc_all_pools();
+        assert!(outcome.refusal.is_none(), "{outcome:?}");
+        assert_eq!(outcome.blobs_live, 1, "{outcome:?}");
+
+        let response = handle_pools_health(State(st.clone())).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&response_bytes(response).await)
+            .expect("health must answer JSON");
+        println!("{json}");
+
+        // `last_gc` is that pass, with its counters. `last_scrub` is untouched:
+        // a collection-only pass is not a repair scan.
+        assert_eq!(json["last_gc"]["blobs_live"], 1, "{json}");
+        assert_eq!(json["last_gc"]["fragments_deleted"], 0, "{json}");
+        assert!(json["last_gc"]["gc_refusal"].is_null(), "{json}");
+        assert!(json["last_scrub"].is_null(), "{json}");
+
+        // One row per configured group (control 1, data 2 and 3), each carrying
+        // this node's own observation of it.
+        let groups = json["groups"]
+            .as_array()
+            .unwrap_or_else(|| panic!("groups must be an array: {json}"));
+        let ids: Vec<u64> = groups
+            .iter()
+            .map(|row| row["group"].as_u64().expect("every row names its group"))
+            .collect();
+        assert_eq!(ids, vec![1, 2, 3], "{json}");
+        for row in groups {
+            assert_eq!(row["role"], "Leader", "{row}");
+            assert_eq!(row["leader_id"], 1, "{row}");
+            assert!(row["term"].is_u64(), "{row}");
+            assert!(row["applied_index"].is_u64(), "{row}");
+            let commit = row["commit_index"]
+                .as_u64()
+                .unwrap_or_else(|| panic!("commit index must be a number: {row}"));
+            assert!(
+                commit >= row["applied_index"].as_u64().unwrap(),
+                "a node cannot apply past its commit index: {row}"
+            );
+            assert_eq!(row["reader_leases_live"], 0, "{row}");
+            assert!(row["reader_lease_nearest_expiry_ms"].is_null(), "{row}");
+        }
+
+        // A reader lease is cached per group. The row for the group that holds
+        // it reports it; the others do not.
+        let lease = st.begin_read_lease(1).unwrap();
+        assert_eq!(lease.group, Some(2));
+        st.end_read_lease(&lease).unwrap();
+        let cached_expiry = st
+            .reader_lease
+            .lock()
+            .unwrap()
+            .get(&Some(2))
+            .expect("the lease is cached for its group")
+            .expires_at_ms;
+
+        let read_rows = |json: &serde_json::Value| {
+            json["groups"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| (row["group"].as_u64().unwrap(), row.clone()))
+                .collect::<BTreeMap<u64, serde_json::Value>>()
+        };
+        let response = handle_pools_health(State(st.clone())).await;
+        let json: serde_json::Value = serde_json::from_slice(&response_bytes(response).await)
+            .unwrap();
+        let rows = read_rows(&json);
+        assert_eq!(rows[&2]["reader_leases_live"], 1, "{json}");
+        assert_eq!(
+            rows[&2]["reader_lease_nearest_expiry_ms"], cached_expiry,
+            "{json}"
+        );
+        assert_eq!(rows[&3]["reader_leases_live"], 0, "{json}");
+        assert!(rows[&3]["reader_lease_nearest_expiry_ms"].is_null(), "{json}");
+
+        // Reading the surface must not take or renew a lease: the expiry is
+        // unchanged after a second read, and no second record was published.
+        let response = handle_pools_health(State(st.clone())).await;
+        let json: serde_json::Value = serde_json::from_slice(&response_bytes(response).await)
+            .unwrap();
+        let rows = read_rows(&json);
+        assert_eq!(
+            rows[&2]["reader_lease_nearest_expiry_ms"], cached_expiry,
+            "the health read renewed a lease it must only observe: {json}"
+        );
+        assert_eq!(st.reader_lease.lock().unwrap().len(), 1, "{json}");
+        assert_eq!(
+            yadb_metakv::gc::live_leases_in(&st.meta, 2).unwrap().len(),
+            1,
+            "the health read published a lease it must not take"
+        );
+
+        // A refused pass is an outcome, not silence: with the control image gone
+        // and the freshness proof dropped, the next pass refuses before it scans,
+        // and `last_gc` must say so instead of keeping the previous success.
+        st.meta
+            .execute(KvCommand::Delete {
+                key: CONTROL_STATE_KEY.into(),
+            })
+            .unwrap();
+        st.control_freshness.lock().unwrap().invalidate();
+        let refused = st.gc_all_pools();
+        let reason = refused
+            .refusal
+            .clone()
+            .expect("a pass without a proven map must refuse");
+        assert!(
+            reason.contains("nothing was scanned or collected"),
+            "{reason}"
+        );
+
+        let response = handle_pools_health(State(st.clone())).await;
+        let json: serde_json::Value = serde_json::from_slice(&response_bytes(response).await)
+            .unwrap();
+        assert_eq!(
+            json["last_gc"]["gc_refusal"],
+            serde_json::json!(reason),
+            "a refused pass must replace the last success: {json}"
+        );
+        assert_eq!(
+            json["last_gc"]["blobs_live"], 0,
+            "the refusal carries its own counters, not the previous pass's: {json}"
+        );
+        // The groups still answer while collection is refused.
+        assert_eq!(json["groups"].as_array().unwrap().len(), 3, "{json}");
 
         drop(st);
         for raft in rafts {

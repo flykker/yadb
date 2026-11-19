@@ -352,6 +352,23 @@ impl<FS: StorageFs> LocalMetaKv<FS> {
         ))
     }
 
+    /// Locally observed state of every configured metadata group.
+    ///
+    /// Read-only and in-process: each row comes from this node's own Raft
+    /// handles, so no peer is contacted and no metadata key is read. Legacy
+    /// single-node metadata configures no groups and returns an empty list
+    /// rather than a fabricated row.
+    pub async fn group_observations(
+        &self,
+    ) -> Result<Vec<crate::openraft_client::GroupObservation>, MetaError> {
+        // Clone the router out of the handle so the returned future borrows
+        // nothing from `self`; the daemon awaits it from a request handler.
+        let Some(router) = self.openraft.clone() else {
+            return Ok(Vec::new());
+        };
+        Ok(router.observations().await)
+    }
+
     /// Quorum-confirmed snapshot of exactly one metadata group.
     ///
     /// The group is named directly instead of being routed from a key, because

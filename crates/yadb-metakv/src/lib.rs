@@ -22,6 +22,7 @@ pub use kv::{
     CasGuard, KvCommand, KvResult, KvValue, MetaSnapshot, MetaStateMachine, RevisionGuard, TxnOp,
     WatchEvent,
 };
+pub use openraft_client::GroupObservation;
 pub use raft::{LocalKv, LocalMetaKv, LogEntry, RaftRpc, RoleState};
 pub use wal::RaftWal;
 
