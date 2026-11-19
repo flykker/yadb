@@ -1,6 +1,9 @@
 # OpenRaft Multi-Raft production checklist
 
-## Current status (2026-11-14)
+## Historical status snapshot (2026-11-14)
+
+This section is a dated snapshot, not a claim about the current tree. Later
+sections record what has changed since.
 
 **Before the test serialization gate described below, the last completed full
 gates were GREEN on the authorization-freshness delta plus the nonblocking-refresh
@@ -106,7 +109,7 @@ bounds and reliability gates remain open.
 ## Authorized client-routing work on the nonproduction test cluster
 
 Status: implementation in progress; the new nonproduction cluster is running but
-is no longer empty (see current status above), and no existing cluster has been
+is no longer empty (see the status snapshot above), and no existing cluster has been
 switched. See `docs/multiraft-verification.md`.
 
 - [x] Add explicit daemon metadata-runtime selection. **Superseded:** the legacy
@@ -212,7 +215,7 @@ initialization/immediate manual-election race under concurrent load; no root cau
 was established and no retry or timeout increase masked it. Both process tests and
 the 17 MiB snapshot test passed in this run, without resolving the historical
 process catch-up failure. At that checkpoint final all-features testing and
-independent Sol review were pending; see current status above.
+independent Sol review were pending; see the status snapshot above.
 
 The subsequent `openraft_daemon` full file passed 2/2 in 2.39 s; its new test
 passed alone 1/1 in 3.58 s. Three actual daemon processes host nine replicas in
@@ -232,7 +235,7 @@ timeout increase or test retry loop was added. The subsequent offline/locked
 the concurrent 17 MiB snapshot test; daemon integration files ran zero tests under
 default features as expected. This predates final daemon control-cache/barrier edits,
 so final combined verification remained necessary. The all-features gate and
-independent Sol review were then pending; see current status above. Neither this
+independent Sol review were then pending; see the status snapshot above. Neither this
 pass nor the test setup change closes production gates or resolves the historical
 process catch-up regression.
 
@@ -765,10 +768,12 @@ design; the removed draft is not kept in the tree.
   procedure and incident response. Dynamic reload, rolling rotation, revocation
   and membership integration are not implemented or validated deployment gates.
 - [x] Protect the legacy internal endpoints: `/raft/rpc` and `/raft/elect`
-  now require the shared `--raft-token` in clustered mode and the daemon
-  refuses to start without it. Client subjects are only trusted with a valid
-  `x-yadb-subject-signature` when `--subject-secret` is configured, and the
-  signature is forwarded to the leader.
+  required the shared `--raft-token` in clustered mode and the daemon refused
+  to start without it. **Historical: that runtime has since been removed and
+  neither route exists in `crates/yadbd/src/main.rs`.** Client subjects are
+  still only trusted with a valid `x-yadb-subject-signature` when
+  `--subject-secret` is configured, and the signature is forwarded to the
+  leader.
 - [x] Authorize control-plane mutations. `/v1/apply` now requires a subject
   proven with `x-yadb-subject-signature` (HMAC-SHA256 over the subject with
   `--subject-secret`) that appears on the `--admin-subject` allowlist. Unsigned
@@ -785,21 +790,23 @@ design; the removed draft is not kept in the tree.
 - [ ] Split the internal Raft listener from the public client listener so the
   Raft port is not reachable from client networks.
 - [x] Protect the remote VDisk RPCs. `PUT|GET|DELETE
-  /internal/vdisk/{pool}/{slot}/blob/{blob_hex}`, `GET .../stats` and `POST
-  .../barrier` are served on the public listener and were unauthenticated: an
-  unauthenticated caller could install a permanent exact-ID tombstone or a
-  garbage-collection barrier that evicts live fragments and fences future
-  writes, repeated per replica slot to defeat erasure redundancy. All five
-  handlers now require the Raft peer token (`x-yadb-raft-token`) and the remote
-  client sends it; the token is threaded from `--raft-token` through
-  `Slot::remote`. The credential is the peer token rather than an admin
-  subject, because this is node-to-node traffic and an admin check would break
-  every remote slot call. Two residual exposures remain and are documented in
-  `multiraft-security-operations.md`: the token is a shared cluster secret, so
-  it authenticates the cluster rather than an individual peer; and the routes
-  are still reachable by anything that can reach the listener, so only the
-  dedicated internal listener plus verified firewall rules actually bound who
-  can attempt them. Separating that listener is the item above.
+  /internal/vdisk/{pool}/{slot}/blob/{blob_hex}`, `GET .../stats`, `POST
+  .../barrier`, `GET .../blobs` and `POST .../compact` are served on the public
+  listener and were unauthenticated: an unauthenticated caller could install a
+  permanent exact-ID tombstone or a garbage-collection barrier that evicts live
+  fragments and fences future writes, repeated per replica slot to defeat
+  erasure redundancy, and could enumerate a slot's live fragment ids or force a
+  compaction. All seven handlers now require the Raft peer token
+  (`x-yadb-raft-token`) and the remote client sends it; the token is threaded
+  from `--raft-token` through `Slot::remote`. The credential is the peer token
+  rather than an admin subject, because this is node-to-node traffic and an
+  admin check would break every remote slot call. Two residual exposures remain
+  and are documented in `multiraft-security-operations.md`: the token is a
+  shared cluster secret, so it authenticates the cluster rather than an
+  individual peer; and the routes are still reachable by anything that can
+  reach the listener, so only the dedicated internal listener plus verified
+  firewall rules actually bound who can attempt them. Separating that listener
+  is the item above.
 
 ## 3. Runtime and operations
 
@@ -838,20 +845,21 @@ design; the removed draft is not kept in the tree.
   per-group directories, per-group failure isolation and bounded resources.
   An in-process registry provides separate directories and a
   group-count limit; it does not yet provide resource isolation, robust
-  cancellation/shutdown handling or shared network routing. The in-progress daemon
-  v2 implementation instead owns multiple groups with dedicated listeners; its
-  integration and failure behavior still require validation.
+  cancellation/shutdown handling or shared network routing. The daemon now
+  always starts a version-2 multi-group configuration with one dedicated mTLS
+  listener per group; its integration and failure behavior still require
+  validation.
 - [ ] Integrate the runtime behind explicit daemon configuration; provide metrics,
   logging, health/readiness, operator commands and recovery/upgrade runbooks.
-  The observational v1 daemon module starts one isolated group with strict bounded
-  JSON configuration, explicit create/open/bootstrap, mandatory mTLS and a separate
-  listener; its create/shutdown/reopen tests pass. In-progress v2 client routing
-  uses a manifest and group-specific listeners; singleton-group child-daemon
-  integration passed, while multi-node validation, full observability and cancellation
-  coverage remain open. Status reports `production_ready: false`.
-  Local certificate
-  chain/name/time and server/client-purpose preflight runs before storage mutation;
-  invalid hostname, untrusted and expired-certificate rejection cases pass without
+  Each group starts from strict bounded JSON configuration, explicit
+  create/open/bootstrap, mandatory mTLS and a separate listener; its
+  create/shutdown/reopen tests pass. The daemon now requires a version-2
+  multi-group manifest and uses group-specific listeners. The singleton-group
+  child-daemon integration passed, while multi-node validation, full
+  observability and cancellation coverage remain open. Status reports
+  `production_ready: false`. Local certificate chain/name/time and
+  server/client-purpose preflight runs before storage mutation; invalid
+  hostname, untrusted and expired-certificate rejection cases pass without
   replica creation. A historical full locked all-features run passed with 111 MetaKV
   tests and 11 daemon tests; its then-needed rerun is superseded by the current
   full gates above, not by that historical result.
@@ -912,11 +920,11 @@ design; the removed draft is not kept in the tree.
 OpenRaft singleton and three-node tests use in-process transport. File-backed
 test stores cover restart, follower catch-up and snapshot transfer; selected
 faults are simulated in process. A persistent group owner and storage adapters
-are available behind the `openraft-storage` feature and wired to an opt-in observational
-daemon group with mandatory mTLS. The multi-group client daemon path has a bounded
-singleton-group child test pass and a narrow local deployment, but is
-still under hardening; none of this establishes
-OS/filesystem/hardware power-loss safety.
+are always compiled and are wired to the daemon's version-2 multi-group
+configuration with mandatory mTLS. The multi-group client daemon path has a
+bounded singleton-group child test pass and a narrow local deployment, but is
+still under hardening; none of this establishes OS/filesystem/hardware
+power-loss safety.
 
 `persistent_singleton_process_kill_reopen` acknowledges three OpenRaft writes
 in a child process, kills it without graceful shutdown, verifies exact values

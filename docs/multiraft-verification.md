@@ -1,6 +1,9 @@
 # Multi-Raft verification and release evidence
 
-## Current status (2026-11-14)
+## Historical status snapshot (2026-11-14)
+
+This section is a dated snapshot, not a current-status claim. Later sections
+record what has changed since.
 
 **Before the test serialization gate described below, the last completed full
 workspace gates were GREEN on the authorization-freshness delta plus the
@@ -158,9 +161,13 @@ Open findings from that review, not fixed in this delta:
   failed, because `KvResult::CasConflict` carries only `current_version` — but it
   means a legitimate concurrent admin apply makes a keyed request fail rather than
   succeed. Retrying with the same key is safe and eventually succeeds.
-- Idempotency has no replicated quota. Records are capped at 16 KiB each but the
-  number of records is unbounded, so a holder of the admin secret can grow the
-  control group without limit. This is a deliberate gap, not an oversight.
+- **At the time of that review**, idempotency had no replicated quota. Records
+  were capped at 16 KiB each but the number of records was unbounded, so a holder
+  of the admin secret could grow the control group without limit; this was a
+  deliberate gap, not an oversight. **Since resolved:** a replicated admission
+  counter (`/sys/idempotency/_usage`, `10_000` records or `8 MiB`) refuses with
+  `429` before planning, and the project scope has its own group-scoped counter
+  with the same limits.
 
 The nonblocking-refresh fix moves the quorum-confirmed control fetch off the Tokio
 worker: HTTP handlers now call `control_for_authorization_async`, which runs
@@ -184,7 +191,8 @@ unchanged; `POST /v1/idempotency/resolve` returned `committed` for the used key 
 `idempotency_key_fenced`; a non-`control` scope returned 400. The records and the
 `live-idem-pool` project survived two clean stop/start cycles. What this does not
 establish: no response-loss injection, no leader kill during a keyed apply, no
-follower-forwarded keyed apply, and no quota behaviour, because no quota exists.
+follower-forwarded keyed apply, and no quota-exhaustion behaviour on a live
+group; the replicated counter's ceiling is covered by unit tests only.
 
 Project-scope idempotency exists for block UNMAP, block write and S3 object
 PUT/DELETE. Its live and integration evidence is narrower than the control
@@ -491,7 +499,7 @@ the first bounded-log checkpoint tests, explicit listener drain/byte-budget test
 snapshot catch-up in the three-process test, and daemon create/status/
 shutdown/reopen. Later `YORLOG05` format/serialization changes, local-certificate
 preflight validation and the TCP-proxy partition scenario then required rerunning
-the integrated gates; see the subsequent results and current status above.
+the integrated gates; see the subsequent results and the status snapshot above.
 
 The next full locked all-features run passed with **111 MetaKV tests, 11 daemon
 tests and all other workspace tests**. This includes `YORLOG04`, the real
@@ -590,8 +598,8 @@ daemon integration files ran zero tests, as expected. This run predates final
 daemon control-cache/barrier edits, so a combined rerun was then necessary; the
 latest full gates above supersede that requirement.
 At that checkpoint the all-features gate and independent Sol review were pending;
-see current status above for their subsequent results. Production gates and the historical process catch-up
-regression remain open.
+see the status snapshot above for their subsequent results. Production gates
+and the historical process catch-up regression remain open.
 
 An earlier all-features verification reached 122/123 MetaKV tests before
 failing at `crates/yadb-metakv/src/openraft_state_machine.rs:723` during the
@@ -654,7 +662,7 @@ last log index 7. The improved precondition's targeted process tests passed 2/2 
 5.92 s, but a true offline-last-log race is being fixed again; the setup is not
 final and this is not a proven fix for the original failure's root cause. The
 subsequent default full-workspace gate passed as recorded above, but final combined
-verification and independent Sol review were then pending; see current status above.
+verification and independent Sol review were then pending; see the status snapshot above.
 
 The subsequent requested target is **actual Multi-Raft client routing**, not the
 single-group adapter tested below. The facade now has an explicit control group
@@ -663,7 +671,7 @@ observations and pre-submission cross-group rejection. Multi-group daemon
 configuration had the bounded child-daemon result above but was not then deployed; the
 independent-leader test has the limited targeted result above. No successful
 singleton result should be read as multi-node verification. Final combined runs
-were then pending; see current status above for the completed, non-accepting review.
+were then pending; see the status snapshot above for the completed, non-accepting review.
 
 The extended `yadbd --test openraft_clients` run passed **2/2** in 2.46 s.
 Its new three-group case uses control group 1 and data groups 2/3, with projects

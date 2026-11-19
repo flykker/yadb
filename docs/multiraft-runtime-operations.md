@@ -58,8 +58,9 @@ and the fetch has per-operation socket timeouts, not a total deadline.
 `force_leader` is routing preference, not a linearizable-read guarantee. OpenRaft
 `consistent=true` block reads are served by a quorum-confirmed extent-map read on
 the project-group leader (iSCSI reads use it too), and a blob collected between
-the map read and the fetch is a `503` rather than zeros; SQL, S3 and status reads
-remain locally applied. S3 GC is
+the map read and the fetch is a `503` rather than zeros. At the time of this
+snapshot SQL, S3 and status reads were still served from local applied state;
+SQL and S3 `consistent` opt-in reads were added later (see below). S3 GC is
 disabled. `/v1/apply` requires a signed subject on the `--admin-subject` allowlist;
 an OpenRaft daemon refuses to start without one, and any allowlist requires a
 non-empty `--subject-secret`. Unsigned or forged subjects get 401, a proven
@@ -102,7 +103,7 @@ group. The version-2 manifest and staged create/open guide are in
 singleton groups before final hardening; a targeted three-process HTTP leader-routing
 test also passed. Broader daemon validation remains open; the only running cluster
 is the local nonproduction loopback deployment described above (not empty; see
-current status). The
+the status snapshot). The
 version-1 standalone interface below remains observational, not a client-routing
 configuration.
 
@@ -549,24 +550,32 @@ qualification remain tracked in `multiraft-production-todo.md`. See also
 the read barrier).
 
 Idempotency is implemented for `POST /v1/apply` and, at project scope, for block
-UNMAP (`POST /block/{project}/{volume}/unmap`). A keyed apply commits its outcome
-record in the same `RevisionTxn` as the control-state mutation, so a lost response
-is resolvable with `POST /v1/idempotency/resolve` rather than by retrying. A
-keyed UNMAP does the same with the extent-map publication: `unmap_at_with` appends
-the record and the admission counter to the map's guarded transaction, so there is
-no state in which the map advanced without the record or the record exists without
-the map. Its record is project-scoped (`/idempotency/<project-id>/…`) and its
-counter is group-scoped (`/idempotency/g<group-id>/_usage`), because a transaction
-cannot span groups; projects sharing a group therefore share one budget. Resolve
-takes `{"scope":"control","key":…}` or
+UNMAP (`POST /block/{project}/{volume}/unmap`), block write
+(`BlockVolumeEngine::write_at_with`) and S3 object PUT/DELETE
+(`ObjectStoreEngine::put_object_with` / `delete_object_with`). A keyed apply
+commits its outcome record in the same `RevisionTxn` as the control-state
+mutation, so a lost response is resolvable with
+`POST /v1/idempotency/resolve` rather than by retrying. A keyed UNMAP does the
+same with the extent-map publication: `unmap_at_with` appends the record and the
+admission counter to the map's guarded transaction, so there is no state in
+which the map advanced without the record or the record exists without the map.
+Block write and S3 PUT/DELETE use the same guarded-transaction shape with the
+engine methods named above. The record is project-scoped
+(`/idempotency/<project-id>/…`) and the counter is group-scoped
+(`/idempotency/g<group-id>/_usage`), because a transaction cannot span groups;
+projects sharing a group therefore share one budget. Resolve takes
+`{"scope":"control","key":…}` or
 `{"scope":"project","project":…,"key":…}`; a control resolve needs an admin
-subject, a project resolve needs `readWrite` on that project. SQL, S3 and block PUT
-reject a key with 501, as does every keyed write on a single-node metadata store.
+subject, a project resolve needs `readWrite` on that project. SQL writes reject a
+key with 501, as does every keyed write on a single-node metadata store.
 Admission for control is bounded by a replicated counter
 (`/sys/idempotency/_usage`, `10_000` records or `8 MiB`, committed in the same
 `RevisionTxn`), which refuses with `429` before planning; the project counter has
 the same limits and refuses before the map is read.
 The read barrier is consumed by OpenRaft block reads with `consistent=true`
-(including iSCSI): the extent map comes from a quorum-confirmed snapshot on the
-project-group leader and a missing blob is a `503`, never zeros. SQL, S3 and
-`/v1/status` still serve the locally applied state.
+(including iSCSI), by the SQL `consistent` body flag and by S3
+`?consistent=true` GET: the block extent map, SQL namespace or object manifest
+comes from a quorum-confirmed snapshot on the project-group leader, and a block
+blob collected between the map read and the fetch is a `503`, never zeros. Those
+reads are opt-in; default SQL/S3 reads and `/v1/status` still serve the locally
+applied state.
