@@ -20,7 +20,10 @@ use yadb_blob::{
 };
 use yadb_block::{BlockError, BlockVolumeEngine, VolumeExtentMap, DEFAULT_BLOCK_SIZE};
 use yadb_control::{parse_manifests, ControlError, ControlPlaneState, DiffOp, Role};
-use yadb_db::{parse_sql_script, script_has_writes, DatabaseEngine, DbError, TabletManifest};
+use yadb_db::{
+    parse_sql_script, script_has_writes, CommitExtras, DatabaseEngine, DbError, QueryResult,
+    SqlStmt, TabletManifest,
+};
 use yadb_io::OsFs;
 use yadb_metakv::{KvCommand, LocalMetaKv, MetaError, RoleState, WatchEvent};
 use yadb_s3::{ObjectManifest, ObjectStoreEngine, S3Error};
@@ -3277,6 +3280,32 @@ fn s3_object_fingerprint(
     sha256_hex(&encoded)
 }
 
+/// Fingerprint of a keyed SQL write.
+///
+/// The target is the immutable project id plus database name, and the exact SQL
+/// text is hashed. The SQL text is what distinguishes one statement from
+/// another, so two requests that differ only in JSON formatting are the same
+/// statement and intentionally share a fingerprint. Every field is
+/// length-prefixed, and the operation tag keeps this domain separate from the
+/// block and S3 domains: reusing a key for SQL and for a block write is a
+/// conflict, not a replay.
+fn sql_write_fingerprint(project_id: u32, database: &str, sql: &str) -> String {
+    let project = project_id.to_string();
+    let mut encoded = Vec::new();
+    for field in [
+        b"yadb-project-idempotency-v1".as_slice(),
+        b"POST".as_slice(),
+        b"sql-write".as_slice(),
+        project.as_bytes(),
+        database.as_bytes(),
+        sql.as_bytes(),
+    ] {
+        encoded.extend_from_slice(&(field.len() as u64).to_be_bytes());
+        encoded.extend_from_slice(field);
+    }
+    sha256_hex(&encoded)
+}
+
 /// The record and admission counter for one project group, read in a single
 /// quorum-confirmed snapshot.
 ///
@@ -3354,6 +3383,109 @@ fn admission_writes(
             value: usage_value,
         },
     ))
+}
+
+/// Conservative upper bound for one keyed SQL outcome record.
+///
+/// The exact size depends on `rows_affected`, which is only known after the
+/// statement is planned. Checking this bound before planning therefore never
+/// admits a record the exact check would refuse; the exact size is re-checked
+/// inside the guarded commit.
+fn sql_record_upper_bound(fingerprint: &str) -> usize {
+    // A DML result has no columns or rows, and `rows_affected` is a u64.
+    let placeholder = QueryResult {
+        columns: Vec::new(),
+        rows: Vec::new(),
+        rows_affected: u64::MAX,
+    };
+    let body = serde_json::to_vec(&placeholder).unwrap_or_default();
+    let record = IdempotencyRecord {
+        version: 1,
+        fingerprint: fingerprint.to_owned(),
+        outcome: "committed".into(),
+        response: Some(RecordedResponse {
+            status: StatusCode::OK.as_u16(),
+            headers: BTreeMap::from([("content-type".into(), "application/json".into())]),
+            body_base64: BASE64.encode(body),
+        }),
+    };
+    serde_json::to_vec(&record)
+        .map(|encoded| encoded.len())
+        .unwrap_or(usize::MAX)
+}
+
+/// Builds the idempotency record, admission-counter update and their guards for
+/// one keyed SQL statement's outcome.
+///
+/// This runs inside the statement's own metadata transaction, after WAL
+/// preparation and with the statement's exact result. It re-reads the record
+/// and counter from a quorum snapshot so the guards are as fresh as possible;
+/// an existing record aborts the whole transaction (the caller replays it), and
+/// a counter that no longer admits the exact record aborts it too.
+fn keyed_sql_extras(
+    meta: &yadb_metakv::LocalMetaKv<OsFs>,
+    record_key: &str,
+    usage_key: &str,
+    fingerprint: &str,
+    result: &QueryResult,
+) -> Result<CommitExtras, DbError> {
+    let snapshot = meta
+        .try_linearizable_snapshot(&[record_key.to_owned(), usage_key.to_owned()], &[])
+        .map_err(DbError::Meta)?;
+    if snapshot.get(record_key).is_some() {
+        return Err(DbError::IdempotencyAlreadyCommitted);
+    }
+    let (usage, usage_revision) = match snapshot.get(usage_key) {
+        Some(kv) => (
+            serde_json::from_slice::<IdempotencyUsage>(&kv.value)
+                .map_err(|e| DbError::Idempotency(format!("invalid idempotency usage: {e}")))?,
+            kv.mod_revision,
+        ),
+        None => (
+            IdempotencyUsage {
+                version: 1,
+                ..IdempotencyUsage::default()
+            },
+            0,
+        ),
+    };
+    let response_body = serde_json::to_vec(result)?;
+    if response_body.len() > 8192 {
+        return Err(DbError::Idempotency(
+            "idempotency response body exceeds 8 KiB".into(),
+        ));
+    }
+    let record = IdempotencyRecord {
+        version: 1,
+        fingerprint: fingerprint.to_owned(),
+        outcome: "committed".into(),
+        response: Some(RecordedResponse {
+            status: StatusCode::OK.as_u16(),
+            headers: BTreeMap::from([("content-type".into(), "application/json".into())]),
+            body_base64: BASE64.encode(response_body),
+        }),
+    };
+    let encoded = serde_json::to_vec(&record)?;
+    if encoded.len() > 16384 {
+        return Err(DbError::Idempotency(
+            "idempotency record exceeds 16 KiB".into(),
+        ));
+    }
+    let (record_op, usage_op) = admission_writes(&usage, usage_key, record_key, &encoded)
+        .map_err(|_| DbError::IdempotencyQuotaExceeded)?;
+    Ok(CommitExtras {
+        guards: vec![
+            yadb_metakv::RevisionGuard {
+                key: record_key.to_owned(),
+                expected_mod_revision: 0,
+            },
+            yadb_metakv::RevisionGuard {
+                key: usage_key.to_owned(),
+                expected_mod_revision: usage_revision,
+            },
+        ],
+        ops: vec![record_op, usage_op],
+    })
 }
 
 async fn s3_wire_dispatch(
@@ -4133,20 +4265,43 @@ async fn handle_db_query(
         }
     }
     if headers.contains_key("idempotency-key") {
-        // SQL writes are deliberately still unkeyed. A script can mutate any
-        // number of tables, shards and secondary indexes through
-        // `DatabaseEngine::commit_tx_buffer_at_boundaries`, which builds its own
-        // metadata transactions; keying it means threading the record and its
-        // counter into *that* transaction (or proving the script's visible
-        // effects are recoverable from one), not appending ops here. Until then
-        // the honest answer is 501 rather than a record that commits separately
-        // from the data. Read-only scripts are refused separately because a key
-        // on them would be meaningless rather than unsupported.
-        return if has_writes {
-            unsupported_idempotency()
-        } else {
-            api_err(StatusCode::BAD_REQUEST, "idempotency key on read-only SQL")
+        // Read-only scripts are refused separately because a key on them would
+        // be meaningless rather than unsupported.
+        if !has_writes {
+            return api_err(StatusCode::BAD_REQUEST, "idempotency key on read-only SQL");
+        }
+        if !st.meta.is_openraft() {
+            return unsupported_idempotency();
+        }
+        // One autocommit INSERT/UPDATE/DELETE has exactly one
+        // `commit_tx_buffer` call, so the idempotency record and its admission
+        // counter can join that one `RevisionTxn`. A multi-statement script can
+        // commit statement by statement; making it atomic would need a
+        // cross-statement transaction that does not exist, so it stays 501
+        // rather than recording an outcome that may cover only part of the
+        // script.
+        let Some(stmt) = stmts.first().filter(|_| stmts.len() == 1) else {
+            return api_err(
+                StatusCode::NOT_IMPLEMENTED,
+                "idempotency is not supported on a multi-statement SQL script; send one INSERT, UPDATE or DELETE",
+            );
         };
+        if !matches!(
+            stmt,
+            SqlStmt::Insert { .. } | SqlStmt::Update { .. } | SqlStmt::Delete { .. }
+        ) {
+            return api_err(
+                StatusCode::NOT_IMPLEMENTED,
+                "idempotency is only supported on a single autocommit INSERT, UPDATE or DELETE",
+            );
+        }
+        if req.require_transaction {
+            return api_err(
+                StatusCode::BAD_REQUEST,
+                "keyed SQL cannot require an existing transaction",
+            );
+        }
+        return keyed_db_write(&st, &headers, &project, &database, &req, stmt).await;
     }
     let min_role = if has_writes {
         Role::ReadWrite
@@ -4289,26 +4444,306 @@ async fn handle_db_query(
 
     match exec {
         Ok(Ok(res)) => Json(res).into_response(),
-        Ok(Err(e @ (DbError::TableNotFound(_) | DbError::IndexNotFound(_, _)))) => {
+        Ok(Err(e)) => db_error_response(&st, e),
+        Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+/// The HTTP mapping shared by the unkeyed and keyed SQL paths.
+fn db_error_response(st: &AppState, e: DbError) -> Response {
+    match e {
+        e @ (DbError::TableNotFound(_) | DbError::IndexNotFound(_, _)) => {
             api_err(StatusCode::NOT_FOUND, e.to_string())
         }
-        Ok(Err(
-            e @ (DbError::InvalidQuery(_)
-            | DbError::UnrecognizedSetting(_)
-            | DbError::TableAlreadyExists(_)
-            | DbError::IndexAlreadyExists(_, _)
-            | DbError::DuplicatePrimaryKey(_)),
-        )) => api_err(StatusCode::BAD_REQUEST, e.to_string()),
-        Ok(Err(DbError::Meta(me))) => meta_err_resp(&st, me),
+        e @ (DbError::InvalidQuery(_)
+        | DbError::UnrecognizedSetting(_)
+        | DbError::TableAlreadyExists(_)
+        | DbError::IndexAlreadyExists(_, _)
+        | DbError::DuplicatePrimaryKey(_)) => api_err(StatusCode::BAD_REQUEST, e.to_string()),
+        DbError::Meta(me) => meta_err_resp(st, me),
         // A refused pool write means the statement did not commit: report it as
         // unavailable rather than as an internal error, so a client retries instead
         // of treating the data as lost.
-        Ok(Err(DbError::Blob(BlobError::RedundancyNotMet { .. }))) => api_err(
+        DbError::Blob(BlobError::RedundancyNotMet { .. }) => api_err(
             StatusCode::SERVICE_UNAVAILABLE,
             "storage pool cannot reach full redundancy; the write was refused",
         ),
-        Ok(Err(e)) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-        Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        other => api_err(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
+    }
+}
+
+/// Reads one project-scope idempotency record from the quorum-confirmed
+/// snapshot of the group that owns it.
+///
+/// `read_record` reads the control group and is only valid for control-scope
+/// records; a project record lives in its project's group, so using it here
+/// would silently report "no record" for a key that did commit.
+async fn read_project_record(
+    st: &AppState,
+    record_key: &str,
+) -> Result<Option<IdempotencyRecord>, String> {
+    let meta = st.meta.clone();
+    let key = record_key.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let snapshot = meta
+            .try_linearizable_snapshot(std::slice::from_ref(&key), &[])
+            .map_err(|e| e.to_string())?;
+        snapshot
+            .get(&key)
+            .map(|kv| {
+                serde_json::from_slice::<IdempotencyRecord>(&kv.value).map_err(|e| e.to_string())
+            })
+            .transpose()
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Re-reads a keyed SQL record and replays it, or reports that the key lost a
+/// conflict without committing.
+async fn read_and_replay_sql(st: &AppState, record_key: &str, fingerprint: &str) -> Response {
+    match read_project_record(st, record_key).await {
+        Ok(Some(record)) => replay_record(record, fingerprint),
+        Ok(None) => api_err(
+            StatusCode::CONFLICT,
+            "SQL transaction conflict; retry the statement",
+        ),
+        Err(e) => api_err(StatusCode::SERVICE_UNAVAILABLE, e),
+    }
+}
+
+/// Keyed SQL write: exactly one autocommit `INSERT`, `UPDATE` or `DELETE`.
+///
+/// The statement has one `commit_tx_buffer` call, so `keyed_sql_extras` joins
+/// the idempotency record, the admission counter update and their guards to the
+/// same `RevisionTxn` as the row and index changes. A conflict or refusal
+/// therefore leaves none of the three applied.
+///
+/// A multi-statement script stays `501`: its first statement may commit before
+/// a later one is refused, and there is no cross-statement transaction to make
+/// that atomic.
+async fn keyed_db_write(
+    st: &AppState,
+    headers: &HeaderMap,
+    project: &str,
+    database: &str,
+    req: &SqlQueryPayload,
+    stmt: &SqlStmt,
+) -> Response {
+    let key = match idempotency_header(headers) {
+        Ok(Some(key)) => key,
+        Ok(None) => unreachable!("the keyed path is chosen from this header"),
+        Err(e) => return e,
+    };
+    // A project record is keyed by subject, so an unproven identity has no
+    // scope to be idempotent in (the same rule as keyed block writes).
+    let Some(subject) = verified_subject(headers, st.subject_secret.as_deref()) else {
+        return ControlAdminError::Unverified.into_response();
+    };
+    // Forward before local authorization, exactly as the unkeyed SQL path does.
+    if let Ok(raw_body) = serde_json::to_vec(req) {
+        if let Some(proxied) = maybe_forward_write(
+            st,
+            headers,
+            Some(project),
+            "POST",
+            db_query_path(project, database),
+            "application/json".to_string(),
+            Bytes::from(raw_body),
+        )
+        .await
+        {
+            return proxied;
+        }
+    }
+    let (pid, wal_pool, data_pool, shards) = {
+        let cp = match st.control_for_authorization_async().await {
+            Ok(cp) => cp,
+            Err(e) => return e.into_response(),
+        };
+        let pid = match cp.authorize(project, &subject, Role::ReadWrite) {
+            Ok(id) => id,
+            Err(e) => return api_err(StatusCode::FORBIDDEN, e.to_string()),
+        };
+        let db_key = format!("{project}/{database}");
+        let Some(db_spec) = cp.databases.get(&db_key) else {
+            return api_err(
+                StatusCode::NOT_FOUND,
+                format!("Database `{db_key}` not found"),
+            );
+        };
+        (
+            pid,
+            db_spec.wal_pool.clone(),
+            db_spec.data_pool.clone(),
+            db_spec.shards,
+        )
+    };
+    // A keyed statement must autocommit. A live interactive transaction would
+    // buffer it, and its later COMMIT would carry neither this record nor its
+    // counter update.
+    if let Some(id) = req.session_id.as_ref() {
+        let session = format!("{subject}#{id}");
+        if st.db.has_session(pid, database, &session) {
+            return api_err(
+                StatusCode::CONFLICT,
+                "keyed SQL cannot join an open transaction; COMMIT or ROLLBACK first",
+            );
+        }
+    }
+    let scope = match project_idempotency_scope(st, pid).await {
+        Ok(scope) => scope,
+        Err(resp) => return resp,
+    };
+    let record_key = project_record_key(&scope.records, &subject, &key);
+    let fingerprint = sql_write_fingerprint(pid, database, &req.sql);
+    // Fast path: an existing record replays without planning or touching data.
+    let pre = {
+        let meta = st.meta.clone();
+        let record_key = record_key.clone();
+        let usage_key = scope.usage_key.clone();
+        match tokio::task::spawn_blocking(move || {
+            read_project_apply_snapshot(&meta, &record_key, &usage_key)
+        })
+        .await
+        {
+            Ok(Ok(snapshot)) => snapshot,
+            Ok(Err(e)) => return api_err(StatusCode::SERVICE_UNAVAILABLE, e),
+            Err(e) => return api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        }
+    };
+    if let Some(record) = pre.record {
+        return replay_record(record, &fingerprint);
+    }
+    // The count ceiling and a conservative byte ceiling are checked before
+    // planning, so a group that is already full writes no WAL fragment. The
+    // exact record size depends on `rows_affected`; it is re-checked inside the
+    // guarded commit, where a concurrent admission can only cause a refusal
+    // (with unreferenced WAL fragments), never a half-committed record.
+    if !pre.usage.admits(sql_record_upper_bound(&fingerprint)) {
+        return idempotency_quota_response();
+    }
+    // Fence the statement against collection exactly as the unkeyed path does.
+    let mut reader_lease: Option<yadb_metakv::GcLease>;
+    let st_fence = st.clone();
+    match tokio::task::spawn_blocking(move || st_fence.begin_read_lease(pid)).await {
+        Ok(Ok(lease)) => reader_lease = Some(lease),
+        Ok(Err(error)) => return api_err(StatusCode::SERVICE_UNAVAILABLE, error.to_string()),
+        Err(error) => return api_err(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+    }
+
+    // Each attempt either commits the data and the record together or commits
+    // nothing. A CAS conflict is a definite non-commit, so re-planning is safe;
+    // re-read the key first in case a concurrent attempt won it.
+    const MAX_ATTEMPTS: usize = 3;
+    let mut outcome: Result<QueryResult, Response> = Err(api_err(
+        StatusCode::CONFLICT,
+        "SQL transaction conflict; retry the statement",
+    ));
+    for attempt in 1..=MAX_ATTEMPTS {
+        let meta = st.meta.clone();
+        let record_key_in = record_key.clone();
+        let usage_key_in = scope.usage_key.clone();
+        let fingerprint_in = fingerprint.clone();
+        let stmt_in = stmt.clone();
+        let wal_pool_in = wal_pool.clone();
+        let data_pool_in = data_pool.clone();
+        let database_in = database.to_owned();
+        let subject_in = subject.clone();
+        let db = st.db.clone();
+        let exec = tokio::task::spawn_blocking(move || {
+            let mut builder = |result: &QueryResult| {
+                keyed_sql_extras(
+                    &meta,
+                    &record_key_in,
+                    &usage_key_in,
+                    &fingerprint_in,
+                    result,
+                )
+            };
+            db.execute_sql_single_keyed(
+                pid,
+                &database_in,
+                &wal_pool_in,
+                &data_pool_in,
+                shards,
+                &subject_in,
+                stmt_in,
+                &mut builder,
+            )
+        })
+        .await;
+        match exec {
+            Ok(Ok(result)) => {
+                outcome = Ok(result);
+                break;
+            }
+            Ok(Err(DbError::IdempotencyAlreadyCommitted)) => {
+                // A concurrent attempt won this key; replay its record.
+                outcome = Err(read_and_replay_sql(st, &record_key, &fingerprint).await);
+                break;
+            }
+            Ok(Err(DbError::IdempotencyQuotaExceeded)) => {
+                outcome = Err(idempotency_quota_response());
+                break;
+            }
+            Ok(Err(DbError::Idempotency(message))) => {
+                outcome = Err(api_err(StatusCode::INTERNAL_SERVER_ERROR, message));
+                break;
+            }
+            Ok(Err(DbError::StaleTabletGeneration { .. })) if attempt < MAX_ATTEMPTS => {
+                match read_project_record(st, &record_key).await {
+                    Ok(Some(record)) => {
+                        outcome = Err(replay_record(record, &fingerprint));
+                        break;
+                    }
+                    Ok(None) => continue,
+                    Err(e) => {
+                        outcome = Err(api_err(StatusCode::SERVICE_UNAVAILABLE, e));
+                        break;
+                    }
+                }
+            }
+            Ok(Err(DbError::StaleTabletGeneration { .. })) => {
+                outcome = Err(api_err(
+                    StatusCode::CONFLICT,
+                    "SQL transaction conflict; retry the statement",
+                ));
+                break;
+            }
+            Ok(Err(e)) => {
+                outcome = Err(db_error_response(st, e));
+                break;
+            }
+            Err(e) => {
+                outcome = Err(api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
+                break;
+            }
+        }
+    }
+
+    // End the read fence before returning. A committed mutation is not undone
+    // by a lost fence; only a read's answer would be invalid.
+    let verified = if let Some(lease) = reader_lease.take() {
+        let st_fence = st.clone();
+        Some(tokio::task::spawn_blocking(move || st_fence.end_read_lease(&lease)).await)
+    } else {
+        None
+    };
+    if matches!(&outcome, Ok(_)) {
+        match verified {
+            None | Some(Ok(Ok(()))) => {}
+            Some(Ok(Err(error))) => eprintln!(
+                "reader lease lost after committed keyed SQL mutation; returning the successful result: {error}"
+            ),
+            Some(Err(error)) => eprintln!(
+                "reader lease verification failed after committed keyed SQL mutation; returning the successful result: {error}"
+            ),
+        }
+    }
+    match outcome {
+        Ok(result) => Json(result).into_response(),
+        Err(response) => response,
     }
 }
 

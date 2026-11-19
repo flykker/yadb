@@ -76,6 +76,35 @@ pub enum DbError {
 
     #[error("stale tablet generation or concurrent transaction conflict (owner_id={owner_id})")]
     StaleTabletGeneration { owner_id: u32 },
+
+    /// A caller-supplied commit extension found its idempotency record already
+    /// present. The statement was not executed; the caller must re-read the
+    /// record and replay it instead.
+    #[error("idempotency key is already committed")]
+    IdempotencyAlreadyCommitted,
+
+    /// A caller-supplied commit extension refused because the replicated
+    /// admission counter is full. Nothing was committed.
+    #[error("idempotency admission limit exceeded")]
+    IdempotencyQuotaExceeded,
+
+    /// A caller-supplied commit extension could not be built (unreadable
+    /// counter, oversized record, or an unreadable quorum snapshot). Nothing
+    /// was committed.
+    #[error("idempotency commit extension failed: {0}")]
+    Idempotency(String),
+}
+
+/// Extra guards and operations a caller joins to the single metadata
+/// transaction that commits one SQL statement.
+///
+/// The engine appends them after its own shard-manifest and secondary-index
+/// guards/ops, so the data mutation, the caller's records and the caller's
+/// counter update are one `RevisionTxn`: any failing guard aborts all of them.
+#[derive(Debug, Default, Clone)]
+pub struct CommitExtras {
+    pub guards: Vec<RevisionGuard>,
+    pub ops: Vec<TxnOp>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -820,6 +849,29 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
         self.commit_tx_buffer_at_boundaries(project_id, db, tx, || {}, || {})
     }
 
+    /// Autocommit a DML statement's buffer, appending caller extras when this is
+    /// the keyed single-statement path.
+    fn commit_tx_buffer_with_extras(
+        &self,
+        project_id: u32,
+        db: &str,
+        tx: TxBuffer,
+        extras: Option<&mut (dyn FnMut(&QueryResult) -> Result<CommitExtras, DbError> + '_)>,
+        result: &QueryResult,
+    ) -> Result<(), DbError> {
+        match extras {
+            Some(builder) => self.commit_tx_buffer_at_boundaries_with(
+                project_id,
+                db,
+                tx,
+                || {},
+                || {},
+                Some((builder, result)),
+            ),
+            None => self.commit_tx_buffer(project_id, db, tx),
+        }
+    }
+
     // Private scheduling boundaries let tests run a real independent engine at
     // the validation/preparation and preparation/publication gaps, without sleeps.
     fn commit_tx_buffer_at_boundaries(
@@ -830,7 +882,45 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
         after_validation: impl FnOnce(),
         after_preparation: impl FnOnce(),
     ) -> Result<(), DbError> {
-        if tx.is_empty() {
+        self.commit_tx_buffer_at_boundaries_with(
+            project_id,
+            db,
+            tx,
+            after_validation,
+            after_preparation,
+            None,
+        )
+    }
+
+    /// Commits a `TxBuffer` and appends caller-supplied guards and ops to the
+    /// same `RevisionTxn`.
+    ///
+    /// `extras` is called after the statement's WAL fragments are prepared and
+    /// immediately before the one metadata transaction, with the result the
+    /// statement will return on success. That ordering matters for the keyed
+    /// SQL path: the idempotency record embeds the exact response, and its
+    /// record/usage guards must be read as late as possible. If `extras` refuses
+    /// (an existing record, a full counter, an unreadable snapshot), no
+    /// metadata transaction is executed, so neither the data nor any extra op is
+    /// applied. WAL fragments already written are unreferenced garbage, exactly
+    /// as for a refused block write.
+    ///
+    /// An empty `TxBuffer` with extras still commits: a statement that matched
+    /// no rows still needs its outcome record, or a replay would re-execute it.
+    fn commit_tx_buffer_at_boundaries_with(
+        &self,
+        project_id: u32,
+        db: &str,
+        tx: TxBuffer,
+        after_validation: impl FnOnce(),
+        after_preparation: impl FnOnce(),
+        extras: Option<(
+            &mut (dyn FnMut(&QueryResult) -> Result<CommitExtras, DbError> + '_),
+            &QueryResult,
+        )>,
+    ) -> Result<(), DbError> {
+        let tx_empty = tx.is_empty();
+        if tx_empty && extras.is_none() {
             return Ok(());
         }
 
@@ -840,13 +930,20 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
         // fragments that are about to be referenced and delete them. The lease is
         // renewed and its guard joins phase 2, so a commit that stalled past the
         // lease fails instead of naming reclaimed fragments.
+        //
+        // A record-only transaction touches no WAL fragment, so it needs no
+        // writer lease.
         let lease_meta = self.meta.clone();
-        let mut writer_lease = yadb_metakv::gc::acquire_writer_if_legacy(
-            &lease_meta,
-            project_id,
-            self.meta.legacy_revision(),
-            yadb_metakv::gc::WRITER_TTL_MS,
-        )?;
+        let mut writer_lease = if tx_empty {
+            None
+        } else {
+            yadb_metakv::gc::acquire_writer_if_legacy(
+                &lease_meta,
+                project_id,
+                self.meta.legacy_revision(),
+                yadb_metakv::gc::WRITER_TTL_MS,
+            )?
+        };
 
         let mut schemas: BTreeMap<String, (TableSchema, u64)> = BTreeMap::new();
         #[allow(clippy::type_complexity)]
@@ -918,7 +1015,7 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
             schemas.insert(table, (schema, schema_revision));
         }
 
-        if expected_rows.is_empty() {
+        if expected_rows.is_empty() && extras.is_none() {
             return Ok(());
         }
 
@@ -992,6 +1089,14 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
         }
 
         after_preparation();
+
+        // Build the caller's additions after preparation so their guards are as
+        // fresh as possible, then put them in the same transaction as the data.
+        if let Some((builder, result)) = extras {
+            let extra = builder(result)?;
+            guards.extend(extra.guards);
+            ops.extend(extra.ops);
+        }
 
         // Phase 2: Single atomic Raft transaction across all shard manifests & secondary indexes!
         let revision = match self.meta.execute(KvCommand::RevisionTxn { guards, ops })? {
@@ -1089,6 +1194,7 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
                 &mut active_tx,
                 session_user,
                 stmt,
+                None,
             ) {
                 Ok(res) => {
                     cumulative_affected += res.rows_affected;
@@ -1325,7 +1431,68 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
             &mut active_tx,
             "yadb",
             stmt,
+            None,
         )
+    }
+
+    /// Executes exactly one autocommit `INSERT`, `UPDATE` or `DELETE` and joins
+    /// the caller's guards and ops to the one metadata transaction that commits
+    /// it.
+    ///
+    /// This is the keyed SQL seam. A single DML statement has exactly one
+    /// `commit_tx_buffer` call, so the caller's record and counter can be
+    /// appended to that same `RevisionTxn`; there is no second transaction and
+    /// no window in which only one half is visible. A statement that matches no
+    /// rows still commits the extras, so its recorded outcome is replayable.
+    ///
+    /// `builder` is called with the result the statement will return, after the
+    /// statement's WAL fragments are prepared and before the transaction. It
+    /// may refuse by returning an error, in which case nothing is committed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_sql_single_keyed(
+        &self,
+        project_id: u32,
+        db: &str,
+        wal_pool: &str,
+        data_pool: &str,
+        default_shards: u32,
+        session_user: &str,
+        stmt: SqlStmt,
+        builder: &mut (dyn FnMut(&QueryResult) -> Result<CommitExtras, DbError> + '_),
+    ) -> Result<QueryResult, DbError> {
+        if !matches!(
+            stmt,
+            SqlStmt::Insert { .. } | SqlStmt::Update { .. } | SqlStmt::Delete { .. }
+        ) {
+            return Err(DbError::InvalidQuery(
+                "keyed SQL supports exactly one autocommit INSERT, UPDATE or DELETE".into(),
+            ));
+        }
+        let _serial = self.query_lock.lock().unwrap();
+        // The keyed path is stateless by construction: it never reads or writes
+        // the interactive session table, so the statement cannot be buffered
+        // into an open transaction whose COMMIT would commit it without the
+        // record. The handler refuses a request that names a live session
+        // before calling here.
+        let mut active_tx = None;
+        let result = self.execute_one_in_ctx(
+            project_id,
+            db,
+            wal_pool,
+            data_pool,
+            default_shards,
+            &mut active_tx,
+            session_user,
+            stmt,
+            Some(builder),
+        )?;
+        if active_tx.is_some() {
+            // Defensive: a keyed statement must have committed, never buffered.
+            return Err(DbError::InvalidQuery(
+                "keyed SQL must commit in one transaction".into(),
+            ));
+        }
+        Ok(result)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1339,6 +1506,7 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
         active_tx: &mut Option<TxBuffer>,
         session_user: &str,
         stmt: SqlStmt,
+        mut extras: Option<&mut (dyn FnMut(&QueryResult) -> Result<CommitExtras, DbError> + '_)>,
     ) -> Result<QueryResult, DbError> {
         match stmt {
             SqlStmt::Begin => {
@@ -1656,17 +1824,24 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
                     total_written += 1;
                 }
 
+                let result = QueryResult {
+                    columns: Vec::new(),
+                    rows: Vec::new(),
+                    rows_affected: total_written,
+                };
                 if is_autocommit {
-                    self.commit_tx_buffer(project_id, db, working_tx)?;
+                    self.commit_tx_buffer_with_extras(
+                        project_id,
+                        db,
+                        working_tx,
+                        extras.take(),
+                        &result,
+                    )?;
                 } else {
                     *active_tx = Some(working_tx);
                 }
 
-                Ok(QueryResult {
-                    columns: Vec::new(),
-                    rows: Vec::new(),
-                    rows_affected: total_written,
-                })
+                Ok(result)
             }
 
             SqlStmt::Update {
@@ -1750,17 +1925,24 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
                     updated_count += 1;
                 }
 
+                let result = QueryResult {
+                    columns: Vec::new(),
+                    rows: Vec::new(),
+                    rows_affected: updated_count,
+                };
                 if is_autocommit {
-                    self.commit_tx_buffer(project_id, db, working_tx)?;
+                    self.commit_tx_buffer_with_extras(
+                        project_id,
+                        db,
+                        working_tx,
+                        extras.take(),
+                        &result,
+                    )?;
                 } else {
                     *active_tx = Some(working_tx);
                 }
 
-                Ok(QueryResult {
-                    columns: Vec::new(),
-                    rows: Vec::new(),
-                    rows_affected: updated_count,
-                })
+                Ok(result)
             }
 
             SqlStmt::Select {
@@ -1814,17 +1996,24 @@ impl<FS: StorageFs> DatabaseEngine<FS> {
                     deleted += 1;
                 }
 
+                let result = QueryResult {
+                    columns: Vec::new(),
+                    rows: Vec::new(),
+                    rows_affected: deleted,
+                };
                 if is_autocommit {
-                    self.commit_tx_buffer(project_id, db, working_tx)?;
+                    self.commit_tx_buffer_with_extras(
+                        project_id,
+                        db,
+                        working_tx,
+                        extras.take(),
+                        &result,
+                    )?;
                 } else {
                     *active_tx = Some(working_tx);
                 }
 
-                Ok(QueryResult {
-                    columns: Vec::new(),
-                    rows: Vec::new(),
-                    rows_affected: deleted,
-                })
+                Ok(result)
             }
 
             SqlStmt::FlushTable { table } => {
@@ -3136,6 +3325,212 @@ mod tests {
         engine.register_pool("wal", wal);
         engine.register_pool("data", data);
         (fs, meta, engine)
+    }
+
+    /// One keyed SQL statement commits its rows, its idempotency record and its
+    /// admission counter in the same transaction, and a refused record leaves
+    /// the rows unapplied.
+    ///
+    /// The extra guards/ops here stand in for the daemon's record and counter;
+    /// what is under test is the seam, so the payloads are opaque bytes. The
+    /// properties that must hold for the keyed SQL path to be honest:
+    ///
+    /// - a successful statement applies the row and both extras exactly once;
+    /// - a statement that matches no rows still commits its extras (otherwise a
+    ///   replay would re-execute it);
+    /// - an extras builder that refuses (an existing record) applies neither the
+    ///   row nor the counter, so a duplicate is never visible.
+    #[test]
+    fn keyed_single_statement_commits_data_record_and_counter_once() {
+        let (_fs, meta, engine) = publication_fixture(9410);
+        let run = |engine: &DatabaseEngine<SimFs>, sql: &str| {
+            engine.execute_sql(1, "db", "wal", "data", 1, sql).unwrap()
+        };
+        run(&engine, "CREATE TABLE t (id INT PRIMARY KEY, v INT);");
+
+        let record_key = "/idempotency/1/record";
+        let usage_key = "/idempotency/g2/_usage";
+        let mut calls = 0usize;
+        let mut builder = |_result: &QueryResult| {
+            calls += 1;
+            Ok(CommitExtras {
+                guards: vec![
+                    RevisionGuard {
+                        key: record_key.to_owned(),
+                        expected_mod_revision: 0,
+                    },
+                    RevisionGuard {
+                        key: usage_key.to_owned(),
+                        expected_mod_revision: 0,
+                    },
+                ],
+                ops: vec![
+                    TxnOp::Put {
+                        key: record_key.to_owned(),
+                        value: b"record".to_vec(),
+                    },
+                    TxnOp::Put {
+                        key: usage_key.to_owned(),
+                        value: b"1".to_vec(),
+                    },
+                ],
+            })
+        };
+        let stmt = parse_sql_script("INSERT INTO t VALUES (1,10);")
+            .unwrap()
+            .remove(0);
+        engine
+            .execute_sql_single_keyed(1, "db", "wal", "data", 1, "yadb", stmt, &mut builder)
+            .unwrap();
+        assert_eq!(calls, 1, "the builder runs exactly once per statement");
+        assert_eq!(meta.get_or_panic(record_key).unwrap().value, b"record");
+        assert_eq!(meta.get_or_panic(usage_key).unwrap().value, b"1");
+        assert_eq!(
+            run(&engine, "SELECT id FROM t ORDER BY id;").rows,
+            vec![vec![SqlValue::Int(1)]],
+            "the row commits with its record"
+        );
+
+        // A statement that matches no rows has an empty TxBuffer. Its record must
+        // still commit, or a replay would look like "never executed" and re-run.
+        let noop_record = "/idempotency/1/noop";
+        let mut noop_builder = |_result: &QueryResult| {
+            Ok(CommitExtras {
+                guards: vec![RevisionGuard {
+                    key: noop_record.to_owned(),
+                    expected_mod_revision: 0,
+                }],
+                ops: vec![TxnOp::Put {
+                    key: noop_record.to_owned(),
+                    value: b"noop".to_vec(),
+                }],
+            })
+        };
+        let noop = parse_sql_script("UPDATE t SET v=99 WHERE id=999;")
+            .unwrap()
+            .remove(0);
+        let result = engine
+            .execute_sql_single_keyed(1, "db", "wal", "data", 1, "yadb", noop, &mut noop_builder)
+            .unwrap();
+        assert_eq!(result.rows_affected, 0);
+        assert!(
+            meta.get_or_panic(noop_record).is_some(),
+            "a statement that matched no rows must still record its outcome"
+        );
+
+        // The daemon's builder refuses when the record already exists. A refusal
+        // must abort the whole transaction: the new row and the counter update
+        // must both be absent.
+        let mut refuse = |_result: &QueryResult| Err(DbError::IdempotencyAlreadyCommitted);
+        let duplicate = parse_sql_script("INSERT INTO t VALUES (2,20);")
+            .unwrap()
+            .remove(0);
+        let refused = engine
+            .execute_sql_single_keyed(1, "db", "wal", "data", 1, "yadb", duplicate, &mut refuse)
+            .unwrap_err();
+        assert!(matches!(refused, DbError::IdempotencyAlreadyCommitted));
+        assert_eq!(
+            run(&engine, "SELECT id FROM t ORDER BY id;").rows,
+            vec![vec![SqlValue::Int(1)]],
+            "a refused record must leave the statement's row unapplied"
+        );
+        assert_eq!(
+            meta.get_or_panic(usage_key).unwrap().value,
+            b"1",
+            "a refused record must not charge the admission counter"
+        );
+    }
+
+    /// A guard conflict on the caller's record key aborts the same transaction
+    /// that holds the row, so neither the row nor the counter is applied.
+    ///
+    /// This is the engine-level half of the keyed SQL contract: the row's shard
+    /// guard and the caller's record/usage guards are one `RevisionTxn`, so a
+    /// CAS conflict on any of them is a total non-commit rather than a committed
+    /// row with no record.
+    #[test]
+    fn keyed_record_cas_conflict_leaves_data_and_counter_unapplied() {
+        let fs = SimFs::new(9411);
+        let meta = LocalMetaKv::open_single_node(&fs, "meta", 1).unwrap();
+        let (wal, data) = make_pools(&fs);
+        let engine = DatabaseEngine::new(meta.clone(), 1024);
+        engine.register_pool("wal", wal);
+        engine.register_pool("data", data);
+        let run = |sql: &str| engine.execute_sql(1, "db", "wal", "data", 1, sql).unwrap();
+        run("CREATE TABLE t (id INT PRIMARY KEY, v INT); INSERT INTO t VALUES (1,10);");
+
+        let record_key = "/idempotency/1/record";
+        let usage_key = "/idempotency/g2/_usage";
+        let mut tx = TxBuffer::default();
+        tx.record_mutation(
+            "t",
+            SqlValue::Int(2).encode_order_preserving_key().unwrap(),
+            None,
+            Some(vec![SqlValue::Int(2), SqlValue::Int(20)]),
+        );
+        let result = QueryResult {
+            columns: Vec::new(),
+            rows: Vec::new(),
+            rows_affected: 1,
+        };
+        let mut builder = |_result: &QueryResult| {
+            Ok(CommitExtras {
+                guards: vec![
+                    RevisionGuard {
+                        key: record_key.to_owned(),
+                        expected_mod_revision: 0,
+                    },
+                    RevisionGuard {
+                        key: usage_key.to_owned(),
+                        expected_mod_revision: 0,
+                    },
+                ],
+                ops: vec![
+                    TxnOp::Put {
+                        key: record_key.to_owned(),
+                        value: b"ours".to_vec(),
+                    },
+                    TxnOp::Put {
+                        key: usage_key.to_owned(),
+                        value: b"1".to_vec(),
+                    },
+                ],
+            })
+        };
+        let committed = engine.commit_tx_buffer_at_boundaries_with(
+            1,
+            "db",
+            tx,
+            || {},
+            || {
+                // A concurrent attempt wins the record key between preparation
+                // and the metadata transaction.
+                meta.execute(KvCommand::Put {
+                    key: record_key.to_owned(),
+                    value: b"winner".to_vec(),
+                })
+                .unwrap();
+            },
+            Some((&mut builder, &result)),
+        );
+        assert!(
+            matches!(committed, Err(DbError::StaleTabletGeneration { .. })),
+            "a lost record guard must surface as a commit conflict: {committed:?}"
+        );
+        assert_eq!(
+            meta.get_or_panic(record_key).unwrap().value,
+            b"winner",
+            "the losing transaction must not overwrite the winning record"
+        );
+        assert!(
+            meta.get_or_panic(usage_key).is_none(),
+            "the losing transaction must not charge the admission counter"
+        );
+        assert_eq!(
+            run("SELECT id FROM t ORDER BY id;").rows,
+            vec![vec![SqlValue::Int(1)]],
+            "the losing transaction must not apply its row"
+        );
     }
 
     fn update_tx(id: i64, from: i64, to: i64) -> TxBuffer {

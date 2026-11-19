@@ -1192,6 +1192,178 @@ spec: {pool: data, sizeBytes: 8192}
     assert_eq!(std::fs::read_dir(legacy).unwrap().count(), 1);
 }
 
+/// Keyed SQL writes: one autocommit statement, its idempotency record and its
+/// admission counter commit in one metadata transaction.
+///
+/// The counter itself is only observable inside the group, so the engine-level
+/// test `keyed_single_statement_commits_data_record_and_counter_once` asserts
+/// that it advances exactly once. What this test proves over HTTP is the
+/// observable half: a replay returns the recorded response without applying the
+/// statement again, a reused key with a different statement is a conflict, and a
+/// multi-statement script stays unsupported and applies nothing.
+#[test]
+fn keyed_sql_single_statement_commits_with_its_record() {
+    let _serial = serialize_daemon_tests();
+    let base = std::env::var_os("YADB_TEST_TMPDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let root = base.join(format!(
+        "yadb-daemon-sqlkey-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir(&root).unwrap();
+    let dir = Dir(root.canonicalize().unwrap());
+    let cert_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../yadb-metakv/testdata/tls")
+        .canonicalize()
+        .unwrap();
+    let metadata = dir.0.join("metadata");
+    std::fs::create_dir(&metadata).unwrap();
+    let (manifest, public, _raft_addrs) = write_manifest(&dir.0, &cert_dir, &metadata);
+    let data = dir.0.join("data");
+    let log = dir.0.join("daemon.log");
+    let mut daemon = spawn(&data, Some(&manifest), public, &log);
+    ready(&mut daemon, public);
+
+    let yaml = r#"apiVersion: yadb.io/v1alpha1
+kind: StoragePool
+metadata: {name: data}
+spec: {erasure: {scheme: mirror, replicas: 3}, failureDomains: 3}
+---
+apiVersion: yadb.io/v1alpha1
+kind: Project
+metadata: {name: alpha}
+spec: {quotas: {maxStorageBytes: 100000000, maxIops: 1000}, members: [{subject: tester, role: readWrite}]}
+---
+apiVersion: yadb.io/v1alpha1
+kind: Database
+metadata: {name: db, project: alpha}
+spec: {walPool: data, dataPool: data, isolation: shared, shards: 2}
+"#;
+    ok(
+        public,
+        "POST",
+        "/v1/apply",
+        &serde_json::to_vec(&json!({"yaml":yaml})).unwrap(),
+        "application/json",
+    );
+
+    let query = |sql: &str| -> Vec<u8> {
+        ok(
+            public,
+            "POST",
+            "/db/alpha/db/query",
+            &serde_json::to_vec(&json!({"sql":sql})).unwrap(),
+            "application/json",
+        )
+    };
+    let keyed = |sql: &str, key: &str| -> (u16, Vec<u8>) {
+        let (status, _, body) = request_extra(
+            public,
+            "POST",
+            "/db/alpha/db/query",
+            &serde_json::to_vec(&json!({"sql":sql})).unwrap(),
+            "application/json",
+            &format!("Idempotency-Key: {key}\r\n"),
+        );
+        (status, body)
+    };
+    let ids = || -> Vec<i64> {
+        let body = query("SELECT id FROM t ORDER BY id");
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        value["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row[0].as_i64().unwrap())
+            .collect()
+    };
+
+    query("CREATE TABLE t (id INT PRIMARY KEY, v INT)");
+
+    // A keyed single INSERT commits the row and its record together.
+    let (status, first) = keyed("INSERT INTO t VALUES (1,10)", "sql-one");
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&first));
+    assert_eq!(ids(), vec![1]);
+
+    // The same key and statement replays the recorded outcome byte for byte and
+    // does not apply the row a second time.
+    let (status, replay) = keyed("INSERT INTO t VALUES (1,10)", "sql-one");
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&replay));
+    assert_eq!(
+        replay, first,
+        "a replayed keyed SQL write must return the recorded response"
+    );
+    assert_eq!(ids(), vec![1], "a replay must not apply the row again");
+
+    // The same key with a different statement is a conflict, not a replay.
+    let (status, body) = keyed("INSERT INTO t VALUES (2,20)", "sql-one");
+    assert_eq!(status, 409, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body).unwrap()["error"],
+        "idempotency_key_conflict"
+    );
+    assert_eq!(
+        ids(),
+        vec![1],
+        "a key conflict must not apply the statement"
+    );
+
+    // A multi-statement script has no cross-statement transaction to make its
+    // record atomic with every statement, so it is refused before anything runs.
+    let (status, body) = keyed(
+        "INSERT INTO t VALUES (3,30); INSERT INTO t VALUES (4,40)",
+        "sql-script",
+    );
+    assert_eq!(status, 501, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(
+        ids(),
+        vec![1],
+        "a refused multi-statement script must apply nothing"
+    );
+
+    // A different key still commits: the refusals above are about this key and
+    // this script shape, not a blanket block.
+    let (status, body) = keyed("INSERT INTO t VALUES (5,50)", "sql-two");
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(ids(), vec![1, 5]);
+
+    // The committed record is visible through resolve and carries its response.
+    let (status, _, resolved) = request_extra(
+        public,
+        "POST",
+        "/v1/idempotency/resolve",
+        &serde_json::to_vec(&json!({"scope":"project","project":"alpha","key":"sql-one"})).unwrap(),
+        "application/json",
+        "",
+    );
+    assert_eq!(status, 200);
+    let resolved: Value = serde_json::from_slice(&resolved).unwrap();
+    assert_eq!(resolved["outcome"], "committed");
+    assert_eq!(resolved["response"]["status"], 200);
+
+    // UPDATE and DELETE take the same one-transaction path; a replay of either
+    // must not change the data again.
+    let (status, body) = keyed("UPDATE t SET v=11 WHERE id=1", "sql-update");
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let (status, replay) = keyed("UPDATE t SET v=11 WHERE id=1", "sql-update");
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&replay));
+    assert_eq!(replay, body);
+    let (status, body) = keyed("DELETE FROM t WHERE id=5", "sql-delete");
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let (status, replay) = keyed("DELETE FROM t WHERE id=5", "sql-delete");
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&replay));
+    assert_eq!(replay, body);
+    assert_eq!(ids(), vec![1], "a replayed DELETE must not delete again");
+
+    daemon.interrupt();
+    drop(daemon);
+}
+
 #[test]
 fn three_daemons_forward_http_to_different_group_leaders() {
     let _serial = serialize_daemon_tests();
