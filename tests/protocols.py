@@ -363,9 +363,12 @@ def assert_multiraft_repair_scan(port, node, fragments=(), checked_at_least=0,
     the complete live set for that group's blobs. A node leads only some
     groups, so its pass refuses the rest by name in `repair_error` (and in the
     sweep's `gc_refusal`) while the groups it does lead are scanned for real.
-    The route answers `200` only when every group was proved, so on this
-    cluster it must answer `409`; a `200` with a refusal in the body would be
-    the old lie.
+    The route answers `200` only when every group was proved, and a `200` that
+    still carries a refusal would be the old lie. While every node is up no
+    node leads both data groups, so the pass must answer `409`; after an outage
+    the group the stopped node led re-elects, and a survivor can then lead both
+    and answer `200`. Neither case is assumed here - the drill derives it from
+    the live election.
 
     Which groups the node leads is read from the live election, not assumed:
     the launcher places one replica of every group on every node, but it is
@@ -373,7 +376,8 @@ def assert_multiraft_repair_scan(port, node, fragments=(), checked_at_least=0,
     body names exactly the groups this *particular* node does not lead. Only
     groups that own a project are scopes (`gc_group_scopes`), so the control
     group is never in the total and a node that leads no data group refuses
-    every scope - which is the control leader's case here, and still a `409`.
+    every scope - which is the control leader's case here, and still a `409`
+    while every node is up.
 
     `checked_at_least` is the number of live blobs the caller knows the led
     group holds. It cannot be asserted for a group whose manifests name no
@@ -638,12 +642,14 @@ def assert_multiraft_repair_drill(health, nodes, temp, env):
     live node. That gives both halves of the repair contract without an
     injection point:
 
-    1. With one node down, a blob written *before* the outage has two parts that
-       cannot be pinned anywhere: the scan reports it `blobs_unrecoverable`,
-       never repaired and never intact. Blobs written *during* the outage are
-       complete through their handoff copies, so they count intact - the ack
-       meant every part was durable - and they are not repaired yet, because
-       the slots that would receive the move are the ones that are down.
+    1. With one node down, every blob written *before* the outage - the whole
+       baseline set plus the one written just before the kill - has two parts
+       that cannot be pinned anywhere: the scan reports each of them
+       `blobs_unrecoverable`, never repaired and never intact. Blobs written
+       *during* the outage are complete through their handoff copies, so they
+       count intact - the ack meant every part was durable - and they are not
+       repaired yet, because the slots that would receive the move are the ones
+       that are down.
     2. With the node back, those handoff parts are rewritten to their nominal
        slots (`fragments_repaired >= 1`), the unrecoverable count returns to
        zero, and every object reads back byte-identical.
@@ -692,15 +698,19 @@ def assert_multiraft_repair_drill(health, nodes, temp, env):
 
         summary = assert_multiraft_repair_scan(
             http_port(leader), leader, live_nodes=[n for n in NODES if n != down])
-        # The shape of this cluster's first pass: the four live blobs the drill
-        # just created, three of them readable, and one unrecoverable because
-        # two of its parts are on the down node. Nothing is repaired while the
-        # receiving slots are down.
+        # Exact, and licensed by the baseline precondition above rather than by
+        # the numbers matching once: that pass proved every pre-existing blob
+        # intact, which means every one of them already had all six parts on
+        # their nominal slots. So each of those `base` blobs, plus the one
+        # written just before the outage, now has parts 2 and 5 on the down node
+        # and cannot be read at all. The three written during the outage are
+        # complete through their handoff copies, so they are the only intact
+        # blobs. Nothing is repaired while the receiving slots are down.
         assert summary["blobs_checked"] == base + 4, summary
-        assert summary["blobs_intact"] == base + 3, summary
+        assert summary["blobs_intact"] == 3, summary
         assert summary["blobs_repaired"] == 0, summary
         assert summary["fragments_repaired"] == 0, summary
-        assert summary["blobs_unrecoverable"] >= 1, summary
+        assert summary["blobs_unrecoverable"] == base + 1, summary
         for key, body in during:
             s3_visible(s3_port(leader), key, body, timeout=120)
     finally:
