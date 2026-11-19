@@ -3330,6 +3330,7 @@ mod tests {
             let st = crate::AppState {
                 openraft: None,
                 listen_addr: "127.0.0.1:0".into(),
+                internal_peer_addrs: None,
                 fs: OsFs::new(temp_dir("route-app")).unwrap(),
                 meta: meta.clone(),
                 raft_token: None,

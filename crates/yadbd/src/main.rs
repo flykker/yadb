@@ -53,6 +53,24 @@ struct Args {
     #[arg(long, default_value = "127.0.0.1:8420")]
     listen: String,
 
+    /// Optional dedicated listener for the token-authenticated node-to-node
+    /// routes (`/internal/...`). When set, those routes are served only here
+    /// and the public listener answers `404` for them, so a firewall can bound
+    /// the peer network. The Raft token check stays in every handler: the
+    /// listener narrows who can attempt the call, it does not authenticate it.
+    /// Unset keeps the historical single-listener behaviour.
+    #[arg(long)]
+    internal_listen: Option<String>,
+
+    /// Peer map for the dedicated internal listener:
+    /// `1=10.0.0.1:9001,2=10.0.0.2:9001`. Required with `--internal-listen`
+    /// when the cluster has more than one voter, because a remote VDisk RPC is
+    /// dialled at the peer's internal address once the routes leave the client
+    /// listener. Keys must match `--peers` exactly and this node's entry must
+    /// equal `--internal-listen`.
+    #[arg(long)]
+    internal_peers: Option<String>,
+
     /// Metadata runtime. OpenRaft is the only clustered metadata runtime and
     /// is always used; the flag is kept so an unsupported value fails loudly.
     #[arg(long, default_value = "openraft", value_parser = ["openraft"])]
@@ -321,6 +339,9 @@ fn require_admin(
 struct AppState {
     openraft: Option<openraft::Status>,
     listen_addr: String,
+    /// Peer map remote VDisk RPCs are dialled at. `None` means the public peer
+    /// map, which is the shape without `--internal-listen`.
+    internal_peer_addrs: Option<BTreeMap<u32, String>>,
     fs: OsFs,
     meta: LocalMetaKv<OsFs>,
     /// Shared secret required by the token-authenticated internal endpoints.
@@ -749,14 +770,24 @@ impl AppState {
             .filter(|id| *id != node_id)
             .ok_or_else(|| "control-group leader unknown".to_string())?;
         let addr = self
-            .meta
-            .peer_addr(leader)
-            .ok_or_else(|| format!("control-group leader {leader} public address missing"))?;
+            .peer_rpc_addr(leader)
+            .ok_or_else(|| format!("control-group leader {leader} RPC address missing"))?;
         let token = self
             .raft_token
             .as_deref()
             .ok_or_else(|| "internal control snapshot token missing".to_string())?;
         fetch_control_snapshot_http(&addr, token)
+    }
+
+    /// The address a peer's *internal* listener is reached at: the
+    /// `--internal-peers` entry when configured, otherwise the public peer map.
+    /// Peer-to-peer traffic (the control snapshot, remote VDisk RPCs) uses this;
+    /// leader hints and client forwarding stay on the public address.
+    fn peer_rpc_addr(&self, id: u32) -> Option<String> {
+        match &self.internal_peer_addrs {
+            Some(map) => map.get(&id).cloned(),
+            None => self.meta.peer_addr(id),
+        }
     }
 
     fn open_or_get_local_vdisk(
@@ -790,7 +821,12 @@ impl AppState {
     /// In clustered `--peers` mode, slots are striped across real cluster nodes in domain round-robin!
     fn placement_targets(&self, cp: &ControlPlaneState) -> Vec<(String, u32, Option<String>)> {
         let my_id = self.meta.node_id();
-        let peer_addrs = self.meta.peer_addrs();
+        // With `--internal-listen` the remote VDisk RPCs exist only on the
+        // internal listener, so slots on another node must be dialled there.
+        let peer_addrs = self
+            .internal_peer_addrs
+            .as_ref()
+            .unwrap_or_else(|| self.meta.peer_addrs());
 
         if peer_addrs.len() > 1 {
             let mut targets: Vec<(String, u32, Option<String>)> = Vec::new();
@@ -1339,6 +1375,63 @@ fn parse_peer_map(raw: &str) -> Result<BTreeMap<u32, String>, String> {
         map.insert(id, addr.trim().to_string());
     }
     Ok(map)
+}
+
+/// The peer map remote VDisk RPCs are dialled at, when it differs from the
+/// public `--peers` map.
+///
+/// `--internal-listen` moves `/internal/...` off the client listener, so a
+/// multi-voter cluster must also say where each peer's internal listener is.
+/// `None` means "dial the public map", which is the historical shape and the
+/// only possible one without the flag. Validation is strict on purpose: a
+/// mismatched key set or a local entry that does not match `--internal-listen`
+/// would start a cluster whose replication silently 404s.
+fn resolve_internal_peers(
+    internal_bind: Option<SocketAddr>,
+    raw: Option<&str>,
+    public: &BTreeMap<u32, String>,
+    node: u32,
+) -> Result<Option<BTreeMap<u32, String>>, String> {
+    let Some(bind) = internal_bind else {
+        if raw.is_some() {
+            return Err("--internal-peers requires --internal-listen".into());
+        }
+        return Ok(None);
+    };
+    let Some(raw) = raw else {
+        if public.len() > 1 {
+            return Err(
+                "--internal-listen requires --internal-peers when the cluster has more than one \
+                 voter: remote VDisk RPCs would otherwise be dialled at each peer's public \
+                 --listen address, which answers 404 for /internal/..."
+                    .into(),
+            );
+        }
+        return Ok(None);
+    };
+    let map = parse_peer_map(raw)?;
+    if map.keys().copied().collect::<Vec<_>>() != public.keys().copied().collect::<Vec<_>>() {
+        return Err("--internal-peers must name exactly the --peers voters".into());
+    }
+    for (id, addr) in &map {
+        match addr.parse::<SocketAddr>() {
+            Ok(a) if a.port() != 0 && !a.ip().is_unspecified() => {}
+            _ => {
+                return Err(format!(
+                    "--internal-peers entry {id}=`{addr}` must be a concrete socket address"
+                ))
+            }
+        }
+    }
+    if map.values().collect::<BTreeSet<_>>().len() != map.len() {
+        return Err("--internal-peers addresses must be unique".into());
+    }
+    if map.get(&node).map(String::as_str) != Some(bind.to_string().as_str()) {
+        return Err(
+            "--internal-peers entry for this node must equal --internal-listen".into(),
+        );
+    }
+    Ok(Some(map))
 }
 
 fn api_err(status: StatusCode, msg: impl Into<String>) -> Response {
@@ -7872,6 +7965,75 @@ async fn handle_pools_gc(State(st): State<AppState>, headers: HeaderMap) -> Resp
     }
 }
 
+/// The token-authenticated node-to-node routes. They are served on the
+/// dedicated internal listener when `--internal-listen` is set, and on the
+/// public listener otherwise (the historical shape).
+///
+/// Nothing client-facing belongs here. In particular `/v1/apply` is absent, so
+/// the internal listener cannot become an unauthenticated way to reach the
+/// control plane: it is peer transport, not a second client surface.
+fn internal_routes() -> Router<AppState> {
+    Router::new()
+        .route(
+            "/internal/vdisk/{pool}/{slot}/blob/{blob_hex}",
+            put(handle_vdisk_put)
+                .get(handle_vdisk_get)
+                .delete(handle_vdisk_delete),
+        )
+        .route(
+            "/internal/vdisk/{pool}/{slot}/stats",
+            get(handle_vdisk_stats),
+        )
+        .route(
+            "/internal/vdisk/{pool}/{slot}/barrier",
+            post(handle_vdisk_barrier),
+        )
+        .route(
+            "/internal/vdisk/{pool}/{slot}/blobs",
+            get(handle_vdisk_blobs),
+        )
+        .route(
+            "/internal/vdisk/{pool}/{slot}/compact",
+            post(handle_vdisk_compact),
+        )
+        .route(
+            "/internal/vdisk/{pool}/{slot}/epoch",
+            get(handle_vdisk_epoch),
+        )
+        .route(
+            "/internal/vdisk/{pool}/{slot}/pins",
+            get(handle_vdisk_pins),
+        )
+        .route(
+            "/internal/vdisk/{pool}/{slot}/pin",
+            post(handle_vdisk_pin),
+        )
+        .route(
+            "/internal/vdisk/{pool}/{slot}/unpin",
+            post(handle_vdisk_unpin),
+        )
+        .route(
+            "/internal/vdisk/{pool}/{slot}/advance",
+            post(handle_vdisk_advance),
+        )
+        .route(
+            "/internal/control/snapshot",
+            get(handle_internal_control_snapshot),
+        )
+        .layer(axum::extract::DefaultBodyLimit::max(16 * 1024 * 1024))
+}
+
+/// Wait for the dedicated internal listener, or never resolve when none is
+/// configured, so the daemon's `select!` keeps one shutdown path.
+async fn internal_serve(
+    server: Option<&mut tokio::task::JoinHandle<std::io::Result<()>>>,
+) -> std::io::Result<()> {
+    match server {
+        Some(handle) => handle.await.map_err(std::io::Error::other).and_then(|r| r),
+        None => std::future::pending::<std::io::Result<()>>().await,
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
@@ -7927,6 +8089,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .into(),
         );
     }
+    // The dedicated internal listener is optional. Validate it before anything
+    // is bound: a typo must fail startup rather than leave the internal routes
+    // unreachable (404 on every listener) or bound on the client address.
+    let internal_bind = match args.internal_listen.as_deref() {
+        Some(addr) => {
+            let parsed: SocketAddr = addr
+                .parse()
+                .map_err(|_| format!("--internal-listen must be a socket address: {addr}"))?;
+            if parsed.port() == 0 {
+                return Err("--internal-listen must use a nonzero port".into());
+            }
+            if args.listen.parse::<SocketAddr>().ok() == Some(parsed) {
+                return Err("--internal-listen must differ from --listen".into());
+            }
+            Some(parsed)
+        }
+        None => None,
+    };
     let data_dir = args.data_dir.clone().unwrap_or_else(|| {
         PathBuf::from("/data/data/com.foxdebug.acodefree/cache/opencode/yadbd-data")
     });
@@ -7948,8 +8128,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .ok_or("--peers public HTTP map required for OpenRaft")?,
     )
     .map_err(std::io::Error::other)?;
+    // Remote VDisk RPCs are dialled at the peer address from the peer map. Once
+    // the routes leave the client listener they must be dialled at the peer's
+    // internal listener instead, so a cluster needs that map too. Refusing a
+    // shape whose replication would 404 is better than starting it.
+    let internal_peer_addrs = resolve_internal_peers(
+        internal_bind,
+        args.internal_peers.as_deref(),
+        &public_peers,
+        args.node_id,
+    )?;
     prepared_multi.validate_client_root(&data_dir, args.node_id, &public_peers, &args.listen)?;
     let listener = tokio::net::TcpListener::bind(&args.listen).await?;
+    let internal_listener = match internal_bind {
+        Some(addr) => Some((addr, tokio::net::TcpListener::bind(addr).await?)),
+        None => None,
+    };
     let _client_root_owner = prepared_multi.provision_client_root(&data_dir, &public_peers)?;
     let mut raft_owner = openraft::Owner::Multi(prepared_multi.start().await?);
     let result: Result<(), Box<dyn std::error::Error>> = async {
@@ -7977,6 +8171,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = AppState {
         openraft: Some(raft_owner.status()),
         listen_addr: args.listen.clone(),
+        internal_peer_addrs,
         fs,
         meta: meta.clone(),
         raft_token: args.raft_token.clone(),
@@ -8104,7 +8299,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("AWS S3 path-style listening on {addr}");
     }
 
-    let app = Router::new()
+    // The public client surface. It deliberately contains no `/internal/...`
+    // route: when `--internal-listen` is set those routes exist only on the
+    // dedicated listener, so axum answers 404 here instead of a token
+    // challenge. Without the flag `main` merges the internal routes back in,
+    // which is the historical single-listener shape.
+    let public = Router::new()
         .route("/", get(handle_ui))
         .route("/ui", get(handle_ui))
         .route("/healthz", get(handle_health))
@@ -8117,46 +8317,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/pools/health", get(handle_pools_health))
         .route("/v1/pools/scrub", post(handle_pools_scrub))
         .route("/v1/pools/gc", post(handle_pools_gc))
-        .route(
-            "/internal/vdisk/{pool}/{slot}/blob/{blob_hex}",
-            put(handle_vdisk_put).get(handle_vdisk_get).delete(handle_vdisk_delete),
-        )
-        .route(
-            "/internal/vdisk/{pool}/{slot}/stats",
-            get(handle_vdisk_stats),
-        )
-        .route(
-            "/internal/vdisk/{pool}/{slot}/barrier",
-            post(handle_vdisk_barrier),
-        )
-        .route(
-            "/internal/vdisk/{pool}/{slot}/blobs",
-            get(handle_vdisk_blobs),
-        )
-        .route(
-            "/internal/vdisk/{pool}/{slot}/compact",
-            post(handle_vdisk_compact),
-        )
-        .route(
-            "/internal/vdisk/{pool}/{slot}/epoch",
-            get(handle_vdisk_epoch),
-        )
-        .route(
-            "/internal/vdisk/{pool}/{slot}/pins",
-            get(handle_vdisk_pins),
-        )
-        .route(
-            "/internal/vdisk/{pool}/{slot}/pin",
-            post(handle_vdisk_pin),
-        )
-        .route(
-            "/internal/vdisk/{pool}/{slot}/unpin",
-            post(handle_vdisk_unpin),
-        )
-        .route(
-            "/internal/vdisk/{pool}/{slot}/advance",
-            post(handle_vdisk_advance),
-        )
+        .route("/openraft/status", get(handle_openraft_status))
         .route("/db/{project}/{database}/query", post(handle_db_query))
         .route("/block/{project}/{volume}/unmap", post(handle_block_unmap))
         .route(
@@ -8171,31 +8332,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .delete(handle_s3_delete)
                 .post(handle_s3_multipart),
         )
-        .layer(axum::extract::DefaultBodyLimit::max(16 * 1024 * 1024))
-        ;
-    let app = app
-        .route(
-            "/openraft/status",
-            get(handle_openraft_status),
-        )
-        .route(
-            "/internal/control/snapshot",
-            get(handle_internal_control_snapshot),
-        );
-    let app = app.with_state(state);
+        .layer(axum::extract::DefaultBodyLimit::max(16 * 1024 * 1024));
+    let internal = internal_routes();
+    let app = if internal_listener.is_some() {
+        public
+    } else {
+        public.merge(internal)
+    };
+    let app = app.with_state(state.clone());
 
     println!(
         "yadbd node {} listening on http://{} (data={:?}, generation={})",
         args.node_id, args.listen, data_dir, recovered_cp.generation
     );
+    if let Some((addr, _)) = &internal_listener {
+        println!(
+            "internal node-to-node routes listening on http://{addr} (absent from the public listener)"
+        );
+    }
+    // A dedicated internal listener that stops while the daemon runs is fatal:
+    // the routes exist nowhere else, so continuing would look like a healthy
+    // node that no peer can replicate to.
+    let mut internal_server = internal_listener.map(|(_, listener)| {
+        let app = internal_routes().with_state(state.clone());
+        tokio::spawn(async move { axum::serve(listener, app).await })
+    });
     {
         let result = tokio::select! {
             result = axum::serve(listener, app) => result,
             result = tokio::signal::ctrl_c() => result,
             result = raft_owner.listener_finished() => Err(std::io::Error::other(format!("OpenRaft listener stopped: {result}"))),
+            result = internal_serve(internal_server.as_mut()) => result,
         };
         let _ = watch_stop.send(());
         let _ = watch_thread.join();
+        // The public `axum::serve` future is dropped by the select, so stop
+        // accepting on the dedicated listener too rather than leaving it up
+        // while the Raft owner shuts down.
+        if let Some(server) = &internal_server {
+            server.abort();
+        }
         result?;
     }
     Ok(())
@@ -8207,6 +8383,54 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod security_tests {
     use super::*;
+
+    /// The internal peer map decides where a remote VDisk RPC is dialled. A
+    /// wrong shape here starts a cluster whose replication 404s, so every
+    /// rejection is asserted rather than only the happy path.
+    #[test]
+    fn internal_peers_validation() {
+        let public = parse_peer_map("1=127.0.0.1:8420,2=127.0.0.1:8421").unwrap();
+        let bind: SocketAddr = "127.0.0.1:9001".parse().unwrap();
+        // Unset flag: the public map is used, whether or not a map was given.
+        assert_eq!(
+            resolve_internal_peers(None, None, &public, 1).unwrap(),
+            None
+        );
+        assert!(resolve_internal_peers(None, Some("1=127.0.0.1:9001"), &public, 1).is_err());
+        // Single voter without a map keeps working: nothing is dialled remotely.
+        let single = parse_peer_map("1=127.0.0.1:8420").unwrap();
+        assert_eq!(
+            resolve_internal_peers(Some(bind), None, &single, 1).unwrap(),
+            None
+        );
+        // A multi-voter cluster must say where the internal listeners are.
+        assert!(resolve_internal_peers(Some(bind), None, &public, 1).is_err());
+        // The map must name exactly the voters, use concrete and unique
+        // addresses, and agree with this node's own `--internal-listen`.
+        for bad in [
+            "1=127.0.0.1:9001",
+            "1=127.0.0.1:9001,2=127.0.0.1:9002,3=127.0.0.1:9003",
+            "1=127.0.0.1:9001,2=0.0.0.0:9002",
+            "1=127.0.0.1:9001,2=127.0.0.1:0",
+            "1=127.0.0.1:9001,2=127.0.0.1:9001",
+            "1=127.0.0.1:9001,2=nonsense",
+        ] {
+            assert!(
+                resolve_internal_peers(Some(bind), Some(bad), &public, 1).is_err(),
+                "{bad} must be rejected"
+            );
+        }
+        let map = resolve_internal_peers(
+            Some(bind),
+            Some("1=127.0.0.1:9001,2=127.0.0.1:9002"),
+            &public,
+            1,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(map[&1], "127.0.0.1:9001");
+        assert_eq!(map[&2], "127.0.0.1:9002");
+    }
 
     #[test]
     fn idempotency_validation_and_fingerprint() {
@@ -8883,6 +9107,7 @@ mod security_tests {
         let mut st = AppState {
             openraft: None,
             listen_addr: "127.0.0.1:0".into(),
+            internal_peer_addrs: None,
             fs,
             meta: meta.clone(),
             raft_token: Some("secret".into()),
@@ -9038,6 +9263,7 @@ mod security_tests {
         let st = AppState {
             openraft: None,
             listen_addr: "127.0.0.1:0".into(),
+            internal_peer_addrs: None,
             fs,
             meta: meta.clone(),
             raft_token: None,
@@ -9517,6 +9743,7 @@ mod security_tests {
         let state = AppState {
             openraft: None,
             listen_addr: "127.0.0.1:0".into(),
+            internal_peer_addrs: None,
             fs,
             meta: meta.clone(),
             raft_token: None,
@@ -10393,6 +10620,7 @@ mod security_tests {
         let st = AppState {
             openraft: None,
             listen_addr: "127.0.0.1:0".into(),
+            internal_peer_addrs: None,
             fs,
             meta: meta.clone(),
             raft_token: None,
@@ -10846,6 +11074,7 @@ mod raft_status_tests {
         let st = AppState {
             openraft: None,
             listen_addr: "127.0.0.1:0".into(),
+            internal_peer_addrs: None,
             fs,
             meta: meta.clone(),
             raft_token: Some("secret".into()),
@@ -10966,6 +11195,7 @@ mod raft_status_tests {
         let state = AppState {
             openraft: None,
             listen_addr: "127.0.0.1:0".into(),
+            internal_peer_addrs: None,
             fs,
             meta: meta.clone(),
             raft_token: None,
