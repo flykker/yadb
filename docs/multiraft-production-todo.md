@@ -954,7 +954,19 @@ design; the removed draft is not kept in the tree.
   (all three daemon module tests passed). This does not qualify arbitrary owner
   drop or cancellation during startup.
   `multiraft-runtime-operations.md` records ownership/shutdown and fail-closed
-  recovery boundaries. It does not establish implemented operational tooling.
+  recovery boundaries. It does not establish the remaining operational tooling.
+- [x] Provide the operator collection commands. `yadbctl pool-gc` and
+  `yadbctl pool-scrub` sign their admin request (`--subject`,
+  `--subject-secret` / `YADB_SUBJECT_SECRET`) and interpret the daemon's three
+  response shapes instead of printing JSON: `200` prints the counters and exits
+  `0`; a per-group `409` prints the counters that ran, lists the named groups and
+  exits `2` (a partial pass, not a failure); a whole-pass `409` from the
+  unavailable control-plane snapshot says nothing was scanned or collected and
+  exits `1`. The interpretation is a pure function over `(status, body)` with
+  unit tests for all three shapes and for a malformed body, and `pool-gc --json`
+  prints the daemon body verbatim. `pool-scrub` was not signed before this
+  change, so on any node with a non-empty admin allowlist it could not pass the
+  gate at all; that is fixed here rather than worked around.
 - [x] Test replication over a real TCP transport with authenticated envelopes
   and durable file stores (`openraft_net_test`), including rejection of unknown
   addresses and forged signatures.
@@ -982,9 +994,26 @@ design; the removed draft is not kept in the tree.
   boundary, so the error and its mapping are proven in adjacent tests rather
   than in one HTTP test. `watch_prefix` still validates its scope with an
   `expect`; it is a subscription-scope check, not a data read.
-- [ ] Test node shutdown/restart, partitions, leadership changes, quorum loss,
-  delayed/duplicate messages, snapshots and catch-up with independent
-  processes, real filesystems and TLS.
+- [x] Test node shutdown/restart, partitions, leadership changes, quorum loss,
+  snapshots and catch-up with independent processes, real filesystems and TLS.
+  `three_process_mtls_failover_and_quorum_loss` covers stop/restart, quorum
+  loss/restoration and a cross-process snapshot install;
+  `three_process_mtls_network_partition` covers bidirectional link cuts; and
+  `three_process_mtls_leader_kill_elects_a_replacement_and_the_dead_leader_catches_up`
+  covers a SIGKILLed leader (the exit status is asserted to be signal 9, so this
+  is a kill and not a clean exit), a different survivor elected inside the 20 s
+  budget, a post-kill write acknowledged and applied on both survivors, a
+  wrong-identity restart refused with `replica identity or bootstrap voters
+  mismatch` before storage, and the dead leader reopened on its own directory
+  and identity, converging on every key as a follower of the replacement. Each
+  test asserts that no acknowledged key was lost, and the kill test reads every
+  key back through the durable adapter after all three processes die.
+- [ ] Test delayed and duplicated messages between independent processes, and
+  run the process tests on more than one host. All three run on loopback, so a
+  delayed or duplicated RPC, a real network reordering and a multi-host
+  deployment are unproven. A killed process is also not a power cut: dirty
+  filesystem pages survive `SIGKILL`, so OS and device power loss stay with the
+  separate durability gates.
 
 ## 4. Migration and release
 

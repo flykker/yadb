@@ -3428,7 +3428,6 @@ mod tests {
             drop(engine);
             shutdown(f).await;
         }
-        #[ignore = "Multi-Raft GC is temporarily disabled"]
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn a_multigroup_pass_reclaims_each_groups_dead_fragments() {
             tokio::time::timeout(Duration::from_secs(30), async {
@@ -3482,7 +3481,6 @@ mod tests {
             .expect("multigroup sweep timed out");
         }
 
-        #[ignore = "Multi-Raft GC is temporarily disabled"]
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn a_follower_group_refuses_and_deletes_nothing() {
             tokio::time::timeout(Duration::from_secs(30), async {
@@ -3524,7 +3522,6 @@ mod tests {
             .expect("follower refusal test timed out");
         }
 
-        #[ignore = "Multi-Raft GC is temporarily disabled"]
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn a_group_writer_lease_protects_an_unpublished_fragment() {
             tokio::time::timeout(Duration::from_secs(30), async {
@@ -3778,7 +3775,6 @@ mod tests {
             .expect("leader-death-after-publication test timed out");
         }
 
-        #[ignore = "Multi-Raft GC is temporarily disabled"]
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn a_prepared_s3_intent_protects_its_chunks() {
             tokio::time::timeout(Duration::from_secs(30), async {

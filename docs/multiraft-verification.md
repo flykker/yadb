@@ -724,6 +724,7 @@ unproven and no timeout was increased or retry added to mask the failure.
 | Loopback TCP/mTLS | Actual socket/TLS/signature protocol for tested identities | Firewall isolation, credential lifecycle or hostile-network audit |
 | Child process kill/reopen | Acknowledged state survives that process death with the OS still running | Dirty page eviction, device loss or hardware power-cut behavior |
 | Multi-process failure suite | Only the tested stop/restart/quorum/failover scenarios | Network partitions unless explicitly injected; arbitrary schedules |
+| Multi-process leader kill | `three_process_mtls_leader_kill_elects_a_replacement_and_the_dead_leader_catches_up`: three child processes over mTLS and real directories, SIGKILL of the leader (exit status asserted to be signal 9), a different survivor elected within the 20 s budget, a post-kill write acknowledged and applied on both survivors, a wrong-identity restart refused with `replica identity or bootstrap voters mismatch` before storage, the same directory and identity reopened and polled to hold every key as a follower of the replacement, and every key read back through the durable adapter after all three processes die | Delayed or duplicated RPCs, multi-host deployment, OS/device power loss, or any schedule other than the one tested |
 | OS/device crash test | Recorded host/filesystem/device/power-failure scenario | Other hardware configurations or unrestricted power-loss guarantees |
 
 ### Durability findings S1/S2/S4/S6/S7 (2026-11-15)

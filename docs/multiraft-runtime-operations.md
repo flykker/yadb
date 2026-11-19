@@ -301,10 +301,11 @@ the same request on each named group's leader to cover the rest. A different
 `409` shape says no group ran at all: `repair_error` (scrub) or `refusal` (gc)
 names an unavailable control-plane snapshot, which a pass needs for its
 volume-to-pool map, and the counters are all zero because nothing was touched.
-Re-run once the node can reach the control group's quorum. `yadbctl
-pool-scrub` cannot express that distinction — it prints the body and exits `1`
-on any non-`200` — so a scripted scrub must inspect `repair_error` rather than
-the exit status.
+Re-run once the node can reach the control group's quorum. `yadbctl pool-gc`
+and `yadbctl pool-scrub` express the distinction in their exit status: `200`
+exits `0`, a per-group `409` exits `2` after printing the counters that ran and
+the named groups, and a whole-pass `409` exits `1` after saying nothing was
+scanned or collected.
 
 Two repair limits stay stated. A blob published after the snapshot is not
 repaired by that pass — repair is idempotent, not atomic with publication. A
@@ -567,6 +568,36 @@ upload. A BlobId takes `owner_id` from the high 32 bits of the allocation id and
 `generation` from the low 24, so `generation` wraps at the 24-bit boundary while
 `owner_id` increments; uniqueness comes from the pair, not from `generation`
 alone. `MAX_ALLOCATION` is `2^56-1`, so `owner_id` still fits 32 bits.
+
+## Operator collection commands
+
+`yadbctl pool-gc` and `yadbctl pool-scrub` call `POST /v1/pools/gc` and
+`POST /v1/pools/scrub` as signed admin subjects. Pass `--subject <name>` (the
+default is `yadbctl`) and either `--subject-secret <secret>` or
+`YADB_SUBJECT_SECRET`; the daemon verifies the same HMAC-SHA256 signature the
+apply path uses and refuses an unsigned or non-admin subject. Neither command
+falls back to the local state file: a collection pass is a live-node operation.
+
+Both commands read the daemon's response instead of printing it:
+
+| Daemon answer | Meaning | Printed | Exit |
+| --- | --- | --- | --- |
+| `200` | The pass ran for every group this node leads. | Counters. | `0` |
+| `409` naming metadata groups (`gc_refusal` for GC, `repair_error` for scrub) | This node leads only some groups; the named ones were refused and the counters cover the groups that did run. | Counters, the named groups, and the instruction to run the same command on each named group's leader. | `2` |
+| `409`, every counter zero, refusal names the unavailable control-plane snapshot | No group ran; the pass could not obtain the volume-to-pool map it needs. | That nothing was scanned or collected, and that the node must reach the control group's quorum first. | `1` |
+| Any other status, or a body that is not a JSON object | The request did not produce a collection result. | The daemon body. | `1` |
+
+`exit 2` is a partial pass, not a failure: do not retry the same node expecting
+the refused groups to run. Run the command on each named group's leader; the
+counters from each node cover only that node's groups. `exit 1` means nothing
+was collected, so retrying before quorum is restored cannot help.
+
+The counters line prints `blobs live`, `fragments deleted`, `barriers applied`,
+`leases live`, `refused puts`, `pools refused` and `groups refused`. The two
+handlers do not report the same fields: GC carries `barriers_applied`, scrub
+carries `refused_puts`; a counter absent from the body is printed as `n/a`, not
+as zero. `yadbctl pool-gc --json` prints the daemon body verbatim and still exits
+with the interpreted code.
 
 ## Fail-closed recovery matrix
 
