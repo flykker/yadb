@@ -1277,47 +1277,43 @@ a crash between the two renames is harmless and idempotent. A `Base > 0` with a
 missing or unparsable checkpoint, a checkpoint below the WAL base, and a
 checkpoint term disagreeing with the base term all refuse to start.
 
-Tests (`cargo test -p yadb-metakv`, 177 tests):
-- `compaction_bounds_the_wal_and_preserves_state_across_reopen`: 51 puts, forced
-  threshold, base advances, WAL shrinks, every key reads back, reopen reproduces
-  base/floor/revision and does not append.
-- `checkpoint_renamed_before_the_wal_rewrite_is_reconciled_on_open`: the crash
-  window; the stale WAL is rewritten on open, state and revision are identical,
-  and the file shrinks.
-- `a_compacted_base_without_a_checkpoint_refuses_to_start`,
-  `an_unparsable_checkpoint_refuses_to_start` and
-  `a_checkpoint_from_another_membership_refuses_to_start`: explicit `Checkpoint`
-  errors.
-- `term_and_vote_survive_compaction`: the rewritten WAL itself carries the hard
-  state, so replay cannot rewind the term.
-- `compaction_never_drops_an_entry_above_a_stopped_peer_match`: 3-node cluster,
-  one peer stopped, leader's base and floor stop at that peer's match, and the
-  peer catches up after healing.
-- `a_peer_below_the_compacted_base_is_sent_the_durable_image`: the leader sends
-  one `InstallSnapshot` chunk with the base index/term, the group id and the
-  membership instead of refusing, while the follower still refuses an append
-  whose prefix is below its own base.
-- `a_replica_that_lost_its_log_rejoins_through_the_durable_image`: a replica
-  replaced with an empty directory gets the image, publishes
-  `checkpoint.json`, has its WAL rewritten, and then receives the entries above
-  the base through the ordinary log.
-- `a_snapshot_from_another_group_or_membership_is_refused`: wrong group id and
-  wrong membership are refused with the state and files untouched.
-- `a_corrupted_or_stale_snapshot_is_refused_without_publishing`: a flipped byte
-  fails the whole-image checksum, a retried intact image still installs, and an
-  image below the base or with another term is refused.
-- `a_snapshot_transfer_resumes_without_duplicating_bytes`: 32-byte chunks, a
-  retransmitted chunk keeps the offset, an out-of-order chunk is refused with
-  the offset the receiver still needs, and the resumed transfer completes.
-- `an_install_interrupted_by_a_power_cut_leaves_the_old_state`: two chunks, a
-  power cut, and the reopened node keeps base 0 with no partial image.
-- `a_crash_after_publishing_the_image_keeps_the_new_base`: the rename reaches
-  the disk and the following sync fails; the in-memory base does not move, the
-  published image survives the power cut, and the reopened node adopts it and
-  rewrites its log.
-- WAL layer: `base_marker_replays_and_rewrite_preserves_hard_state`,
-  `rewrite_replaces_the_whole_file_and_shrinks_it`, `a_gap_above_the_base_is_corruption`,
-  `an_append_below_the_base_is_corruption`.
+Tests. These fourteen cases were written against the legacy `RaftCore` and were
+deleted with it in `634efeb`, so they are history, not current evidence. They
+are kept in this record because the shapes they established are still required
+of the replacement, and the current suite covers those shapes at the OpenRaft
+boundary (`cargo test -p yadb-metakv`):
+
+- checkpoint and compaction: `real_frame_limit_triggers_checkpoint`,
+  `automatic_checkpoint_preserves_vote_purge_and_suffix`,
+  `append_after_checkpoint_survives_reopen`;
+- checkpoint failure and recovery: `checkpoint_faults_poison_and_recover_valid_primary`,
+  `invalid_primary_preserves_checkpoint_temp`,
+  `purge_missing_prefix_preserves_checkpoint_continuity`;
+- a base that cannot be restored: `a_store_with_a_compacted_base_it_cannot_restore_refuses_to_open`,
+  `previous_log_format_is_rejected_without_modification`,
+  `wrong_identity_and_missing_log_never_modify_data`;
+- snapshot identity, atomicity and staleness: `snapshot_build_and_install_are_atomic_and_metadata_bound`,
+  `same_applied_snapshot_requires_identical_state_and_membership`,
+  `stale_snapshot_install_cannot_roll_back_applied_state`,
+  `snapshot_id_binds_bytes_not_just_last_applied_log`,
+  `snapshot_install_simulated_failures_require_reopen`;
+- catch-up through the durable image: `openraft_persistent_cluster_recovers_lagging_follower_via_snapshot`,
+  `snapshot_can_install_on_another_replica_of_same_group`;
+- transfer resumption and bounds: `large_snapshot_stream_round_trip`,
+  `snapshot_stream_rejects_bad_data_and_releases_budget_on_disconnect`.
+
+One shape did not survive the replacement and has no current equivalent:
+`compaction_never_drops_an_entry_above_a_stopped_peer_match` asserted that
+YADB's own compactor stopped at a stopped peer's match index. Compaction is now
+OpenRaft's policy, so there is no YADB code for that assertion to be about. What
+is proven is the consequence — a lagging follower is caught up through a
+snapshot — not that the log is never truncated above a peer's match. That is a
+real reduction in coverage, not a rename, and it stays stated.
+
+The WAL layer tests are still current (`crates/yadb-metakv/src/wal.rs`):
+`base_marker_replays_and_rewrite_preserves_hard_state`,
+`rewrite_replaces_the_whole_file_and_shrinks_it`, `a_gap_above_the_base_is_corruption`,
+`an_append_below_the_base_is_corruption`.
 
 Live measurement on a three-node legacy cluster (ports 21000-21300, fresh root):
 4801 rows written through pgwire in three runs, 19491 Raft entries. `base_index`
@@ -2200,7 +2196,10 @@ and treats silence as evidence only after it has held for
 Regressions: `execute_keeps_waiting_through_silence_shorter_than_the_no_quorum_window`
 (five silent rounds then a reply, must commit) and
 `execute_refuses_after_sustained_silence_and_before_the_commit_budget` (silence
-that holds, refused at or after 1500 ms and before the 3000 ms budget).
+that holds, refused at or after 1500 ms and before the 3000 ms budget). Both
+were removed with `execute_with` itself in `ad67c94`, when the legacy Raft core
+was deleted; the budget they tuned no longer exists, and the equivalent shape is
+now OpenRaft's own apply path (see the snapshot and apply coverage above).
 
 ### The ambiguous-write drill had stopped being ambiguous
 
@@ -2785,3 +2784,15 @@ not through an admin route, and the install is still initiated by an inbound
   a SKIP; the `--install-snapshot-live` flag no longer exists. The install path
   itself is also proven by the crate-level process test
   `three_process_mtls_failover_and_quorum_loss`.
+* Offline guards, run without a cluster: `scripts/test_protocols_review.py`,
+  `scripts/test_doc_anchors.py`, `scripts/test_doc_test_names.py` and
+  `tests/test_gc_refusal_protocol.py`. `test_doc_test_names.py` is new. It
+  requires every lowercase backticked identifier of twelve or more characters in
+  `docs/` to exist somewhere under `crates/`, `tests/` or `scripts/`, unless the
+  script lists it with a reason: a dependency symbol, or a name whose code was
+  removed, with the commit that removed it. A listed name that starts existing
+  again fails the guard, so the list cannot rot into a blanket exemption. It
+  exists because this record listed fourteen checkpoint/compaction tests as
+  current evidence after `634efeb` deleted the legacy `RaftCore` and every one of
+  them; the block above now says they are history and names the coverage that
+  replaced them.
