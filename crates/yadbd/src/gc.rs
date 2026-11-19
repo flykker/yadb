@@ -1197,17 +1197,22 @@ mod tests {
             "before={before} after={after} live={live}"
         );
 
+        // A rerun with nothing to reclaim deletes nothing and frees nothing.
+        //
+        // This comes before the read on purpose. A read appends a reader pin and
+        // its release on every slot, and compaction reclaims that bookkeeping, so
+        // a read first would make "nothing to reclaim" false for a reason that
+        // has nothing to do with collection.
+        let again = f.sweep();
+        assert!(again.refusal.is_none(), "{again:?}");
+        assert_eq!(again.fragments_deleted, 0, "{again:?}");
+        assert_eq!(again.bytes_reclaimed, 0, "{again:?}");
+
         // The surviving bytes are the newest write, intact.
         let read = engine
             .read_at(1, "disk", POOL, 1 << 20, 0, 16 * BLOCK_SIZE as usize)
             .unwrap();
         assert_eq!(read, vec![47u8; 16 * BLOCK_SIZE as usize]);
-
-        // A rerun with nothing to reclaim deletes nothing and frees nothing.
-        let again = f.sweep();
-        assert!(again.refusal.is_none(), "{again:?}");
-        assert_eq!(again.fragments_deleted, 0, "{again:?}");
-        assert_eq!(again.bytes_reclaimed, 0, "{again:?}");
     }
 
     #[test]

@@ -3252,6 +3252,12 @@ mod tests {
             matches!(result, Err(DbError::Meta(_))),
             "the caller must see the sync failure: {result:?}"
         );
+        // `sync_data_fault` is a persistent mode, not a one-shot: every later
+        // file sync fails until the configuration changes. Clear it before
+        // reading, because a read now records a durable reader pin on the blob
+        // target, so leaving it set would test "reads while fsync is broken"
+        // (which must refuse, not return the row) instead of recovery.
+        fs.set_faults(FaultConfig::default());
         // In this process the failed append was not applied to the local state
         // machine, so the read still sees the old row. The durable outcome is
         // unknown from here; only recovery decides which of the two it is.
@@ -3398,6 +3404,11 @@ mod tests {
             matches!(result, Err(DbError::Meta(_))),
             "the caller must see the ambiguous error: {result:?}"
         );
+        // The injected sync fault is persistent. A read now records a durable
+        // reader pin on the blob target, so the fault is cleared here to keep
+        // this test about the ambiguous publication, not about reading from a
+        // target that cannot fsync.
+        fs.set_faults(FaultConfig::default());
 
         // The caller sees exactly one error; there is no internal retry. A
         // same-process retry cannot run at all because the WAL that failed its
