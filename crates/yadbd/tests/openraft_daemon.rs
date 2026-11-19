@@ -9,6 +9,7 @@ use std::{
     net::{SocketAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
+    sync::{Mutex, MutexGuard},
     time::{Duration, Instant},
 };
 use yadb_metakv::{
@@ -22,6 +23,22 @@ use yadb_metakv::{
 /// unsigned subject would be treated as anonymous.
 const SUBJECT: &str = "tester";
 const SUBJECT_SECRET: &str = "integration-test-subject-secret";
+
+/// Held for the duration of each test that starts a daemon.
+///
+/// Each test reserves ephemeral ports, drops the reservations, and only then
+/// lets the child bind them. Between the drop and the bind another test in this
+/// binary can take a port, in which case `ready` polls a foreign daemon and the
+/// test's own daemon fails to bind — the run then fails on a closed listener
+/// rather than on the behaviour under test. The four daemon tests are already
+/// slow enough that running them one at a time costs nothing measurable.
+static DAEMON_TESTS: Mutex<()> = Mutex::new(());
+
+fn serialize_daemon_tests() -> MutexGuard<'static, ()> {
+    // A panicking test poisons the lock. The remaining tests still have to run
+    // and report their own result, so the poison is ignored deliberately.
+    DAEMON_TESTS.lock().unwrap_or_else(|error| error.into_inner())
+}
 
 fn subject_signature(subject: &str) -> String {
     let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, SUBJECT_SECRET.as_bytes());
@@ -284,6 +301,7 @@ fn config(path: &Path, value: &Value) {
 
 #[test]
 fn daemon_multigroup_http_shutdown_reopen_and_root_guards() {
+    let _serial = serialize_daemon_tests();
     let base = std::env::var_os("YADB_TEST_TMPDIR")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
@@ -980,6 +998,7 @@ spec: {pool: data, sizeBytes: 8192}
 
 #[test]
 fn three_daemons_forward_http_to_different_group_leaders() {
+    let _serial = serialize_daemon_tests();
     let started = Instant::now();
     let base = std::env::var_os("YADB_TEST_TMPDIR")
         .map(PathBuf::from)
@@ -1603,6 +1622,7 @@ spec: {quotas: {maxStorageBytes: 100000000, maxIops: 1000}, members: []}
 /// the startup contract, so it needs no cluster and no manifest.
 #[test]
 fn startup_refuses_an_admin_allowlist_it_cannot_verify() {
+    let _serial = serialize_daemon_tests();
     let base = std::env::var_os("YADB_TEST_TMPDIR")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
@@ -1740,6 +1760,7 @@ fn startup_refuses_an_admin_allowlist_it_cannot_verify() {
 /// `--subject-secret` must not answer an unverified caller.
 #[test]
 fn openraft_status_requires_verified_subject() {
+    let _serial = serialize_daemon_tests();
     let base = std::env::var_os("YADB_TEST_TMPDIR")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
