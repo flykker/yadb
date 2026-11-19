@@ -100,7 +100,7 @@ and (1) is not a cross-group question either:
   yields the *complete* live set for that group's blobs, not a partial one.
 
 Deletion is the operation that needs a cross-group decision, and it already
-makes that decision per group (`sweep_groups` at `crates/yadbd/src/gc.rs:611`).
+makes that decision per group (`sweep_groups` at `crates/yadbd/src/gc.rs:614`).
 Repair deletes nothing except the handoff copy of a part it has already written
 to the nominal slot, and a tombstoned id refuses that write
 (`crates/yadb-blob/src/volume.rs:634`), so a pass cannot resurrect a blob a
@@ -150,10 +150,15 @@ in the repair path crosses groups.
      `POST /v1/pools/scrub`, and assert `fragments_repaired >= 1` — the parts
      have returned to their nominal slots. The harness already produces this
      placement in the quorum-loss drill.
-   * inversion: run the same scrub while the node is still down. The nominal
-     slot is unreachable, so the blob is counted `blobs_unrecoverable`, nothing
-     is moved, the object still reads back from the handoff copies, and the
-     route does not report a repair it did not make.
+   * inversion: run the same scrub while the node is still down. Nothing is
+     moved (`fragments_repaired == 0`), and a blob whose nominal slots sit on
+     the down node is counted `blobs_unrecoverable` because its parts cannot be
+     pinned anywhere — its absence is not proved, so the pass does not claim it
+     healed one. The object just written *does* read back from its handoff
+     copies and is counted intact, which is the honest shape: the route reports
+     no repair it did not make, and it does not call a readable blob lost.
+     (Observed on a live three-node run: 4 blobs checked, 3 intact, 1
+     unrecoverable, 0 fragments repaired.)
 5. **Guards and docs** — the scenario is dropped from `EXPECTED_SKIPS` and
    `REQUIRED_SUBSTRINGS` in `scripts/test_protocols_review.py`,
    `assert_multiraft_scrub_repair_refusal` is replaced with a positive
@@ -180,7 +185,7 @@ in the repair path crosses groups.
 
 ### What it said
 
-`begin_read_lease` (`crates/yadbd/src/main.rs:546`) is gated by
+`begin_read_lease` (`crates/yadbd/src/main.rs:548`) is gated by
 `!st.app.meta.is_openraft()` (`crates/yadbd/src/protocols/s3.rs:683`), so on
 Multi-Raft no metadata read lease is acquired, renewed or expired.
 

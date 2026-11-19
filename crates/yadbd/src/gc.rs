@@ -200,6 +200,9 @@ pub struct RepairOutcome {
     pub blobs_intact: usize,
     pub blobs_repaired: usize,
     pub fragments_repaired: usize,
+    /// Blobs the pass could not prove intact: the payload did not decode, or a
+    /// fragment sat on a target that could not be reached so its absence was
+    /// never proved. Never repaired and never counted intact.
     pub blobs_unrecoverable: usize,
     /// Metadata groups that were refused, with the reason. Empty when every
     /// group's live set was proved and scanned.

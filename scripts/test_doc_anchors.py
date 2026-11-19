@@ -52,8 +52,8 @@ CURRENT_CLAIMS = {
     "crates/yadb-block/src/lib.rs:311": ["acquire_writer_if_legacy"],
     # `docs/multiraft-skip-closure-plan.md`: the mechanisms the record reuses.
     # The refusal constant it removed is gone, so it is named by symbol only.
-    "crates/yadbd/src/main.rs:546": ["begin_read_lease"],
-    "crates/yadbd/src/gc.rs:611": ["sweep_groups"],
+    "crates/yadbd/src/main.rs:548": ["begin_read_lease"],
+    "crates/yadbd/src/gc.rs:614": ["sweep_groups"],
     "crates/yadbd/src/protocols/s3.rs:683": ["is_openraft"],
     "crates/yadb-blob/src/pool.rs:1136": ["read_part"],
     "crates/yadb-blob/src/pool.rs:1590": ["repair_blob"],

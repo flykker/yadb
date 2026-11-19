@@ -355,9 +355,11 @@ struct ScrubSummary {
     pub blobs_intact: usize,
     pub blobs_repaired: usize,
     pub fragments_repaired: usize,
-    /// Blobs whose payload could not be reconstructed from the surviving
-    /// fragments. Counted, never repaired and never reported intact: a pass that
-    /// cannot read a blob must not claim it healed one.
+    /// Blobs the pass could not prove intact. Two shapes produce one: the
+    /// payload could not be reconstructed from the surviving fragments, or a
+    /// fragment sat on a target that could not be reached, so its absence was
+    /// never proved. Counted, never repaired and never reported intact: a pass
+    /// that cannot read a blob must not claim it healed one.
     pub blobs_unrecoverable: usize,
     /// Writes refused because the pool could not promise the redundancy it
     /// advertises, summed over pools since this process started. A refused write
