@@ -365,6 +365,19 @@ advanced" a single atomic step from the target's point of view. A pin taken
 concurrently either lands before the check (pass aborts) or after the advance
 (it names the new epoch and fences only the new epoch's fragments).
 
+The unit of the protocol is one VDisk slot, not one pool. Each slot has its own
+durable epoch and pin table, so the collector reads and advances every slot that
+can hold a dead fragment, and it advances all of them before the first deletion
+in that group. A refusal on any one slot - a live pin, a stale expected epoch, an
+unreadable clock - stops the group's pass with nothing deleted: deleting on the
+slots that did advance while another slot still had a pinned reader would be
+exactly the partial fence this protocol exists to prevent. Handoff copies make
+the set a superset of the nominal slots: every candidate slot the pool can place
+a part on is advanced too. A barrier carries the collector lease deadline but not
+the epoch; after the advance has proved that no pin exists on any epoch and
+admission is closed, a barrier can only evict fragments the mark has already
+proved dead, so it does not need a separate epoch field.
+
 ## What has to change, by component
 
 | Component | Change |
