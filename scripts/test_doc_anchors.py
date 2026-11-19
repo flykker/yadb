@@ -43,10 +43,10 @@ CITATION_RE = re.compile(
 # Current claims: the cited line must still contain every listed substring.
 # A citation with no entry here must be a historical snapshot instead.
 CURRENT_CLAIMS = {
-    "crates/yadbd/src/main.rs:77": ["value_parser", "openraft"],
-    "crates/yadbd/src/main.rs:7912": ["require_admin"],
+    "crates/yadbd/src/main.rs:80": ["value_parser", "openraft"],
+    "crates/yadbd/src/main.rs:8379": ["require_admin"],
     "crates/yadb-metakv/src/gc.rs:790": ["acquire_writer", "map(Some)"],
-    "crates/yadb-db/src/lib.rs:844": ["acquire_writer_if_legacy"],
+    "crates/yadb-db/src/lib.rs:940": ["acquire_writer_if_legacy"],
     "crates/yadb-db/src/tablet.rs:916": ["acquire_writer_if_legacy"],
     "crates/yadb-db/src/tablet.rs:982": ["acquire_writer_if_legacy"],
     "crates/yadb-block/src/lib.rs:311": ["acquire_writer_if_legacy"],

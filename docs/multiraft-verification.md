@@ -197,8 +197,9 @@ establish: no response-loss injection, no leader kill during a keyed apply, no
 follower-forwarded keyed apply, and no quota-exhaustion behaviour on a live
 group; the replicated counter's ceiling is covered by unit tests only.
 
-Project-scope idempotency exists for block UNMAP, block write and S3 object
-PUT/DELETE. Its live and integration evidence is narrower than the control
+Project-scope idempotency exists for block UNMAP, block write, S3 object
+PUT/DELETE and one autocommit SQL `INSERT`/`UPDATE`/`DELETE`. Its live and
+integration evidence is narrower than the control
 scope's. The integration test
 `three_daemons_forward_http_to_different_group_leaders` drives the UNMAP path
 through the real daemon: an unproven identity gets 401 and a verified non-member
@@ -240,21 +241,32 @@ tests only. The keyed S3 wire path additionally depends on a configured
 `--subject-secret` (the gateway mints the internal subject signature from the
 SigV4-authenticated identity), which no daemon test exercises.
 
-SQL writes are deliberately still not keyed: `POST /db/{project}/db/query` with
-an `Idempotency-Key` and a write script returns 501. A script can mutate any
-number of tables, shards and secondary indexes through
-`DatabaseEngine::commit_tx_buffer_at_boundaries`, and each of those builds its own
-metadata transactions; making the script keyed requires threading the record and
-its counter into that transaction. A handler-level record committed separately
+SQL writes are keyed for exactly one autocommit `INSERT`, `UPDATE` or `DELETE`,
+and not for a multi-statement script. The single-statement path has one
+`commit_tx_buffer` call, so the record and its counter update join the same
+guarded `RevisionTxn` as the rows, index entries and shard manifests
+(`DatabaseEngine::commit_tx_buffer_at_boundaries_with`); a conflict or refusal
+commits none of them, and a statement that matched no rows still records its
+outcome so a replay cannot re-execute it. A multi-statement script still returns
+501: it commits statement by statement through
+`commit_tx_buffer_at_boundaries`, and there is no cross-statement transaction
+joining them. A handler-level record committed separately
 from the data would reintroduce exactly the ambiguity the key exists to remove,
-so the gap is stated rather than papered over. A SQL write *without* a key is
+so the gap is stated rather than papered over. Evidence:
+`keyed_single_statement_commits_data_record_and_counter_once` and
+`keyed_record_cas_conflict_leaves_data_and_counter_unapplied` in
+`crates/yadb-db/src/lib.rs`, and the end-to-end
+`keyed_sql_single_statement_commits_with_its_record` in
+`crates/yadbd/tests/openraft_daemon.rs` (replay is byte-identical and does not
+apply the row twice; a reused key with a different statement is 409; a
+multi-statement script is 501 and applies nothing). A SQL write *without* a key is
 deliberately still accepted: requiring one would stop `psql`, the pgwire
 protocol and every existing script from writing at all, and an unkeyed write is
 the pre-existing contract rather than a new hole. The review that asked for a
 mandatory key is answered here: the key is opt-in for SQL, mandatory nowhere, and
-a client that wants an ambiguous write to be resolvable must use the block or S3
-path, or supply the key and accept the 501 that says the guarantee is not there
-yet.
+a client that wants a multi-statement write to be resolvable must send one
+statement per key, use the block or S3 path, or accept the 501 that says the
+guarantee is not there yet.
 
 That was also exercised live on the three-process deployment (binary
 `b00018a9f092da23d3cfae818bc0e4ac7008dea659abca6336924bfeb7f87ddc`, built from
@@ -2909,3 +2921,42 @@ not through an admin route, and the install is still initiated by an inbound
   current evidence after `634efeb` deleted the legacy `RaftCore` and every one of
   them; the block above now says they are history and names the coverage that
   replaced them.
+
+## The health surface as Prometheus text (2026-11-19)
+
+`GET /metrics` on the public listener renders the rows `/v1/pools/health`
+already carries — node and runtime, per pool, per slot, the last collection
+pass, the last repair scan and one row per metadata group — in the Prometheus
+text format (`version=0.0.4`). It is a projection, not a second source of truth:
+the handler gathers exactly what the health endpoint gathers, including the
+remote slot probe, and adds nothing.
+
+Rendering is a pure function over those rows, so most of it is proved without a
+daemon. The properties and the assertions:
+
+| Property | Test (`crates/yadbd/src/metrics.rs` unless noted) |
+| --- | --- |
+| Every family is emitted with `HELP` and `TYPE`, even with no input | `every_family_is_emitted_with_help_and_type` |
+| Pool and slot samples carry the health values, and an offline slot is a `0` gauge rather than a missing sample | `pool_and_slot_samples_carry_the_health_values` |
+| An absent pass reports `*_last_pass_present 0` and publishes no other value from that family | `an_absent_gc_or_scrub_pass_reports_zero_present_and_no_samples` |
+| A refused pass is `yadb_gc_refused 1` with its own counters | `a_refused_pass_is_visible_as_a_refusal_and_counts` |
+| Group rows become per-group samples; a row with no group is the observation-error gauge | `group_rows_become_per_group_samples_and_a_null_row_is_an_observation_error` |
+| Label values escape backslash, quote and newline, and the escaping cannot split a sample across lines | `label_values_escape_the_three_reserved_characters` |
+| Large counters stay decimal, not scientific notation | `values_are_finite_decimals_not_scientific_notation` |
+| Rendering is deterministic for the same rows | `rendering_is_deterministic_for_the_same_rows` |
+
+The wiring is proved end to end on the multi-group fixture by
+`raft_status_tests::metrics_endpoint_serves_the_health_surface_as_prometheus_text`.
+It runs a real collection pass, scrapes, and asserts the node row, the recorded
+pass and all three group rows; then it asserts a scrape is **not** a pass — the
+recorded `SweepOutcome` is identical, the reader-lease cache is empty and no
+lease record was published — and finally that a refused pass is
+`yadb_gc_refused 1` while the exposition still parses.
+
+Sensitivity, run by inverting the rendering: dropping the `yadb_gc_refused`
+sample fails the refusal test, and removing the label escape fails with the
+sample split across lines. Both restored.
+
+Open: nothing consumes the endpoint. No scrape config, alert rules or dashboard
+are shipped, and the families are this node's local observations — the role in
+`yadb_group_info` is not proof of quorum.

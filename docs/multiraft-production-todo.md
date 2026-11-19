@@ -660,16 +660,19 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   implemented (`Idempotency-Key`, the outcome record committed in the same
   `RevisionTxn` as the mutation, `POST /v1/idempotency/resolve`, and a replicated
   `10_000`-record / `8 MiB` admission counter at `/sys/idempotency/_usage` that
-  refuses with `429` before planning). Three project-scope data paths are keyed:
-  block UNMAP, block write and S3 object PUT/DELETE. For all three the record is
-  project-scoped (`/idempotency/<project-id>/…`), the counter is group-scoped
+  refuses with `429` before planning). Four project-scope data paths are keyed:
+  block UNMAP, block write, S3 object PUT/DELETE and one autocommit SQL
+  `INSERT`/`UPDATE`/`DELETE`. For all four the record is project-scoped
+  (`/idempotency/<project-id>/…`), the counter is group-scoped
   (`/idempotency/g<group-id>/_usage`) because a transaction cannot span groups,
   and the record, its counter update and the data mutation are appended to *one*
   guarded `RevisionTxn`: `BlockVolumeEngine::unmap_at_with` /
-  `write_at_with` and `ObjectStoreEngine::put_object_with` /
-  `delete_object_with`. A caller guard that fails aborts the whole apply, so
-  there is no state in which the map/object advanced without the record or the
-  record exists without the mutation. `resolve` accepts a project scope and
+  `write_at_with`, `ObjectStoreEngine::put_object_with` /
+  `delete_object_with` and `DatabaseEngine::execute_sql_single_keyed` (through
+  `commit_tx_buffer_at_boundaries_with`). A caller guard that fails aborts the
+  whole apply, so
+  there is no state in which the map/object/row advanced without the record or
+  the record exists without the mutation. `resolve` accepts a project scope and
   fences in the project group. Block writes and S3 PUTs stage immutable
   fragments before that transaction; a refused, conflicted or crashed write
   therefore leaves unreferenced fragments (and, for S3, a `Prepared` intent)
@@ -690,14 +693,18 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   legacy `fragments_of_a_refused_write_are_reclaimed_and_the_old_data_survives`
   and the multi-group
   `openraft_tests::a_refused_block_write_is_reclaimed_by_a_multigroup_pass`,
-  which drives `sweep_groups` over three real OpenRaft groups. SQL
-  writes are
-  still **not** keyed: `POST /db/{project}/db/query` returns 501 for a keyed
-  write script, because a script can mutate any number of tables, shards and
-  secondary indexes through `DatabaseEngine::commit_tx_buffer_at_boundaries`,
-  and keying it requires threading the record into *that* transaction rather
-  than appending ops to one handler-level transaction. That is deliberately a
-  separate change.
+  which drives `sweep_groups` over three real OpenRaft groups. SQL writes are
+  keyed for exactly one autocommit `INSERT`, `UPDATE` or `DELETE`:
+  `POST /db/{project}/db/query` with an `Idempotency-Key` builds the record and
+  the group-counter update inside the statement's own commit
+  (`DatabaseEngine::commit_tx_buffer_at_boundaries_with`), so the rows, index
+  entries, shard manifests, record and counter are appended to one guarded
+  `RevisionTxn` and a conflict or refusal commits none of them. A statement that
+  matched no rows still records its outcome, or a replay would re-execute it.
+  A multi-statement script still returns 501: it commits statement by statement,
+  and there is no cross-statement transaction to make one record cover every
+  effect, so a handler-level record committed separately would reintroduce the
+  ambiguity the key exists to remove.
   Reads mostly still serve the locally applied state:
   `LocalMetaKv::try_linearizable_snapshot` is consumed by the OpenRaft block
   read with `consistent=true`, the SQL `consistent` body flag and the S3
@@ -711,8 +718,10 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   snapshot. Those paths are still opt-in, and the default read remains
   local-applied.
   `docs/multiraft-idempotency-design.md` holds the full contract and the blockers
-  that prevented the remaining scopes before this change; the SQL blocker above
-  is the one that remains. A linearizable read still needs one pinned snapshot
+  that prevented the remaining scopes before this change; the SQL blocker is now
+  narrowed to multi-statement scripts and interactive sessions, since one
+  autocommit `INSERT`/`UPDATE`/`DELETE` publishes all its visible effects in one
+  transaction. A linearizable read still needs one pinned snapshot
   per read path. The group-scoped counter also means projects that share a group
   share one budget, which is intended but not yet exercised with a real second
   project on the same group.
@@ -1118,7 +1127,7 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
     now met for the write path:** the function keeps its name but always
     publishes a writer lease (`acquire_writer(...).map(Some)`,
     `crates/yadb-metakv/src/gc.rs:790`), and the SQL and block write paths call
-    it unconditionally (`crates/yadb-db/src/lib.rs:844`, the flush and merge
+    it unconditionally (`crates/yadb-db/src/lib.rs:940`, the flush and merge
     paths at `crates/yadb-db/src/tablet.rs:916` and
     `crates/yadb-db/src/tablet.rs:982`, and `crates/yadb-block/src/lib.rs:311`);
     S3 keeps using its `Prepared` intent. The collector side now honours those
@@ -1375,9 +1384,30 @@ design; the removed draft is not kept in the tree.
   group rows, proves two health reads neither take nor renew a lease, then
   invalidates control freshness and asserts the refusal replaces the previous
   success; removing either recording line fails the test.
-- [ ] Complete the operational surface around that health data: metrics export,
-  logging, alerting and recovery/upgrade runbooks, and validate them across
-  multi-node deployments.
+- [ ] Complete the operational surface around that health data: logging,
+  alerting and recovery/upgrade runbooks, and validate them across
+  multi-node deployments. Metrics export is done (next bullet) but nothing
+  consumes it: no alert rules, no dashboard and no scrape config are shipped,
+  and the runbooks for recovery, upgrade and group reconfiguration are still
+  unwritten.
+  - [x] Export that health data for a scraper. `GET /metrics` on the public
+    listener renders the same rows `/v1/pools/health` serves — node and runtime,
+    one family per pool, one per slot, the last collection pass, the last repair
+    scan and one row per metadata group — in the Prometheus text format
+    (`version=0.0.4`). Rendering is a pure function over those rows, so it is
+    unit-tested without a daemon. Every family is emitted with `HELP` and `TYPE`
+    even when its input is absent, and a `*_last_pass_present 0` gauge says "no
+    pass has run" rather than letting a dashboard silently stop matching after
+    a restart; a refused pass is `yadb_gc_refused 1` with its own counters, not
+    a missing family. Label values escape backslash, quote and newline, and
+    large counters stay decimal. The handler gathers exactly what the health
+    endpoint gathers and adds nothing: no lease is taken, no pass runs and no
+    counter moves, which
+    `metrics_endpoint_serves_the_health_surface_as_prometheus_text` asserts
+    against the multi-group fixture by comparing the recorded pass before and
+    after a scrape and checking the lease cache and the published records. It
+    is a read-only surface on the public listener, not a new control plane, and
+    it publishes no subject, key or object name.
   Each group starts from strict bounded JSON configuration, explicit
   create/open/bootstrap, mandatory mTLS and a separate listener; its
   create/shutdown/reopen tests pass. The daemon now requires a version-2

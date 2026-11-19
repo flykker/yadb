@@ -6,7 +6,7 @@ This section is a dated record, not a statement about the current tree. Since it
 was written the legacy multi-node Raft runtime was **removed** rather than kept as
 a default: `--metadata-runtime` is pinned to `openraft`, `--openraft-config` is
 mandatory, and there is no fallback runtime
-(`crates/yadbd/src/main.rs:77`, where the CLI value parser accepts only
+(`crates/yadbd/src/main.rs:80`, where the CLI value parser accepts only
 `openraft`, and `crates/yadb-metakv/src/raft.rs:4-21`). The
 only non-replicated store left is the single-node `LocalKv`, which is a test and
 library facility. Statements below about a "legacy default", a "legacy mode" or a
@@ -603,6 +603,36 @@ so it is safe to poll. A legacy single-node store configures no groups and
 reports `"groups": []`. As with every local metric here, an observed leader or
 commit index is not proof of quorum, freshness or safe client routing.
 
+### `GET /metrics`
+
+`/metrics` renders the same data in the Prometheus text format
+(`version=0.0.4`), so a scraper does not have to parse JSON. It is a read-only
+projection, not a second source of truth: the handler gathers exactly what
+`/v1/pools/health` gathers (including the remote slot probe, so `online` is
+never a stale cached value) and adds nothing — no lease is taken, no collection
+pass runs and no counter moves.
+
+Families: `yadb_node_info`, `yadb_pool_*` (slots, handoff slots, online slots,
+read/write quorum, repairs, refused and degraded puts), `yadb_slot_*` (online,
+live blobs/bytes, segments, capacity, puts/gets/repairs), `yadb_gc_*` (the last
+pass: live blobs, fragments deleted, bytes reclaimed, live leases, barriers,
+refused flag, refused group/pool counts, errors), `yadb_scrub_*` (the last
+repair scan, including its refusal gauges), and `yadb_group_*` (per metadata
+group: term, commit index, applied index, live reader leases, nearest lease
+expiry, error flag).
+
+Every family is emitted with `HELP` and `TYPE` even when its input is absent, so
+a query keeps matching after a restart: `yadb_gc_last_pass_present 0` means "no
+pass has run since this process started", not "the metric disappeared". A
+refused pass is `yadb_gc_refused 1` carrying its own counters, so "refused"
+never reads as "collected nothing". `yadb_group_observation_error 1` means the
+groups could not be enumerated at all and is the only sample without a `group`
+label. Label values escape backslash, quote and newline.
+
+These are still local observations with the same caveats as the JSON surface:
+the role in `yadb_group_info` is what this node last observed, not proof of
+quorum. The endpoint publishes no subject, key, bucket or object name.
+
 ## Operator collection commands
 
 `yadbctl pool-gc` and `yadbctl pool-scrub` call `POST /v1/pools/gc` and
@@ -723,8 +753,10 @@ engine methods named above. The record is project-scoped
 projects sharing a group therefore share one budget. Resolve takes
 `{"scope":"control","key":…}` or
 `{"scope":"project","project":…,"key":…}`; a control resolve needs an admin
-subject, a project resolve needs `readWrite` on that project. SQL writes reject a
-key with 501, as does every keyed write on a single-node metadata store.
+subject, a project resolve needs `readWrite` on that project. A single-statement
+SQL `INSERT`/`UPDATE`/`DELETE` accepts a key and commits its record, counter
+update and data in one transaction; a multi-statement script rejects it with
+501, as does every keyed write on a single-node metadata store.
 Admission for control is bounded by a replicated counter
 (`/sys/idempotency/_usage`, `10_000` records or `8 MiB`, committed in the same
 `RevisionTxn`), which refuses with `429` before planning; the project counter has
