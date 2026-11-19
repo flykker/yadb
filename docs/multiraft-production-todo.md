@@ -64,7 +64,7 @@ The completed final independent Sol leadership review accepted only the narrow
 local group-count balance, not production readiness. Earlier
 targeted checks also passed: security tests 16/16, state tests 16/16, storage
 23/23, S3 19/19 and IO 7/7; `git diff --check` passed. These do not replace the
-full gates above. S3 GC is disabled. OpenRaft `consistent=true` block reads are
+full gates above. At that snapshot, S3 GC was disabled. OpenRaft `consistent=true` block reads are
 implemented (linearizable extent-map read on the project-group leader, forwarded
 from followers, missing blob is a `503`), so the iSCSI read path is no longer
 refused; that map snapshot is not a GC fence. SQL (`"consistent": true` in the
@@ -347,7 +347,8 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   fragments before that transaction; a refused, conflicted or crashed write
   therefore leaves unreferenced fragments (and, for S3, a `Prepared` intent)
   and nothing rolls them back. Only the S3 namespace has an intent collector
-  (`ObjectStoreEngine::collect_orphans_all`, disabled on Multi-Raft), so block
+  (`ObjectStoreEngine::collect_orphans_all`, and per group
+  `collect_orphans_in_group` on Multi-Raft), so block
   fragments from a refused or replaced write accumulate until a mark-and-sweep
   pass reclaims them; see the garbage-collection item. SQL writes are
   still **not** keyed: `POST /db/{project}/db/query` returns 501 for a keyed
@@ -415,8 +416,10 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   can still be missing there; `?consistent=true` is the opt-in that reads the
   project-group leader's snapshot. Open: a part is
   capped at 16 MiB (not 5 GiB), there is no `ListMultipartUploads` and no
-  `UploadPartCopy`, and orphan collection stays disabled on Multi-Raft, so
-  aborted or expired upload fragments are not reclaimed there.
+  `UploadPartCopy`. Orphan blob collection runs per metadata group (see the
+  GC item below); aborted or expired upload fragments are reclaimed by the
+  group that owns the project, and a node that does not lead that group reports
+  it instead of collecting from a lagging view.
 - [x] Garbage collection on the legacy metadata runtime. `POST /v1/pools/gc`
   runs one bounded mark-and-sweep pass, and `POST /v1/pools/scrub` runs the same
   pass after its repair scan; the leader's periodic repair scan runs the sweep
@@ -557,7 +560,8 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   durable barrier and the compaction is simulated by dropping the volume after
   the barrier records are written: reopening reaps the expired collector lease,
   the rerun finishes, and the newest generation still reads back byte-identical.
-  Open: the collector is legacy-only (the Multi-Raft item below still refuses);
+  Open: the namespace-wide collector is legacy-only (Multi-Raft uses the
+  per-group entry point described below);
   a pass needs each node to be read-idle for one lease TTL, so a continuously
   busy node refuses rather than waits for a quiet window, and there is no
   grace-period scheduling; `/s3-retired/` records are retained indefinitely; the
@@ -660,16 +664,18 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   stalls proposals; a single-node cluster compacts on its own applied index
   without a peer bound; and a failed install retries from offset 0 on the next
   heartbeat rather than keeping a per-snapshot failure state.
-- [ ] Garbage collection on Multi-Raft. A per-group, leader-only,
-  quorum-confirmed pass was implemented (each group with its own collector lease
-  `/gc/g<group>/collector` and writer leases `/gc/g<group>/writer/<id>`) and is
-  now **disabled** (fail-closed). `POST /v1/pools/gc` and the sweep inside
-  `POST /v1/pools/scrub` return `409` with `MULTIRAFT_GC_REFUSAL`, delete
-  nothing, reclaim nothing and leave fragments intact; the periodic task logs
-  the same reason. The fence is not safe: a writer lease can be renewed while a
-  collector pass is in flight, and collector RPCs can continue past lease
-  expiry, so a reader lease alone is not a sufficient fence. Storage-side
-  fencing exists end to end on the legacy runtime. A barrier carries the
+- [x] Garbage collection on Multi-Raft. `sweep` routes to `sweep_groups`, one
+  leader-only, quorum-confirmed pass per data group, each with its own collector
+  lease `/gc/g<group>/collector` and writer leases `/gc/g<group>/writer/<id>`.
+  `POST /v1/pools/gc` answers `200` when every group and pool completed, and
+  `409` with `gc_refusal` naming any that refused; the sweep inside
+  `POST /v1/pools/scrub` runs the same pass, while the scrub route always
+  answers `409` on Multi-Raft because its repair scan refuses. A group whose leadership, leases or storage fence cannot
+  be proved is named in `gc_groups_refused` and deletes nothing; a pool whose
+  epoch advance is refused is named in `gc_pools_refused` and deletes nothing.
+  Four live drills in `tests/protocols.py` cover a live reader pin, a superseded
+  collector epoch, a non-leader refusal and a clean collection. Storage-side
+  fencing exists end to end on both runtimes. A barrier carries the
   collector lease deadline and the target refuses an expired one with `409`
   (`BlobError::BarrierLeaseExpired`), and an unreadable target clock refuses
   with `BarrierClockUnreadable` instead of defaulting to a live deadline. A
@@ -688,17 +694,18 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   and deletes through `delete_collectable`. The per-group path shares that
   `sweep_pool` and additionally refuses a live lease whose provenance it cannot
   verify (`lease_belongs_to_group` checks the record's group and claimed
-  revision against the group's applied index). What is still missing is the
-  Multi-Raft side: `sweep` returns the refusal before reaching any of it, so the
-  per-group path has no runtime caller, no route verifies the signed fence token
-  (the routes authenticate with the shared internal Raft token), and the four
-  cluster drills have not run. Collection therefore stays refused, and garbage accumulates and
-  can fill the disk;
-  this is a knowingly accepted temporary measure. The repair (orphan) scan is
-  also still refused, because it needs one whole-deployment view.
+  revision against the group's applied index). `sweep` reaches this path on
+  Multi-Raft, and the four cluster drills run. What is still missing: no route
+  verifies a *signed* fence token (the internal routes authenticate with the
+  shared Raft token, which is only reachable on the internal listener), and no
+  drill runs two collectors concurrently on one group or expires a collector
+  lease in the middle of a pass - the daemon has no injection point for the
+  latter, and the storage-level drills cover it instead. The repair scan is
+  still refused, because it needs one whole-deployment view; orphan blob
+  collection does not and runs per group.
 
-  The per-group design that was implemented and then disabled, from the
-  read-only analysis of the primitives:
+  The per-group design, from the read-only analysis of the primitives, is now
+  implemented and runs:
 
   * **Cross-group references are impossible, so the mark can stay group-scoped.**
     Every fragment id carries its `project_id`, and a manifest only names
@@ -731,12 +738,14 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
     it unconditionally (`crates/yadb-db/src/lib.rs:844`, the flush and merge
     paths at `crates/yadb-db/src/tablet.rs:916` and
     `crates/yadb-db/src/tablet.rs:982`, and `crates/yadb-block/src/lib.rs:311`);
-    S3 keeps using its `Prepared` intent. What is still missing is the collector
-    side: the per-group sweep that would honour those leases is unreachable while
-    `sweep` refuses.
+    S3 keeps using its `Prepared` intent. The collector side now honours those
+    leases: `sweep_groups` takes each group's leader fence before marking and
+    refuses the group if any lease is live.
   * **Order of work:** per-group collector lease and writer fence → leader-only
     per-group sweep with the intent grace → a drill that kills the group leader
     between fragment write and manifest commit and proves nothing is reclaimed.
+    The first two are done. The third is not: no drill kills a group leader
+    between a fragment write and its manifest commit.
 
 Backup and restore are **out of scope by owner decision**, not an oversight: no
 command, artifact format, fence or validator exists, and none is planned. A lost

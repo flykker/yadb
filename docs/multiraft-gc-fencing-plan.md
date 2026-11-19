@@ -1,7 +1,10 @@
 # Plan: storage-side fencing for Multi-Raft garbage collection
 
-**Status: the mechanism below is implemented for the legacy metadata runtime and
-is still refused on Multi-Raft.** Six pieces exist in `main`: a barrier carries
+**Status: the mechanism below is implemented on both metadata runtimes.** On
+Multi-Raft, collection runs per data group through `sweep_groups`, and the four
+drills in "What would prove it" are exercised by `tests/protocols.py`; drill 3
+(a collector losing its lease mid-pass) is not injectable at the cluster level
+and stays covered by the storage-level drill only. Six pieces exist in `main`: a barrier carries
 the collector lease deadline and the target refuses an expired one; a target
 keeps a durable epoch it can refuse an exact delete against (see "What the target
 epoch now establishes"); a target keeps a durable pin table it can refuse an
@@ -13,11 +16,12 @@ read path now pins"); and the legacy sweep advances every slot of a pool before
 its first deletion and deletes through the collectable form (see "The collector
 pass now advances first").
 
-Multi-Raft mark-and-sweep stays refused (`409` on `/v1/pools/gc` and
-`/v1/pools/scrub`, periodic task logged and skipped). Its `sweep` returns the
-refusal before reaching any of the above, no per-group pass exists, and the four
-cluster drills in "What would prove it" have not run.
-Garbage accumulates in the meantime; that cost was accepted deliberately.
+Multi-Raft mark-and-sweep runs: `POST /v1/pools/gc` calls `sweep`, which routes
+to `sweep_groups`, one leader-only pass per data group, reaching all of the
+above; the route answers `409` only when a group or pool refused. `POST /v1/pools/scrub` still answers `409`, but only because its
+repair scan needs one whole-deployment view; its collection half runs. What the
+plan does not yet establish is a collector lease expiring mid-pass at cluster
+level, which the daemon cannot inject.
 
 ## Why the current refusal exists
 
@@ -231,14 +235,14 @@ What it does **not** establish, and why the invariant still does not hold:
   takes and releases one pin per candidate it tries, and a pin cannot be
   extended: the TTL is the maximum the target accepts, so a fetch that outlives
   five minutes loses its protection. No read path can extend a pin.
-* The collector path that advances epochs and calls `delete_collectable` runs
-  only on the legacy runtime. The per-group functions exist and share the same
-  `sweep_pool`, but `sweep` returns the Multi-Raft refusal before reaching them,
-  and the unfenced `delete` remains callable from any caller that has a
-  `PoolSlot`.
-* GC enablement is still refused on Multi-Raft (`409` on `/v1/pools/gc` and
-  `/v1/pools/scrub`), and none of the four live drills in "What would prove it"
-  has run.
+* The collector path that advances epochs and calls `delete_collectable` runs on
+  both runtimes: the per-group functions share the same `sweep_pool`, and `sweep`
+  routes to `sweep_groups` on Multi-Raft. The unfenced `delete` remains callable
+  from any caller that has a `PoolSlot`.
+* GC runs on Multi-Raft (`/v1/pools/gc`; `409` only when a group or pool
+  refuses); scrub's repair half still refuses (`409`). Three of the four live
+  drills in "What would prove it" run at cluster level; the fourth is not
+  injectable there.
 * `crates/yadb-blob/tests/epoch_fence_drills.rs` is the storage-side precursor
   of those drills. It drives `VolumeStore` directly and proves four storage
   invariants: a live pin refuses the advance and the collectable delete of every
@@ -314,10 +318,10 @@ written by the leaseholder - so trusting them would let a foreign or forged
 record act as a fence.
 
 What this does not establish: the ordering is enforced structurally (the advance
-is the first statement), not observed as a write sequence; no concurrent reader
-fetches while a pass runs in any test; the provenance check has no runtime caller
-because `sweep_groups` is unreachable; and none of it runs on Multi-Raft, where
-`sweep` still returns the refusal first.
+is the first statement), not observed as a write sequence; no test has a
+concurrent reader fetching while a pass runs; and no drill runs two collectors on
+one group. The provenance check does have a runtime caller now: `sweep_groups`
+runs it on Multi-Raft.
 
 ## Why the reader lease is not the next increment
 
@@ -542,9 +546,11 @@ What this does **not** establish:
   cannot delete" rests today on the target's epoch compare-and-swap alone. The
   token would add the property that the *operation*, not just the connection,
   was issued by a voter of that group; it does not exist yet.
-* **Nothing calls these routes.** No collector advances an epoch or calls
-  `delete_collectable`; no reader takes a pin before a fetch. GC enablement is
-  still refused, and the four drills in "What would prove it" have not run.
+* **These routes now have callers.** The collector advances an epoch and calls
+  `delete_collectable` through `sweep_pool` on Multi-Raft, and the read path takes
+  a pin before every fragment fetch. Three of the four drills in "What would
+  prove it" run at cluster level; the mid-pass lease loss is not injectable
+  there.
 
 ## What has to change, by component
 
@@ -568,8 +574,11 @@ What this does **not** establish:
 4. After all pins expire, the same fragments are collected and `degraded_puts`
    stays zero.
 
-Until all four pass in `tests/protocols.py` on a three-process cluster, the
-refusal stays.
+Drills 1, 2 and 4 run in `tests/protocols.py` on a three-process cluster
+(`assert_multiraft_gc_drills`). Drill 3 is not injectable at the cluster level:
+the daemon has no way to expire a collector lease in the middle of a pass, so
+only the storage-level drill below covers it, and no PASS is claimed for the
+cluster-level form.
 
 `crates/yadb-blob/tests/epoch_fence_drills.rs` covers the storage half of
 drills 1, 2 and 4 and the "stop, do not retry" shape of drill 3, against a

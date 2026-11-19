@@ -392,7 +392,7 @@ overall acceptance. Earlier entries below are historical checkpoints.
   demonstrated as a possible mechanism, not proven as the original failure's root
   cause.
 * After fail-closed forwarded tests, orchestrator-targeted daemon and client tests
-  each passed 2/2. S3 GC is disabled. OpenRaft `consistent=true` block reads now
+  each passed 2/2. At that snapshot, S3 GC was disabled. OpenRaft `consistent=true` block reads now
   forward to the project-group leader and read the extent map through
   `try_linearizable_snapshot`; a blob collected between the map read and the fetch
   is a `503`, not zeros. That snapshot is not a GC fence.
@@ -1129,19 +1129,18 @@ the object and the 602 rows intact. Gates on this tree: `yadbd --bins` **76/76**
 `tests/protocols.py --native-clients` **17/17** on the legacy three-node
 cluster.
 
-**Open.** The collector is legacy-only. On Multi-Raft both endpoints return
-`409` with `MULTIRAFT_GC_REFUSAL`: a writer lease can be renewed while a
-collector pass is in flight, and collector RPCs can continue past lease expiry,
-so a reader lease alone is not a sufficient fence. The per-group collector
-described in "Per-group garbage collection on Multi-Raft" below was implemented
-and then disabled for the same reason: `sweep` returns the refusal before
-`sweep_groups`, and `sweep_groups` carries
-`#[allow(dead_code)] // Retained temporarily, unreachable while Multi-Raft GC is
-disabled`, so the code exists but nothing calls it. Storage-side fencing is
-partial — a barrier carries the collector lease deadline, a volume keeps a
-durable epoch with a fenced delete, and a volume keeps a durable pin table with
-expiry — and none of the three crosses a process boundary, so
-garbage accumulates. The legacy behaviour in this section is unchanged. A
+**Open at the 2026-11-15 snapshot; superseded 2026-11-19.** At that time the
+collector was legacy-only: on Multi-Raft both endpoints returned `409` with
+`MULTIRAFT_GC_REFUSAL`, because a writer lease can be renewed while a collector
+pass is in flight and collector RPCs can continue past lease expiry, so a reader
+lease alone is not a sufficient fence. The per-group collector described in
+"Per-group garbage collection on Multi-Raft" below was implemented, then
+disabled for that reason, and has since been re-enabled: `sweep` now routes to
+`sweep_groups` on Multi-Raft. Storage-side fencing was partial at that snapshot —
+a barrier carries the collector lease deadline, a volume keeps a durable epoch
+with a fenced delete, and a volume keeps a durable pin table with expiry — and
+none of the three crossed a process boundary then, so garbage accumulated. The
+legacy behaviour in this section is unchanged. A
 pass needs each node read-idle for one lease TTL (30 s), because a node keeps
 its reader lease for reuse instead of deleting it per statement; a
 continuously busy node refuses instead of waiting. A read that
@@ -1585,8 +1584,9 @@ deletions and zero reclaimed bytes and leave fragments intact.
 
 (At `234d49a` the reason was `garbage collection disabled for Multi-Raft: no
 single atomic cross-group metadata snapshot`, and scrub answered 200. The
-per-group collector described below replaced that, then was itself disabled;
-current behaviour is the fail-closed refusal above.)
+per-group collector replaced that, was then disabled, and was re-enabled on
+2026-11-19; see "Per-group garbage collection on Multi-Raft" below. The refusal
+above is what this 2026-11-16 run observed, not current behaviour.)
 
 ### Failure drills
 
@@ -1963,10 +1963,14 @@ are impossible (a fragment id carries its `project_id`, a manifest only names
 fragments of its own project, and a project maps to exactly one data group), so
 the live set stays group-scoped and no cross-group snapshot is needed.
 
-The rules and tests in this historical section describe the former per-group
-implementation, which is now disabled because of lease-expiry fencing races.
-They are not a current safety guarantee. Manual and periodic Multi-Raft
-mark-and-sweep now refuse; a live reclamation proof remains open.
+**Updated 2026-11-19.** The per-group path was disabled after this section was
+written, because of lease-expiry fencing races, and has since been re-enabled:
+`sweep` routes to `sweep_groups`, `/v1/pools/gc` runs it (answering `409` with
+`gc_refusal` when any group or pool refused), and four live cluster drills in
+`tests/protocols.py` cover a live reader pin, a superseded collector epoch, a
+non-leader refusal and a clean collection. The
+rules below therefore describe current behaviour again. What is still open is
+listed at the end of the section.
 
 | Concern | Per-group rule |
 | --- | --- |
@@ -1979,8 +1983,10 @@ mark-and-sweep now refuse; a live reclamation proof remains open.
 | Refusal | Not leader, unreadable fence, collector lease held, snapshot failure or an unprovable live set refuses the group with the reason in `gc_groups_refused`; `/v1/pools/gc` answers `409` with that reason. Other groups are unaffected. |
 | Compaction | Physical and fenced by durable barriers, so it runs once after the groups. A pass in which every group refused touches no volume. |
 
-The repair (orphan) scan still refuses on Multi-Raft (`scrub disabled for
-Multi-Raft`): it needs one whole-deployment view, which Multi-Raft does not have.
+The repair (orphan) scan still refuses on Multi-Raft (`repair scan disabled for
+Multi-Raft: it needs one whole-deployment view of live manifests`): it needs one
+whole-deployment view, which Multi-Raft does not have. Orphan blob collection
+does not need that view and runs per group.
 
 ### Tests
 
@@ -2015,8 +2021,10 @@ passes when run alone (pre-existing timing sensitivity, not touched here).
 
 ### Open
 
-* No live-cluster drill of the per-group path: the evidence is in-process
-  fixtures, not a three-node deployment with a killed group leader.
+* The four live cluster drills cover a live pin, a superseded epoch, a
+  non-leader refusal and a clean collection. None kills a group leader between a
+  fragment write and its manifest commit, and none runs two collectors
+  concurrently on one group.
 * Readers on Multi-Raft take no reader lease (`begin_read_lease` is still
   legacy-gated), so only the per-group writer lease and the S3 `Prepared` intent
   fence in-flight writes there.
@@ -2469,24 +2477,38 @@ as a progress error that resets nothing, so nothing retried it. The status field
 are what made the shape visible before the tracing subscriber was installed, and
 they remain the cheapest first look at any future stall.
 
-## Forcing a cross-process InstallSnapshot (2026-11-18)
+## Forcing a cross-process InstallSnapshot (2026-11-18, updated 2026-11-19)
+
+**Current behaviour (2026-11-19).** Every run of `tests/protocols.py` now
+executes the cross-process InstallSnapshot scenario; there is no opt-in flag.
+The harness provisions two test-only knobs into every group's `raft_timing`
+through `scripts/yadb-openraft-dev.py`: `snapshot_after_logs=128` and
+`max_in_snapshot_log_to_keep=1`. The leader therefore builds a snapshot every
+128 applied entries and keeps one already-snapshotted log, so a 512-entry burst
+purges past the stopped node's index and only an install can catch that node up.
+The launcher's default provisioning still omits both knobs, so a production
+config keeps openraft's defaults (`since_last:5000`, 1000 retained). Neither
+knob changes a fence: they decide when the leader compacts its log. A burst
+timeout is now a suite failure, not a SKIP, because 512 entries took about
+150 s on this host and the deadline is two hours.
+
+The rest of this section is the 2026-11-18 analysis that motivated the knobs.
+It records what the default policy costs and why the scenario was once opt-in;
+the flag and the SKIP it produced no longer exist.
 
 Every restart in `tests/protocols.py` used to restart the whole cluster, so each
 node replayed its own WAL and no node ever installed a snapshot from another
-process. That gap is now covered at the HTTP level by an opt-in scenario,
-`--install-snapshot-live`. The install path itself was never unproven: the
-crate-level process test `three_process_mtls_failover_and_quorum_loss` in
-`yadb-metakv` drives three real child processes over mTLS, calls
-`raft.trigger().snapshot()` directly, waits until the leader has purged past the
-offline node's last log index, restarts that node and asserts `snapshots > 0`
-plus every value. What that test does not cover is a *daemon* reaching the
-trigger through its own configuration, because the daemon exposes no admin route
-for it.
+process. The install path itself was never unproven: the crate-level process
+test `three_process_mtls_failover_and_quorum_loss` in `yadb-metakv` drives three
+real child processes over mTLS, calls `raft.trigger().snapshot()` directly,
+waits until the leader has purged past the offline node's last log index,
+restarts that node and asserts `snapshots > 0` plus every value. What that test
+does not cover is a *daemon* reaching the trigger through its own configuration,
+because the daemon exposes no admin route for it.
 
-It is opt-in because reaching the trigger through the shipped configuration is
-expensive. openraft 0.9.25's defaults — `snapshot_policy since_last:5000` and
-`max_in_snapshot_log_to_keep 1000` — make the leader build a snapshot once its
-committed index reaches `snapshot_last_log + 5000`, then purge everything below
+With openraft 0.9.25's defaults — `snapshot_policy since_last:5000` and
+`max_in_snapshot_log_to_keep 1000` — the leader builds a snapshot once its
+committed index reaches `snapshot_last_log + 5000`, then purges everything below
 `snapshot_last_log - 1000`. This run has no earlier snapshot in the billing
 group, and the suite has already committed about 940 entries in it, so **5000
 more entries is the floor** that reaches the trigger; the purge point then lands
@@ -2500,9 +2522,8 @@ measured on this build: the log grows with statements, not with rows. The burst
 therefore writes one row per statement, which was also the fastest shape per
 entry (5.0 entries/s against 4.0 for twenty rows per statement).
 
-Without the flag nothing else changes: the scenario prints a SKIP naming that
-cost, and the `RUST_LOG=openraft=info` filter the evidence needs is set only on
-the one node that is restarted, so a normal run's output and timing are
+The `RUST_LOG=openraft=info` filter the evidence needs is set only on the one
+node that is restarted, so the rest of the run's output and timing are
 untouched. Enabling that filter on the whole cluster was measured to cost about
 a factor of ten in commit throughput, which is why only the restarted node is
 instrumented.
@@ -2520,8 +2541,9 @@ instrumented.
 4. Waits for the leader to apply every burst entry, restarts only the stopped
    node, and waits for that node's own applied index to reach the leader's.
 5. If the burst does not reach the trigger, restarts the stopped node, so the
-   rest of the run sees a full cluster, and reports a SKIP with the entries it
-   did commit. A timeout is never reported as a pass.
+   rest of the run sees a full cluster, then fails. With the knobs provisioned a
+   timeout means a regression, not an expensive scenario, so it is never
+   reported as a pass or as a SKIP.
 
 ### Evidence, and how strong it is
 
@@ -2552,26 +2574,25 @@ wire or which peer sent them. openraft retries a failed install and prints the
 completed line only on success, so the line proves a success happened, not that
 it happened once.
 
-The timeout branch was exercised on purpose (a 60 s burst deadline, scratch
-harness, not committed) and it behaves as described: the SKIP carries the
-entries committed, the stopped node is restarted, and the following scenarios
-run. It also showed a side effect worth knowing: an attempted-but-unfinished
-burst leaves the billing group carrying 1254 extra rows, and in both such runs a
-later partition scenario failed on the daemon's fixed six-second commit budget
+The timeout branch was exercised on purpose on 2026-11-18 (a 60 s burst
+deadline, scratch harness, not committed), when a timeout still produced a SKIP.
+It also showed a side effect worth knowing: an attempted-but-unfinished burst
+leaves the billing group carrying 1254 extra rows, and in both such runs a later
+partition scenario failed on the daemon's fixed six-second commit budget
 (`OpenRaft write outcome unknown: metadata bridge response timed out or stopped`)
 — a different scenario each time, so it is a budget under a heavier state rather
-than one specific assertion. The default run does not take this branch; an
-opt-in run that times out can therefore end non-zero after printing its SKIP,
-and that failure is the pre-existing budget, not a claim about the install.
+than one specific assertion. With the knobs provisioned a timeout is a failure,
+so a run that hits it ends non-zero by design rather than printing a SKIP.
 
 The purge point itself is not asserted, because `/openraft/status` reports
 `last_log_index`, `last_applied` and replication but not `RaftMetrics.snapshot`
 or `.purged`; the daemon builds that payload in `crates/yadbd/src/openraft.rs`.
-The scenario therefore relies on the 5000-entry burst leaving the log at or past
-the trigger with the purge point around index 4000, and it fails loudly rather
-than quietly if the node catches up by log replication instead. Exposing
-`snapshot` and `purged` in that payload is the second `crates/` change this
-scenario would benefit from; like the first, it was not made here.
+The scenario therefore relies on the provisioned 128-entry interval leaving the
+purge point above the stopped node's index, and it fails loudly rather than
+quietly if the node catches up by log replication instead: it asserts the
+restarted node's applied index and its local read, and it requires the
+`Done install complete snapshot` line. Exposing `snapshot` and `purged` in that
+payload would make the assertion direct; it was not done.
 
 ### Measured cost
 
@@ -2588,9 +2609,12 @@ So 2507 entries cost 59 minutes, and the remaining half of a 5000-entry burst is
 extrapolated in hours at 0.29 entries/s. Each applied entry persists a state
 delta that grows with the log, so the tail is inherently the expensive part; a
 quiet host reaches 8.5 entries/s over a short burst, which is why short probes
-understate the total. **No PASS of this scenario has been observed on this
-host.** The scenario reports an unfinished burst as a SKIP carrying the entries
-it did commit, so a timeout is visible and is never counted as success.
+understate the total. **These numbers are the 2026-11-18 cost of the default
+policy, not of the current run.** With `snapshot_after_logs=128` and
+`max_in_snapshot_log_to_keep=1` provisioned, a 512-entry burst took about 150 s
+and a live PASS was observed on 2026-11-19 (node 3 stopped at index 301, its
+restarted state installed at meta index 1550). A timeout is a failure, not a
+SKIP, and is never counted as success.
 
 Short-burst measurements, for the record:
 
@@ -2634,36 +2658,26 @@ passing silently. Earlier flagged runs on a host loaded by other work stopped
 this way at 1254 entries; the bounded retry is the fix for that, not a
 change to what the scenario proves.
 
-Making the burst cheaper would need a knob the daemon does not expose:
-`snapshot_policy` and `max_in_snapshot_log_to_keep` are openraft `Config` fields
-that `crates/yadbd/src/openraft.rs` leaves at their defaults, since it overrides
-only `heartbeat_interval` and `election_timeout_min`/`_max`. Lowering the
-trigger there would shrink the burst by an order of magnitude, but the scenario
-exists to prove the shipped configuration, so no `crates/` change was made. The
-exact change, if it is ever wanted: a config field for `snapshot_policy` (or a
-test-only override) next to the heartbeat overrides in that file, plus
-`max_in_snapshot_log_to_keep` if the purge point needs to move as well.
+Making the burst cheaper is what the 2026-11-19 change does. `RaftTiming` in
+`crates/yadbd/src/openraft.rs` now has `snapshot_after_logs` and
+`max_in_snapshot_log_to_keep`, both optional and both validated (zero is
+rejected); the daemon builds `LogsSinceLast(n)` and sets the retention only when
+they are present, so an unmodified config keeps openraft's defaults. The
+launcher does not write them; the test harness does. This does not weaken the
+proof: the daemon still reaches the trigger through its own configured policy,
+not through an admin route, and the install is still initiated by an inbound
+`InstallSnapshot` RPC.
 
 ### Gates
 
-* `python3 tests/protocols.py` — 20 PASS / 4 SKIP, exit 0; the SKIP reads
-  `cross-process InstallSnapshot: not run by default: reaching the daemon's
-  shipped snapshot trigger (Config::default, since_last:5000) needs a burst of
-  5000 committed entries, measured at 2.4 entries/s for the first 1250 entries,
-  0.6 for the next 1250, and 0.29 measured after that, as the persisted state
-  delta grows: 59 min for 2507 entries and hours for the tail, so this scenario
-  is opt-in through --install-snapshot-live; the install path itself is proven by
-  the crate-level process test three_process_mtls_failover_and_quorum_loss in
-  yadb-metakv, which drives three child processes over mTLS, calls
-  raft.trigger().snapshot(), waits for the leader to purge past the offline
-  node's index and then asserts that node's snapshot count and every value after
-  restart; this scenario would add HTTP-level coverage only, and no PASS of it
-  has been observed on this host. Without it a full-cluster restart only
-  re-elects and replays every node's local WAL`.
-* `python3 tests/protocols.py --install-snapshot-live` — opt-in, not part of the
-  gate on this host. It has not passed here: the burst reached 2507 of 5000
-  entries in 59 minutes at a decaying rate and was stopped. When it does
-  complete, the scenario prints a PASS naming the installed snapshot's meta index
-  and states that the install path itself is proven by
-  `three_process_mtls_failover_and_quorum_loss`; when it does not complete, it
-  prints a SKIP with the entries it committed.
+* `python3 tests/protocols.py` — 23 PASS / 2 SKIP, exit 0 on 2026-11-19. The two
+  SKIPs are `Multi-Raft repair scan` (repair needs one whole-deployment view of
+  live manifests) and `reader lease` (legacy-gated). The cross-process
+  InstallSnapshot scenario runs in this gate and prints a PASS naming the
+  installed snapshot's meta index; it is no longer a SKIP and the
+  `--install-snapshot-live` flag no longer exists.
+* The InstallSnapshot PASS from that run: node 3 was stopped at log index 301,
+  the leader purged past it under the provisioned 128-entry snapshot interval,
+  and the restarted node installed a snapshot at meta index 1550 and served its
+  own local read. The install path itself is also proven by the crate-level
+  process test `three_process_mtls_failover_and_quorum_loss`.

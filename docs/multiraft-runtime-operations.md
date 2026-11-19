@@ -61,8 +61,8 @@ and the fetch has per-operation socket timeouts, not a total deadline.
 the project-group leader (iSCSI reads use it too), and a blob collected between
 the map read and the fetch is a `503` rather than zeros. At the time of this
 snapshot SQL, S3 and status reads were still served from local applied state;
-SQL and S3 `consistent` opt-in reads were added later (see below). S3 GC is
-disabled. `/v1/apply` requires a signed subject on the `--admin-subject` allowlist;
+SQL and S3 `consistent` opt-in reads were added later (see below). At that
+snapshot, S3 GC was disabled. `/v1/apply` requires a signed subject on the `--admin-subject` allowlist;
 an OpenRaft daemon refuses to start without one, and any allowlist requires a
 non-empty `--subject-secret`. Unsigned or forged subjects get 401, a proven
 non-admin subject gets 403. This is a shared-secret check, not per-operator
@@ -265,17 +265,29 @@ exactly item 3 of the plan: the record lives in metadata, the deletion happens o
 a storage target that never sees it. The durable target epoch above is a
 target-side fact, not a lease the target can evaluate; it only says which epoch a
 fragment belongs to.
-Manual GC and scrub return `409`, report zero deletions and zero reclaimed
-bytes, and leave fragments intact; the periodic task logs the refusal. Garbage
-therefore accumulates and can exhaust disk space. This change does not cancel
-requests already in flight from older processes or prove unrelated deletion
-paths safe. Stop old processes before deploying it and account for in-flight
-storage work.
+Manual GC runs per metadata group: it answers `200` when every group and pool
+completed, and `409` with `gc_refusal` naming any that refused. Scrub runs the
+same collection and always answers `409` on Multi-Raft, because its repair scan
+refuses (see below).
+Both report `blobs_live`, `fragments_deleted`, `bytes_reclaimed`, `leases_live`,
+`gc_groups_refused`, `gc_pools_refused` and an explicit `gc_refusal`. A group
+whose leadership, leases or storage fence cannot be proved is refused by name
+and deletes nothing; a pool whose epoch advance is refused (a live reader pin,
+or an unreadable slot) is refused by name and deletes nothing. The four live
+drills in `tests/protocols.py` cover a live pin, a superseded collector epoch,
+a non-leader refusal and a clean collection.
+
+Scrub's repair half still refuses on Multi-Raft and reports why in
+`repair_error`: repair asks which blobs should exist against every live manifest
+at once, and the groups share no atomic view. Orphan blob collection does not
+need that view and runs per group; a node reports the groups it does not lead in
+`orphan_collection_error` rather than treating them as collected. No live drill
+seeds an expired upload intent, because `INTENT_GRACE_SECS` is 300 s.
 
 Multi-Raft readers do not publish reader leases; a quorum-confirmed
 `consistent=true` snapshot does not fence fragment collection. Plain reads use
-the locally applied view. Per-group GC has not been verified by a live
-reclamation drill and must not be re-enabled without a safe fencing protocol.
+the locally applied view, and collection is fenced by the target-side durable
+epoch instead.
 
 `PersistentGroup::create` requires a new replica directory. It reserves that
 directory, syncs its parent, writes a versioned `replica.json` binding the exact

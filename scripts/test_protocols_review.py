@@ -34,7 +34,7 @@ REQUIRED_SUBSTRINGS = {
     "crates/yadbd/src/protocols/s3.rs:683": ["is_openraft"],
     "crates/yadbd/src/main.rs:539": ["begin_read_lease"],
     "crates/yadbd/src/main.rs:7661": ["CONFLICT"],
-    "crates/yadbd/src/gc.rs:149": ["MULTIRAFT_GC_REFUSAL"],
+    "crates/yadbd/src/gc.rs:151": ["MULTIRAFT_GC_REFUSAL"],
 }
 
 # Every SKIP in tests/protocols.py, with the anchors its reason must keep.

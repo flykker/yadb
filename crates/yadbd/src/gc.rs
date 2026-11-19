@@ -46,9 +46,11 @@
 //! pass per group. Each pass is bounded by that group's leadership, refuses on
 //! any live lease, verifies every observed lease's provenance, marks from a
 //! quorum-confirmed snapshot, advances every slot's epoch before the first
-//! deletion, and deletes only through the target's collectable delete. This is
-//! code-only evidence: the four live cluster drills that belong in
-//! `tests/protocols.py` have not run.
+//! deletion, and deletes only through the target's collectable delete. Four
+//! live cluster drills in `tests/protocols.py` cover a live pin, a superseded
+//! epoch, a non-leader refusal and a clean collection. Still unproven at cluster
+//! level: two concurrent collectors on one group, and a collector lease expiring
+//! mid-pass (the daemon has no injection point for the latter).
 //!
 //! Crash safety comes from the order, not from atomicity: the fence and the
 //! barrier/tombstone records are durable before any byte is freed, and every step
@@ -162,10 +164,10 @@ pub const MULTIRAFT_GC_REFUSAL: &str = "garbage collection refused: mark-and-swe
 /// going through the target's collectable delete. A group that refuses deletes
 /// nothing and does not stop another group's pass.
 ///
-/// The four live cluster drills that belong in `tests/protocols.py` (see
-/// `docs/multiraft-gc-fencing-plan.md`, "What would prove it") are the
-/// outstanding evidence for this path. Until they pass on a three-process
-/// cluster, this code half must not be treated as proof.
+/// The four live cluster drills are in `tests/protocols.py` (see
+/// `docs/multiraft-gc-fencing-plan.md`, "What would prove it"). They run on a
+/// three-process cluster; two concurrent collectors on one group and a
+/// mid-pass lease expiry are still unproven there.
 pub fn sweep(
     meta: &LocalMetaKv<OsFs>,
     pools: &BTreeMap<String, std::sync::Arc<PoolStriper<OsFs>>>,
@@ -420,10 +422,12 @@ fn sweep_legacy(
 /// If no project is routed to a data group there is nothing to mark, so the
 /// pass refuses instead of reporting a successful sweep of nothing.
 ///
-/// The four live cluster drills that belong in `tests/protocols.py` (see
-/// `docs/multiraft-gc-fencing-plan.md`, "What would prove it") have not run.
-/// They are the outstanding evidence for this path; a green unit suite is not a
-/// substitute.
+/// The four live cluster drills are in `tests/protocols.py`
+/// (`assert_multiraft_gc_drills`): a live reader pin, a superseded collector
+/// epoch, a non-leader refusal and a clean collection. They run on the
+/// three-process cluster. Still unproven here: two concurrent collectors on one
+/// group, and a collector lease expiring mid-pass - the daemon has no injection
+/// point for the latter, and the storage-level drills cover it instead.
 fn sweep_groups(
     meta: &LocalMetaKv<OsFs>,
     pools: &BTreeMap<String, std::sync::Arc<PoolStriper<OsFs>>>,
