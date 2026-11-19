@@ -141,6 +141,8 @@ enum Fault {
     CheckpointSync,
     CheckpointRename,
     CheckpointDirSync,
+    BootstrapParentSync,
+    BootstrapSync,
 }
 
 fn storage_error(
@@ -153,6 +155,31 @@ fn storage_error(
 
 fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
+}
+
+/// Make the directory entry that names `dir` in its parent durable.
+///
+/// `create_dir_all` only changes the parent directory in memory; syncing the
+/// parent is what makes the new entry survive a crash. Without this a log
+/// created inside a fresh directory can be durable while the directory that
+/// contains it is not.
+fn sync_parent_dir(dir: &Path, fault: Option<Fault>) -> io::Result<()> {
+    let Some(parent) = dir.parent() else {
+        return Ok(());
+    };
+    // A relative single-component path has the empty path as its parent, which
+    // is the current directory.
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+    if matches!(fault, Some(Fault::BootstrapParentSync)) {
+        return Err(io::Error::other(
+            "simulated bootstrap parent-directory sync failure",
+        ));
+    }
+    File::open(parent)?.sync_all()
 }
 
 struct LimitedBuffer {
@@ -613,19 +640,55 @@ fn recover(file: &mut File, dir: &Path, identity: &ReplicaIdentity) -> io::Resul
 impl DurableOpenRaftLog {
     /// Explicitly create a new test log. Existing files are never overwritten.
     pub fn create(dir: impl AsRef<Path>, identity: &ReplicaIdentity) -> io::Result<Self> {
+        Self::create_with_fault(dir, identity, None)
+    }
+
+    /// Create with an optional bootstrap failure injection.
+    ///
+    /// The bootstrap is ordered so that every step before the rename publishes
+    /// nothing that `open` could accept: a failure leaves at most a temporary
+    /// file, which `open` ignores and a retry truncates.
+    fn create_with_fault(
+        dir: impl AsRef<Path>,
+        identity: &ReplicaIdentity,
+        fault: Option<Fault>,
+    ) -> io::Result<Self> {
         let dir = dir.as_ref().to_path_buf();
         fs::create_dir_all(&dir)?;
+        // The directory must itself be durable before a log inside it can be
+        // acknowledged; otherwise a crash can leave the log while its directory
+        // entry is gone.
+        sync_parent_dir(&dir, fault)?;
         let lock = OsDirectoryLock::try_acquire(&dir)?;
         let path = dir.join("openraft.log");
-        let mut file = OpenOptions::new()
-            .create_new(true)
-            .read(true)
-            .append(true)
-            .open(&path)?;
-        file.write_all(&header(identity))?;
-        file.sync_data()?;
-        File::open(&dir)?.sync_all()?;
+        if path.try_exists()? {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "OpenRaft log already exists",
+            ));
+        }
+        // Publish the header with a rename so a failure cannot leave a
+        // headerless or partially written `openraft.log` behind. A temporary
+        // left by an earlier failed bootstrap is truncated and rewritten.
+        let temp = dir.join("openraft.log.tmp");
         let header = header(identity);
+        {
+            let mut file = OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .read(true)
+                .write(true)
+                .open(&temp)?;
+            file.write_all(&header)?;
+            if matches!(fault, Some(Fault::BootstrapSync)) {
+                return Err(io::Error::other("simulated bootstrap sync failure"));
+            }
+            file.sync_data()?;
+        }
+        fs::rename(&temp, &path)?;
+        File::open(&dir)?.sync_all()?;
+        // Rebind the append handle to the active path after the replacement.
+        let file = OpenOptions::new().read(true).append(true).open(&path)?;
         Ok(Self {
             inner: Arc::new(Mutex::new(Inner {
                 file,
@@ -776,7 +839,11 @@ impl DurableOpenRaftLog {
                     .write_all(&frame)
                     .and_then(|_| inner.file.sync_data())
             }
-            None => append_frame(&mut inner.file, record),
+            // Bootstrap faults are consumed by `create` before a handle exists.
+            // A stray one on a live handle injects nothing, like `None`.
+            Some(Fault::BootstrapParentSync | Fault::BootstrapSync) | None => {
+                append_frame(&mut inner.file, record)
+            }
         };
         if let Err(error) = result {
             inner.failed = true;
@@ -1880,5 +1947,124 @@ mod tests {
             store.get_log_state().await.unwrap().last_log_id,
             Some(boundary)
         );
+    }
+
+    /// A failure after the header is written but before it is published must
+    /// leave nothing that `open` accepts, and a retry must be able to bootstrap
+    /// over the leftover temporary file.
+    #[test]
+    fn failed_bootstrap_leaves_nothing_openable_and_retry_succeeds() {
+        let dir = TempDir::new();
+        let error = match DurableOpenRaftLog::create_with_fault(
+            &dir.0,
+            &identity(),
+            Some(Fault::BootstrapSync),
+        ) {
+            Ok(_) => panic!("create succeeded despite an injected bootstrap sync failure"),
+            Err(error) => error,
+        };
+        assert_eq!(error.to_string(), "simulated bootstrap sync failure");
+        assert!(
+            !dir.0.join("openraft.log").exists(),
+            "a failed bootstrap must not publish a log file"
+        );
+        assert!(
+            DurableOpenRaftLog::open(&dir.0, &identity()).is_err(),
+            "open must refuse a directory whose bootstrap never completed"
+        );
+
+        // A retry must truncate and rewrite whatever temporary the failed
+        // attempt left behind instead of treating it as an obstacle.
+        fs::write(dir.0.join("openraft.log.tmp"), b"stale partial bootstrap").unwrap();
+        let store = DurableOpenRaftLog::create(&dir.0, &identity()).unwrap();
+        drop(store);
+        let reopened = DurableOpenRaftLog::open(&dir.0, &identity()).unwrap();
+        let expected = header(&identity());
+        assert_eq!(
+            &fs::read(dir.0.join("openraft.log")).unwrap()[..expected.len()],
+            &expected[..],
+            "the retried bootstrap must publish the requested identity"
+        );
+        assert_eq!(reopened.coverage().first_index, None);
+    }
+
+    /// `create` is a bootstrap operation, never an overwrite: an existing log
+    /// and its acknowledged records must be left byte-for-byte unchanged.
+    #[test]
+    fn create_never_overwrites_an_existing_complete_log() {
+        let dir = TempDir::new();
+        let store = DurableOpenRaftLog::create(&dir.0, &identity()).unwrap();
+        store
+            .append_durable(&Record::Append(vec![entry(0)]))
+            .unwrap();
+        drop(store);
+        let before = fs::read(dir.0.join("openraft.log")).unwrap();
+
+        let error = match DurableOpenRaftLog::create(&dir.0, &identity()) {
+            Ok(_) => panic!("create overwrote an existing complete log"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            fs::read(dir.0.join("openraft.log")).unwrap(),
+            before,
+            "create must not modify an existing log"
+        );
+    }
+
+    /// The publish ordering is internally consistent: once `create` returns,
+    /// `open` reads the same identity from the file that was just synced.
+    #[test]
+    fn created_log_opens_immediately_with_the_same_identity() {
+        let dir = TempDir::new();
+        let store = DurableOpenRaftLog::create(&dir.0, &identity()).unwrap();
+        drop(store);
+
+        let expected = header(&identity());
+        let bytes = fs::read(dir.0.join("openraft.log")).unwrap();
+        assert_eq!(&bytes[..expected.len()], &expected[..]);
+
+        let reopened = DurableOpenRaftLog::open(&dir.0, &identity()).unwrap();
+        assert_eq!(reopened.coverage().first_index, None);
+        assert_eq!(reopened.coverage().last_purged, None);
+
+        let other = ReplicaIdentity::new(
+            crate::multiraft::GroupIdentity {
+                incarnation: 2,
+                ..identity().group().clone()
+            },
+            1,
+            vec![1],
+        )
+        .unwrap();
+        assert!(
+            DurableOpenRaftLog::open(&dir.0, &other).is_err(),
+            "the published header must be bound to the identity passed to create"
+        );
+    }
+
+    /// Creating a directory is only durable once its parent is synced. This
+    /// test proves the bootstrap path performs that sync before publishing.
+    #[test]
+    fn create_propagates_a_parent_directory_sync_failure() {
+        let dir = TempDir::new();
+        let error = match DurableOpenRaftLog::create_with_fault(
+            &dir.0,
+            &identity(),
+            Some(Fault::BootstrapParentSync),
+        ) {
+            Ok(_) => panic!("create succeeded despite an injected parent-directory sync failure"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.to_string(),
+            "simulated bootstrap parent-directory sync failure"
+        );
+        assert!(!dir.0.join("openraft.log").exists());
+
+        // Only the sync failed: the same call succeeds without the injection.
+        let store = DurableOpenRaftLog::create(&dir.0, &identity()).unwrap();
+        drop(store);
+        assert!(DurableOpenRaftLog::open(&dir.0, &identity()).is_ok());
     }
 }
