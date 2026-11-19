@@ -116,6 +116,9 @@ struct Inner {
     repaired_delta: Option<TailRepair>,
     failed: bool,
     fault: Option<PersistFault>,
+    /// Consumed by the next durable publication; see [`PersistGate`].
+    #[cfg(test)]
+    gate: Option<PersistGate>,
 }
 
 /// A corrupt `state.json` that [`DurableMetaStateMachine::open_or_rebuild`]
@@ -140,6 +143,20 @@ enum PersistFault {
     AfterFileSync,
     AfterRename,
     AfterDirSync,
+}
+
+/// Test-only rendezvous inside [`persist_locked`].
+///
+/// The writer signals `reached` after it has written the temporary image but
+/// before any phase that makes that image durable, then blocks on `release`
+/// while still holding the inner lock. A test can therefore observe the exact
+/// boundary where a "notify before persist" implementation would already have
+/// delivered its delta, and where a concurrent build or install would already
+/// have entered the locked region if it were not serialised.
+#[cfg(test)]
+struct PersistGate {
+    reached: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
 }
 
 #[derive(Clone)]
@@ -529,6 +546,8 @@ fn persist_locked(inner: &mut Inner) -> Result<(), StorageError<u32>> {
     let temp = inner.dir.join("state.json.tmp");
     let path = inner.dir.join("state.json");
     let fault = inner.fault.take();
+    #[cfg(test)]
+    let gate = inner.gate.take();
     let mut created = false;
     let result = (|| -> io::Result<()> {
         let mut file = OpenOptions::new()
@@ -537,6 +556,11 @@ fn persist_locked(inner: &mut Inner) -> Result<(), StorageError<u32>> {
             .open(&temp)?;
         created = true;
         file.write_all(&bytes)?;
+        #[cfg(test)]
+        if let Some(gate) = gate.as_ref() {
+            let _ = gate.reached.send(());
+            let _ = gate.release.recv();
+        }
         if matches!(fault, Some(PersistFault::AfterWrite)) {
             return Err(io::Error::other("simulated failure after write"));
         }
@@ -761,6 +785,8 @@ impl DurableMetaStateMachine {
                 repaired_delta: None,
                 failed: false,
                 fault: None,
+                #[cfg(test)]
+                gate: None,
             })),
         })
     }
@@ -870,6 +896,8 @@ impl DurableMetaStateMachine {
                 repaired_delta,
                 failed: false,
                 fault: None,
+                #[cfg(test)]
+                gate: None,
             })),
         })
     }
@@ -904,6 +932,27 @@ impl DurableMetaStateMachine {
     #[cfg(test)]
     pub(crate) fn poison_for_test(&self) {
         self.inner.lock().unwrap().failed = true;
+    }
+
+    /// Test-only: stop the next durable publication at the point where the
+    /// temporary image has been written but nothing has been synced, renamed
+    /// or directory-synced yet.
+    ///
+    /// Returns the signal that the boundary was reached and the sender that
+    /// releases it. The gate is consumed by that publication, so a later one
+    /// runs normally. The publication holds the inner lock while it waits, so
+    /// the same helper also proves that build and install are serialised.
+    #[cfg(test)]
+    pub(crate) fn gate_next_persist_for_test(
+        &self,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (reached, reached_rx) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        self.inner.lock().unwrap().gate = Some(PersistGate {
+            reached,
+            release: release_rx,
+        });
+        (reached_rx, release)
     }
 }
 
@@ -1844,6 +1893,305 @@ mod tests {
         drop(sm);
         let sm = DurableMetaStateMachine::open(&dir.0, &identity()).unwrap();
         assert_eq!(sm.snapshot().get("a").unwrap().value, b"one");
+    }
+
+    /// A snapshot binds the group it was built in, and every meta field must
+    /// agree with the image bytes.
+    ///
+    /// `snapshot_can_install_on_another_replica_of_same_group` proves the
+    /// image is portable across *nodes* of one group; this is the other half:
+    /// the same bytes must be refused across a group boundary. The metadata
+    /// half covers the two fields the atomicity test does not alter:
+    /// `last_membership` and (again, on its own) `last_log_id`.
+    #[tokio::test]
+    async fn snapshot_identity_binds_group_membership_and_log_pointer() {
+        let source_dir = TempDir::new();
+        let mut source = DurableMetaStateMachine::create(&source_dir.0, &identity()).unwrap();
+        source.apply(vec![put(1, "a", b"one")]).await.unwrap();
+        let snapshot = source
+            .get_snapshot_builder()
+            .await
+            .build_snapshot()
+            .await
+            .unwrap();
+        let bytes = snapshot.snapshot.into_inner();
+
+        // Same node id, different group: the image's group is part of its
+        // identity, not just the replica directory it was written in.
+        let other_group = ReplicaIdentity::new(
+            GroupIdentity {
+                cluster: [9; 16],
+                group: 5,
+                incarnation: 2,
+            },
+            1,
+            vec![1],
+        )
+        .unwrap();
+        let dir = TempDir::new();
+        let mut target = DurableMetaStateMachine::create(&dir.0, &other_group).unwrap();
+        let before = fs::read(dir.0.join("state.json")).unwrap();
+        assert!(target
+            .install_snapshot(&snapshot.meta, Box::new(Cursor::new(bytes.clone())))
+            .await
+            .is_err());
+        assert_eq!(fs::read(dir.0.join("state.json")).unwrap(), before);
+        assert!(target.snapshot().get("a").is_none());
+
+        // Same group: a meta field that disagrees with the image is refused
+        // even when every other field matches.
+        let dir = TempDir::new();
+        let mut target = DurableMetaStateMachine::create(&dir.0, &identity()).unwrap();
+        let before = fs::read(dir.0.join("state.json")).unwrap();
+
+        let mut wrong_log = snapshot.meta.clone();
+        wrong_log.last_log_id = None;
+        assert!(target
+            .install_snapshot(&wrong_log, Box::new(Cursor::new(bytes.clone())))
+            .await
+            .is_err());
+
+        let mut wrong_membership = snapshot.meta.clone();
+        wrong_membership.last_membership = StoredMembership::new(
+            snapshot.meta.last_log_id,
+            openraft::Membership::new(vec![[1u32, 2].into_iter().collect()], None),
+        );
+        assert!(target
+            .install_snapshot(&wrong_membership, Box::new(Cursor::new(bytes)))
+            .await
+            .is_err());
+
+        assert_eq!(fs::read(dir.0.join("state.json")).unwrap(), before);
+        assert!(target.snapshot().get("a").is_none());
+    }
+
+    /// The installed-state delta must be delivered only after the whole durable
+    /// publication has finished.
+    ///
+    /// The gate stops `persist_locked` after the temporary image is written but
+    /// before it is synced, renamed or directory-synced. A "notify before
+    /// persist" implementation would already have delivered the delta at that
+    /// point; the contract here is that the watcher still has nothing. Releasing
+    /// the gate completes the publication, and only then does the delta arrive.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn snapshot_install_notifies_watchers_only_after_durable_publication() {
+        let source_dir = TempDir::new();
+        let mut source = DurableMetaStateMachine::create(&source_dir.0, &identity()).unwrap();
+        source
+            .apply(vec![put(1, "control", b"installed")])
+            .await
+            .unwrap();
+        let snapshot = source
+            .get_snapshot_builder()
+            .await
+            .build_snapshot()
+            .await
+            .unwrap();
+        let bytes = snapshot.snapshot.into_inner();
+
+        let dir = TempDir::new();
+        let target = DurableMetaStateMachine::create(&dir.0, &identity()).unwrap();
+        let rx = target.try_watch_prefix("".into()).unwrap();
+        let (reached, release) = target.gate_next_persist_for_test();
+
+        let mut installer = target.clone();
+        let meta = snapshot.meta.clone();
+        let install = tokio::spawn(async move {
+            installer
+                .install_snapshot(&meta, Box::new(Cursor::new(bytes)))
+                .await
+        });
+        reached
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the installation must reach the persistence boundary");
+        assert!(
+            rx.try_recv().is_err(),
+            "the delta must not reach a watcher before the image is durable"
+        );
+        release.send(()).unwrap();
+        install.await.unwrap().unwrap();
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            WatchEvent::Put {
+                key: "control".into(),
+                value: b"installed".to_vec(),
+                version: 1,
+                revision: 1
+            }
+        );
+        assert!(rx.try_recv().is_err());
+        assert_eq!(
+            target.snapshot().get("control").unwrap().value,
+            b"installed"
+        );
+    }
+
+    /// The install delta is a diff against the state it replaces: a key whose
+    /// value did not change is not reported.
+    ///
+    /// This is the contract the code implements (`previous.values.get(key) !=
+    /// Some(value)` in `install_snapshot`), and it matters to control-plane and
+    /// RBAC watchers: replaying a snapshot must not look like a rewrite of
+    /// every key, only of the keys the installed state actually changed.
+    #[tokio::test]
+    async fn snapshot_install_notifies_only_the_values_it_changed() {
+        let source_dir = TempDir::new();
+        let mut source = DurableMetaStateMachine::create(&source_dir.0, &identity()).unwrap();
+        source
+            .apply(vec![
+                put(1, "same", b"v"),
+                put(2, "changed", b"old"),
+                put(3, "changed", b"new"),
+            ])
+            .await
+            .unwrap();
+        let snapshot = source
+            .get_snapshot_builder()
+            .await
+            .build_snapshot()
+            .await
+            .unwrap();
+
+        let dir = TempDir::new();
+        let mut target = DurableMetaStateMachine::create(&dir.0, &identity()).unwrap();
+        target
+            .apply(vec![put(1, "same", b"v"), put(2, "changed", b"old")])
+            .await
+            .unwrap();
+        let rx = target.try_watch_prefix("".into()).unwrap();
+        target
+            .install_snapshot(&snapshot.meta, snapshot.snapshot)
+            .await
+            .unwrap();
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            WatchEvent::Put {
+                key: "changed".into(),
+                value: b"new".to_vec(),
+                version: 2,
+                revision: 3
+            },
+            "only the value the install changed may be reported"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "an unchanged value must not produce a delta"
+        );
+        assert_eq!(target.snapshot().get("same").unwrap().value, b"v");
+        assert_eq!(target.snapshot().get("changed").unwrap().value, b"new");
+    }
+
+    /// A build and an install on the same replica are serialised by the inner
+    /// lock, not by scheduling luck.
+    ///
+    /// While a build is paused inside its durable publication, an install on
+    /// another handle cannot finish; it is blocked on the same lock the build
+    /// holds. After the release the build returns the pre-install image whole,
+    /// and the install replaces it whole. An apply at the next index then
+    /// continues from the installed log pointer, and a reopen sees that same
+    /// state, so no torn image and no half-installed state machine survived.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_snapshot_build_and_install_serialise_on_the_inner_lock() {
+        let source_dir = TempDir::new();
+        let mut source = DurableMetaStateMachine::create(&source_dir.0, &identity()).unwrap();
+        source
+            .apply(vec![
+                put(1, "control", b"installed"),
+                put(2, "extra", b"only-in-snapshot"),
+            ])
+            .await
+            .unwrap();
+        let snapshot = source
+            .get_snapshot_builder()
+            .await
+            .build_snapshot()
+            .await
+            .unwrap();
+        let bytes = snapshot.snapshot.into_inner();
+        let meta = snapshot.meta.clone();
+
+        let dir = TempDir::new();
+        let mut target = DurableMetaStateMachine::create(&dir.0, &identity()).unwrap();
+        target
+            .apply(vec![put(1, "control", b"built")])
+            .await
+            .unwrap();
+        let (reached, release) = target.gate_next_persist_for_test();
+
+        let mut builder = target.clone();
+        let build = tokio::spawn(async move { builder.build_snapshot().await });
+        reached
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the build must reach the persistence boundary");
+
+        let mut installer = target.clone();
+        let (started, started_rx) = std::sync::mpsc::channel();
+        let (finished, finished_rx) = std::sync::mpsc::channel();
+        let install = tokio::spawn(async move {
+            started.send(()).unwrap();
+            let result = installer
+                .install_snapshot(&meta, Box::new(Cursor::new(bytes)))
+                .await;
+            let _ = finished.send(());
+            result
+        });
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the install task must start");
+        assert!(
+            finished_rx
+                .recv_timeout(std::time::Duration::from_millis(200))
+                .is_err(),
+            "the install must not pass the build's locked region"
+        );
+
+        release.send(()).unwrap();
+        let built = build.await.unwrap().unwrap();
+        let built_image = decode_snapshot_image(&built.snapshot.into_inner()).unwrap();
+        assert_eq!(
+            built.meta.snapshot_id,
+            snapshot_id(&snapshot_image_bytes(&built_image).unwrap()),
+            "the build must return a self-consistent image"
+        );
+        assert_eq!(built_image.applied.unwrap().index, 1);
+        assert_eq!(
+            built_image.state.values.get("control").unwrap().value,
+            b"built",
+            "the build must not capture a half-installed state"
+        );
+        assert!(built_image.state.values.get("extra").is_none());
+
+        install.await.unwrap().unwrap();
+        assert!(finished_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .is_ok());
+        assert_eq!(
+            target.snapshot().get("control").unwrap().value,
+            b"installed"
+        );
+        assert_eq!(
+            target.snapshot().get("extra").unwrap().value,
+            b"only-in-snapshot"
+        );
+        let current = target.get_current_snapshot().await.unwrap().unwrap();
+        assert_eq!(current.meta, snapshot.meta);
+        let current_image = decode_snapshot_image(&current.snapshot.into_inner()).unwrap();
+        assert_eq!(
+            snapshot_id(&snapshot_image_bytes(&current_image).unwrap()),
+            current.meta.snapshot_id
+        );
+        target
+            .apply(vec![put(3, "control", b"after")])
+            .await
+            .unwrap();
+        drop(target);
+        let mut reopened = DurableMetaStateMachine::open(&dir.0, &identity()).unwrap();
+        assert_eq!(reopened.snapshot().get("control").unwrap().value, b"after");
+        assert_eq!(
+            reopened.snapshot().get("extra").unwrap().value,
+            b"only-in-snapshot"
+        );
+        assert_eq!(reopened.applied_state().await.unwrap().0.unwrap().index, 3);
     }
 
     #[test]
