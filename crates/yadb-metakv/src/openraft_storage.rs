@@ -131,18 +131,62 @@ impl LogCoverage {
     }
 }
 
+/// One in-process failure at a named syscall, for tests that assert the durable
+/// contract rather than only that an operation returned an error.
+///
+/// Every variant names the operation and the syscall that fails, because what a
+/// reopen must see depends on exactly how far the record got: nothing written,
+/// a prefix written, a complete but unsynced frame, or a complete synced frame
+/// whose publication (`rename`, directory sync) did not finish. A `Fault` is
+/// consumed by the call it is set for, so a test cannot accidentally inject the
+/// same failure twice.
 #[allow(dead_code)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum Fault {
+    /// `write_all` of an appended frame fails before any byte reaches the file.
+    WriteFails,
+    /// `write_all` of an appended frame fails after half of it was written.
     WritePartial,
+    /// The frame is complete in the file but its `sync_data` fails. The bytes
+    /// may or may not reach the platter, but they form a whole frame.
     SyncBefore,
+    /// The frame is written and synced, and then the operation reports failure.
     SyncAfter,
-    CheckpointWrite,
+
+    /// Checkpoint: writing the checkpoint body to the temporary file fails
+    /// before any of it is written (the copied header is already there).
+    CheckpointWriteFails,
+    /// Checkpoint: writing the checkpoint body fails after half of it.
+    CheckpointWritePartial,
+    /// Checkpoint: the temporary file is complete but its `sync_data` fails.
     CheckpointSync,
+    /// Checkpoint: `rename` fails, so the active log is still the old file and
+    /// the complete temporary file is left unpublished beside it.
     CheckpointRename,
+    /// Checkpoint: `rename` succeeded but the directory sync fails, so the new
+    /// name may not survive a crash.
     CheckpointDirSync,
-    BootstrapParentSync,
+    /// Checkpoint: `rename` and the directory sync succeeded, and then the
+    /// operation reports failure before the append handle is rebound.
+    CheckpointAfterDirSync,
+
+    /// Bootstrap: writing the temporary header fails before any byte is written.
+    BootstrapWriteFails,
+    /// Bootstrap: the temporary header write fails after half of it.
+    BootstrapWritePartial,
+    /// Bootstrap: the temporary header is complete but its `sync_data` fails.
     BootstrapSync,
+    /// Bootstrap: `rename` of the temporary file fails, so nothing is published.
+    BootstrapRename,
+    /// Bootstrap: `rename` succeeded but the directory sync fails.
+    BootstrapDirSync,
+    /// Bootstrap: the parent-directory sync fails before anything is created.
+    BootstrapParentSync,
+
+    /// Reopen: the post-recovery `sync_data` fails.
+    OpenSync,
+    /// Reopen: the post-recovery directory sync fails.
+    OpenDirSync,
 }
 
 fn storage_error(
@@ -277,9 +321,12 @@ fn compact(inner: &mut Inner, checkpoint: &[u8], fault: Option<Fault>) -> io::Re
         .append(true)
         .open(&temp)?;
     file.write_all(&inner.header)?;
-    if matches!(fault, Some(Fault::CheckpointWrite)) {
-        file.write_all(&checkpoint[..checkpoint.len() / 2])?;
+    if matches!(fault, Some(Fault::CheckpointWriteFails)) {
         return Err(io::Error::other("simulated checkpoint write failure"));
+    }
+    if matches!(fault, Some(Fault::CheckpointWritePartial)) {
+        file.write_all(&checkpoint[..checkpoint.len() / 2])?;
+        return Err(io::Error::other("simulated partial checkpoint write"));
     }
     file.write_all(checkpoint)?;
     if matches!(fault, Some(Fault::CheckpointSync)) {
@@ -289,14 +336,17 @@ fn compact(inner: &mut Inner, checkpoint: &[u8], fault: Option<Fault>) -> io::Re
     // Explicitly rebind the append handle to the active path after replacement.
     // POSIX rename does not invalidate the temporary file descriptor.
     drop(file);
-    fs::rename(&temp, &active)?;
     if matches!(fault, Some(Fault::CheckpointRename)) {
+        return Err(io::Error::other("simulated checkpoint rename failure"));
+    }
+    fs::rename(&temp, &active)?;
+    if matches!(fault, Some(Fault::CheckpointDirSync)) {
         return Err(io::Error::other(
-            "simulated failure after checkpoint rename",
+            "simulated checkpoint directory sync failure",
         ));
     }
     File::open(&inner.dir)?.sync_all()?;
-    if matches!(fault, Some(Fault::CheckpointDirSync)) {
+    if matches!(fault, Some(Fault::CheckpointAfterDirSync)) {
         return Err(io::Error::other(
             "simulated failure after checkpoint directory sync",
         ));
@@ -645,9 +695,12 @@ impl DurableOpenRaftLog {
 
     /// Create with an optional bootstrap failure injection.
     ///
-    /// The bootstrap is ordered so that every step before the rename publishes
-    /// nothing that `open` could accept: a failure leaves at most a temporary
-    /// file, which `open` ignores and a retry truncates.
+    /// The bootstrap is ordered so that a failure before the rename publishes
+    /// nothing that `open` could accept: it leaves at most a temporary file,
+    /// which `open` ignores and a retry truncates. A failure after the rename
+    /// (the directory sync) leaves a complete log whose name is not yet proven
+    /// durable; `open` accepts it and re-syncs the directory, so recovery from
+    /// that outcome is a reopen, not a retry of `create`.
     fn create_with_fault(
         dir: impl AsRef<Path>,
         identity: &ReplicaIdentity,
@@ -679,13 +732,28 @@ impl DurableOpenRaftLog {
                 .read(true)
                 .write(true)
                 .open(&temp)?;
+            if matches!(fault, Some(Fault::BootstrapWriteFails)) {
+                return Err(io::Error::other("simulated bootstrap write failure"));
+            }
+            if matches!(fault, Some(Fault::BootstrapWritePartial)) {
+                file.write_all(&header[..header.len() / 2])?;
+                return Err(io::Error::other("simulated partial bootstrap write"));
+            }
             file.write_all(&header)?;
             if matches!(fault, Some(Fault::BootstrapSync)) {
                 return Err(io::Error::other("simulated bootstrap sync failure"));
             }
             file.sync_data()?;
         }
+        if matches!(fault, Some(Fault::BootstrapRename)) {
+            return Err(io::Error::other("simulated bootstrap rename failure"));
+        }
         fs::rename(&temp, &path)?;
+        if matches!(fault, Some(Fault::BootstrapDirSync)) {
+            return Err(io::Error::other(
+                "simulated bootstrap directory sync failure",
+            ));
+        }
         File::open(&dir)?.sync_all()?;
         // Rebind the append handle to the active path after the replacement.
         let file = OpenOptions::new().read(true).append(true).open(&path)?;
@@ -707,6 +775,19 @@ impl DurableOpenRaftLog {
 
     /// Reopen only an existing log for the same group incarnation and node.
     pub fn open(dir: impl AsRef<Path>, identity: &ReplicaIdentity) -> io::Result<Self> {
+        Self::open_with_fault(dir, identity, None)
+    }
+
+    /// Reopen with an optional failure injection for the steps after recovery.
+    ///
+    /// Recovery repairs a torn tail before these steps, so a failure here never
+    /// returns a handle: the repair is already durable and a retry reopens the
+    /// repaired file.
+    fn open_with_fault(
+        dir: impl AsRef<Path>,
+        identity: &ReplicaIdentity,
+        fault: Option<Fault>,
+    ) -> io::Result<Self> {
         let dir = dir.as_ref();
         let lock = OsDirectoryLock::try_acquire(dir)?;
         let mut file = OpenOptions::new()
@@ -722,8 +803,14 @@ impl DurableOpenRaftLog {
         // Validate checkpoint size too, so every recovered state can later be compacted.
         checkpoint_frame(&state)?;
         // A process-only restart may still see bytes whose previous sync failed.
+        if matches!(fault, Some(Fault::OpenSync)) {
+            return Err(io::Error::other("simulated reopen sync failure"));
+        }
         file.sync_data()?;
-        File::open(&dir)?.sync_all()?;
+        if matches!(fault, Some(Fault::OpenDirSync)) {
+            return Err(io::Error::other("simulated reopen directory sync failure"));
+        }
+        File::open(dir)?.sync_all()?;
         match fs::remove_file(dir.join("openraft.log.tmp")) {
             Ok(()) => File::open(dir)?.sync_all()?,
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -802,11 +889,16 @@ impl DurableOpenRaftLog {
             }
             let fault = match inner.fault {
                 Some(
-                    Fault::CheckpointWrite
+                    fault @ (Fault::CheckpointWriteFails
+                    | Fault::CheckpointWritePartial
                     | Fault::CheckpointSync
                     | Fault::CheckpointRename
-                    | Fault::CheckpointDirSync,
-                ) => inner.fault.take(),
+                    | Fault::CheckpointDirSync
+                    | Fault::CheckpointAfterDirSync),
+                ) => {
+                    inner.fault = None;
+                    Some(fault)
+                }
                 _ => None,
             };
             if let Err(error) = compact(&mut inner, &checkpoint, fault) {
@@ -815,6 +907,9 @@ impl DurableOpenRaftLog {
             }
         }
         let result = match inner.fault.take() {
+            Some(Fault::WriteFails) => {
+                encode(record).and_then(|_| Err(io::Error::other("simulated write failure")))
+            }
             Some(Fault::WritePartial) => encode(record).and_then(|frame| {
                 inner.file.write_all(&frame[..frame.len() / 2])?;
                 Err(io::Error::other("simulated partial write"))
@@ -828,22 +923,34 @@ impl DurableOpenRaftLog {
             Some(Fault::SyncAfter) => append_frame(&mut inner.file, record)
                 .and_then(|_| Err(io::Error::other("simulated sync failure after persistence"))),
             Some(
-                fault @ (Fault::CheckpointWrite
+                fault @ (Fault::CheckpointWriteFails
+                | Fault::CheckpointWritePartial
                 | Fault::CheckpointSync
                 | Fault::CheckpointRename
-                | Fault::CheckpointDirSync),
+                | Fault::CheckpointDirSync
+                | Fault::CheckpointAfterDirSync),
             ) => {
+                // No checkpoint was needed for this record: keep the fault for
+                // the compaction that will consume it and append normally.
                 inner.fault = Some(fault);
                 inner
                     .file
                     .write_all(&frame)
                     .and_then(|_| inner.file.sync_data())
             }
-            // Bootstrap faults are consumed by `create` before a handle exists.
-            // A stray one on a live handle injects nothing, like `None`.
-            Some(Fault::BootstrapParentSync | Fault::BootstrapSync) | None => {
-                append_frame(&mut inner.file, record)
-            }
+            // Faults that belong to `create`/`open` are consumed there. A stray
+            // one on a live handle injects nothing, like `None`.
+            Some(
+                Fault::BootstrapWriteFails
+                | Fault::BootstrapWritePartial
+                | Fault::BootstrapSync
+                | Fault::BootstrapRename
+                | Fault::BootstrapDirSync
+                | Fault::BootstrapParentSync
+                | Fault::OpenSync
+                | Fault::OpenDirSync,
+            )
+            | None => append_frame(&mut inner.file, record),
         };
         if let Err(error) = result {
             inner.failed = true;
@@ -1184,14 +1291,14 @@ mod tests {
 
     // The openraft-visible image, so a repair can be shown to drop only bytes
     // that never reached the state.
-    async fn image(
-        store: &mut DurableOpenRaftLog,
-    ) -> (
+    type Image = (
         Option<LogId<u32>>,
         Option<LogId<u32>>,
         Option<Vote<u32>>,
         Vec<u8>,
-    ) {
+    );
+
+    async fn image(store: &mut DurableOpenRaftLog) -> Image {
         let state = store.get_log_state().await.unwrap();
         let vote = store.read_vote().await.unwrap();
         let entries = store.try_get_log_entries(0..u64::MAX).await.unwrap();
@@ -1629,13 +1736,21 @@ mod tests {
         );
     }
 
+    // Every checkpoint failure must leave a log that a reopen accepts at the
+    // last durable state, and the failure must poison the live handle rather
+    // than let the next append run against a half-published file. The
+    // difference between the faults is what they publish: a failure before the
+    // rename leaves the old log plus an unpublished temporary, and a failure
+    // after it leaves the new checkpoint under the active name.
     #[tokio::test]
     async fn checkpoint_faults_poison_and_recover_valid_primary() {
         for fault in [
-            Fault::CheckpointWrite,
+            Fault::CheckpointWriteFails,
+            Fault::CheckpointWritePartial,
             Fault::CheckpointSync,
             Fault::CheckpointRename,
             Fault::CheckpointDirSync,
+            Fault::CheckpointAfterDirSync,
         ] {
             let dir = TempDir::new();
             let mut store = DurableOpenRaftLog::create(&dir.0, &identity()).unwrap();
@@ -1643,19 +1758,60 @@ mod tests {
             store
                 .append_durable(&Record::Append(vec![entry(0), entry(1)]))
                 .unwrap();
+            let path = dir.0.join("openraft.log");
+            let temp = dir.0.join("openraft.log.tmp");
+            let before_bytes = fs::read(&path).unwrap();
+            let before = image(&mut store).await;
             {
                 let mut inner = store.inner.lock().unwrap();
                 inner.frames = MAX_LOG_FRAMES;
                 inner.fault = Some(fault);
             }
-            assert!(store.save_vote(&Vote::new(2, 1)).await.is_err());
-            assert!(store.read_vote().await.is_err());
-            assert!(store.save_vote(&Vote::new(3, 1)).await.is_err());
+            assert!(
+                store.save_vote(&Vote::new(2, 1)).await.is_err(),
+                "{fault:?} was not injected"
+            );
+            // Every read and write is refused until a validated reopen.
+            assert!(store.read_vote().await.is_err(), "{fault:?}");
+            assert!(store.get_log_state().await.is_err(), "{fault:?}");
+            assert!(store.try_get_log_entries(0..10).await.is_err(), "{fault:?}");
+            assert!(
+                store.save_vote(&Vote::new(3, 1)).await.is_err(),
+                "{fault:?}"
+            );
+            match fault {
+                Fault::CheckpointWriteFails
+                | Fault::CheckpointWritePartial
+                | Fault::CheckpointSync
+                | Fault::CheckpointRename => {
+                    assert!(temp.exists(), "{fault:?} must leave the temporary behind");
+                    assert_eq!(
+                        fs::read(&path).unwrap(),
+                        before_bytes,
+                        "{fault:?} must not touch the active log"
+                    );
+                }
+                _ => {
+                    assert!(!temp.exists(), "{fault:?} published the temporary");
+                    assert_ne!(
+                        fs::read(&path).unwrap(),
+                        before_bytes,
+                        "{fault:?} must publish the checkpoint"
+                    );
+                }
+            }
             drop(store);
+
             let mut reopened = DurableOpenRaftLog::open(&dir.0, &identity()).unwrap();
+            assert_eq!(
+                image(&mut reopened).await,
+                before,
+                "{fault:?} must reopen to the last durable state"
+            );
             assert_eq!(reopened.read_vote().await.unwrap(), Some(Vote::new(1, 1)));
             assert_eq!(reopened.read_entries(0, 2).len(), 2);
-            assert!(!dir.0.join("openraft.log.tmp").exists());
+            assert!(!temp.exists());
+            // The failed record is absent, and the recovered log is writable.
             reopened.save_vote(&Vote::new(2, 1)).await.unwrap();
         }
     }
@@ -1687,10 +1843,17 @@ mod tests {
         let dir = TempDir::new();
         let store = DurableOpenRaftLog::create(&dir.0, &identity()).unwrap();
         drop(store);
+        let active = dir.0.join("openraft.log");
         let temp = dir.0.join("openraft.log.tmp");
         fs::write(&temp, b"recovery evidence").unwrap();
-        fs::write(dir.0.join("openraft.log"), b"corrupt").unwrap();
-        assert!(DurableOpenRaftLog::open(&dir.0, &identity()).is_err());
+        fs::write(&active, b"corrupt").unwrap();
+        let error = DurableOpenRaftLog::open(&dir.0, &identity())
+            .err()
+            .expect("a corrupt primary must not open");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        // Refusing must keep both the unreadable primary (the evidence of what
+        // happened) and the temporary (the only complete copy of the state).
+        assert_eq!(fs::read(&active).unwrap(), b"corrupt");
         assert_eq!(fs::read(temp).unwrap(), b"recovery evidence");
     }
 
@@ -1758,7 +1921,7 @@ mod tests {
     #[tokio::test]
     async fn partial_write_poisoned_until_reopen_which_repairs_the_torn_tail() {
         let dir = TempDir::new();
-        let store = DurableOpenRaftLog::create(&dir.0, &identity()).unwrap();
+        let mut store = DurableOpenRaftLog::create(&dir.0, &identity()).unwrap();
         store
             .append_durable(&Record::Vote(Vote::new(1, 1)))
             .unwrap();
@@ -1774,7 +1937,11 @@ mod tests {
             .append_durable(&Record::Vote(Vote::new(2, 1)))
             .is_err());
         // The live handle stays poisoned until it is reopened, even though the
-        // failure left only a repairable tail on disk.
+        // failure left only a repairable tail on disk. Reads are refused too, so
+        // a caller cannot observe a state the log could not confirm.
+        assert!(store.read_vote().await.is_err());
+        assert!(store.get_log_state().await.is_err());
+        assert!(store.try_get_log_entries(0..10).await.is_err());
         assert!(store
             .append_durable(&Record::Vote(Vote::new(3, 1)))
             .is_err());
@@ -1811,14 +1978,20 @@ mod tests {
         assert_eq!(reopened.read_vote().await.unwrap(), Some(Vote::new(2, 1)));
     }
 
+    // A sync failure happens after the whole frame reached the file, so a
+    // reopen must accept that complete frame instead of repairing it away. The
+    // fault is still an error to the caller and still poisons the handle.
     #[tokio::test]
     async fn sync_errors_poison_writer_and_reopen_resyncs_visible_record() {
         for fault in [Fault::SyncBefore, Fault::SyncAfter] {
             let dir = TempDir::new();
-            let store = DurableOpenRaftLog::create(&dir.0, &identity()).unwrap();
+            let mut store = DurableOpenRaftLog::create(&dir.0, &identity()).unwrap();
             store
                 .append_durable(&Record::Vote(Vote::new(1, 1)))
                 .unwrap();
+            let path = dir.0.join("openraft.log");
+            let before = fs::read(&path).unwrap();
+            let frame = encode(&Record::Vote(Vote::new(2, 1))).unwrap();
             store.inner.lock().unwrap().fault = Some(fault);
             assert!(store
                 .append_durable(&Record::Vote(Vote::new(2, 1)))
@@ -1826,9 +1999,287 @@ mod tests {
             assert!(store
                 .append_durable(&Record::Vote(Vote::new(3, 1)))
                 .is_err());
+            assert!(store.read_vote().await.is_err());
+            assert!(store.get_log_state().await.is_err());
             drop(store);
+            let after = fs::read(&path).unwrap();
+            assert_eq!(after.len(), before.len() + frame.len(), "{fault:?}");
+            assert_eq!(&after[..before.len()], &before[..], "{fault:?}");
             let mut reopened = DurableOpenRaftLog::open(&dir.0, &identity()).unwrap();
+            assert_eq!(reopened.repaired_tail(), None, "{fault:?}");
+            assert_eq!(fs::read(&path).unwrap(), after, "{fault:?}");
             assert_eq!(reopened.read_vote().await.unwrap(), Some(Vote::new(2, 1)));
+        }
+    }
+
+    /// The durable record appends the adapter performs, so a fault on the shared
+    /// append path is checked for every record kind and not only for votes.
+    #[derive(Clone, Copy, Debug)]
+    enum AppendOp {
+        Vote,
+        Append,
+        Truncate,
+        Purge,
+    }
+
+    impl AppendOp {
+        const ALL: [AppendOp; 4] = [
+            AppendOp::Vote,
+            AppendOp::Append,
+            AppendOp::Truncate,
+            AppendOp::Purge,
+        ];
+
+        fn record(self) -> Record {
+            match self {
+                AppendOp::Vote => Record::Vote(Vote::new(2, 1)),
+                AppendOp::Append => Record::Append(vec![entry(2)]),
+                AppendOp::Truncate => Record::Truncate(entry(1).log_id),
+                AppendOp::Purge => Record::Purge(entry(0).log_id),
+            }
+        }
+    }
+
+    /// The state a store reaches after applying `op` to the common prefix. This
+    /// is an oracle for the faulted store's recovered state, so the expectations
+    /// are not hand-written copies of the adapter's own serialization.
+    async fn image_after(op: AppendOp) -> Image {
+        let dir = TempDir::new();
+        let mut control = DurableOpenRaftLog::create(&dir.0, &identity()).unwrap();
+        control.save_vote(&Vote::new(1, 1)).await.unwrap();
+        control
+            .append_durable(&Record::Append(vec![entry(0), entry(1)]))
+            .unwrap();
+        control.append_durable(&op.record()).unwrap();
+        image(&mut control).await
+    }
+
+    /// Every record kind shares `append_durable`, so every fault on that path is
+    /// exercised for all of them. The contract differs only in how far the
+    /// record got: a failed write must leave the file untouched, a partial write
+    /// must be repaired as a tail, and a failed sync must keep the whole frame,
+    /// because a complete frame is never a torn record.
+    #[tokio::test]
+    async fn append_path_faults_poison_and_reopen_to_a_complete_state() {
+        for op in AppendOp::ALL {
+            let expected_after = image_after(op).await;
+            for fault in [
+                Fault::WriteFails,
+                Fault::WritePartial,
+                Fault::SyncBefore,
+                Fault::SyncAfter,
+            ] {
+                let dir = TempDir::new();
+                let mut store = DurableOpenRaftLog::create(&dir.0, &identity()).unwrap();
+                store.save_vote(&Vote::new(1, 1)).await.unwrap();
+                store
+                    .append_durable(&Record::Append(vec![entry(0), entry(1)]))
+                    .unwrap();
+                let path = dir.0.join("openraft.log");
+                let before_bytes = fs::read(&path).unwrap();
+                let before = image(&mut store).await;
+                let frame = encode(&op.record()).unwrap();
+                assert!(
+                    frame.len() / 2 > FRAME_HEADER_LEN,
+                    "{op:?} must exercise a torn payload, not a torn header"
+                );
+
+                store.inner.lock().unwrap().fault = Some(fault);
+                assert!(
+                    store.append_durable(&op.record()).is_err(),
+                    "{op:?}/{fault:?} was not injected"
+                );
+                // Poisoned: reads, state and further writes are all refused, so
+                // nothing can be appended after a partial frame.
+                assert!(store.read_vote().await.is_err(), "{op:?}/{fault:?}");
+                assert!(store.get_log_state().await.is_err(), "{op:?}/{fault:?}");
+                assert!(
+                    store.try_get_log_entries(0..10).await.is_err(),
+                    "{op:?}/{fault:?}"
+                );
+                assert!(
+                    store
+                        .append_durable(&Record::Vote(Vote::new(9, 1)))
+                        .is_err(),
+                    "{op:?}/{fault:?}"
+                );
+
+                let on_disk = fs::read(&path).unwrap();
+                match fault {
+                    Fault::WriteFails => assert_eq!(
+                        on_disk, before_bytes,
+                        "{op:?}: a failed write must not change the file"
+                    ),
+                    Fault::WritePartial => {
+                        assert_eq!(
+                            on_disk.len(),
+                            before_bytes.len() + frame.len() / 2,
+                            "{op:?}"
+                        );
+                        assert_eq!(&on_disk[..before_bytes.len()], &before_bytes[..]);
+                    }
+                    _ => {
+                        assert_eq!(on_disk.len(), before_bytes.len() + frame.len(), "{op:?}");
+                        assert_eq!(&on_disk[..before_bytes.len()], &before_bytes[..]);
+                    }
+                }
+                drop(store);
+
+                let mut reopened = DurableOpenRaftLog::open(&dir.0, &identity()).unwrap();
+                match fault {
+                    Fault::WriteFails => {
+                        assert_eq!(reopened.repaired_tail(), None, "{op:?}");
+                        assert_eq!(image(&mut reopened).await, before, "{op:?}");
+                    }
+                    Fault::WritePartial => {
+                        assert_eq!(
+                            reopened.repaired_tail(),
+                            Some(TailRepair {
+                                valid_len: before_bytes.len() as u64,
+                                discarded: (frame.len() / 2) as u64,
+                            }),
+                            "{op:?}"
+                        );
+                        assert_eq!(fs::read(&path).unwrap(), before_bytes, "{op:?}");
+                        assert_eq!(image(&mut reopened).await, before, "{op:?}");
+                    }
+                    _ => {
+                        // The whole frame is on disk and complete: accepting it
+                        // is correct, and repairing it would lose a record.
+                        assert_eq!(reopened.repaired_tail(), None, "{op:?}");
+                        assert_eq!(fs::read(&path).unwrap(), on_disk, "{op:?}");
+                        assert_eq!(image(&mut reopened).await, expected_after, "{op:?}");
+                    }
+                }
+                reopened.save_vote(&Vote::new(7, 1)).await.unwrap();
+            }
+        }
+    }
+
+    /// Every bootstrap failure is classified by what it published: a failure
+    /// before the rename leaves nothing `open` accepts, and a failure after it
+    /// leaves a complete log that `open` accepts and re-syncs. Neither may leave
+    /// a log that opens to a torn or headerless image.
+    #[test]
+    fn bootstrap_faults_publish_nothing_or_a_reopenable_log() {
+        for (fault, message, published) in [
+            (
+                Fault::BootstrapWriteFails,
+                "simulated bootstrap write failure",
+                false,
+            ),
+            (
+                Fault::BootstrapWritePartial,
+                "simulated partial bootstrap write",
+                false,
+            ),
+            (
+                Fault::BootstrapSync,
+                "simulated bootstrap sync failure",
+                false,
+            ),
+            (
+                Fault::BootstrapRename,
+                "simulated bootstrap rename failure",
+                false,
+            ),
+            (
+                Fault::BootstrapDirSync,
+                "simulated bootstrap directory sync failure",
+                true,
+            ),
+            (
+                Fault::BootstrapParentSync,
+                "simulated bootstrap parent-directory sync failure",
+                false,
+            ),
+        ] {
+            let dir = TempDir::new();
+            let path = dir.0.join("openraft.log");
+            let error =
+                match DurableOpenRaftLog::create_with_fault(&dir.0, &identity(), Some(fault)) {
+                    Ok(_) => panic!("{fault:?} did not fail"),
+                    Err(error) => error,
+                };
+            assert_eq!(error.to_string(), message, "{fault:?}");
+            assert_eq!(path.exists(), published, "{fault:?}");
+
+            if published {
+                // The rename landed but its directory entry is not proven
+                // durable. A reopen accepts the complete log and syncs the
+                // directory, so recovery is `open`, not a second `create`.
+                assert!(
+                    DurableOpenRaftLog::create(&dir.0, &identity()).is_err(),
+                    "{fault:?} must not be re-bootstrapped over"
+                );
+                let store = DurableOpenRaftLog::open(&dir.0, &identity()).unwrap();
+                assert_eq!(store.coverage().first_index, None, "{fault:?}");
+                drop(store);
+            } else {
+                assert!(
+                    DurableOpenRaftLog::open(&dir.0, &identity()).is_err(),
+                    "{fault:?} must not publish an openable log"
+                );
+                // Bootstrap is retryable over whatever temporary was left.
+                let store = DurableOpenRaftLog::create(&dir.0, &identity()).unwrap();
+                drop(store);
+            }
+            let reopened = DurableOpenRaftLog::open(&dir.0, &identity()).unwrap();
+            let expected = header(&identity());
+            assert_eq!(
+                &fs::read(&path).unwrap()[..expected.len()],
+                &expected[..],
+                "{fault:?} must end with the requested identity"
+            );
+            assert_eq!(reopened.coverage().first_index, None, "{fault:?}");
+        }
+    }
+
+    /// A failure after recovery must not return a handle, and because recovery
+    /// truncates a torn tail before the injected sync, the retry sees a repaired
+    /// file and reports nothing left to repair.
+    #[test]
+    fn reopen_faults_refuse_and_a_retry_recovers_the_repaired_log() {
+        for (fault, message) in [
+            (Fault::OpenSync, "simulated reopen sync failure"),
+            (
+                Fault::OpenDirSync,
+                "simulated reopen directory sync failure",
+            ),
+        ] {
+            let dir = TempDir::new();
+            let store = DurableOpenRaftLog::create(&dir.0, &identity()).unwrap();
+            store
+                .append_durable(&Record::Append(vec![entry(0), entry(1)]))
+                .unwrap();
+            drop(store);
+            let path = dir.0.join("openraft.log");
+            let prefix = fs::read(&path).unwrap();
+            let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+            file.write_all(b"YORF\x08").unwrap();
+            drop(file);
+
+            let error = match DurableOpenRaftLog::open_with_fault(&dir.0, &identity(), Some(fault))
+            {
+                Ok(_) => panic!("{fault:?} did not fail"),
+                Err(error) => error,
+            };
+            assert_eq!(error.to_string(), message);
+            assert_eq!(
+                fs::read(&path).unwrap(),
+                prefix,
+                "{fault:?}: the repair must be complete before the failure"
+            );
+            let reopened = DurableOpenRaftLog::open(&dir.0, &identity()).unwrap();
+            assert_eq!(reopened.repaired_tail(), None, "{fault:?}");
+            assert_eq!(
+                reopened
+                    .read_entries(0, 10)
+                    .iter()
+                    .map(|e| e.log_id.index)
+                    .collect::<Vec<_>>(),
+                vec![0, 1]
+            );
         }
     }
 
