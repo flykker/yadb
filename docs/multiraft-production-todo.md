@@ -562,8 +562,8 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   unchanged. The truncation test also shows the hazard it guards: the raw
   `read_at` returns 8 of 16 bytes without complaint. In-process injection proves
   the code path, not the disk.
-- [ ] Extend the injected-fault coverage to cross-operation sequences, then pair
-  it with the separate-process crash/kill gate. The state machine's own recovery
+- [x] Extend the injected-fault coverage to cross-operation sequences. The state
+  machine's own recovery
   read now goes through the `yadb-io` seam: `load_image` opens `state.json`
   through `OsFs` and `read_image` reads it with `VirtualFile::read_exact_at`, so
   a positional-read fault reaches that syscall. The seam separates two failures
@@ -585,9 +585,36 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   `legal_short_read_is_retried_at_recovery` shows a legal short read is retried.
   The seam is compiled only under the `yadb-io` `test-faults` feature, which
   `yadb-metakv` enables as a dev-dependency, so no shipped build contains it.
-  Cross-operation sequences (a fault on the second of two appends, a sync
-  failure followed by a read failure) are still not expressible as one per-call
-  point, and the separate-process crash/kill gate remains open.
+  A sequence is expressible now because every operation has its own ordered
+  fault list and a `Pass` slot that consumes its turn without changing the
+  call, so a test can fail the *second* append rather than the first. The seam
+  also covers writes, file syncs, directory syncs and renames, and the state
+  machine's append and checkpoint paths call those seamed functions instead of
+  `std` beside them. Evidence:
+  `a_fault_on_the_second_delta_append_keeps_only_the_first` lets one append
+  land and fails the next, then asserts the delta is back at the first append's
+  length, the live machine and the reopened one serve the first entry only, and
+  the rolled-back append is not reported as a torn tail;
+  `a_sync_failure_followed_by_a_read_failure_recovers_on_reopen` fails the
+  append's file sync, then fails the next operation's recovery read, and
+  asserts the image is byte-identical, nothing is renamed aside, and the
+  replica reopens with only the acknowledged entry. Dropping the rollback fails
+  the second test with the delta at `left: 324, right: 162`; making the `Pass`
+  slot not consume its turn fails the first at its own first append with
+  `injected write fault`, which is what proves the positioning semantics.
+  Default builds contain none of it: `nm` finds no `take_write`,
+  `take_file_sync`, `take_dir_sync`, `take_rename`, `writes`, `file_syncs`,
+  `dir_syncs` or `renames` symbol in `libyadb_io.rlib`, and all eight appear
+  under `--features test-faults`. What this still cannot show is a real crash:
+  every fault is in-process, so the separate-process crash/kill gate below
+  remains open.
+- [ ] Pair the fault matrix with a separate-process crash/kill gate. Every
+  injected fault above is in-process: it proves the code path that sees the
+  error, not what a killed process leaves on disk, and a `kill -9` between two
+  syscalls is not expressible as a return value. The gate needs a child process
+  that dies at a chosen point, a parent that reopens its directory, and a
+  check that the acknowledged prefix survives; nothing of that shape exists
+  yet, and it is the remaining half of the original item.
 - [ ] Make a crash during `DurableMetaStateMachine::create` recoverable. `create`
   makes `state.json` with `create_new`, drops the handle, then reopens with
   `truncate` and writes; a crash in between leaves a 0-byte image in a root the

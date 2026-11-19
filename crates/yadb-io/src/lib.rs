@@ -1,22 +1,30 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io;
-use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-mod sys;
+/// The syscall boundary, exposed so a dependent crate can route its own
+/// open-time file I/O through the same injectable calls instead of calling
+/// `std` beside the seam. Not a stable API and not a second filesystem: each
+/// function is the `std` call it names.
+#[doc(hidden)]
+pub mod sys;
 
 /// The syscall fault seam, exposed to a dependent crate's own tests.
 ///
 /// Enabled only by the `test-faults` feature, which is pulled in through a
 /// dev-dependency, so no shipped build compiles it. It is deliberately not
-/// part of the supported API: arming is per-thread, one-shot and cleared by
-/// the returned guard, exactly as in `yadb-io`'s own tests.
+/// part of the supported API: arming is per-thread, fault lists are consumed
+/// in order and cleared by the returned guard, exactly as in `yadb-io`'s own
+/// tests.
 #[cfg(feature = "test-faults")]
 #[doc(hidden)]
 pub mod fault {
-    pub use crate::sys::fault::{lock, reads, Armed, LockFault, ReadFault};
+    pub use crate::sys::fault::{
+        dir_syncs, file_syncs, lock, reads, renames, writes, Armed, DirSyncFault, FileSyncFault,
+        LockFault, ReadFault, RenameFault, WriteFault,
+    };
 }
 
 pub type IoResult<T> = Result<T, io::Error>;
@@ -155,7 +163,7 @@ pub struct OsFile {
 
 impl VirtualFile for OsFile {
     fn write_at(&self, offset: u64, buf: &[u8]) -> IoResult<()> {
-        self.file.write_all_at(buf, offset)
+        sys::write_at(&self.file, offset, buf)
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> IoResult<usize> {
@@ -171,7 +179,7 @@ impl VirtualFile for OsFile {
     }
 
     fn sync_data(&self) -> IoResult<()> {
-        self.file.sync_data()
+        sys::sync_data(&self.file)
     }
 }
 
@@ -222,12 +230,11 @@ impl StorageFs for OsFs {
         if let Some(parent) = dst.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::rename(self.resolve(from), dst)
+        sys::rename(&self.resolve(from), &dst)
     }
 
     fn sync_dir(&self, dir: &str) -> IoResult<()> {
-        let f = File::open(self.resolve(dir))?;
-        f.sync_all()
+        sys::sync_dir(&self.resolve(dir))
     }
 
     fn exists(&self, path: &str) -> bool {

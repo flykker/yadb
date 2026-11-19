@@ -904,6 +904,31 @@ pins it, and it needs a create-completed marker rather than a decoder change.
 The seam compiles only under the `yadb-io` `test-faults` feature, enabled as a
 `yadb-metakv` dev-dependency.
 
+**Updated 2026-11-19: a fault can be placed on the second operation, and one
+sequence can span two seams.** Every operation now has its own ordered fault
+list and a `Pass` slot that consumes its turn without changing the call, so
+`writes(&[Pass, Error(Other)])` lets the first append land and fails the second.
+The seam also covers writes, file syncs, directory syncs and renames, and the
+state machine's delta append and checkpoint publish call those functions instead
+of `std` beside them, so a sequence can cross operations.
+`a_fault_on_the_second_delta_append_keeps_only_the_first` fails the second
+append and asserts the delta is back at the first append's length, that the
+reopened replica serves only the first entry, and that the rolled-back append is
+not reported as a torn tail.
+`a_sync_failure_followed_by_a_read_failure_recovers_on_reopen` fails an append's
+file sync and then the next open's recovery read, and asserts a byte-identical
+image, no `.corrupt`/`.tmp` artifact and a clean reopen with only the
+acknowledged entry. Sensitivity: dropping the rollback fails the second with
+`left: 324, right: 162`; making the `Pass` slot not consume its turn fails the
+first at its own first append with `injected write fault`, which is what proves
+the positioning semantics rather than just the error path. Default builds
+contain no seam symbol — `nm` on `libyadb_io.rlib` finds none of
+`take_write`, `take_file_sync`, `take_dir_sync`, `take_rename`, `writes`,
+`file_syncs`, `dir_syncs` or `renames`, and all eight appear under
+`--features test-faults`. Still not covered: a real process kill. Every fault
+here is a return value from a syscall the process is still running, so it says
+nothing about what `kill -9` leaves behind.
+
 **Startup recovery is reported, not silent.** Both repairs above change durable
 state during `open`: a torn tail is truncated and a corrupt image is renamed
 aside and replaced. Neither was surfaced outside tests, so a daemon could start

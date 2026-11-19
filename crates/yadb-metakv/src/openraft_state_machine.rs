@@ -415,7 +415,7 @@ fn append_delta_locked(inner: &mut Inner, entries: &[Entry<C>]) -> io::Result<()
         let existed = path.exists();
         let file = OpenOptions::new().append(true).create(true).open(&path)?;
         if !existed {
-            File::open(&inner.dir)?.sync_all()?;
+            yadb_io::sys::sync_dir(&inner.dir)?;
         }
         inner.delta = Some(file);
     }
@@ -429,11 +429,11 @@ fn append_delta_locked(inner: &mut Inner, entries: &[Entry<C>]) -> io::Result<()
     let file = inner.delta.as_mut().expect("delta handle is open");
     let start_len = file.metadata()?.len();
     let result = (|| -> io::Result<()> {
-        file.write_all(&frame)?;
+        yadb_io::sys::write_all(file, &frame)?;
         if matches!(fault, Some(PersistFault::AfterWrite)) {
             return Err(io::Error::other("simulated failure after write"));
         }
-        file.sync_data()?;
+        yadb_io::sys::sync_data(file)?;
         if matches!(fault, Some(PersistFault::AfterFileSync)) {
             return Err(io::Error::other("simulated failure after file sync"));
         }
@@ -447,7 +447,7 @@ fn append_delta_locked(inner: &mut Inner, entries: &[Entry<C>]) -> io::Result<()
         // itself fails the handle is poisoned anyway, and `replay_delta`
         // resolves a torn final frame on the next open.
         let _ = file.set_len(start_len);
-        let _ = file.sync_data();
+        let _ = yadb_io::sys::sync_data(file);
         return Err(error);
     }
     inner.delta_entries = inner.delta_entries.saturating_add(entries.len() as u64);
@@ -590,7 +590,7 @@ fn persist_locked(inner: &mut Inner) -> Result<(), StorageError<u32>> {
             .create_new(true)
             .open(&temp)?;
         created = true;
-        file.write_all(&bytes)?;
+        yadb_io::sys::write_all(&file, &bytes)?;
         #[cfg(test)]
         if let Some(gate) = gate.as_ref() {
             let _ = gate.reached.send(());
@@ -599,15 +599,15 @@ fn persist_locked(inner: &mut Inner) -> Result<(), StorageError<u32>> {
         if matches!(fault, Some(PersistFault::AfterWrite)) {
             return Err(io::Error::other("simulated failure after write"));
         }
-        file.sync_data()?;
+        yadb_io::sys::sync_data(&file)?;
         if matches!(fault, Some(PersistFault::AfterFileSync)) {
             return Err(io::Error::other("simulated failure after file sync"));
         }
-        fs::rename(&temp, &path)?;
+        yadb_io::sys::rename(&temp, &path)?;
         if matches!(fault, Some(PersistFault::AfterRename)) {
             return Err(io::Error::other("simulated failure after rename"));
         }
-        File::open(&inner.dir)?.sync_all()?;
+        yadb_io::sys::sync_dir(&inner.dir)?;
         if matches!(fault, Some(PersistFault::AfterDirSync)) {
             return Err(io::Error::other("simulated failure after directory sync"));
         }
@@ -2521,6 +2521,109 @@ mod tests {
         assert_eq!(reopened.applied_state().await.unwrap().0.unwrap().index, 1);
         assert_eq!(fs::read(dir.0.join("state.json")).unwrap(), before);
         assert!(!dir.0.join("state.json.corrupt").exists());
+    }
+
+    /// A fault on the second of two appends keeps the first and leaves nothing
+    /// of the second.
+    ///
+    /// This is the cross-operation shape a single per-call point could not
+    /// express: `writes(&[Pass, Error])` lets one append land and fails the
+    /// next, so the failure happens on a file that already has a durable frame
+    /// in front of it. The failed append must roll back to exactly the first
+    /// append's length, because a complete-but-unacknowledged frame would be
+    /// replayed after a restart and apply an entry this call reported as
+    /// failed.
+    #[tokio::test]
+    async fn a_fault_on_the_second_delta_append_keeps_only_the_first() {
+        use yadb_io::fault::{writes, WriteFault};
+
+        let dir = TempDir::new();
+        let mut sm = DurableMetaStateMachine::create(&dir.0, &identity()).unwrap();
+        let armed = writes(&[WriteFault::Pass, WriteFault::Error(io::ErrorKind::Other)]);
+        sm.apply(vec![put(1, "a", b"one")]).await.unwrap();
+        let after_first = fs::metadata(dir.0.join(DELTA_FILE)).unwrap().len();
+        let error = sm
+            .apply(vec![put(2, "b", b"two")])
+            .await
+            .expect_err("the second append must fail");
+        drop(armed);
+        assert!(
+            format!("{error:?}").contains("injected write fault"),
+            "the failure must be the injected one, got {error:?}"
+        );
+
+        assert_eq!(
+            fs::metadata(dir.0.join(DELTA_FILE)).unwrap().len(),
+            after_first,
+            "a failed append must leave the delta at the previous end"
+        );
+        assert_eq!(sm.snapshot().get("a").unwrap().value, b"one");
+        assert!(sm.snapshot().get("b").is_none());
+        drop(sm);
+
+        let mut reopened = DurableMetaStateMachine::open(&dir.0, &identity()).unwrap();
+        assert_eq!(reopened.snapshot().get("a").unwrap().value, b"one");
+        assert!(
+            reopened.snapshot().get("b").is_none(),
+            "the entry whose append failed must not be replayed"
+        );
+        assert_eq!(reopened.applied_state().await.unwrap().0.unwrap().index, 1);
+        assert!(
+            reopened.repaired_delta().is_none(),
+            "a rolled-back append is not a torn tail and must not be reported as one"
+        );
+    }
+
+    /// A file-sync failure in one operation followed by a read failure in the
+    /// next: two different seams in one sequence.
+    ///
+    /// The sync failure leaves the append unacknowledged and rolled back, and
+    /// the later read failure must not turn that into corruption. The image is
+    /// byte-identical afterwards, nothing is renamed aside, and the replica
+    /// reopens with the entries whose appends did land.
+    #[tokio::test]
+    async fn a_sync_failure_followed_by_a_read_failure_recovers_on_reopen() {
+        use yadb_io::fault::{file_syncs, reads, FileSyncFault, ReadFault};
+
+        let dir = TempDir::new();
+        let mut sm = DurableMetaStateMachine::create(&dir.0, &identity()).unwrap();
+        sm.apply(vec![put(1, "a", b"one")]).await.unwrap();
+        let after_first = fs::metadata(dir.0.join(DELTA_FILE)).unwrap().len();
+
+        let armed = file_syncs(&[FileSyncFault::Error(io::ErrorKind::Other)]);
+        let error = sm
+            .apply(vec![put(2, "b", b"two")])
+            .await
+            .expect_err("the append's file sync must fail");
+        drop(armed);
+        assert!(
+            format!("{error:?}").contains("injected file sync fault"),
+            "the failure must be the injected one, got {error:?}"
+        );
+        assert_eq!(
+            fs::metadata(dir.0.join(DELTA_FILE)).unwrap().len(),
+            after_first,
+            "the rollback after a failed sync must leave the delta at the previous end"
+        );
+        assert!(sm.snapshot().get("b").is_none());
+        drop(sm);
+
+        let image = fs::read(dir.0.join("state.json")).unwrap();
+        let armed = reads(&[ReadFault::Error(io::ErrorKind::Other)]);
+        let error =
+            DurableMetaStateMachine::open_or_rebuild(&dir.0, &identity(), rebuild_coverage())
+                .err()
+                .expect("the recovery read must fail");
+        drop(armed);
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(fs::read(dir.0.join("state.json")).unwrap(), image);
+        assert!(!dir.0.join("state.json.corrupt").exists());
+        assert!(!dir.0.join("state.json.tmp").exists());
+
+        let mut reopened = DurableMetaStateMachine::open(&dir.0, &identity()).unwrap();
+        assert_eq!(reopened.snapshot().get("a").unwrap().value, b"one");
+        assert!(reopened.snapshot().get("b").is_none());
+        assert_eq!(reopened.applied_state().await.unwrap().0.unwrap().index, 1);
     }
 
     /// Flip one bit in `state.json`'s payload, which the header CRC covers, so
