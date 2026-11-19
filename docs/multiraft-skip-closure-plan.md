@@ -97,14 +97,34 @@ run inside the one-second intent grace. The set comparison was not weakened.
 
 ## What this record still does not claim
 
-These stay unproven, and the text below must not be read as proving them:
+The following are not claimed at live-cluster level, and the text below must not
+be read as proving them there. Two of them were subsequently proved at sweep
+level against real single-node OpenRaft groups and real volume directories; the
+bullet says which test does that and what the live cluster still lacks.
 
-* a collector lease expiring in the middle of a pass — the daemon has no
-  injection point, so only the storage-level drill covers the shape;
+* a collector lease expiring in the middle of a live cluster pass — the daemon
+  still has no injection point, so the live cluster cannot produce it. The
+  shape is proved at sweep level with a real single-node OpenRaft group and
+  real volume directories: `a_collector_fence_lost_mid_pool_stops_deleting_and_is_never_counted`
+  fails the fence closure `sweep_pool` receives between two barrier ranges and
+  observes that the earlier range is evicted and counted, the later range is
+  untouched and uncounted, and the outcome names the stop. What stays unproven
+  is the same failure through `POST /v1/pools/gc` on a cluster;
 * a reader lease expiring in the middle of a read — the live run observed the
   record block a pass and then expire with no read in flight, not a read that
   outlived its lease;
-* two concurrent collectors on one group;
+* two concurrent collectors on one group on a live cluster — a concurrent
+  `POST /v1/pools/gc` pair is inherently racy, so there is no deterministic
+  drill. The shape is proved at sweep level against a real single-node
+  OpenRaft group: `a_held_group_collector_lease_refuses_the_second_pass_and_deletes_nothing`
+  holds the group's collector record and observes the second pass refuse by
+  name, delete nothing and leave the same fragments collectable once the record
+  is released; `two_concurrent_passes_on_one_group_delete_each_fragment_at_most_once`
+  runs two real passes on separate threads and asserts that at most one
+  reports a deletion, every dead fragment is deleted exactly once in total, a
+  refusal names the collector lease, and no live fragment disappears. Both
+  passes succeeding back to back satisfies the same invariant, so the race
+  alone is not the proof — the held-record test is the deterministic half;
 * a group leader dying between a fragment write and its manifest commit;
 * `block_pool_lookup` resolving through the local control-plane cache rather
   than the group snapshot: a stale cache can make the pass skip a blob, and can
