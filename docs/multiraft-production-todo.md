@@ -694,12 +694,12 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   epoch advance is refused is named in `gc_pools_refused` and deletes nothing.
   Four live drills in `tests/protocols.py` cover a live reader pin, a superseded
   collector epoch, a non-leader refusal and a clean collection. A separate live
-  drill covers the reader lease: `POST /v1/pools/gc` reports `leases_live: 0`
+  run observed the reader lease: `POST /v1/pools/gc` reported `leases_live: 0`
   before any read, then `409` with `leases_live: 1` and `fragments_deleted: 0`
-  after a `PUT` + `GET`, and the lease expires by +35 s with no intervening
-  reads. Storage-side
-  fencing exists end to end on both runtimes. A barrier carries the
-  collector lease deadline and the target refuses an expired one with `409`
+  after a `PUT` + `GET`, and the lease expired by +35 s with no intervening
+  reads. Storage-side fencing exists end to end on both runtimes. A barrier
+  carries the collector lease deadline and the target refuses an expired one
+  with `409`
   (`BlobError::BarrierLeaseExpired`), and an unreadable target clock refuses
   with `BarrierClockUnreadable` instead of defaulting to a live deadline. A
   volume keeps a durable, monotonic epoch and stamps every fragment with the

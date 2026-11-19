@@ -50,7 +50,7 @@ branch; it is not merged into the tree this record was written on.
    index the group has not applied. On legacy metadata `reader_is_safe` still
    runs; on Multi-Raft the lease publication is itself a committed group write,
    so that check is skipped. The TTL is 30 s (`DEFAULT_TTL_MS`). A live
-   three-node drill observed the refusal and its expiry (see "SKIP 2" below).
+   three-node run observed the refusal and its expiry (see "SKIP 2" below).
    `feat/reader-lease` (`e4555c5`) implements it; the option the record
    rejected is now the implemented one, on that branch.
 6. **Guards and docs — done.** `scripts/test_protocols_review.py` passes 21
@@ -85,7 +85,7 @@ These stay unproven, and the text below must not be read as proving them:
 
 * a collector lease expiring in the middle of a pass — the daemon has no
   injection point, so only the storage-level drill covers the shape;
-* a reader lease expiring in the middle of a read — the live drill observed the
+* a reader lease expiring in the middle of a read — the live run observed the
   record block a pass and then expire with no read in flight, not a read that
   outlived its lease;
 * two concurrent collectors on one group;
@@ -323,7 +323,7 @@ So the change buys a collector that can be told to back off without inspecting
 every target, and a lease that the collection path consults before it takes its
 mark; it costs collection availability after reads. It is not a pure win.
 
-### The drill that was observed
+### The live run that was observed
 
 On a live three-node cluster with the new daemon, `POST /v1/pools/gc` before
 any read reported `leases_live: 0`. After a `PUT` and a `GET`, the same request

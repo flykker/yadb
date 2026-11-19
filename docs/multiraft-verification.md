@@ -2718,7 +2718,7 @@ not through an admin route, and the install is still initiated by an inbound
   a refusal, and prints `PASS Multi-Raft repair scan repairs per group, refuses
   only groups this node does not lead`. In that run the `reader lease` SKIP was
   still the narrowed record. The implementation closes it: every S3 `GET` on
-  Multi-Raft publishes and renews a per-group lease, and the drill observes
+  Multi-Raft publishes and renews a per-group lease, and a live run observed
   `POST /v1/pools/gc` refusing with `leases_live: 1` after a read, then the
   reader-lease clause leaving the refusal once the 30 s lease expires. The
   exact PASS/SKIP total after the implementation lands is not stated here
