@@ -373,6 +373,143 @@ def assert_multiraft_gc_refusal(port, path, fragments):
         assert result[0] == 200 and result[2] == expected, (fragment_path, result)
 
 
+def assert_vdisk_fence_rpc(port, pool_name, slot_index):
+    """Drive the durable epoch and pin table over the shipped internal surface.
+
+    The handler-level test calls these functions directly, and the volume tests
+    run on `SimFs`. This drill goes through the router of a running node, with
+    the real token check and a real on-disk epoch, so it proves the routes are
+    wired and that a refusal leaves the fragment readable. It does not run a
+    collector: none exists yet, and the four collection drills still cannot run.
+    """
+    internal = {"x-yadb-raft-token": RAFT_TOKEN}
+    json_headers = {**internal, "Content-Type": "application/json"}
+    base = f"/internal/vdisk/{pool_name}/{slot_index}"
+
+    def get_epoch():
+        status, _, body = request(port, "GET", base + "/epoch", headers=internal)
+        assert status == 200, ("epoch", status, body)
+        return json.loads(body)["epoch"]
+
+    def advance(expected):
+        status, _, body = request(
+            port, "POST", base + "/advance",
+            json.dumps({"expected_epoch": expected}).encode(), json_headers)
+        return status, json.loads(body) if body else {}
+
+    def pin(epoch, ttl_ms):
+        status, _, body = request(
+            port, "POST", base + "/pin",
+            json.dumps({"epoch": epoch, "ttl_ms": ttl_ms}).encode(), json_headers)
+        return status, json.loads(body) if body else {}
+
+    def unpin(pin_id):
+        status, _, body = request(
+            port, "POST", base + "/unpin",
+            json.dumps({"pin_id": pin_id}).encode(), json_headers)
+        return status, json.loads(body) if body else {}
+
+    def live_pins():
+        status, _, body = request(port, "GET", base + "/pins", headers=internal)
+        assert status == 200, ("pins", status, body)
+        return json.loads(body)["pins"]
+
+    def delete(blob_hex, query=""):
+        status, _, body = request(
+            port, "DELETE", f"{base}/blob/{blob_hex}{query}", headers=internal)
+        # A refusal is a JSON envelope and a success is the plain word
+        # `deleted`/`absent`; decoding only the former keeps both checkable.
+        if body.startswith(b"{"):
+            return status, json.loads(body)
+        return status, body
+
+    # The shared token is the whole authentication of this surface. Without it
+    # the epoch is not readable, so an unauthenticated caller cannot even learn
+    # which value to advance from.
+    assert request(port, "GET", base + "/epoch")[0] == 401
+
+    start = get_epoch()
+    blob = ((0xFFFFFFFD << 96) | (1 << 64) | (1 << 40)
+            | ((slot_index + 1) << 16) | (248 << 8) | 1)
+    blob_hex = f"{blob:032x}"
+    path = f"{base}/blob/{blob_hex}"
+    payload = b"fence-drill-fragment"
+    assert request(port, "PUT", path, payload, internal)[0] == 200
+
+    # A pin names the target's current epoch or nothing. A pin on the epoch a
+    # collector might advance to would prove nothing about bytes already
+    # written, so it is refused rather than stored.
+    status, body = pin(start + 1, 60_000)
+    assert status == 409 and body["error"] == "pin_epoch_not_current", (status, body)
+    # A zero or over-long lifetime is refused rather than clamped: a pin that
+    # expires under the read it protects is worse than no pin at all.
+    assert pin(start, 0)[0] == 400, "zero TTL must be refused"
+    assert pin(start, 300_001)[0] == 400, "an over-long TTL must be refused"
+
+    status, grant = pin(start, 60_000)
+    assert status == 200 and grant["epoch"] == start, (status, grant)
+    assert [p["pin_id"] for p in live_pins()] == [grant["pin_id"]], live_pins()
+
+    # 1. The advance refusal is what protects a fragment the reader did not
+    #    write: the collector cannot move past the epoch a reader holds.
+    status, body = advance(start)
+    assert status == 409 and body["error"] == "epoch_pinned", (status, body)
+    # 2. The per-fragment refusal protects the fragment the pin names.
+    status, body = delete(blob_hex, f"?collector_epoch={start + 1}")
+    assert status == 409 and body["error"] == "fragment_pinned", (status, body)
+    # Neither refusal may consume the fragment or move the epoch.
+    survived = request(port, "GET", path, headers=internal)
+    assert survived[0] == 200 and survived[2] == payload, survived
+    assert get_epoch() == start
+
+    status, body = unpin(grant["pin_id"])
+    assert (status, body) == (200, {"released": True}), (status, body)
+    assert live_pins() == []
+    # Releasing again is a no-op, not an error and not a resurrection.
+    status, body = unpin(grant["pin_id"])
+    assert (status, body) == (200, {"released": False}), (status, body)
+
+    status, body = advance(start)
+    assert status == 200 and body["epoch"] == start + 1, (status, body)
+    assert get_epoch() == start + 1
+    # The advance is a compare-and-swap: the old expectation is now stale.
+    status, body = advance(start)
+    assert status == 409 and body["error"] == "epoch_mismatch", (status, body)
+
+    # An exact fence must name the fragment's own epoch, and equality is not
+    # "older" for a collector. Both are distinct refusals, not a generic one.
+    status, body = delete(blob_hex, f"?fence_epoch={start + 1}")
+    assert status == 409 and body["error"] == "fenced_by_epoch", (status, body)
+    status, body = delete(blob_hex, f"?collector_epoch={start}")
+    assert status == 409 and body["error"] == "fragment_not_older", (status, body)
+    status, body = delete(blob_hex, f"?fence_epoch={start}&collector_epoch={start + 1}")
+    assert status == 400 and body["error"] == "bad_fence_params", (status, body)
+    survived = request(port, "GET", path, headers=internal)
+    assert survived[0] == 200 and survived[2] == payload, survived
+
+    # Only a strictly newer epoch collects, and a replay is "absent".
+    status, body = delete(blob_hex, f"?collector_epoch={start + 1}")
+    assert (status, body) == (200, b"deleted"), (status, body)
+    assert request(port, "GET", path, headers=internal)[0] == 404
+    status, body = delete(blob_hex, f"?collector_epoch={start + 1}")
+    assert (status, body) == (200, b"absent"), (status, body)
+
+    # An expired pin stops blocking: the target's own clock, not a caller's
+    # promise, is the deadline. Re-attempting the advance is safe because it is
+    # a compare-and-swap and a refusal changes nothing.
+    # Two seconds, not a hundred milliseconds: the assertion below must observe
+    # the pin while it is certainly live, so the TTL cannot expire inside the
+    # round trip that proves it blocks the advance.
+    status, grant = pin(start + 1, 2_000)
+    assert status == 200, (status, grant)
+    assert advance(start + 1)[0] == 409, "a live pin must refuse the advance"
+    eventually(lambda: advance(start + 1),
+               lambda result: result[0] == 200,
+               "expired pin stops blocking the advance", timeout=10)
+    assert get_epoch() == start + 2
+    assert live_pins() == []
+
+
 def signed(port, method, path, body=b"", extra=None, secret=None, timeout=30):
     secret = SECRET if secret is None else secret
     now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -1258,11 +1395,22 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None,
             print("PASS Multi-Raft GC and scrub explicitly refuse without deleting fragments")
             skip("VDisk orphan collection",
                  "scrub's repair/orphan scan is disabled on Multi-Raft: "
-                 "crates/yadbd/src/main.rs:7365 answers 409 instead of 200")
+                 "crates/yadbd/src/main.rs:7636 answers 409 instead of 200")
             skip("per-group GC collection",
                  "mark-and-sweep is disabled for Multi-Raft: "
                  "crates/yadbd/src/gc.rs:144 refuses before any pass")
             print("PASS VDisk exact DELETE, idempotent tombstone and delayed PUT fencing")
+            # The epoch and pin surface is wired into the shipped router, not
+            # only into the handler functions the unit test calls. One slot is
+            # enough: every slot is served by the same handlers, and the drill
+            # is about the routes and the durable state behind them.
+            first_pool = health["pools"][0]
+            first_slot = first_pool["slots"][0]
+            assert_vdisk_fence_rpc(
+                http_port(first_slot["node_id"]),
+                first_pool["pool_name"],
+                first_slot["slot_index"])
+            print("PASS VDisk epoch, pin, advance and collectable-delete refusals")
             a, b = Pg(pg_port(2)), Pg(pg_port(3))
             a.query("CREATE TABLE wire (id INT PRIMARY KEY, balance INT);")
             a.query("INSERT INTO wire VALUES (1,100), (2,200);")

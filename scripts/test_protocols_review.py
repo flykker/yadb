@@ -33,7 +33,7 @@ ANCHOR_RE = re.compile(r"([A-Za-z0-9_./-]+\.(?:rs|py)):(\d+)")
 REQUIRED_SUBSTRINGS = {
     "crates/yadbd/src/protocols/s3.rs:683": ["is_openraft"],
     "crates/yadbd/src/main.rs:524": ["begin_read_lease"],
-    "crates/yadbd/src/main.rs:7365": ["CONFLICT"],
+    "crates/yadbd/src/main.rs:7636": ["CONFLICT"],
     "crates/yadbd/src/gc.rs:144": ["MULTIRAFT_GC_REFUSAL"],
 }
 
@@ -45,7 +45,7 @@ REQUIRED_SUBSTRINGS = {
 EXPECTED_SKIPS = {
     "VDisk orphan collection": [
         "repair/orphan scan is disabled on Multi-Raft",
-        "crates/yadbd/src/main.rs:7365",
+        "crates/yadbd/src/main.rs:7636",
     ],
     "per-group GC collection": [
         "mark-and-sweep is disabled for Multi-Raft",
