@@ -102,6 +102,16 @@ struct RaftTiming {
     nonpreferred_election_min_ms: u64,
     #[serde(default)]
     snapshot_after_logs: Option<u64>,
+    /// How many already-snapshotted log entries the leader keeps. Absent means
+    /// OpenRaft's default of 1000.
+    ///
+    /// A threshold alone does not make the InstallSnapshot path reachable in a
+    /// test: the leader builds a snapshot but still retains 1000 logs below it,
+    /// so a follower that is only a few dozen entries behind is caught up by
+    /// replay. Keeping 1 entry lets a test trigger a real purge, which is what
+    /// forces the install. Test/tuning only; it changes no fence.
+    #[serde(default)]
+    max_in_snapshot_log_to_keep: Option<u64>,
 }
 
 #[derive(Deserialize, PartialEq, Eq)]
@@ -745,6 +755,12 @@ pub fn prepare(path: &Path) -> io::Result<Prepared> {
                 return Err(invalid("invalid snapshot_after_logs bound"));
             }
             raft_config.snapshot_policy = openraft::SnapshotPolicy::LogsSinceLast(threshold);
+        }
+        if let Some(keep) = timing.max_in_snapshot_log_to_keep {
+            if keep == 0 || keep > 1_000_000 {
+                return Err(invalid("invalid max_in_snapshot_log_to_keep bound"));
+            }
+            raft_config.max_in_snapshot_log_to_keep = keep;
         }
     }
     let raft_config = Arc::new(raft_config.validate().map_err(|e| invalid(e.to_string()))?);
@@ -1414,6 +1430,33 @@ mod tests {
             prepared.raft_config.snapshot_policy,
             openraft::SnapshotPolicy::LogsSinceLast(32)
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A threshold alone does not make an install reachable: the leader still
+    /// retains its default 1000 snapshotted logs, so a follower a few dozen
+    /// entries behind is caught up by replay. The retention knob is what lets a
+    /// test force a purge, and it must be separately configurable and bounded.
+    #[test]
+    fn the_snapshot_log_retention_is_configurable_and_bounded() {
+        let (dir, path, mut config) = fixture();
+        config["preferred_leader"] = json!(1);
+        config["raft_timing"] = json!({"heartbeat_ms":750,"election_min_ms":2250,"nonpreferred_election_min_ms":3000,"election_max_ms":3500});
+        std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+        assert_eq!(prepare(&path).unwrap().raft_config.max_in_snapshot_log_to_keep, 1000);
+
+        config["raft_timing"] = json!({"heartbeat_ms":750,"election_min_ms":2250,"nonpreferred_election_min_ms":3000,"election_max_ms":3500,"max_in_snapshot_log_to_keep":1});
+        std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+        assert_eq!(prepare(&path).unwrap().raft_config.max_in_snapshot_log_to_keep, 1);
+
+        for keep in [0, 1_000_001] {
+            config["raft_timing"] = json!({"heartbeat_ms":750,"election_min_ms":2250,"nonpreferred_election_min_ms":3000,"election_max_ms":3500,"max_in_snapshot_log_to_keep":keep});
+            std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+            assert!(
+                prepare(&path).is_err(),
+                "max_in_snapshot_log_to_keep {keep} must be rejected"
+            );
+        }
         std::fs::remove_dir_all(dir).unwrap();
     }
 
