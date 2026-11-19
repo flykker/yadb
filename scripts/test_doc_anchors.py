@@ -65,7 +65,7 @@ CURRENT_CLAIMS = {
     # `collect_orphans_in_scopes_with`, which the prefix-scoped repair pass
     # deliberately does not copy. It no longer refuses a `project_ids == None`
     # scope: the project set is derived from the group's own fenced snapshot.
-    "crates/yadb-s3/src/lib.rs:1612": ["collect_orphans_in_scopes_with"],
+    "crates/yadb-s3/src/lib.rs:1619": ["collect_orphans_in_scopes_with"],
 }
 
 # Citations inside explicitly dated snapshots. Only the file and range are

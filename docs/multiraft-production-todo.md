@@ -136,14 +136,78 @@ switched. See `docs/multiraft-verification.md`.
   multi-node daemon and protocol validation remain pending.
 - [ ] Select the independent group leader for forwarding and protocol transaction
   fencing; do not use the control group's leader/term for every project.
-- [ ] Reject transactions spanning groups before submission. Never synthesize a
+- [x] Reject transactions spanning groups before submission. Never synthesize a
   global revision or an atomic cross-group snapshot. Use project-group revisions
   for S3 leases/GC; administrative merged scans are non-atomic local observations.
-- [ ] Require a new empty data root for creation, bind its runtime/replica identity
+  `GroupRouter::group_for` routes every key before any group is used, so a
+  spanning scope fails with `Routing` and no Raft core sees it. The test does not
+  rely on the error alone: it snapshots every leader's
+  `last_log_index`/`last_applied` and asserts they do not move for a rejected
+  `Txn`, `RevisionTxn` or snapshot, on both singleton groups and live three-replica
+  groups, because an accepted write appends a log entry even if it never applies.
+  `try_revision` refuses and `legacy_revision()` is `0` on OpenRaft, so a lease
+  carries the group's own revision, is published under
+  `gc::group_lease_prefix(group)` and is fenced by `gc::lease_belongs_to_group`;
+  the legacy `live_leases`/`reader_is_safe` namespaces refuse on Multi-Raft rather
+  than answering "safe". `try_scan` is a merged local observation whose rows carry
+  no revision, so it structurally cannot become a `MetaSnapshot`, and every
+  production scan call site is scoped to one project or one group. A group's
+  leader is selected independently for the lease and snapshot paths
+  (`role_info_for_group`, `try_linearizable_group_snapshot`), so a control-group
+  leader is not consulted for a project group's fence. This is in-process; the
+  live multi-node drill remains the separate gate.
+- [x] Require a new empty data root for creation, bind its runtime/replica identity
   durably, reject mismatched reopen and legacy access to marked OpenRaft roots.
   Do not modify, import or erase old legacy directories; no automatic fallback.
-- [ ] Test actual adapter/engine paths, empty-root admission, persistence/reopen,
+  Create admits only a missing or empty root: a missing root is validated without
+  being created, then provisioned as the directory plus one
+  `.yadb-openraft-runtime.json` marker (written `create_new`, fsync'd, hardlinked
+  from `.pending`, then the root directory is fsync'd). An empty subdirectory, a
+  stray file, a half-written `.pending` or a file-as-root is refused without
+  touching the root (`create_admits_only_a_missing_or_empty_root`); the empty
+  subdirectory is the case a naive `read_dir(root)?.next().is_none()` gets wrong.
+  The marker binds cluster, group, incarnation, node, voters and the canonical
+  root; a reopen that changes group, incarnation, cluster, node or the voter set
+  fails with a marker mismatch and does not rewrite the marker
+  (`a_changed_group_incarnation_node_or_voter_set_is_refused_on_reopen`). A
+  synthetic pre-OpenRaft tree (WAL, descriptor, state image, empty subdirectory,
+  dotfile) is refused on both create and open at the single-group and multi-group
+  entry points, and a snapshot of every path, type, mode, mtime and byte is
+  unchanged with no marker or `.pending` created
+  (`a_legacy_directory_is_refused_and_left_byte_identical`,
+  `a_legacy_directory_is_refused_by_the_multi_group_root_guard`); a real daemon
+  child refuses a legacy `--data-dir` with the root guard's message, never reaches
+  "listening on http", and leaves the tree byte-identical
+  (`startup_refuses_a_legacy_data_root_and_leaves_it_byte_identical`). The legacy
+  runtime is deleted rather than refused (`--metadata-runtime` accepts only
+  `openraft`; `/raft/rpc` and `/raft/elect` return `404`), so no fallback path
+  exists. A refused open of a directory with no marker now names the guard
+  instead of surfacing a bare `ENOENT`, which is a diagnostic change only. Open:
+  marker durability is by construction (fsync + hardlink + parent fsync), not
+  proven by crash or power-loss injection; the legacy runtime cannot open a
+  marked root because that code no longer exists, which is structural rather than
+  tested; and a symlinked root is not tested (a link to a non-empty directory is
+  refused, a link to an empty one is admitted and then canonicalized).
+- [x] Test actual adapter/engine paths, empty-root admission, persistence/reopen,
   follower write rejection and disabled legacy Raft endpoints in OpenRaft mode.
+  `openraft_clients.rs` drives the real SQL, S3 and block engines through
+  `LocalMetaKv::from_openraft_groups` and reopens each replica set. Empty-root
+  admission is covered by `create_admits_only_a_missing_or_empty_root` and by the
+  daemon test that starts from a nonexistent `--data-dir`. Persistence/reopen is
+  covered by `multigroup_create_write_reopen_and_marker_binding`, the reopen
+  loop in `crates/yadbd/tests/openraft_clients.rs` and the daemon SIGINT/reopen
+  read. Follower write
+  rejection is covered by `three_daemons_forward_http_to_different_group_leaders`:
+  a plain follower write forwards to the project-group leader (`x-yadb-leader-id`),
+  and a request that already carries `x-yadb-forwarded` on a non-leader is refused
+  with `503`, no `x-yadb-write-outcome: unknown`/`committed` and no
+  `x-yadb-retry: do-not-retry`; the refused control mutation leaves every node's
+  applied pools unchanged. Disabled legacy endpoints are covered by the same
+  daemon test asserting `404` for `GET` and `POST` on `/raft/rpc` and
+  `/raft/elect`. Open: there is no direct assertion that the follower's own state
+  image never received a forwarded entry - replication makes "local commit"
+  indistinguishable there - so the strict no-local-effect assertion is on the
+  refused path only.
 - [x] Preserve control-plane/RBAC watcher correctness across durable snapshot
   installation: notify installed-state deltas only after successful persistence,
   never on failed installation, and retain subscriptions for later applies.

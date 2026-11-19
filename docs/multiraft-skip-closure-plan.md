@@ -296,7 +296,7 @@ in the repair path crosses groups.
      complete view;
    * repairs each live blob through `repair_blob`.
    * **Does not copy the `project_ids.is_some()` guard** from
-     `collect_orphans_in_scopes_with` (`crates/yadb-s3/src/lib.rs:1612`). That
+     `collect_orphans_in_scopes_with` (`crates/yadb-s3/src/lib.rs:1619`). That
      guard existed because orphan collection enumerated projects; this pass is
      prefix-scoped, so a `project_ids == None` scope is not a blocker. The
      doc comment says this, so the next reader does not copy the refusal. The
