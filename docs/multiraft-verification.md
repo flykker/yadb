@@ -564,8 +564,8 @@ The 21 and 22 figures above are historical run records, not the current
 inventory. The durable-fault work added a per-call failure point for each of the
 five fault classes on every durable operation and 14 tests that assert the
 on-disk bytes, the poisoned handle and the reopen contract, so
-`cargo test -p yadb-metakv openraft_storage` now runs **36** and the whole crate
-**200** (orchestrator re-run on the merged tree, 44.05 s, no failures).
+`cargo test -p yadb-metakv openraft_storage` now runs **37** and the whole crate
+**201** (the storage filter re-run on the merged tree, 0.08 s, no failures).
 
 ### Local environment observed for these runs
 

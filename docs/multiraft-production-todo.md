@@ -315,10 +315,36 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   markers immediately before, within and beyond the suffix, conflicting identity,
   unchanged files after rejection and checkpoint/reopen of accepted states.
   All then 22 storage tests and the adapted suite passed after that fix (the
-  file now holds 36); broader storage-contract and combined-regression gates
+  file now holds 37); broader storage-contract and combined-regression gates
   remain open.
-- [ ] Ensure file and parent-directory durability for create, rename and reopen,
+- [x] Ensure file and parent-directory durability for create, rename and reopen,
   including partial bootstrap, directory sync failures and unknown outcomes.
+  The barrier order is explicit. `create` creates the directory chain and syncs
+  the parent of every directory it created — including intermediates of a
+  nested path, whose own entry in *its* parent would otherwise stay unsynced,
+  which was a real gap: `root/a/b/c` made `c`'s entry durable in `b` while `b`'s
+  entry in `a` and `a`'s entry in `root` were never synced, so a crash could
+  leave a durable log unreachable — then writes and syncs the temporary header,
+  renames it, syncs the directory that holds it, and only then opens the append
+  handle. Checkpoint replacement writes and syncs a new file, renames, syncs the
+  directory, then rebinds the handle. Reopen creates no entries, so the
+  parent-of-directory barrier belongs to `create`; it re-syncs the log and its
+  directory and removes a leftover temporary before returning a handle. A failed
+  `sync_data` is an unknown outcome: the handle is refused and a reopen either
+  accepts the complete frame and re-syncs it — which can make the failed record
+  durable after all — or drops it as a torn tail, so a caller must treat the
+  append as possibly applied and never infer from the error that the record is
+  gone. A real crash is not observable in-process, so the nested-path test proves
+  the ancestor sync is on the path before publication by failing it there;
+  supported-host power-loss qualification remains separate. Evidence: 37
+  storage tests, of which
+  `create_propagates_a_parent_directory_sync_failure`,
+  `create_syncs_each_new_ancestor_before_publishing_the_log`,
+  `bootstrap_faults_publish_nothing_or_a_reopenable_log` and
+  `sync_errors_poison_writer_and_reopen_resyncs_visible_record` cover the
+  ordering and unknown-outcome claims. Dropping the ancestor sync fails the
+  nested-path test; moving the parent sync after publication fails the
+  single-level one.
 - [ ] Make snapshot identity, membership, log pointers, concurrent build/install,
   watchers and recovery correct; explicitly test stale and conflicting snapshots.
 - [x] Inject write, partial write, file sync, rename and directory sync faults for
@@ -333,7 +359,7 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   instead of being repaired. Bootstrap failures are classified by what they
   publish: before the rename nothing `open` accepts and `create` is retried,
   after the rename a complete log that `open` accepts and re-syncs. Evidence:
-  36 storage tests, of which
+  37 storage tests, of which
   `append_path_faults_poison_and_reopen_to_a_complete_state`,
   `checkpoint_faults_poison_and_recover_valid_primary`,
   `bootstrap_faults_publish_nothing_or_a_reopenable_log` and
