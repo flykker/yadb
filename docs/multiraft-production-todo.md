@@ -785,8 +785,19 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   * **Order of work:** per-group collector lease and writer fence → leader-only
     per-group sweep with the intent grace → a drill that kills the group leader
     between fragment write and manifest commit and proves nothing is reclaimed.
-    The first two are done. The third is not: no drill kills a group leader
-    between a fragment write and its manifest commit.
+    The first two are done. The third is proved at sweep level, not on a live
+    cluster:
+    `a_group_leader_death_before_publication_keeps_the_fragment_leased_and_unreadable`
+    and
+    `a_group_leader_death_after_publication_keeps_the_committed_blob_readable`
+    in `crates/yadbd/src/gc.rs` append/publish through the real engines, stop
+    every single-node group and reopen the same replica identities from disk.
+    The uncommitted half is absent and lease-protected until the lease expires
+    and is then collected; the committed half reads back its exact bytes and
+    keeps its fragments through a pass. What is still missing is the live drill
+    on a multi-node cluster, where one group leader fails over to a peer while
+    the other groups keep serving, and where the death can cut a log entry
+    mid-fsync rather than shut down cleanly.
 
 - [ ] Orphan blob collection refuses a scope whose `project_ids` is `None`.
   `collect_orphans_in_scopes_with` enumerates a group's projects before it

@@ -2017,8 +2017,13 @@ does not lead while repairing the ones it does lead.
 
 Two repair limits stay stated. A blob published after the snapshot is not
 repaired by that pass; repair is idempotent, not atomic with publication. A
-group leader dying between a fragment write and its manifest commit still has no
-drill.
+group leader dying between a fragment write and its manifest commit has no
+live-cluster drill; the shape is proved at sweep level across a real restart by
+`a_group_leader_death_before_publication_keeps_the_fragment_leased_and_unreadable`
+and
+`a_group_leader_death_after_publication_keeps_the_committed_blob_readable`
+(below), which restart a one-node deployment rather than failing one leader over
+to a peer.
 
 The volume-to-pool map is no longer a limit. `block_pool_lookup` used to be
 read from this node's local control-plane cache; a pass now takes it only from a
@@ -2044,6 +2049,8 @@ inside the grace and observes it collected after it.
 | `gc::tests::openraft_tests::a_multigroup_pass_reclaims_each_groups_dead_fragments` | Two data groups over projects 1 and 2 each keep exactly the newest generation (16 fragments) and serve their newest bytes after the pass. |
 | `gc::tests::openraft_tests::a_follower_group_refuses_and_deletes_nothing` | Group 2 is a two-node cluster whose local node is a follower. The pass refuses group 2, deletes nothing, and the group 2 leader then reclaims the same fragments — so the refusal, not the data, kept them. |
 | `gc::tests::openraft_tests::a_group_writer_lease_protects_an_unpublished_fragment` | An unexpired writer lease in group 2 keeps an appended, unpublished fragment alive and refuses group 2, while group 3 still reclaims its own garbage. Releasing the lease makes the fragment provably dead. |
+| `gc::tests::openraft_tests::a_group_leader_death_before_publication_keeps_the_fragment_leased_and_unreadable` | A fragment is appended for project 1 (group 2) with a writer lease published exactly as the block write path does, then every group is stopped and reopened from its durable directories. After the restart a quorum-confirmed read is `ObjectNotFound`, the recovered live lease refuses group 2 and deletes nothing, and after the record is deterministically expired the pass reaps it, collects the fragment and reports `fragments_deleted > 0`. |
+| `gc::tests::openraft_tests::a_group_leader_death_after_publication_keeps_the_committed_blob_readable` | An S3 object is published through the real `put_object` path, every group is stopped and reopened, and `get_object_consistent` returns the exact bytes. A real pass after recovery keeps every chunk the committed manifest names, and a plain read still returns the same bytes. |
 | `gc::tests::openraft_tests::a_prepared_s3_intent_protects_its_chunks` | A `Prepared` intent keeps its chunks through a pass with `fragments_deleted: 0`; deleting the intent makes the same chunks dead. |
 | `gc::tests::openraft_tests::a_held_group_collector_lease_refuses_the_second_pass_and_deletes_nothing` | A second pass over group 2 while its collector record is held refuses with "another pass holds the collector lease of group 2", deletes and barriers nothing, and leaves the same fragments collectable once the record is released. This is the deterministic half of "two concurrent collectors on one group". |
 | `gc::tests::openraft_tests::two_concurrent_passes_on_one_group_delete_each_fragment_at_most_once` | Two real passes over group 2 on separate threads: at most one reports a deletion, the dead fragments are deleted exactly once in total, a refusal names the collector lease, and no live fragment disappears. Back-to-back success satisfies the same invariant, so this is a race check, not the proof of exclusion. |
@@ -2069,6 +2076,19 @@ check was restored; the suite is green with it. This is the inversion that
 shows the exclusivity test is testing the collector record and not an
 incidental live-set refusal.
 
+Two inversions cover the leader-death pair. Making `live_leases_in` return an
+empty list (skipping the writer-lease fence) makes
+`a_group_leader_death_before_publication_keeps_the_fragment_leased_and_unreadable`
+fail at the pass after recovery:
+`SweepOutcome { blobs_live: 0, fragments_deleted: 3, ..., groups_refused: [] }`
+— the fragment appended before the death is collected while its lease is live
+(`left: 3, right: 0`). Dropping `/s3/` from `LIVE_PREFIXES` makes
+`a_group_leader_death_after_publication_keeps_the_committed_blob_readable` fail
+at the post-recovery pass:
+`a committed manifest must keep its fragments through a pass: SweepOutcome {
+blobs_live: 0, fragments_deleted: 15, ... }`. Both checks were restored; the
+suite is green with them.
+
 ### Gates
 
 `cargo fmt --all` then `cargo fmt --all -- --check` clean;
@@ -2084,14 +2104,21 @@ passes when run alone (pre-existing timing sensitivity, not touched here).
 
 * The four live cluster drills cover a live pin, a superseded epoch, a
   non-leader refusal and a clean collection. None kills a group leader between a
-  fragment write and its manifest commit, and none runs two collectors
-  concurrently on one group. The latter is proved at sweep level instead, with
-  real single-node OpenRaft groups and real volume directories: a held group
-  collector record makes the second pass refuse by name and delete nothing, and
-  two real passes on separate threads delete each dead fragment at most once
-  while no live fragment disappears. A live `POST /v1/pools/gc` pair is not
-  drilled because it is inherently racy, so the deterministic proof is the
-  held-record test and the concurrent test only guards the invariant.
+  fragment write and its manifest commit on a multi-node cluster, and none runs
+  two collectors concurrently on one group. The leader-death shape is proved at
+  sweep level across a real restart by
+  `a_group_leader_death_before_publication_keeps_the_fragment_leased_and_unreadable`
+  and
+  `a_group_leader_death_after_publication_keeps_the_committed_blob_readable`,
+  but those restart a one-node deployment with a clean shutdown, not one leader
+  failing over to a peer. The concurrent-collector shape is likewise proved at
+  sweep level instead, with real single-node OpenRaft groups and real volume
+  directories: a held group collector record makes the second pass refuse by
+  name and delete nothing, and two real passes on separate threads delete each
+  dead fragment at most once while no live fragment disappears. A live
+  `POST /v1/pools/gc` pair is not drilled because it is inherently racy, so the
+  deterministic proof is the held-record test and the concurrent test only
+  guards the invariant.
 * Readers on Multi-Raft now publish a per-group metadata lease as well as
   pinning the fragment at the target. The lease blocks `POST /v1/pools/gc` and
   scrub's collection half for up to its 30 s TTL after the last read in the

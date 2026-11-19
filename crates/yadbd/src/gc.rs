@@ -48,15 +48,21 @@
 //! quorum-confirmed snapshot, advances every slot's epoch before the first
 //! deletion, and deletes only through the target's collectable delete. Four
 //! live cluster drills in `tests/protocols.py` cover a live pin, a superseded
-//! epoch, a non-leader refusal and a clean collection. Two shapes are proved at
-//! sweep level with real single-node OpenRaft groups and real volume
+//! epoch, a non-leader refusal and a clean collection. Other shapes are proved
+//! at sweep level with real single-node OpenRaft groups and real volume
 //! directories (`gc::tests::openraft_tests`) instead of on the live cluster: a
 //! second collector on one group refuses on the held collector record and
-//! deletes nothing (both deterministically and under a real race), and a fence
+//! deletes nothing (both deterministically and under a real race), a fence
 //! lost between two barrier ranges stops the pass, leaving the later range
-//! untouched and uncounted and naming the stop. The live cluster still proves
-//! neither: a concurrent `POST /v1/pools/gc` pair is inherently racy, and the
-//! daemon has no injection point for expiring a collector record mid-pass.
+//! untouched and uncounted and naming the stop, and a group leader dying
+//! between a fragment write and its manifest commit is reopened from the same
+//! durable directories — the unpublished fragment stays unreadable and
+//! lease-protected until the lease expires and is then collected, while a
+//! committed manifest still reads back its exact bytes. The live cluster still
+//! proves none of them: a concurrent `POST /v1/pools/gc` pair is inherently
+//! racy, the daemon has no injection point for expiring a collector record
+//! mid-pass, and no live drill stages a leader death between a fragment write
+//! and its manifest commit.
 //!
 //! Crash safety comes from the order, not from atomicity: the fence and the
 //! barrier/tombstone records are durable before any byte is freed, and every step
@@ -2503,6 +2509,7 @@ mod tests {
         }
 
         struct GroupFixture {
+            dir: PathBuf,
             meta: LocalMetaKv<OsFs>,
             pool: Arc<PoolStriper<OsFs>>,
             pools: BTreeMap<String, Arc<PoolStriper<OsFs>>>,
@@ -2548,6 +2555,7 @@ mod tests {
                 }
                 let pools = BTreeMap::from([(POOL.to_string(), pool.clone())]);
                 Self {
+                    dir,
                     meta,
                     pool,
                     pools,
@@ -2607,8 +2615,14 @@ mod tests {
             dir
         }
 
-        async fn single_group(dir: &Path, group: u64) -> (YadbRaft, DurableMetaStateMachine) {
-            let identity = ReplicaIdentity::new(
+        /// The one replica identity every group in this fixture is created
+        /// with. A restart reuses it: the durable log and state machine bind
+        /// their headers to the group incarnation, so a *new* incarnation is a
+        /// new replica rather than a reopen of this one, and would be refused
+        /// by `open`. This is the process-restart shape a one-node deployment
+        /// has: the leader process dies and the same replica comes back.
+        fn replica_identity(group: u64) -> ReplicaIdentity {
+            ReplicaIdentity::new(
                 GroupIdentity {
                     cluster: CLUSTER,
                     group,
@@ -2617,34 +2631,68 @@ mod tests {
                 1,
                 vec![1],
             )
-            .unwrap();
+            .unwrap()
+        }
+
+        fn raft_config() -> Arc<openraft::Config> {
+            Arc::new(openraft::Config::default().validate().unwrap())
+        }
+
+        async fn leader_after_start(raft: &YadbRaft) {
+            raft.wait(Some(Duration::from_secs(5)))
+                .current_leader(1, "leader")
+                .await
+                .unwrap();
+        }
+
+        async fn single_group(dir: &Path, group: u64) -> (YadbRaft, DurableMetaStateMachine) {
+            let identity = replica_identity(group);
             let log =
                 DurableOpenRaftLog::create(dir.join(format!("g{group}-log")), &identity).unwrap();
             let state =
                 DurableMetaStateMachine::create(dir.join(format!("g{group}-state")), &identity)
                     .unwrap();
-            let config = Arc::new(openraft::Config::default().validate().unwrap());
-            let raft = YadbRaft::new(1, config, NoNetwork, log, state.clone())
+            let raft = YadbRaft::new(1, raft_config(), NoNetwork, log, state.clone())
                 .await
                 .unwrap();
             raft.initialize(BTreeMap::from([(1, BasicNode::new("one"))]))
                 .await
                 .unwrap();
-            raft.wait(Some(Duration::from_secs(5)))
-                .current_leader(1, "leader")
-                .await
-                .unwrap();
+            leader_after_start(&raft).await;
             (raft, state)
         }
 
-        /// Two groups (2 and 3) over projects 1 and 2, with group 1 as the
-        /// control group. Every group is a single-node cluster on node 1, which
-        /// is what a one-node deployment looks like.
-        async fn multigroup(tag: &str) -> GroupFixture {
-            let dir = temp_dir(tag);
-            let (control, control_state) = single_group(&dir, 1).await;
-            let (group2, group2_state) = single_group(&dir, 2).await;
-            let (group3, group3_state) = single_group(&dir, 3).await;
+        /// Reopen one existing single-node group from its durable directories.
+        ///
+        /// This is a process restart, not a fresh replica: the membership and
+        /// the applied state come back from disk, and the single voter elects
+        /// itself again. Nothing is initialized and no log entry is invented.
+        async fn reopened_single_group(
+            dir: &Path,
+            group: u64,
+        ) -> (YadbRaft, DurableMetaStateMachine) {
+            let identity = replica_identity(group);
+            let log =
+                DurableOpenRaftLog::open(dir.join(format!("g{group}-log")), &identity).unwrap();
+            let state =
+                DurableMetaStateMachine::open(dir.join(format!("g{group}-state")), &identity)
+                    .unwrap();
+            let raft = YadbRaft::new(1, raft_config(), NoNetwork, log, state.clone())
+                .await
+                .unwrap();
+            leader_after_start(&raft).await;
+            (raft, state)
+        }
+
+        fn assemble_multigroup(
+            dir: PathBuf,
+            control: YadbRaft,
+            control_state: DurableMetaStateMachine,
+            group2: YadbRaft,
+            group2_state: DurableMetaStateMachine,
+            group3: YadbRaft,
+            group3_state: DurableMetaStateMachine,
+        ) -> GroupFixture {
             let meta = LocalMetaKv::from_openraft_groups(
                 1,
                 BTreeMap::from([
@@ -2658,6 +2706,43 @@ mod tests {
             )
             .unwrap();
             GroupFixture::new(dir, meta, vec![control, group2, group3])
+        }
+
+        /// Two groups (2 and 3) over projects 1 and 2, with group 1 as the
+        /// control group. Every group is a single-node cluster on node 1, which
+        /// is what a one-node deployment looks like.
+        async fn multigroup(tag: &str) -> GroupFixture {
+            let dir = temp_dir(tag);
+            let (control, control_state) = single_group(&dir, 1).await;
+            let (group2, group2_state) = single_group(&dir, 2).await;
+            let (group3, group3_state) = single_group(&dir, 3).await;
+            assemble_multigroup(
+                dir,
+                control,
+                control_state,
+                group2,
+                group2_state,
+                group3,
+                group3_state,
+            )
+        }
+
+        /// Reopen a fixture built by [`multigroup`] from the same directories,
+        /// as a restarted one-node deployment would. The old fixture must have
+        /// been shut down first: its replicas own the directory locks.
+        async fn reopen_multigroup(dir: &Path) -> GroupFixture {
+            let (control, control_state) = reopened_single_group(dir, 1).await;
+            let (group2, group2_state) = reopened_single_group(dir, 2).await;
+            let (group3, group3_state) = reopened_single_group(dir, 3).await;
+            assemble_multigroup(
+                dir.to_path_buf(),
+                control,
+                control_state,
+                group2,
+                group2_state,
+                group3,
+                group3_state,
+            )
         }
 
         /// Group 2 is a two-node cluster whose local node (1) is kept a follower
@@ -3500,6 +3585,197 @@ mod tests {
             })
             .await
             .expect("writer-lease test timed out");
+        }
+
+        /// The leader of group 2 dies after a writer appended a fragment and
+        /// published its writer lease, but before the manifest that names the
+        /// fragment is committed.
+        ///
+        /// This is the recovery half the sweep-level writer-lease test does not
+        /// cover: the record and the fragment are read back from disk by a
+        /// restarted replica, not merely observed in the process that wrote
+        /// them. The two outcomes are asserted separately:
+        ///
+        /// * while the lease is live, the object is absent and a real pass
+        ///   refuses group 2 and deletes nothing, so the fragment cannot be
+        ///   collected under an in-flight write;
+        /// * once the record has expired, the same pass reaps it, collects the
+        ///   fragment and reports the deletion, so the fragment cannot leak
+        ///   forever either.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_group_leader_death_before_publication_keeps_the_fragment_leased_and_unreadable()
+        {
+            tokio::time::timeout(Duration::from_secs(60), async {
+                let f = multigroup("leader-death-unpublished").await;
+                let dir = f.dir.clone();
+
+                // The shape of a block/SQL write between its fragment append and
+                // its map publication: the fragment is on disk, the lease that
+                // fences the collector is durable in group 2, and no manifest
+                // names the fragment. `acquire_writer_if_legacy` publishes
+                // exactly this record on Multi-Raft.
+                let orphan = BlobId::new(1, 0x00FF_FFFF, 1, 0, yadb_block::BLOCK_CHANNEL, 0);
+                f.pool
+                    .put_blob(orphan, &vec![0xC7u8; BLOCK_SIZE as usize])
+                    .unwrap();
+                let writer =
+                    yadb_metakv::gc::acquire(&f.meta, gc::LeaseKind::Writer, 1, 0, gc::WRITER_TTL_MS)
+                        .unwrap();
+                assert!(f.distinct_ids().contains(&orphan));
+
+                // Nothing is published, so a quorum-confirmed read is absent -
+                // not a partial object and not a read of the uncommitted bytes.
+                let s3 = f.s3();
+                match s3.get_object_consistent(1, "store", "bucket", "unpublished") {
+                    Err(S3Error::ObjectNotFound { .. }) => {}
+                    other => panic!("an unpublished write must not be readable: {other:?}"),
+                }
+                drop(s3);
+
+                // The leader dies. In this one-node deployment the leader is the
+                // process, so every group stops and is reopened from its durable
+                // directories with the same replica identity.
+                shutdown(f).await;
+                let f = reopen_multigroup(&dir).await;
+
+                // The recovery path is real: the lease record comes back from
+                // group 2's applied state and the fragment is still on disk.
+                assert!(
+                    f.distinct_ids().contains(&orphan),
+                    "the appended fragment must survive the restart"
+                );
+                let s3 = f.s3();
+                match s3.get_object_consistent(1, "store", "bucket", "unpublished") {
+                    Err(S3Error::ObjectNotFound { .. }) => {}
+                    other => panic!("the restart must not publish the manifest: {other:?}"),
+                }
+
+                // A live lease still refuses its group after recovery, and the
+                // orphan survives a real collection pass.
+                let outcome = f.sweep();
+                assert_eq!(outcome.fragments_deleted, 0, "{outcome:?}");
+                assert_eq!(outcome.groups_refused.len(), 1, "{outcome:?}");
+                let refusal = &outcome.groups_refused[0];
+                assert!(refusal.starts_with("group 2 refused:"), "{refusal}");
+                assert!(refusal.contains("live lease"), "{refusal}");
+                assert!(
+                    f.distinct_ids().contains(&orphan),
+                    "a live writer lease must protect its fragment across a leader death: {outcome:?}"
+                );
+
+                // Expire the record deterministically, as the existing sweep
+                // tests do: it stays present and unreaped, and the next pass
+                // must reap it before it may delete anything.
+                let mut expired = writer.clone();
+                expired.expires_at_ms = 1;
+                let expired_write = f
+                    .meta
+                    .execute(KvCommand::RevisionTxn {
+                        guards: vec![writer.guard()],
+                        ops: vec![yadb_metakv::TxnOp::Put {
+                            key: gc::lease_key(&writer),
+                            value: serde_json::to_vec(&expired).unwrap(),
+                        }],
+                    })
+                    .unwrap();
+                assert!(
+                    matches!(expired_write, yadb_metakv::KvResult::TxnOk { .. }),
+                    "{expired_write:?}"
+                );
+
+                let outcome = f.sweep();
+                assert!(outcome.refusal.is_none(), "{outcome:?}");
+                assert!(outcome.groups_refused.is_empty(), "{outcome:?}");
+                assert!(outcome.fragments_deleted > 0, "{outcome:?}");
+                assert!(
+                    !f.distinct_ids().contains(&orphan),
+                    "an expired writer lease must let the pass collect its fragment: {outcome:?}"
+                );
+                assert!(
+                    f.meta.try_get(&gc::lease_key(&writer)).unwrap().is_none(),
+                    "the pass must reap the expired writer lease"
+                );
+
+                drop(s3);
+                shutdown(f).await;
+            })
+            .await
+            .expect("leader-death-before-publication test timed out");
+        }
+
+        /// The leader of group 2 dies after the manifest that names an S3
+        /// object's fragments has committed.
+        ///
+        /// The committed half of the same shape: the restart must return the
+        /// exact bytes, and a real pass after recovery must keep every fragment
+        /// the committed manifest names. A death alone may not turn an
+        /// acknowledged write into garbage.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_group_leader_death_after_publication_keeps_the_committed_blob_readable() {
+            tokio::time::timeout(Duration::from_secs(60), async {
+                let f = multigroup("leader-death-committed").await;
+                let dir = f.dir.clone();
+
+                // The real S3 write path: allocation, intent, fragments and the
+                // manifest publication all go through the engine.
+                let payload: Vec<u8> = (0..40_000u32).map(|i| (i % 251) as u8).collect();
+                let s3 = f.s3();
+                let published = s3
+                    .put_object(
+                        1,
+                        "store",
+                        POOL,
+                        "bucket",
+                        "committed",
+                        "application/octet-stream",
+                        &payload,
+                    )
+                    .unwrap();
+                let chunks: Vec<BlobId> = published
+                    .chunks
+                    .iter()
+                    .map(|chunk| chunk.blob_id.with_part(0))
+                    .collect();
+                assert!(
+                    chunks.len() >= 2,
+                    "the fixture must span several chunks: {}",
+                    chunks.len()
+                );
+                let before = f.distinct_ids();
+                assert!(chunks.iter().all(|id| before.contains(id)), "{chunks:?}");
+                drop(s3);
+
+                shutdown(f).await;
+                let f = reopen_multigroup(&dir).await;
+
+                // A quorum-confirmed read, not the local applied view: the
+                // manifest and every fragment it names survived the restart.
+                let s3 = f.s3();
+                let (manifest, bytes) = s3
+                    .get_object_consistent(1, "store", "bucket", "committed")
+                    .expect("a committed blob must be readable after the leader restarts");
+                assert_eq!(bytes, payload);
+                assert_eq!(manifest.etag, published.etag);
+                assert_eq!(manifest.size, payload.len() as u64);
+
+                // A pass after recovery keeps every fragment the manifest names.
+                let outcome = f.sweep();
+                assert!(outcome.refusal.is_none(), "{outcome:?}");
+                assert!(outcome.groups_refused.is_empty(), "{outcome:?}");
+                let after = f.distinct_ids();
+                assert!(
+                    chunks.iter().all(|id| after.contains(id)),
+                    "a committed manifest must keep its fragments through a pass: {outcome:?}"
+                );
+
+                let (_, reread) = s3.get_object(1, "store", "bucket", "committed").unwrap();
+                assert_eq!(reread, payload);
+
+                drop(s3);
+                shutdown(f).await;
+            })
+            .await
+            .expect("leader-death-after-publication test timed out");
         }
 
         #[ignore = "Multi-Raft GC is temporarily disabled"]

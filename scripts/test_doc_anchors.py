@@ -56,7 +56,7 @@ CURRENT_CLAIMS = {
     # were dropped when that section was rewritten: the implementation is on
     # `feat/reader-lease`, so a line number taken from `main` would describe the
     # tree before the change. Those symbols are named in prose instead.
-    "crates/yadbd/src/gc.rs:628": ["sweep_groups"],
+    "crates/yadbd/src/gc.rs:634": ["sweep_groups"],
     "crates/yadb-blob/src/pool.rs:1590": ["repair_blob"],
     "crates/yadb-blob/src/volume.rs:634": ["tombstones"],
     "crates/yadb-metakv/src/openraft_client.rs:129": ["group_id"],
