@@ -32,9 +32,7 @@ ANCHOR_RE = re.compile(r"([A-Za-z0-9_./-]+\.(?:rs|py)):(\d+)")
 # rejected: an unverifiable anchor is not allowed to pass.
 REQUIRED_SUBSTRINGS = {
     "crates/yadbd/src/protocols/s3.rs:683": ["is_openraft"],
-    "crates/yadbd/src/main.rs:539": ["begin_read_lease"],
-    "crates/yadbd/src/main.rs:7661": ["CONFLICT"],
-    "crates/yadbd/src/gc.rs:151": ["MULTIRAFT_GC_REFUSAL"],
+    "crates/yadbd/src/main.rs:548": ["begin_read_lease"],
 }
 
 # Every SKIP in tests/protocols.py, with the anchors its reason must keep.
@@ -43,15 +41,9 @@ REQUIRED_SUBSTRINGS = {
 # appear in the reason.  Adding a SKIP means adding it here: the scenario set
 # is compared exactly, in both directions.
 EXPECTED_SKIPS = {
-    "Multi-Raft repair scan": [
-        "repair asks which blobs should exist against every live manifest at once",
-        "crates/yadbd/src/main.rs:7661",
-        "Per-group garbage collection runs",
-        "no live drill",
-    ],
     "reader lease": [
         "crates/yadbd/src/protocols/s3.rs:683",
-        "crates/yadbd/src/main.rs:539",
+        "crates/yadbd/src/main.rs:548",
         "Multi-Raft has no fenced read lease",
     ],
 }

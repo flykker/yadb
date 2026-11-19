@@ -21,13 +21,13 @@ than the project-group leader can therefore lag a commit; assertions that need
 read-your-writes poll with `eventually` instead of racing the apply loop.
 
 Unavailable capabilities are reported as `SKIP <scenario>: <reason>` instead
-of being turned into a pass. Reader leases are legacy-gated, and Multi-Raft
-scrub still refuses its repair and orphan halves because both need one
-whole-deployment view of live manifests. Everything else runs: per-group
-garbage collection is driven through four live drills, and a cross-process
-`InstallSnapshot` is part of the normal run because the harness provisions the
-snapshot knobs instead of waiting for the 5000-entry default trigger. A skipped
-scenario is still a non-zero exit if anything else fails.
+of being turned into a pass. Reader leases are legacy-gated. Everything else
+runs: the repair scan repairs one metadata group at a time and refuses only the
+groups the scanning node does not lead, per-group garbage collection is driven
+through four live drills, and a cross-process `InstallSnapshot` is part of the
+normal run because the harness provisions the snapshot knobs instead of waiting
+for the 5000-entry default trigger. A skipped scenario is still a non-zero exit
+if anything else fails.
 """
 import argparse
 import datetime
@@ -80,6 +80,10 @@ CONTROL_GROUP = 1
 PROJECT_GROUPS = {"1": 2, "2": 3}
 # billing is project id 1 and therefore owned by data group 2.
 BILLING_GROUP = PROJECT_GROUPS["1"]
+# `examples/platform.yaml` routes the S3 store `receipts` (this harness's
+# `DEV.S3_TARGET`) to the striped `data-ec` pool. Every S3 object below is
+# therefore striped over that pool's six nominal slots, two per node.
+S3_POOL = "data-ec"
 
 # The daemon's default snapshot policy is `since_last:5000` with 1000 retained
 # logs (openraft 0.9.25 defaults), so reaching a cross-process InstallSnapshot
@@ -346,39 +350,83 @@ def request(port, method, path, body=b"", headers=None, timeout=30):
     return status, hs, data
 
 
-def assert_multiraft_scrub_repair_refusal(port, fragments):
-    """Scrub's repair half refuses on Multi-Raft; its collection halves run.
+def assert_multiraft_repair_scan(port, node, fragments=(), checked_at_least=0,
+                                 live_nodes=NODES):
+    """Scrub repairs per group and refuses only the groups this node does not lead.
 
-    The repair scan needs one whole-deployment view of every live manifest,
-    which Multi-Raft does not have, so it is refused and reported in
-    `repair_error` while the route answers 409. Garbage collection and orphan
-    blob collection do not need that view and are wired per group; here only
-    the wiring is asserted, because no intent expires inside a run. The
-    per-group garbage collection behaviour itself is exercised by
-    `assert_multiraft_gc_drills`.
+    The repair scan asks "which blobs should exist" and answers it from one
+    metadata group's quorum-confirmed snapshot: a project routes to exactly one
+    data group and a blob id embeds its project, so one group's manifests are
+    the complete live set for that group's blobs. A node leads only some
+    groups, so its pass refuses the rest by name in `repair_error` (and in the
+    sweep's `gc_refusal`) while the groups it does lead are scanned for real.
+    The route answers `200` only when every group was proved, so on this
+    cluster it must answer `409`; a `200` with a refusal in the body would be
+    the old lie.
+
+    Which groups the node leads is read from the live election, not assumed:
+    the launcher places one replica of every group on every node, but it is
+    OpenRaft that elects a leader, and the point of the assertion is that the
+    body names exactly the groups this *particular* node does not lead. Only
+    groups that own a project are scopes (`gc_group_scopes`), so the control
+    group is never in the total and a node that leads no data group refuses
+    every scope - which is the control leader's case here, and still a `409`.
+
+    `checked_at_least` is the number of live blobs the caller knows the led
+    group holds. It cannot be asserted for a group whose manifests name no
+    blob (the control group here), so it defaults to zero.
+
+    `live_nodes` is the set of nodes asked which leader they see. It defaults
+    to every node; a drill that stopped one passes the survivors, because
+    `wait_group_leader` refuses to agree on an answer that a dead node never
+    gave.
+
+    Returns the summary so a drill can assert the counters it produced.
     """
+    # A scope is a data group with a project routed to it; the control group
+    # owns no project and is not a scope at all.
+    data_groups = sorted(set(PROJECT_GROUPS.values()))
+    led = {group for group in data_groups
+           if wait_group_leader(group, nodes=live_nodes) == node}
+    refused = [group for group in data_groups if group not in led]
     status, _, body = request(port, "POST", "/v1/pools/scrub",
                               headers=admin_headers())
-    assert status == 409, (status, body)
     summary = json.loads(body)
-    reason = summary["repair_error"] or ""
-    assert "repair scan disabled for Multi-Raft" in reason, summary
-    assert summary["blobs_repaired"] == 0 and summary["fragments_repaired"] == 0, summary
-    # Orphan blob collection is per group, so the whole-deployment refusal must
-    # be gone. A node leads only some groups, so the rest are named in the
-    # error rather than silently treated as collected; that is the expected
-    # shape, not a failure. This proves the wiring, not the deletion path: no
-    # intent expires inside a run (`INTENT_GRACE_SECS` is 300 s), so a live
-    # pass always has nothing to collect.
+    refusal = summary["repair_error"]
+    sweep_refusal = summary["gc_refusal"]
+    # The route's own rule, checked against the body rather than assumed: a
+    # refusal is an error status, never a 200 with zero counts.
+    expected = 200 if refusal is None and sweep_refusal is None else 409
+    assert status == expected, (status, summary)
+    if refused:
+        assert refusal, summary
+        assert sweep_refusal, summary
+        assert refusal.startswith(
+            f"repair scan refused for {len(refused)} of {len(data_groups)} "
+            f"metadata group(s): "), summary
+        for group in refused:
+            assert f"group {group} refused:" in refusal, summary
+        for group in led:
+            assert f"group {group} refused:" not in refusal, summary
+    else:
+        assert refusal is None, summary
+    if sweep_refusal:
+        for group in refused:
+            assert f"group {group}" in sweep_refusal, summary
+    # Orphan collection is per group too: no group is refused for lacking a
+    # whole-deployment view, and an unproven group is named rather than counted
+    # as collected. The deletion path is exercised by the orphan-collection
+    # drill.
     error = summary["orphan_collection_error"] or ""
     assert "whole-deployment view" not in error, summary
-    assert summary["orphan_blobs_collected"] == 0, summary
-    for reason in [error] if error else []:
+    for reason in error.split("; ") if error else []:
         assert reason.startswith("group "), summary
+    assert summary["blobs_checked"] >= checked_at_least, summary
     for fragment_port, fragment_path, expected in fragments:
         result = request(fragment_port, "GET", fragment_path,
                          headers={"x-yadb-raft-token": RAFT_TOKEN})
         assert result[0] == 200 and result[2] == expected, (fragment_path, result)
+    return summary
 
 
 def vdisk_blob_id(project, owner, generation, step, channel, part=1):
@@ -579,6 +627,104 @@ def assert_multiraft_gc_drills(health, control_fragments):
     control_fragments_intact()
 
 
+def assert_multiraft_repair_drill(health, nodes, temp, env):
+    """Drive the per-group repair scan through a node outage and its return.
+
+    Every object is striped over the pool's six nominal slots, two per node, and
+    a write whose nominal slot is offline moves that part to a handoff slot on a
+    live node. That gives both halves of the repair contract without an
+    injection point:
+
+    1. With one node down, a blob written *before* the outage has two parts that
+       cannot be pinned anywhere: the scan reports it `blobs_unrecoverable`,
+       never repaired and never intact. Blobs written *during* the outage are
+       complete through their handoff copies, so they count intact - the ack
+       meant every part was durable - and they are not repaired yet, because
+       the slots that would receive the move are the ones that are down.
+    2. With the node back, those handoff parts are rewritten to their nominal
+       slots (`fragments_repaired >= 1`), the unrecoverable count returns to
+       zero, and every object reads back byte-identical.
+
+    The node taken down hosts nominal slots 2 and 5 of the striped pool and
+    leads neither the billing group nor the control group, so both metadata
+    leaders stay in office and the scrub still runs on a group leader. Reads are
+    local-applied, so every read below goes to the billing group's leader.
+    """
+    pool = next(each for each in health["pools"] if each["pool_name"] == S3_POOL)
+    node_of = {slot["slot_index"]: slot["node_id"] for slot in pool["slots"]}
+    leader = wait_group_leader(BILLING_GROUP)
+    control_leader = wait_group_leader(CONTROL_GROUP)
+    down = 3
+    # Placement is the launcher's, but the drill's meaning is not: if the
+    # striped pool ever puts these slots elsewhere, or elects this node as a
+    # leader, fail instead of asserting a story about the wrong node.
+    assert down not in (leader, control_leader), (down, leader, control_leader)
+    assert node_of[2] == down and node_of[5] == down, node_of
+
+    # Precondition, not decoration: the counters below are exact only if this
+    # drill starts from a healthy, fully checked live set. A pass that cannot
+    # prove the pre-outage state would make the deltas meaningless.
+    baseline = assert_multiraft_repair_scan(http_port(leader), leader)
+    assert baseline["blobs_unrecoverable"] == 0, baseline
+    assert baseline["blobs_intact"] == baseline["blobs_checked"], baseline
+    base = baseline["blobs_checked"]
+
+    # One blob from before the outage: its parts 2 and 5 are on the node that
+    # goes down, and it has no handoff copy to read them from.
+    before_key = "/invoices-2026/repair/before-outage"
+    before_body = b"p" * (1024 * 1024)
+    assert signed(s3_port(leader), "PUT", before_key, before_body, timeout=120)[0] == 200
+    s3_visible(s3_port(leader), before_key, before_body, timeout=120)
+
+    nodes[down-1].kill()
+    nodes[down-1].wait(timeout=10)
+    during = []
+    try:
+        for index in range(3):
+            key = f"/invoices-2026/repair/during-outage-{index}"
+            body = bytes([0x41 + index]) * (1024 * 1024)
+            status, _, response = signed(s3_port(leader), "PUT", key, body, timeout=120)
+            assert status == 200, (key, status, response)
+            during.append((key, body))
+
+        summary = assert_multiraft_repair_scan(
+            http_port(leader), leader, live_nodes=[n for n in NODES if n != down])
+        # The shape of this cluster's first pass: the four live blobs the drill
+        # just created, three of them readable, and one unrecoverable because
+        # two of its parts are on the down node. Nothing is repaired while the
+        # receiving slots are down.
+        assert summary["blobs_checked"] == base + 4, summary
+        assert summary["blobs_intact"] == base + 3, summary
+        assert summary["blobs_repaired"] == 0, summary
+        assert summary["fragments_repaired"] == 0, summary
+        assert summary["blobs_unrecoverable"] >= 1, summary
+        for key, body in during:
+            s3_visible(s3_port(leader), key, body, timeout=120)
+    finally:
+        # The rest of the run needs all three nodes. Restart even when an
+        # assertion above failed, then let the failure propagate.
+        if nodes[down-1].poll() is not None:
+            DEV.sync_replica_modes(temp)
+            nodes[down-1] = launch_node(temp, down, env)
+            wait(http_port(down))
+
+    wait_all_leaders()
+    leader = wait_group_leader(BILLING_GROUP)
+    summary = assert_multiraft_repair_scan(http_port(leader), leader)
+    # The same four blobs, now all readable: the pre-outage one is whole again,
+    # and the handoff parts of the three written during the outage were moved to
+    # their nominal slots.
+    assert summary["blobs_checked"] == base + 4, summary
+    assert summary["blobs_unrecoverable"] == 0, summary
+    assert summary["blobs_repaired"] >= 1, summary
+    assert summary["fragments_repaired"] >= 1, summary
+    assert (summary["blobs_intact"] + summary["blobs_repaired"]
+            + summary["blobs_unrecoverable"] == summary["blobs_checked"]), summary
+    for key, body in [(before_key, before_body)] + during:
+        s3_visible(s3_port(leader), key, body, timeout=120)
+    return summary
+
+
 def assert_vdisk_fence_rpc(port, pool_name, slot_index):
     """Drive the durable epoch and pin table over the shipped internal surface.
 
@@ -586,7 +732,7 @@ def assert_vdisk_fence_rpc(port, pool_name, slot_index):
     run on `SimFs`. This drill goes through the router of a running node, with
     the real token check and a real on-disk epoch, so it proves the routes are
     wired and that a refusal leaves the fragment readable. It does not run a
-    collector: none exists yet, and the four collection drills still cannot run.
+    collector: `assert_multiraft_gc_drills` does that through `/v1/pools/gc`.
     """
     internal = {"x-yadb-raft-token": RAFT_TOKEN}
     json_headers = {**internal, "Content-Type": "application/json"}
@@ -1510,7 +1656,11 @@ def launch_node(root, node, env):
 
 def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
     global SECRET, RAFT_TOKEN, SUBJECT_SECRET
-    base = "/data/data/com.foxdebug.acodefree/cache/opencode"
+    # This used to be a hardcoded Termux path
+    # (/data/data/com.foxdebug.acodefree/cache/opencode) that does not exist on
+    # a normal host, which killed the run before provisioning. The system temp
+    # directory is the portable default; YADB_PROTOCOLS_TMP overrides it.
+    base = os.environ.get("YADB_PROTOCOLS_TMP") or tempfile.gettempdir()
     with tempfile.TemporaryDirectory(prefix="yadb-protocols-", dir=base) as temp:
         temp = Path(temp)
         # Provisioning is the launcher's, not a copy: credentials, TLS keys,
@@ -1599,17 +1749,14 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
                     gc_fragments.append((port, gc_path, payload))
             assert gc_fragments, "no VDisk fragments seeded for the GC drills"
             control_leader = wait_group_leader(CONTROL_GROUP)
-            assert_multiraft_scrub_repair_refusal(http_port(control_leader), gc_fragments)
-            print("PASS Multi-Raft scrub refuses its repair half, collects per group")
-            skip("Multi-Raft repair scan",
-                 "repair asks which blobs should exist against every live "
-                 "manifest at once, and Multi-Raft has no single atomic view "
-                 "across groups: crates/yadbd/src/main.rs:7661 answers 409 and "
-                 "names that view. Per-group garbage collection runs and the "
-                 "four drills below cover it; orphan-blob collection runs per "
-                 "group but has no live drill, because an upload intent only "
-                 "expires after INTENT_GRACE_SECS = 300 s and nothing in a run "
-                 "waits that long")
+            # The control group's leader leads no data group, so its pass
+            # proves the refusal half of the contract: every scope is named and
+            # nothing is reported as scanned. The repair itself is proved by
+            # `assert_multiraft_repair_drill` below.
+            assert_multiraft_repair_scan(http_port(control_leader), control_leader,
+                                         gc_fragments)
+            print("PASS Multi-Raft scrub answers 409 and names every data group "
+                  "this node does not lead")
             assert_multiraft_gc_drills(health, gc_fragments)
             print("PASS Multi-Raft GC: live-pin fence, per-group leadership, "
                   "superseded epoch, clean collection")
@@ -1625,6 +1772,12 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
                 first_pool["pool_name"],
                 first_slot["slot_index"])
             print("PASS VDisk epoch, pin, advance and collectable-delete refusals")
+            # These drills run after the GC drills and before the sections that
+            # create their own objects: the repair drill's counters are exact
+            # only while its four objects are the whole live set.
+            assert_multiraft_repair_drill(health, nodes, temp, env)
+            print("PASS Multi-Raft repair scan repairs per group, refuses only "
+                  "groups this node does not lead")
             a, b = Pg(pg_port(2)), Pg(pg_port(3))
             a.query("CREATE TABLE wire (id INT PRIMARY KEY, balance INT);")
             a.query("INSERT INTO wire VALUES (1,100), (2,200);")
@@ -1869,7 +2022,7 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
             skip("reader lease",
                  "begin_read_lease is legacy-gated: the gate is `!st.app.meta."
                  "is_openraft()` at crates/yadbd/src/protocols/s3.rs:683, and the "
-                 "lease itself is declared at crates/yadbd/src/main.rs:539, so "
+                 "lease itself is declared at crates/yadbd/src/main.rs:548, so "
                  "Multi-Raft has no fenced read lease to acquire, renew or expire; "
                  "consistent reads use the quorum snapshot instead")
             # Multipart upload: the parts are real durable allocations, and the
