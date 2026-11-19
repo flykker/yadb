@@ -1,0 +1,13 @@
+{
+  "version": 2,
+  "control_group": 1,
+  "project_groups": {
+    "1": 2,
+    "2": 3
+  },
+  "groups": [
+    "/home/flykker/usr/yadb/cluster_data/config/node-3-group-1.json",
+    "/home/flykker/usr/yadb/cluster_data/config/node-3-group-2.json",
+    "/home/flykker/usr/yadb/cluster_data/config/node-3-group-3.json"
+  ]
+}

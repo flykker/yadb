@@ -1,0 +1,10 @@
+{
+  "http_base": 8420,
+  "node_ids": [
+    1,
+    2,
+    3
+  ],
+  "deployment_id": "29c61a5f-1d79-447d-a670-e0c8d8627b96",
+  "listener_sha256": "8a46eab4bf2049512046221023f43d3a26fb92029337c5a3db4f22099773ad42"
+}

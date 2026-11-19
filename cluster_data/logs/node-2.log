@@ -1,0 +1,7 @@
+yadbd node 2 listening on http://127.0.0.1:8421 (data="/home/flykker/usr/yadb/cluster_data/data/node-2", generation=0)
+openraft transport node=2 group=1 peer=None connection closed before dispatch occurrence=1
+openraft transport node=2 group=2 peer=None connection closed before dispatch occurrence=3
+openraft transport node=2 group=3 peer=None connection closed before dispatch occurrence=2
+openraft transport node=2 group=1 peer=None connection closed before dispatch occurrence=4
+openraft transport node=2 group=2 peer=None connection closed before dispatch occurrence=5
+openraft transport node=2 group=3 peer=None connection closed before dispatch occurrence=6

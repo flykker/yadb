@@ -134,8 +134,31 @@ switched. See `docs/multiraft-verification.md`.
   election. A separate targeted three-process daemon test covers SQL/S3 HTTP
   leader routing; the local cluster smoke also covers SQL/S3/block, but broader
   multi-node daemon and protocol validation remain pending.
-- [ ] Select the independent group leader for forwarding and protocol transaction
+- [x] Select the independent group leader for forwarding and protocol transaction
   fencing; do not use the control group's leader/term for every project.
+  Forwarding, the forwarded-request guard and the PostgreSQL-wire transaction
+  term resolve `role_info_for_key("/db/{id}/")`; reader leases resolve
+  `gc_group_for_project` and carry that group's applied index; per-group GC uses
+  `role_info_for_group`. The control group's `role_info()` remains only for
+  control-plane and unkeyed traffic, health/status reporting and the legacy
+  runtime, where a single namespace really is what is being asked about. The
+  audit found no site that used the control group where the project group was
+  right, so this is proof rather than a fix.
+  `forwarding_and_fencing_follow_the_project_group_not_the_control_group` pins
+  it in-process with a mesh fixture that separates the leaders: the control
+  group is led by node 2 while group 2 is led by node 1 and later node 3. A
+  control-group change alone neither redirects nor fences a project write, a
+  project write this node leads runs locally although the node is a control
+  follower, a group-2 change redirects the write to node 3 with
+  `x-yadb-leader-id: 3` while control role, term and leader are unchanged, a
+  forwarded copy reaching a non-leader is refused naming that group's leader,
+  and the reader lease lands in group 2 carrying group 2's applied index with no
+  record in group 3. The two keyed routing sites were inverted and the test
+  fails at each: forcing either to `role_info()` makes the project write address
+  the control leader (`left: "2"`, `right: "3"`) or run locally when it must be
+  forwarded. Open: the live multi-process/multi-host drill, which is a separate
+  gate, and the fake remote leader only answers the forwarding HTTP, so the test
+  proves addressing and refusal rather than a committed write on node 3.
 - [x] Reject transactions spanning groups before submission. Never synthesize a
   global revision or an atomic cross-group snapshot. Use project-group revisions
   for S3 leases/GC; administrative merged scans are non-atomic local observations.
