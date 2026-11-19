@@ -231,9 +231,11 @@ What it does **not** establish, and why the invariant still does not hold:
   takes and releases one pin per candidate it tries, and a pin cannot be
   extended: the TTL is the maximum the target accepts, so a fetch that outlives
   five minutes loses its protection. No read path can extend a pin.
-* Only the legacy collector path advances epochs and calls
-  `delete_collectable`. On Multi-Raft nothing does, and the unfenced `delete`
-  remains callable from any caller that has a `PoolSlot`.
+* The collector path that advances epochs and calls `delete_collectable` runs
+  only on the legacy runtime. The per-group functions exist and share the same
+  `sweep_pool`, but `sweep` returns the Multi-Raft refusal before reaching them,
+  and the unfenced `delete` remains callable from any caller that has a
+  `PoolSlot`.
 * GC enablement is still refused on Multi-Raft (`409` on `/v1/pools/gc` and
   `/v1/pools/scrub`), and none of the four live drills in "What would prove it"
   has run.
@@ -302,9 +304,19 @@ on the legacy runtime, does the following before its first deletion:
    fence is still checked before the first deletion, before every barrier group
    and every 32 exact tombstones.
 
+The per-group path (`sweep_groups` -> `sweep_group`) uses the same `sweep_pool`,
+so it inherits the advance-then-delete ordering. It additionally checks that
+every live lease it found could have been published by the group it is sweeping:
+`lease_belongs_to_group` compares the record's `group` field and its claimed
+`revision` against the group's applied index, re-read after admission closed, and
+refuses the group on a mismatch. Neither field is self-enforcing - both are
+written by the leaseholder - so trusting them would let a foreign or forged
+record act as a fence.
+
 What this does not establish: the ordering is enforced structurally (the advance
 is the first statement), not observed as a write sequence; no concurrent reader
-fetches while a pass runs in any test; and none of it runs on Multi-Raft, where
+fetches while a pass runs in any test; the provenance check has no runtime caller
+because `sweep_groups` is unreachable; and none of it runs on Multi-Raft, where
 `sweep` still returns the refusal first.
 
 ## Why the reader lease is not the next increment

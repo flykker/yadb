@@ -685,11 +685,14 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   `collector_epoch`), and `PoolStriper` uses them: the read path pins a slot
   before every fragment fetch and fails closed when the pin is refused, and the
   legacy `sweep_pool` advances every slot of a pool before its first deletion
-  and deletes through `delete_collectable`. What is still missing is the
-  Multi-Raft side: `sweep` returns the refusal before reaching any of it, no
-  per-group pass exists, no route verifies the signed fence token (the routes
-  authenticate with the shared internal Raft token), and the four cluster drills
-  have not run. Collection therefore stays refused, and garbage accumulates and
+  and deletes through `delete_collectable`. The per-group path shares that
+  `sweep_pool` and additionally refuses a live lease whose provenance it cannot
+  verify (`lease_belongs_to_group` checks the record's group and claimed
+  revision against the group's applied index). What is still missing is the
+  Multi-Raft side: `sweep` returns the refusal before reaching any of it, so the
+  per-group path has no runtime caller, no route verifies the signed fence token
+  (the routes authenticate with the shared internal Raft token), and the four
+  cluster drills have not run. Collection therefore stays refused, and garbage accumulates and
   can fill the disk;
   this is a knowingly accepted temporary measure. The repair (orphan) scan is
   also still refused, because it needs one whole-deployment view.
