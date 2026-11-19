@@ -230,11 +230,12 @@ need the PostgreSQL, S3 and iSCSI frontends as well; `scripts/yadb-local.py`
 provisions a Multi-Raft cluster without the client protocol listeners.
 
 Multi-Raft mark-and-sweep runs per metadata group. Each pass is leader-only and
-marks from a quorum-confirmed snapshot of its group; a live writer lease refuses
-that group, and a pool whose epoch advance is refused (a live pin, or an
-unreadable slot) is refused by name and deletes nothing. Multi-Raft readers
-publish no *metadata* lease, by design; the target-side pin is what protects a
-read in flight.
+marks from a quorum-confirmed snapshot of its group; a live writer or reader
+lease refuses that group, and a pool whose epoch advance is refused (a live
+pin, or an unreadable slot) is refused by name and deletes nothing. Readers
+publish a per-group reader lease as well as pinning each fragment at the
+target, so a group that has served a read in the last 30 s refuses collection
+until that lease lapses.
 
 Storage-side fencing crosses the wire. A barrier carries the collector lease
 deadline, and a target refuses an expired one with `409` instead of evicting a
@@ -264,7 +265,9 @@ until the record expires on its own. A reader or writer therefore cannot
 act under a lease the collector already considers dead, and `begin_read_lease`
 publishes a fresh record instead of reusing a dead one. What remains unproven is
 exactly item 3 of the plan: the record lives in metadata, the deletion happens on
-a storage target that never sees it. The durable target epoch above is a
+a storage target that never sees it. The reader lease added on Multi-Raft does
+not change that: it is a back-off signal the collector consults before its mark,
+while the pin is the target-side fence. The durable target epoch above is a
 target-side fact, not a lease the target can evaluate; it only says which epoch a
 fragment belongs to.
 Manual GC runs per metadata group: it answers `200` when every group and pool
@@ -315,13 +318,24 @@ rather than counted as collected. Orphan collection still needs an enumerable
 project set: a scope that covers every project (`project_ids == None`, as in a
 single-group deployment) is refused instead of scanned partially.
 
-Multi-Raft readers take no *metadata* read lease, by design: `read_part` reads
-the slot epoch and pins it, and `delete_collectable` refuses while any pin is
-live. The fence is per fragment at the point of use; it cannot expire mid-read
-without the read failing closed, and it does not depend on the reader
-re-checking a metadata record around each fetch. A positive drill holds an S3
-`GET` open, observes the slot's live pin, then releases the response and
-observes the pin drain with the object intact.
+Multi-Raft readers publish a *metadata* read lease, renewed across reads and
+scoped to the project's metadata group, as well as pinning the fragment at the
+target. `AppState::begin_read_lease` resolves the owning group with
+`gc_group_for_project` and caches one record per group (a map keyed by
+`Option<u64>`, `None` being the legacy namespace); the record carries the
+group's applied log index as its revision, and `lease_belongs_to_group` checks
+that provenance when the collector closes admission. The target-side pin is
+still the finer fence: `read_part` reads the slot epoch and pins it, and
+`delete_collectable` refuses while any pin is live, so a read that outlives its
+metadata lease is still fenced per fetch by the pin at the point of use.
+
+The operational consequence is deliberate: `POST /v1/pools/gc` and the
+collection half of `POST /v1/pools/scrub` refuse a group whose reader lease is
+live, for up to the 30 s TTL after the last read in that group. A collector
+against a recently read group therefore refuses rather than collects; run it
+after a quiet window, or read the refusal and retry. The lease is coarser than the pin — it
+fences the whole group, not the fragment being read — and it buys a
+collector-visible back-off signal that is consulted before the mark is taken.
 
 `PersistentGroup::create` requires a new replica directory. It reserves that
 directory, syncs its parent, writes a versioned `replica.json` binding the exact
