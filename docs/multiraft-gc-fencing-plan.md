@@ -1,14 +1,17 @@
 # Plan: storage-side fencing for Multi-Raft garbage collection
 
 **Status: the mechanism below is design only and is not implemented**, apart from
-three narrow pieces of storage-side fencing: a barrier carries the collector
+four narrow pieces of storage-side fencing: a barrier carries the collector
 lease deadline and the target refuses an expired one, a target keeps a durable
 epoch it can refuse an exact delete against (see "What the target epoch now
-establishes"), and a target keeps a durable pin table it can refuse an epoch
+establishes"), a target keeps a durable pin table it can refuse an epoch
 advance and a collectable delete against (see "What the pin table now
-establishes"). None of the three establishes the invariant, and Multi-Raft
-mark-and-sweep stays refused (`409` on `/v1/pools/gc` and `/v1/pools/scrub`,
-periodic task logged and skipped) until the mechanism below exists and is proven.
+establishes"), and a remote slot can reach all of it over the internal VDisk
+surface (see "What the fence transport now establishes"). The last one is
+transport: no collector calls it and no reader pins before a fetch. None of the
+four establishes the invariant, and Multi-Raft mark-and-sweep stays refused
+(`409` on `/v1/pools/gc` and `/v1/pools/scrub`, periodic task logged and skipped)
+until the mechanism below exists and is proven.
 Garbage accumulates in the meantime; that cost was accepted deliberately.
 
 ## Why the current refusal exists
@@ -341,7 +344,8 @@ the ordering above and from the same fail-closed rule the barrier uses.
 * **A pin names one epoch, and it must be the current one.** A pin for an older
   epoch is refused: the reader would be pinning an epoch the collector may already
   have advanced past, so the pin would prove nothing. A pin for a newer epoch is
-  also refused — that epoch does not exist yet.
+  also refused — that epoch does not exist yet. (Implemented: `pin` returns
+  `PinEpochNotCurrent` naming both epochs.)
 * **`advance_epoch` refuses while any unexpired pin exists**, with a distinct
   error, in addition to the existing expected-epoch check. Both refusals are "stop
   this pass", never retryable.
@@ -360,6 +364,29 @@ the ordering above and from the same fail-closed rule the barrier uses.
 * **Compaction keeps unexpired pins and may drop expired ones.** Dropping a live
   pin while rewriting a segment would be the same loss as forgetting it on restart.
 * **Recovery drops expired pins and keeps the rest**, and never invents a pin.
+
+#### How one pin protects fragments the reader did not write
+
+A reader pins the target's current epoch, but the fragment it fetches may have
+been written under an older one. The per-fragment rule ("no unexpired pin names
+`f`") does not cover that case on its own: nothing can pin an older epoch, so a
+fragment from epoch `N-1` has no pin of its own and looks collectable at
+collector epoch `N+1`.
+
+The protection is the advance refusal, and it only works because the collector
+advances before it deletes:
+
+1. A reader reads epoch `N` and pins it. A collector's `advance_epoch(N)` is now
+   refused, so the collector's pass stops with nothing deleted — including the
+   older fragments, which were never reached.
+2. If the collector advanced to `N+1` first, the reader's `pin(N)` is refused as
+   not-current, and the read must fail closed rather than fetch unfenced.
+
+So the ordering is load-bearing in both directions, and a reader that treats a
+refused pin as "retry with the new epoch" would silently read a fragment the
+collector may already have deleted. A retry is only safe if it re-reads the
+fragment under the new pin, which is a different operation from resuming the one
+in flight.
 
 ## Epoch advance protocol (collector)
 
@@ -388,15 +415,54 @@ the epoch; after the advance has proved that no pin exists on any epoch and
 admission is closed, a barrier can only evict fragments the mark has already
 proved dead, so it does not need a separate epoch field.
 
+## What the fence transport now establishes
+
+A remote slot can now reach a target's epoch and pin table. `PoolSlot` exposes
+`epoch`, `live_pins`, `pin`, `unpin`, `advance_epoch`, `delete_fenced` and
+`delete_collectable` for a slot backed by another process, and the daemon serves
+them on the internal VDisk surface:
+
+| Route | Effect |
+| --- | --- |
+| `GET /internal/vdisk/{pool}/{slot}/epoch` | the durable epoch |
+| `GET /internal/vdisk/{pool}/{slot}/pins` | every unexpired pin |
+| `POST /internal/vdisk/{pool}/{slot}/pin` | take a pin on one epoch for a TTL |
+| `POST /internal/vdisk/{pool}/{slot}/unpin` | release a pin id, idempotently |
+| `POST /internal/vdisk/{pool}/{slot}/advance` | raise the epoch from an expected value |
+| `DELETE /internal/vdisk/{pool}/{slot}/blob/{blob_hex}?fence_epoch=` | delete only if the fragment's epoch equals the named one |
+| `DELETE …?collector_epoch=` | delete only if the fragment is older than the named epoch and unpinned |
+
+Every handler requires the internal Raft token, and a refusal is a `409` with a
+stable code (`epoch_mismatch`, `epoch_pinned`, `fenced_by_epoch`,
+`fragment_not_older`, `fragment_pinned`, `epoch_exhausted`, …). The client maps
+`storage_unavailable` to `StorageUnavailable` and every other non-200 to
+`RemoteFenceRefused`; only a transport failure becomes `Io`. That distinction is
+the point: "the target refused" and "the target could not be asked" have
+different consequences for a collector, and neither may be read as success.
+
+What this does **not** establish:
+
+* **No route verifies a fence token.** The handlers authenticate the connection
+  with the shared internal Raft token, not the operation with a group-key
+  signature. `yadb_metakv::fence_token` exists as a signed primitive - group,
+  sender, recipient, operation, epoch, deadline, under a domain prefix separate
+  from the Raft envelope - but it has no consumer. So "a superseded collector
+  cannot delete" rests today on the target's epoch compare-and-swap alone. The
+  token would add the property that the *operation*, not just the connection,
+  was issued by a voter of that group; it does not exist yet.
+* **Nothing calls these routes.** No collector advances an epoch or calls
+  `delete_collectable`; no reader takes a pin before a fetch. GC enablement is
+  still refused, and the four drills in "What would prove it" have not run.
+
 ## What has to change, by component
 
 | Component | Change |
 | --- | --- |
 | `crates/yadb-metakv/src/gc.rs` | Keep the admission CAS and the provenance check, but demote the lease to an optimisation: correctness no longer depends on it |
 | `crates/yadbd/src/gc.rs` | Sweep only with a fence epoch obtained per target; treat `stale fence` as "stop this pass", never as retryable |
-| storage target (blob volume + the daemon's fragment endpoint) | Durable epoch and pin table with expiry (both done for the volume, see above), versioned delete RPC, signed fence token |
+| storage target (blob volume + the daemon's fragment endpoint) | Durable epoch and pin table with expiry (done for the volume), versioned delete RPC (done, see above), signed fence token (primitive only, no route verifies it) |
 | reader path (S3/DB/iSCSI fragment fetch) | Pin before fetch, unpin after; fail closed when a pin is refused |
-| `crates/yadb-metakv/src/openraft_transport.rs` | Sign the fence token with the existing per-node key; do not invent a second identity |
+| `crates/yadb-metakv/src/openraft_transport.rs` | Sign the fence token with the existing per-node key; do not invent a second identity (done: `sign`/`verify_signature` are shared) |
 | `tests/protocols.py` | A live drill: start a pass, hold a read open, assert the fragment survives; then assert it is collected after the pin is released |
 
 ## What would prove it
