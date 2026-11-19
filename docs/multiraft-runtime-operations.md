@@ -292,7 +292,12 @@ to its nominal slot, and a tombstoned id refuses that write, so a pass cannot
 resurrect a collected blob. A follower group, or a group without a quorum, is
 refused by name in `repair_error`; one group's refusal does not stop another
 group's pass, so on a multi-node cluster a node leads only some data groups,
-repairs those, and answers `409` naming the ones it does not lead.
+repairs those, and answers `409` naming the ones it does not lead. That `409`
+is not a failed pass: read the counters for the groups this node leads, and run
+the same request on each named group's leader to cover the rest. `yadbctl
+pool-scrub` cannot express that distinction — it prints the body and exits `1`
+on any non-`200` — so a scripted scrub must inspect `repair_error` rather than
+the exit status.
 
 Three limits stay stated. `block_pool_lookup` comes from the local control-plane
 cache, so a stale cache can make a pass skip a blob; it never repairs or deletes
