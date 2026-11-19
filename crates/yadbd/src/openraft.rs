@@ -154,6 +154,21 @@ fn read_bounded(path: &Path, max: u64) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// Reads the runtime marker of an existing root.
+///
+/// The marker is the only thing that makes a directory an OpenRaft root. A
+/// pre-OpenRaft directory reaches this branch, and a bare `NotFound` would tell
+/// the operator nothing about why the root was refused, so the failure names
+/// the guard. This reads; it never creates the marker.
+fn read_marker(root: &Path, max: u64) -> io::Result<Vec<u8>> {
+    read_bounded(&root.join(".yadb-openraft-runtime.json"), max).map_err(|error| {
+        invalid(format!(
+            "OpenRaft runtime marker is missing or unreadable in {}: {error}",
+            root.display()
+        ))
+    })
+}
+
 pub struct Prepared {
     identity: ReplicaIdentity,
     path: PathBuf,
@@ -358,7 +373,7 @@ impl PreparedMulti {
                 return Err(invalid("OpenRaft create requires new or empty data root"));
             }
         } else if root.join(".yadb-openraft-runtime.pending").exists()
-            || read_bounded(&root.join(".yadb-openraft-runtime.json"), MAX_MARKER)? != marker
+            || read_marker(&absolute, MAX_MARKER)? != marker
         {
             return Err(invalid("multi-group runtime marker mismatch"));
         }
@@ -396,7 +411,7 @@ impl PreparedMulti {
             std::fs::remove_file(pending)?;
             std::fs::File::open(root)?.sync_all()?;
         } else if root.join(".yadb-openraft-runtime.pending").exists()
-            || read_bounded(&root.join(".yadb-openraft-runtime.json"), MAX_MARKER)? != expected
+            || read_marker(root, MAX_MARKER)? != expected
         {
             return Err(invalid("multi-group runtime marker mismatch"));
         }
@@ -859,7 +874,6 @@ impl Prepared {
                 "public peer addresses must be concrete and local address must match --listen",
             ));
         }
-        let marker = root.join(".yadb-openraft-runtime.json");
         let canonical_root = if root.exists() {
             root.canonicalize()?
         } else {
@@ -890,7 +904,7 @@ impl Prepared {
                 if root.join(".yadb-openraft-runtime.pending").exists() {
                     return Err(invalid("incomplete OpenRaft root provisioning"));
                 }
-                let actual = read_bounded(&marker, 16 * 1024)?;
+                let actual = read_marker(&canonical_root, 16 * 1024)?;
                 if actual != self.marker_bytes(&canonical_root)? {
                     return Err(invalid("OpenRaft runtime marker mismatch"));
                 }
@@ -918,7 +932,7 @@ impl Prepared {
         if self.mode == Mode::Open {
             let lock = yadb_io::OsDirectoryLock::try_acquire(root)?;
             if root.join(".yadb-openraft-runtime.pending").exists()
-                || read_bounded(&root.join(".yadb-openraft-runtime.json"), 16 * 1024)?
+                || read_marker(&root.canonicalize()?, 16 * 1024)?
                     != self.marker_bytes(&root.canonicalize()?)?
             {
                 return Err(invalid("OpenRaft runtime marker mismatch"));
@@ -1139,6 +1153,119 @@ mod tests {
         let path = dir.join("config.json");
         std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
         (dir, path, config)
+    }
+
+    /// Everything a refused open must not change: the set of paths, each
+    /// entry's type, permissions and modification time, and every file's
+    /// bytes. Comparing mtimes catches an in-place rewrite that keeps the same
+    /// length; comparing the path set catches a created or removed lock,
+    /// marker or pending file.
+    #[derive(Debug, PartialEq, Eq)]
+    struct TreeEntry {
+        kind: &'static str,
+        mode: u32,
+        modified: Option<std::time::SystemTime>,
+        bytes: Vec<u8>,
+    }
+
+    fn tree_snapshot(root: &Path) -> BTreeMap<PathBuf, TreeEntry> {
+        fn walk(root: &Path, path: &Path, out: &mut BTreeMap<PathBuf, TreeEntry>) {
+            use std::os::unix::fs::PermissionsExt;
+            let metadata = std::fs::symlink_metadata(path).unwrap();
+            let kind = if metadata.is_dir() {
+                "dir"
+            } else if metadata.is_file() {
+                "file"
+            } else {
+                "other"
+            };
+            out.insert(
+                path.strip_prefix(root).unwrap().to_path_buf(),
+                TreeEntry {
+                    kind,
+                    mode: metadata.permissions().mode(),
+                    modified: metadata.modified().ok(),
+                    bytes: if metadata.is_file() {
+                        std::fs::read(path).unwrap()
+                    } else {
+                        Vec::new()
+                    },
+                },
+            );
+            if metadata.is_dir() {
+                let mut children = std::fs::read_dir(path)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path())
+                    .collect::<Vec<_>>();
+                children.sort();
+                for child in children {
+                    walk(root, &child, out);
+                }
+            }
+        }
+        let mut out = BTreeMap::new();
+        walk(root, root, &mut out);
+        out
+    }
+
+    /// A synthetic pre-OpenRaft directory: a legacy metadata tree with a WAL,
+    /// descriptors and an empty subdirectory. Nothing here is an OpenRaft
+    /// marker; a create must not adopt it and a refusal must not touch it.
+    fn legacy_tree(root: &Path) {
+        std::fs::create_dir_all(root.join("metakv")).unwrap();
+        std::fs::write(
+            root.join("metakv").join("state.json"),
+            br#"{"revision":7,"projects":{"alpha":1}}"#,
+        )
+        .unwrap();
+        std::fs::write(root.join("metakv").join("leases"), vec![0x7f; 64]).unwrap();
+        std::fs::create_dir_all(root.join("group")).unwrap();
+        std::fs::write(
+            root.join("group").join("raft.wal"),
+            b"YADBWAL1\x00\x01legacy",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("group").join("replica.identity"),
+            br#"{"node":1,"group":1,"incarnation":1}"#,
+        )
+        .unwrap();
+        std::fs::write(root.join("raft.wal"), b"YADBWAL1").unwrap();
+        std::fs::create_dir(root.join("empty-subdir")).unwrap();
+        std::fs::write(root.join("zero-byte"), b"").unwrap();
+        std::fs::write(root.join(".legacy-marker"), b"legacy-runtime-v1").unwrap();
+    }
+
+    /// Three singleton group configs plus a version-2 manifest, the shape the
+    /// daemon requires. No listener is ever bound here: the guards under test
+    /// run before `start`.
+    fn multi_fixture() -> (PathBuf, PathBuf, Vec<PathBuf>, String) {
+        let (dir, _, template) = fixture();
+        let mut paths = Vec::new();
+        let mut sockets = Vec::new();
+        for id in 1..=3u64 {
+            let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = socket.local_addr().unwrap();
+            sockets.push(socket);
+            let mut cfg = template.clone();
+            cfg["group"] = json!(id);
+            cfg["listen"] = json!(addr);
+            cfg["peers"][0]["address"] = json!(addr);
+            let path = dir.join(format!("group-{id}.json"));
+            std::fs::write(&path, serde_json::to_vec(&cfg).unwrap()).unwrap();
+            paths.push(path);
+        }
+        drop(sockets);
+        let manifest = dir.join("multi.json");
+        std::fs::write(
+            &manifest,
+            serde_json::to_vec(
+                &json!({"version":2,"control_group":1,"project_groups":{"1":2,"2":3},"groups":paths}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        (dir, manifest, paths, "127.0.0.1:8420".to_string())
     }
 
     async fn reopen_after_cancel(path: &Path) {
@@ -1545,6 +1672,314 @@ mod tests {
         assert!(prepared
             .validate_client_root(&root, 2, &peers, &listen)
             .is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Admission for creation is "the root is missing or empty", and every
+    /// refusal must leave the root exactly as it was. A root containing only an
+    /// *empty subdirectory* is the case a naive
+    /// `read_dir(root)?.next().is_none()` gets wrong, so it is checked
+    /// explicitly alongside a stray file and a half-written marker.
+    #[test]
+    fn create_admits_only_a_missing_or_empty_root() {
+        let (dir, path, mut config) = fixture();
+        let prepared = prepare(&path).unwrap();
+        let listen = prepared.members[&1].addr.clone();
+        let peers = BTreeMap::from([(1, listen.clone())]);
+        let root = dir.join("data");
+        let cluster = "01".repeat(16);
+
+        // Missing: validation admits it without writing; provisioning creates
+        // the directory and binds exactly one marker.
+        assert!(!root.exists());
+        prepared
+            .validate_client_root(&root, 1, &peers, &listen)
+            .unwrap();
+        assert!(!root.exists(), "validation must not create the root");
+        drop(prepared.provision_client_root(&root).unwrap());
+        let created = tree_snapshot(&root);
+        assert_eq!(created.len(), 2, "root and marker only: {created:?}");
+        assert!(created.contains_key(Path::new(".yadb-openraft-runtime.json")));
+        assert!(created.contains_key(Path::new("")));
+
+        // An existing OpenRaft root is reopened, not recreated, and reopening
+        // changes nothing. An open requires the replica path to exist, which
+        // creation itself would have made.
+        std::fs::create_dir(dir.join(format!("{cluster}-1-1-1"))).unwrap();
+        config["mode"] = json!("open");
+        config["initialize"] = json!(false);
+        std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+        let reopened = prepare(&path).unwrap();
+        reopened
+            .validate_client_root(&root, 1, &peers, &listen)
+            .unwrap();
+        drop(reopened.provision_client_root(&root).unwrap());
+        assert_eq!(tree_snapshot(&root), created);
+
+        // Creating again against the marked root is refused, not re-initialized.
+        // A new incarnation keeps the replica path absent, so the refusal below
+        // is the root guard and not the create/open path check.
+        config["mode"] = json!("create");
+        config["initialize"] = json!(true);
+        config["incarnation"] = json!(2);
+        std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+        let recreate = prepare(&path).unwrap();
+        let error = recreate
+            .validate_client_root(&root, 1, &peers, &listen)
+            .expect_err("a marked OpenRaft root must not be recreated");
+        assert!(error.to_string().contains("new or empty"), "{error}");
+        assert_eq!(tree_snapshot(&root), created);
+
+        // Anything else is refused, and the refusal is non-destructive.
+        for (case, build, message) in [
+            (
+                "empty-subdir",
+                (|root: &Path| std::fs::create_dir(root.join("sub")).unwrap()) as fn(&Path),
+                "empty",
+            ),
+            (
+                "stray-file",
+                (|root: &Path| std::fs::write(root.join("stray"), b"keep").unwrap()) as fn(&Path),
+                "empty",
+            ),
+            (
+                "partial-descriptor",
+                (|root: &Path| {
+                    std::fs::write(
+                        root.join(".yadb-openraft-runtime.pending"),
+                        b"{\"version\":",
+                    )
+                    .unwrap()
+                }) as fn(&Path),
+                "empty",
+            ),
+        ] {
+            let case_root = dir.join(case);
+            std::fs::create_dir(&case_root).unwrap();
+            build(&case_root);
+            let before = tree_snapshot(&case_root);
+            let error = prepared
+                .validate_client_root(&case_root, 1, &peers, &listen)
+                .expect_err(case);
+            assert!(error.to_string().contains(message), "{case}: {error}");
+            let error = match prepared.provision_client_root(&case_root) {
+                Ok(_) => panic!("{case}: provisioning accepted a non-empty root"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains(message), "{case}: {error}");
+            assert_eq!(tree_snapshot(&case_root), before, "{case} was modified");
+            assert!(
+                !case_root.join(".yadb-openraft-runtime.json").exists(),
+                "{case}: a refused create wrote the marker"
+            );
+        }
+
+        // A root that is a file rather than a directory is refused too.
+        let file_root = dir.join("not-a-directory");
+        std::fs::write(&file_root, b"x").unwrap();
+        let error = prepared
+            .validate_client_root(&file_root, 1, &peers, &listen)
+            .expect_err("a file root");
+        assert!(error.to_string().contains("new or empty"), "{error}");
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The marker binds the replica identity, so a reopen that changes the
+    /// group, incarnation, node or voter set must be refused even when the
+    /// replica path exists and every other config check passes.
+    #[test]
+    fn a_changed_group_incarnation_node_or_voter_set_is_refused_on_reopen() {
+        let (dir, path, config) = fixture();
+        let prepared = prepare(&path).unwrap();
+        let root = dir.join("data");
+        std::fs::create_dir(&root).unwrap();
+        let listen = prepared.members[&1].addr.clone();
+        let peers = BTreeMap::from([(1, listen.clone())]);
+        drop(prepared.provision_client_root(&root).unwrap());
+        let marker = std::fs::read(root.join(".yadb-openraft-runtime.json")).unwrap();
+        let cluster = "01".repeat(16);
+        let tls_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../yadb-metakv/testdata/tls");
+
+        // Node 2's material, so a voters or node mutation is a config `prepare`
+        // accepts rather than one it refuses for an unrelated reason.
+        let node2_key = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
+        let node2_pair = Ed25519KeyPair::from_pkcs8(node2_key.as_ref()).unwrap();
+        let node2_signing = dir.join("signing-2.der");
+        std::fs::write(&node2_signing, node2_key.as_ref()).unwrap();
+        let node2_cert = std::fs::read(tls_dir.join("node-2.test.cert.der")).unwrap();
+        let node2_socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let node2_addr = node2_socket.local_addr().unwrap();
+        drop(node2_socket);
+        let node2 = json!({"id":2,"address":node2_addr,"public_key":node2_pair.public_key().as_ref(),
+            "server_name":"node-2.test","cert_sha256":MutualTls::fingerprint(&node2_cert)});
+        let both = BTreeMap::from([(1, listen.clone()), (2, node2_addr.to_string())]);
+
+        let opened = || {
+            let mut cfg = config.clone();
+            cfg["mode"] = json!("open");
+            cfg["initialize"] = json!(false);
+            cfg
+        };
+        // `prepare` refuses a changed replica path before the marker is read,
+        // so each case creates the path it would compute and then proves the
+        // refusal came from the marker instead.
+        let refuse = |cfg: Value, peers: &BTreeMap<u32, String>, listen: &str, case: &str| {
+            std::fs::write(&path, serde_json::to_vec(&cfg).unwrap()).unwrap();
+            let prepared = prepare(&path).unwrap_or_else(|error| {
+                panic!("{case}: prepare refused before the marker check: {error}")
+            });
+            let node = cfg["node"].as_u64().unwrap() as u32;
+            let error = prepared
+                .validate_client_root(&root, node, peers, listen)
+                .expect_err(case);
+            assert!(
+                error.to_string().contains("marker mismatch"),
+                "{case}: {error}"
+            );
+        };
+
+        std::fs::create_dir(dir.join(format!("{cluster}-2-1-1"))).unwrap();
+        let mut group = opened();
+        group["group"] = json!(2);
+        refuse(group, &peers, &listen, "group");
+
+        std::fs::create_dir(dir.join(format!("{cluster}-1-2-1"))).unwrap();
+        let mut incarnation = opened();
+        incarnation["incarnation"] = json!(2);
+        refuse(incarnation, &peers, &listen, "incarnation");
+
+        std::fs::create_dir(dir.join(format!("{}-1-1-1", "02".repeat(16)))).unwrap();
+        let mut changed_cluster = opened();
+        changed_cluster["cluster"] = json!(vec![2u8; 16]);
+        refuse(changed_cluster, &peers, &listen, "cluster");
+
+        let mut voters = opened();
+        voters["peers"].as_array_mut().unwrap().push(node2.clone());
+        // The unchanged replica path must exist for an open to reach the marker.
+        std::fs::create_dir(dir.join(format!("{cluster}-1-1-1"))).unwrap();
+        refuse(voters, &both, &listen, "voters");
+
+        std::fs::create_dir(dir.join(format!("{cluster}-1-1-2"))).unwrap();
+        let mut node = opened();
+        node["node"] = json!(2);
+        node["listen"] = json!(node2_addr);
+        node["signing_key_der"] = json!(node2_signing);
+        node["tls"]["chain_der"] = json!([tls_dir.join("node-2.test.cert.der")]);
+        node["tls"]["key_der"] = json!(tls_dir.join("node-2.test.key.der"));
+        node["peers"].as_array_mut().unwrap().push(node2);
+        refuse(node, &both, &node2_addr.to_string(), "node");
+
+        assert_eq!(
+            std::fs::read(root.join(".yadb-openraft-runtime.json")).unwrap(),
+            marker,
+            "a refused reopen must not rewrite the marker"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A pre-OpenRaft directory passed as the client-data root must be refused
+    /// by creation (it is not empty) and by reopen (it carries no marker), and
+    /// the refusal must leave every path, byte, mode and mtime untouched: no
+    /// import, no rewrite, no lock file, no marker.
+    #[test]
+    fn a_legacy_directory_is_refused_and_left_byte_identical() {
+        let (dir, path, mut config) = fixture();
+        let prepared = prepare(&path).unwrap();
+        let root = dir.join("legacy-data");
+        legacy_tree(&root);
+        let before = tree_snapshot(&root);
+        let listen = prepared.members[&1].addr.clone();
+        let peers = BTreeMap::from([(1, listen.clone())]);
+
+        let error = prepared
+            .validate_client_root(&root, 1, &peers, &listen)
+            .expect_err("a legacy directory must be refused for creation");
+        assert!(error.to_string().contains("new or empty"), "{error}");
+        let error = match prepared.provision_client_root(&root) {
+            Ok(_) => panic!("provisioning adopted a legacy directory"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("not empty"), "{error}");
+        assert_eq!(
+            tree_snapshot(&root),
+            before,
+            "the create refusal was destructive"
+        );
+
+        // An open needs the replica path, which creation itself would have made.
+        std::fs::create_dir(dir.join(format!("{}-1-1-1", "01".repeat(16)))).unwrap();
+        config["mode"] = json!("open");
+        config["initialize"] = json!(false);
+        std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+        let reopened = prepare(&path).unwrap();
+        let error = reopened
+            .validate_client_root(&root, 1, &peers, &listen)
+            .expect_err("a legacy directory must be refused on reopen");
+        assert!(error.to_string().contains("marker"), "{error}");
+        let error = match reopened.provision_client_root(&root) {
+            Ok(_) => panic!("provisioning opened a legacy directory"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("marker"), "{error}");
+        assert_eq!(
+            tree_snapshot(&root),
+            before,
+            "the open refusal was destructive"
+        );
+
+        for name in [
+            ".yadb-openraft-runtime.json",
+            ".yadb-openraft-runtime.pending",
+        ] {
+            assert!(!root.join(name).exists(), "{name} was created");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The same guard on the multi-group path the daemon actually runs.
+    #[test]
+    fn a_legacy_directory_is_refused_by_the_multi_group_root_guard() {
+        let (dir, manifest, paths, public) = multi_fixture();
+        let prepared = prepare_multi(&manifest).unwrap();
+        let peers = BTreeMap::from([(1, public.clone())]);
+        let root = dir.join("client-data");
+        legacy_tree(&root);
+        let before = tree_snapshot(&root);
+
+        let error = prepared
+            .validate_client_root(&root, 1, &peers, &public)
+            .expect_err("a legacy directory must be refused for creation");
+        assert!(error.to_string().contains("new or empty"), "{error}");
+        let error = match prepared.provision_client_root(&root, &peers) {
+            Ok(_) => panic!("multi-group provisioning adopted a legacy directory"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("not empty"), "{error}");
+        assert_eq!(tree_snapshot(&root), before);
+
+        // An open needs each replica path, which creation itself would have made.
+        let cluster = "01".repeat(16);
+        for group in 1..=3 {
+            std::fs::create_dir(dir.join(format!("{cluster}-{group}-1-1"))).unwrap();
+        }
+        for path in &paths {
+            let mut cfg: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+            cfg["mode"] = json!("open");
+            cfg["initialize"] = json!(false);
+            std::fs::write(path, serde_json::to_vec(&cfg).unwrap()).unwrap();
+        }
+        let reopened = prepare_multi(&manifest).unwrap();
+        let error = reopened
+            .validate_client_root(&root, 1, &peers, &public)
+            .expect_err("a legacy directory must be refused on reopen");
+        assert!(error.to_string().contains("marker"), "{error}");
+        let error = match reopened.provision_client_root(&root, &peers) {
+            Ok(_) => panic!("multi-group provisioning opened a legacy directory"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("marker"), "{error}");
+        assert_eq!(tree_snapshot(&root), before);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
