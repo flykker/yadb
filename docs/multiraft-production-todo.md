@@ -459,12 +459,35 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   than a hand-copied constant. Removing the poison flag, not poisoning a
   half-published checkpoint, or skipping the durable tail truncation each fail
   these tests.
-  Injection is a per-call fault point, not a pluggable filesystem.
-- [ ] Replace the per-call fault points with an injectable filesystem so lock
-  acquisition, a failed recovery read and cross-operation fault sequences can be
-  injected, and pair it with the separate-process crash/kill gate. Lock
-  acquisition lives in `yadb-io` and the recovery read walks frames inside
-  `open`, so neither is injectable today without changing those signatures.
+  In `yadb-metakv` injection is a per-call fault point; `yadb-io` now adds a
+  syscall seam for lock acquisition and positional reads (next item).
+- [x] Make `yadb-io` lock acquisition and open-time reads injectable and
+  validated. `crates/yadb-io/src/sys.rs` is a thread-local, one-shot fault seam
+  over the directory lock's `open`/`try_lock`/`unlock` and over positional
+  reads; unarmed it is the direct `std` call, so production behaviour and cost
+  are unchanged. A failed acquire returns a distinguishable `ErrorKind`
+  (`WouldBlock` for a lost race, `PermissionDenied` for an unopenable directory,
+  `NotFound` for a missing target, `InvalidInput` for a non-directory or an
+  unnormalized path), creates no lock file and leaves the directory usable, and
+  an immediate retry succeeds because the fault is one-shot; a held lock refuses
+  the second acquirer without disturbing the holder's descriptor. On the read
+  side `VirtualFile::read_exact_at` retries a legal short read but refuses an
+  early end of file with `UnexpectedEof` instead of accepting a shorter,
+  silently valid record, and a mid-read error propagates and leaves the file
+  unchanged. The truncation test also shows the hazard it guards: the raw
+  `read_at` returns 8 of 16 bytes without complaint. In-process injection proves
+  the code path, not the disk.
+- [ ] Extend the injected-fault coverage to the state machine's own recovery
+  read and to cross-operation sequences, then pair it with the
+  separate-process crash/kill gate. `load_image` in
+  `crates/yadb-metakv/src/openraft_state_machine.rs` opens `state.json` with
+  `std::fs` and reads it with `take(...).read_to_end`, so the `yadb-io` seam
+  cannot reach it. Its content is validated — the header declares a length, the
+  length must match the bytes read, and a CRC covers the payload — and bit rot
+  is tested, but a *truncated* `state.json` has no test of its own and no
+  injectable short read at that syscall. Cross-operation sequences (a fault on
+  the second of two appends, a sync failure followed by a read failure) are also
+  not expressible as one per-call point.
 - [ ] Run separate-process crash/kill and OS/filesystem power-loss tests; document
   filesystem and hardware assumptions. In-process fault simulation is not proof.
   `three_process_mtls_power_loss_after_ack_keeps_acknowledged_writes` SIGKILLs
@@ -484,15 +507,31 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   `PoolHealthSnapshot::refused_puts` / `ScrubSummary::refused_puts`, and mapped to
   `503` on the SQL, S3 and block paths. Nothing is published for a refused write, so
   the caller holds no reference to the fragments that did land; those fragments are
-  garbage, not corruption, and the mark-and-sweep collector reclaims them (see the
-  garbage-collection item). The consequence is deliberate: a pool with any slot
-  offline refuses new writes instead of accepting unprotected ones, so write
-  availability now follows full redundancy. The three-node daemon test asserts this:
-  a write while one replica is stopped is refused with `503` and stays invisible,
-  and the same statement succeeds after that replica returns. Open: no test
-  exercises a real multi-node pool; a refused write is still readable by id until
-  the next collection pass; and refusal is per pool, so one offline domain stops
-  writes for every volume on it.
+  garbage, not corruption, and are **not** reclaimed automatically - the only
+  orphan collection implemented is scoped to the S3 namespace and is disabled on
+  Multi-Raft, so they accumulate until a pool-wide collector exists (see the
+  garbage-collection item). An earlier version of this paragraph said the
+  mark-and-sweep collector reclaimed them; that was wrong, and the new fixture
+  makes the difference observable by asserting the fragments are still on disk
+  after the refusal. The consequence is deliberate: a pool with any slot offline
+  refuses new writes instead of accepting unprotected ones, so write
+  availability now follows full redundancy. The three-node daemon test asserts
+  this: a write while one replica is stopped is refused with `503` and stays
+  invisible, and the same statement succeeds after that replica returns.
+  `crates/yadb-blob/tests/remote_pool_redundancy.rs` adds the crate-level
+  multi-node proof over real TCP: one independent HTTP server per slot, each
+  with its own `VolumeStore` in its own directory, and assertions against each
+  server's own store - a healthy put acks only when every server holds its own
+  verified fragment, one stopped server refuses with `RedundancyNotMet` and
+  advances `refused_puts` while the four survivors keep only unreferenced
+  fragments, the same put succeeds once it returns, and a pool with
+  `min_write_quorum` below `total_parts()` acks one fragment short, counts
+  `degraded_puts`, and still reads the exact bytes from the survivors with one
+  server down. Open: that fixture runs on loopback, so separate hosts, network
+  partitions and power loss remain unproven; a refused write's landed fragments
+  are still readable by id until a collection pass, which no test yet shows
+  reclaiming them; and refusal is per pool, so one offline domain stops writes
+  for every volume on it.
 - [ ] Idempotency and read-consistency contracts. A keyed `POST /v1/apply` is
   implemented (`Idempotency-Key`, the outcome record committed in the same
   `RevisionTxn` as the mutation, `POST /v1/idempotency/resolve`, and a replicated
