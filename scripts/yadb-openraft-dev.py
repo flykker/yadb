@@ -433,6 +433,11 @@ def provision(root, base):
                 # for seconds. 750 ms keeps the budget far above the transport
                 # cost while staying well below election_min (the constraint is
                 # election_min >= 3 x heartbeat).
+                # Test/tuning knob: add `'snapshot_after_logs': N` to the
+                # `raft_timing` dict to snapshot (and InstallSnapshot to a
+                # follower) after N log entries instead of the daemon default
+                # of 5000. It is omitted here so the provisioned config is
+                # byte-identical to what earlier versions wrote.
                 'raft_timing': {'heartbeat_ms': 750, 'election_min_ms': 2250,
                                 'nonpreferred_election_min_ms': 3000, 'election_max_ms': 3500},
                 'listen': peers[node - 1]['address'],

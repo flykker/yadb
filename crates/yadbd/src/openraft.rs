@@ -100,6 +100,8 @@ struct RaftTiming {
     election_min_ms: u64,
     election_max_ms: u64,
     nonpreferred_election_min_ms: u64,
+    #[serde(default)]
+    snapshot_after_logs: Option<u64>,
 }
 
 #[derive(Deserialize, PartialEq, Eq)]
@@ -731,6 +733,19 @@ pub fn prepare(path: &Path) -> io::Result<Prepared> {
         // OpenRaft derives the leader lease from election_timeout_max. This
         // maximum MUST match on all replicas, including the preferred one.
         raft_config.election_timeout_max = timing.election_max_ms;
+        // Test/tuning knob only: the default (5000 logs since the last
+        // snapshot) is unchanged when the field is absent, so an existing root
+        // behaves exactly as before. Lowering the threshold does not weaken any
+        // fence; snapshots are a log-compaction optimisation, and the
+        // InstallSnapshot path is the same one the default policy eventually
+        // exercises. It exists so a test deployment can trigger that path
+        // without writing thousands of entries.
+        if let Some(threshold) = timing.snapshot_after_logs {
+            if threshold == 0 || threshold > 1_000_000 {
+                return Err(invalid("invalid snapshot_after_logs bound"));
+            }
+            raft_config.snapshot_policy = openraft::SnapshotPolicy::LogsSinceLast(threshold);
+        }
     }
     let raft_config = Arc::new(raft_config.validate().map_err(|e| invalid(e.to_string()))?);
     // Every Raft RPC opens a fresh connection and pays a pinned mTLS handshake.
@@ -1371,6 +1386,49 @@ mod tests {
         config["raft_timing"]["election_max_ms"] = json!(2600);
         std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
         assert!(prepare(&path).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn snapshot_policy_defaults_to_five_thousand_logs() {
+        let (dir, path, mut config) = fixture();
+        config["preferred_leader"] = json!(1);
+        config["raft_timing"] = json!({"heartbeat_ms":750,"election_min_ms":2250,"nonpreferred_election_min_ms":3000,"election_max_ms":3500});
+        std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+        let prepared = prepare(&path).unwrap();
+        assert_eq!(
+            prepared.raft_config.snapshot_policy,
+            openraft::SnapshotPolicy::LogsSinceLast(5000)
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_configured_snapshot_threshold_replaces_the_default() {
+        let (dir, path, mut config) = fixture();
+        config["preferred_leader"] = json!(1);
+        config["raft_timing"] = json!({"heartbeat_ms":750,"election_min_ms":2250,"nonpreferred_election_min_ms":3000,"election_max_ms":3500,"snapshot_after_logs":32});
+        std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+        let prepared = prepare(&path).unwrap();
+        assert_eq!(
+            prepared.raft_config.snapshot_policy,
+            openraft::SnapshotPolicy::LogsSinceLast(32)
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_zero_or_oversized_snapshot_threshold_is_rejected() {
+        let (dir, path, mut config) = fixture();
+        config["preferred_leader"] = json!(1);
+        for threshold in [0, 1_000_001] {
+            config["raft_timing"] = json!({"heartbeat_ms":750,"election_min_ms":2250,"nonpreferred_election_min_ms":3000,"election_max_ms":3500,"snapshot_after_logs":threshold});
+            std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+            assert!(
+                prepare(&path).is_err(),
+                "snapshot_after_logs {threshold} must be rejected"
+            );
+        }
         std::fs::remove_dir_all(dir).unwrap();
     }
 
