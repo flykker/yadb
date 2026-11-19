@@ -3239,7 +3239,7 @@ mod tests {
                 pools: Arc::new(std::sync::RwLock::new(f.pools.clone())),
                 local_vdisks: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
                 last_scrub: Arc::new(std::sync::RwLock::new(None)),
-                reader_lease: Arc::new(Mutex::new(None)),
+                reader_lease: Arc::new(Mutex::new(BTreeMap::new())),
                 s3: ObjectStoreEngine::new(meta.clone(), 4096),
                 db: yadb_db::DatabaseEngine::new(meta.clone(), 100),
                 block: BlockVolumeEngine::new(meta, BLOCK_SIZE),
