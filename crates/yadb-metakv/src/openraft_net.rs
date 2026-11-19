@@ -1755,6 +1755,564 @@ mod reply_tests {
     }
 }
 
+/// Wire-level tests for the five load-bearing protocol properties: bounded
+/// length prefixes, the payload limit, request deadlines, the connection cap
+/// and the challenge/nonce/reply bindings that the adversarial cases below
+/// exercise.
+#[cfg(test)]
+mod protocol_tests {
+    use super::*;
+    use crate::multiraft::GroupIdentity;
+    use std::sync::atomic::AtomicUsize;
+
+    struct Fixture {
+        client: ReplicaIdentity,
+        server: ReplicaIdentity,
+        client_key: Arc<NodeSigningKey>,
+        server_key: Arc<NodeSigningKey>,
+        registry: Arc<PeerKeyRegistry>,
+    }
+
+    fn fixture(tag: u8) -> Fixture {
+        let group = GroupIdentity {
+            cluster: [tag; 16],
+            group: 1,
+            incarnation: 1,
+        };
+        let client = ReplicaIdentity::new(group.clone(), 1, vec![1, 2]).unwrap();
+        let server = ReplicaIdentity::new(group, 2, vec![1, 2]).unwrap();
+        let mut seed = [0u8; 32];
+        seed[0] = 1;
+        let client_key = Arc::new(NodeSigningKey::from_seed(&seed).unwrap());
+        seed[0] = 2;
+        let server_key = Arc::new(NodeSigningKey::from_seed(&seed).unwrap());
+        let registry = Arc::new(
+            PeerKeyRegistry::new(BTreeMap::from([
+                (1, client_key.public_key()),
+                (2, server_key.public_key()),
+            ]))
+            .unwrap(),
+        );
+        Fixture {
+            client,
+            server,
+            client_key,
+            server_key,
+            registry,
+        }
+    }
+
+    fn vote(term: u64, node: u32) -> WireRequest {
+        WireRequest::Vote(Box::new(VoteRequest {
+            vote: Vote::new(term, node),
+            last_log_id: None,
+        }))
+    }
+
+    fn signed_call(
+        f: &Fixture,
+        sequence: u64,
+        challenge: &[u8; 32],
+        nonce: [u8; 32],
+        request: WireRequest,
+    ) -> Vec<u8> {
+        let payload = serde_json::to_vec(&WireCall {
+            nonce,
+            challenge: *challenge,
+            request,
+        })
+        .unwrap();
+        SignedRaftEnvelope::sign(&f.client, f.server.node(), sequence, payload, &f.client_key)
+            .unwrap()
+            .encode_json()
+            .unwrap()
+    }
+
+    fn counting_handler(
+        count: Arc<AtomicUsize>,
+    ) -> Arc<dyn Fn(WireRequest) -> BoxFuture<WireResponse> + Send + Sync> {
+        Arc::new(move |_| {
+            count.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {
+                WireResponse::Vote(Box::new(VoteResponse {
+                    vote: Vote::new(1, 2),
+                    vote_granted: true,
+                    last_log_id: None,
+                }))
+            })
+        })
+    }
+
+    async fn spawn_server(
+        f: &Fixture,
+        handler: Arc<dyn Fn(WireRequest) -> BoxFuture<WireResponse> + Send + Sync>,
+        request_timeout: Duration,
+    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut config = TransportConfig::new(
+            f.server.clone(),
+            f.server_key.clone(),
+            BTreeMap::new(),
+            f.registry.clone(),
+        );
+        config.request_timeout = request_timeout;
+        let task = tokio::spawn(RaftPeerServer::from_listener(listener, config, handler).serve());
+        (addr, task)
+    }
+
+    fn client_config(f: &Fixture, addr: SocketAddr) -> TransportConfig {
+        TransportConfig::new(
+            f.client.clone(),
+            f.client_key.clone(),
+            BTreeMap::from([(f.server.node(), addr)]),
+            f.registry.clone(),
+        )
+    }
+
+    async fn read_challenge(stream: &mut TcpStream) -> [u8; 32] {
+        let (kind, body) = read_frame(stream).await.unwrap();
+        assert_eq!(kind, CHALLENGE, "server must open with a challenge");
+        body.try_into().unwrap()
+    }
+
+    // ---- 1. Frames: the declared length is bounded before reservation. ----
+
+    #[tokio::test]
+    async fn a_declared_length_above_the_limit_is_refused_before_any_reservation() {
+        // The semaphore permits are the memory reservation taken immediately
+        // before the body buffer is allocated. A refusal that leaves the
+        // permits untouched therefore happened before the reservation and, by
+        // code order, before `vec![0u8; length]`. This test cannot measure heap
+        // bytes; what it pins is the ordering that makes the allocation
+        // unreachable, and it uses a length the budget would otherwise grant.
+        let chunk_over = SNAPSHOT_CHUNK_FRAME + 1;
+        assert!(chunk_over < MAX_IN_FLIGHT_REQUEST_BYTES);
+        let budget = Arc::new(Semaphore::new(MAX_IN_FLIGHT_REQUEST_BYTES));
+        let (mut writer, mut reader) = tokio::io::duplex(64);
+        let mut header = [0u8; 5];
+        header[0] = SNAPSHOT_CHUNK;
+        header[1..].copy_from_slice(&(chunk_over as u32).to_le_bytes());
+        writer.write_all(&header).await.unwrap();
+        let error = tokio::time::timeout(
+            Duration::from_secs(2),
+            read_budgeted_frame(&mut reader, budget.clone(), false),
+        )
+        .await
+        .expect("the limit check must not wait for a body")
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            budget.available_permits(),
+            MAX_IN_FLIGHT_REQUEST_BYTES,
+            "an over-limit length must not reserve any of the byte budget"
+        );
+
+        // A length that cannot be represented as permits at all must still be
+        // refused by the frame check, not by a budget error.
+        let budget = Arc::new(Semaphore::new(MAX_IN_FLIGHT_REQUEST_BYTES));
+        let (mut writer, mut reader) = tokio::io::duplex(64);
+        let mut header = [0u8; 5];
+        header[0] = REQUEST;
+        header[1..].copy_from_slice(&u32::MAX.to_le_bytes());
+        writer.write_all(&header).await.unwrap();
+        let error = tokio::time::timeout(
+            Duration::from_secs(2),
+            read_budgeted_frame(&mut reader, budget.clone(), true),
+        )
+        .await
+        .expect("a huge declared length must be refused immediately")
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(budget.available_permits(), MAX_IN_FLIGHT_REQUEST_BYTES);
+    }
+
+    // ---- 2. Payload limit: over-limit fails closed, later connections work. ----
+
+    #[tokio::test]
+    async fn an_over_limit_request_frame_fails_closed_and_leaves_later_connections_usable() {
+        let f = fixture(11);
+        let count = Arc::new(AtomicUsize::new(0));
+        let (addr, task) =
+            spawn_server(&f, counting_handler(count.clone()), Duration::from_secs(5)).await;
+
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        read_challenge(&mut stream).await;
+        let mut header = [0u8; 5];
+        header[0] = REQUEST;
+        header[1..].copy_from_slice(&((MAX_FRAME + 1) as u32).to_le_bytes());
+        stream.write_all(&header).await.unwrap();
+        // The protocol carries exactly one request per connection, so there is
+        // no later request on this connection to desynchronise. Fail-closed
+        // means the server closes instead of reading the declared body.
+        let refused = tokio::time::timeout(Duration::from_secs(2), read_frame(&mut stream))
+            .await
+            .expect("an over-limit frame must not leave the connection hanging");
+        assert!(refused.is_err(), "server answered an over-limit frame");
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            0,
+            "over-limit frame was dispatched"
+        );
+
+        // A later connection is unaffected: the refusal did not poison the
+        // listener or a shared budget.
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let challenge = read_challenge(&mut stream).await;
+        let body = signed_call(&f, 1, &challenge, [7; 32], vote(1, 1));
+        write_frame(&mut stream, REQUEST, &body).await.unwrap();
+        assert_eq!(read_frame(&mut stream).await.unwrap().0, RESPONSE);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        task.abort();
+        let _ = task.await;
+    }
+
+    // ---- 3. Request timeouts on both sides. ----
+
+    #[tokio::test]
+    async fn the_server_deadline_ends_the_connection_instead_of_reporting_success() {
+        let f = fixture(12);
+        let handler: Arc<dyn Fn(WireRequest) -> BoxFuture<WireResponse> + Send + Sync> =
+            Arc::new(|_| Box::pin(std::future::pending()));
+        let (addr, task) = spawn_server(&f, handler, Duration::from_millis(300)).await;
+        let mut factory = AuthenticatedTcpNetworkFactory::new(client_config(&f, addr));
+        let mut client = factory.new_client(2, &BasicNode::new("node-2")).await;
+
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.call_for_test(vote(1, 1), Duration::from_secs(5)),
+        )
+        .await
+        .expect("the client must not outlive the server deadline");
+        let elapsed = started.elapsed();
+        let error = result.expect_err("a timed-out dispatch must never look like a reply");
+        assert!(
+            elapsed < Duration::from_secs(4),
+            "the server deadline, not the client TTL, must have ended the exchange; took {elapsed:?}"
+        );
+        assert!(
+            matches!(error, TransportError::InvalidInput(_)),
+            "unexpected error classification: {error:?}"
+        );
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn the_client_deadline_is_reported_as_a_timeout_not_a_reply() {
+        // The listener accepts and then says nothing, so the client is in the
+        // exchange when its own TTL fires.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let silent = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let f = fixture(13);
+        let mut factory = AuthenticatedTcpNetworkFactory::new(client_config(&f, addr));
+        let mut client = factory.new_client(2, &BasicNode::new("node-2")).await;
+        let result = client
+            .call_for_test(vote(1, 1), Duration::from_millis(200))
+            .await;
+        assert_eq!(
+            result.unwrap_err(),
+            TransportError::InvalidInput("request timeout"),
+            "an expired client deadline must be classified as a timeout"
+        );
+        silent.abort();
+        let _ = silent.await;
+    }
+
+    // ---- 4. Connection cap: refused above it, no task or fd left behind. ----
+
+    #[tokio::test]
+    async fn a_connection_above_the_cap_is_refused_and_the_cap_recovers() {
+        let f = fixture(14);
+        let count = Arc::new(AtomicUsize::new(0));
+        let (addr, task) =
+            spawn_server(&f, counting_handler(count.clone()), Duration::from_secs(5)).await;
+
+        // Hold exactly the cap. Reading each challenge proves the handler was
+        // spawned and its connection permit is held (the handler is blocked
+        // waiting for a request frame).
+        let mut held = Vec::new();
+        for _ in 0..MAX_CONNECTIONS {
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            read_challenge(&mut stream).await;
+            held.push(stream);
+        }
+
+        // The next connection is accepted at the TCP layer and then dropped
+        // without a handler. Reading EOF proves the server closed its end: a
+        // leaked descriptor would keep the socket open and this read would
+        // time out instead of returning EOF.
+        let mut refused = TcpStream::connect(addr).await.unwrap();
+        match tokio::time::timeout(Duration::from_secs(3), read_frame(&mut refused)).await {
+            Ok(Err(error)) => assert_eq!(
+                error.kind(),
+                io::ErrorKind::UnexpectedEof,
+                "a refused connection must be closed, not reset or answered"
+            ),
+            Ok(Ok(_)) => panic!("the server served a connection above the cap"),
+            Err(_) => panic!("the refused connection was not closed: its socket leaked"),
+        }
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            0,
+            "a refused connection was dispatched"
+        );
+
+        // Releasing the held connections releases their permits. A new
+        // connection being served proves no handler task outlived its permit.
+        drop(held);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            match tokio::time::timeout(Duration::from_millis(500), read_frame(&mut stream)).await {
+                Ok(Ok((kind, _))) => {
+                    assert_eq!(kind, CHALLENGE);
+                    break;
+                }
+                _ if std::time::Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                other => panic!("the cap did not recover after its holders closed: {other:?}"),
+            }
+        }
+        task.abort();
+        let _ = task.await;
+    }
+
+    // ---- 5. Adversarial review of the signature/challenge protocol. ----
+
+    #[tokio::test]
+    async fn a_request_bound_to_another_connections_challenge_is_refused() {
+        let f = fixture(15);
+        let count = Arc::new(AtomicUsize::new(0));
+        let (addr, task) =
+            spawn_server(&f, counting_handler(count.clone()), Duration::from_secs(5)).await;
+
+        let mut first = TcpStream::connect(addr).await.unwrap();
+        let challenge_a = read_challenge(&mut first).await;
+        let mut second = TcpStream::connect(addr).await.unwrap();
+        let challenge_b = read_challenge(&mut second).await;
+        assert_ne!(
+            challenge_a, challenge_b,
+            "the per-connection challenge must be fresh"
+        );
+
+        // A valid signature by the real sender over a request bound to another
+        // connection's challenge must not dispatch.
+        let body = signed_call(&f, 1, &challenge_a, [3; 32], vote(1, 1));
+        write_frame(&mut second, REQUEST, &body).await.unwrap();
+        let refused = tokio::time::timeout(Duration::from_secs(2), read_frame(&mut second))
+            .await
+            .expect("a foreign-challenge request must not hang the connection");
+        assert!(refused.is_err(), "a foreign-challenge request was answered");
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+
+        // Control: the same request bound to this connection's own challenge
+        // is dispatched, so the refusal above was the challenge binding.
+        let mut third = TcpStream::connect(addr).await.unwrap();
+        let challenge_c = read_challenge(&mut third).await;
+        let body = signed_call(&f, 2, &challenge_c, [4; 32], vote(1, 1));
+        write_frame(&mut third, REQUEST, &body).await.unwrap();
+        assert_eq!(read_frame(&mut third).await.unwrap().0, RESPONSE);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn a_captured_request_is_refused_on_another_live_connection() {
+        let f = fixture(16);
+        let count = Arc::new(AtomicUsize::new(0));
+        let (addr, task) =
+            spawn_server(&f, counting_handler(count.clone()), Duration::from_secs(5)).await;
+
+        let mut first = TcpStream::connect(addr).await.unwrap();
+        let challenge = read_challenge(&mut first).await;
+        let captured = signed_call(&f, 1, &challenge, [5; 32], vote(1, 1));
+        write_frame(&mut first, REQUEST, &captured).await.unwrap();
+        assert_eq!(read_frame(&mut first).await.unwrap().0, RESPONSE);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+
+        // Same process, same listener, a fresh connection: the captured bytes
+        // are structurally valid but bound to the first connection's challenge.
+        let mut second = TcpStream::connect(addr).await.unwrap();
+        read_challenge(&mut second).await;
+        write_frame(&mut second, REQUEST, &captured).await.unwrap();
+        let refused = tokio::time::timeout(Duration::from_secs(2), read_frame(&mut second))
+            .await
+            .expect("a replayed request must not hang the connection");
+        assert!(
+            refused.is_err(),
+            "a captured request was replayed on a new connection"
+        );
+        assert_eq!(count.load(Ordering::SeqCst), 1, "the replay was dispatched");
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn a_replayed_frame_after_the_response_is_not_dispatched() {
+        // Within one live connection the protocol serves exactly one request.
+        // A second copy of the same frame must not be dispatched: the server
+        // answers once and closes.
+        let f = fixture(17);
+        let count = Arc::new(AtomicUsize::new(0));
+        let (addr, task) =
+            spawn_server(&f, counting_handler(count.clone()), Duration::from_secs(5)).await;
+
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let challenge = read_challenge(&mut stream).await;
+        let frame = signed_call(&f, 1, &challenge, [6; 32], vote(1, 1));
+        write_frame(&mut stream, REQUEST, &frame).await.unwrap();
+        assert_eq!(read_frame(&mut stream).await.unwrap().0, RESPONSE);
+        // The server closes after one request, so the replay either fails to
+        // write (already closed) or is never answered. Neither may dispatch.
+        if write_frame(&mut stream, REQUEST, &frame).await.is_ok() {
+            let second = tokio::time::timeout(Duration::from_secs(2), read_frame(&mut stream))
+                .await
+                .expect("the connection must be closed after one request");
+            assert!(
+                second.is_err(),
+                "a second frame on a live connection was answered"
+            );
+        }
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "a replayed frame was dispatched"
+        );
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn a_tampered_body_with_a_valid_frame_header_is_refused() {
+        let f = fixture(18);
+        let count = Arc::new(AtomicUsize::new(0));
+        let (addr, task) =
+            spawn_server(&f, counting_handler(count.clone()), Duration::from_secs(5)).await;
+
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let challenge = read_challenge(&mut stream).await;
+        let mut envelope =
+            SignedRaftEnvelope::decode_json(&signed_call(&f, 1, &challenge, [8; 32], vote(1, 1)))
+                .unwrap();
+        // Keep the frame header and the signature; change only the body.
+        envelope.payload[0] ^= 1;
+        write_frame(&mut stream, REQUEST, &envelope.encode_json().unwrap())
+            .await
+            .unwrap();
+        let refused = tokio::time::timeout(Duration::from_secs(2), read_frame(&mut stream))
+            .await
+            .expect("a tampered body must not hang the connection");
+        assert!(refused.is_err(), "a tampered body was accepted");
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            0,
+            "a tampered body was dispatched"
+        );
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum ReplyMode {
+        Correct,
+        WrongNonce,
+        WrongSequence,
+        UntrustedKey,
+        TamperedPayload,
+    }
+
+    /// Plays the server role far enough to substitute a reply: it sends a
+    /// challenge, reads the request, then answers with the requested variant.
+    async fn substituted_reply_server(
+        listener: TcpListener,
+        signer: Arc<NodeSigningKey>,
+        server: ReplicaIdentity,
+        mode: ReplyMode,
+    ) {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        write_frame(&mut stream, CHALLENGE, &[9u8; 32])
+            .await
+            .unwrap();
+        let (kind, body) = read_frame(&mut stream).await.unwrap();
+        assert_eq!(kind, REQUEST);
+        let request = SignedRaftEnvelope::decode_json(&body).unwrap();
+        let call: WireCall = serde_json::from_slice(&request.payload).unwrap();
+        let nonce = match mode {
+            ReplyMode::WrongNonce => [0u8; 32],
+            _ => call.nonce,
+        };
+        let sequence = match mode {
+            ReplyMode::WrongSequence => request.sequence + 1,
+            _ => request.sequence,
+        };
+        let payload = serde_json::to_vec(&WireReply {
+            nonce,
+            response: WireResponse::Vote(Box::new(VoteResponse {
+                vote: Vote::new(1, 2),
+                vote_granted: true,
+                last_log_id: None,
+            })),
+        })
+        .unwrap();
+        let mut reply =
+            SignedRaftEnvelope::sign(&server, request.sender, sequence, payload, &signer).unwrap();
+        if mode == ReplyMode::TamperedPayload {
+            reply.payload[0] ^= 1;
+        }
+        write_frame(&mut stream, RESPONSE, &reply.encode_json().unwrap())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_substituted_response_is_rejected() {
+        let f = fixture(19);
+        let mut attacker_seed = [0u8; 32];
+        attacker_seed[0] = 99;
+        let attacker = Arc::new(NodeSigningKey::from_seed(&attacker_seed).unwrap());
+
+        for (mode, expected_ok) in [
+            (ReplyMode::Correct, true),
+            (ReplyMode::WrongNonce, false),
+            (ReplyMode::WrongSequence, false),
+            (ReplyMode::UntrustedKey, false),
+            (ReplyMode::TamperedPayload, false),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let signer = if mode == ReplyMode::UntrustedKey {
+                attacker.clone()
+            } else {
+                f.server_key.clone()
+            };
+            let server_id = f.server.clone();
+            let fake = tokio::spawn(substituted_reply_server(listener, signer, server_id, mode));
+            let mut factory = AuthenticatedTcpNetworkFactory::new(client_config(&f, addr));
+            let mut client = factory.new_client(2, &BasicNode::new("node-2")).await;
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                client.call_for_test(vote(1, 1), Duration::from_secs(5)),
+            )
+            .await
+            .expect("the client must not hang on a substituted reply");
+            assert_eq!(
+                result.is_ok(),
+                expected_ok,
+                "reply mode {mode:?} was not judged as expected: {result:?}"
+            );
+            fake.await.unwrap();
+        }
+    }
+}
+
 #[cfg(test)]
 mod deadline_tests {
     use super::*;
