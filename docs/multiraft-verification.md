@@ -824,6 +824,27 @@ image with a purged or front-holed log is `Err(InvalidData)` and the file is
 byte-identical afterwards. `yadb-metakv` 149 → 150 covers the rebuild, the
 refusal, the numbered evidence files and the empty-log case.
 
+**Updated 2026-11-19: the recovery read is now faultable, and the two failures
+are distinct.** `read_image` used to read with `take(...).read_to_end`, which the
+`yadb-io` seam could not reach. It now opens through `OsFs` and reads with
+`VirtualFile::read_exact_at`, sizing the buffer from the file's own reported
+length. That makes the split structural rather than conventional: a read that
+stops before that length is `UnexpectedEof` and is refused (a fault at the
+syscall says nothing about the bytes, so renaming them aside would destroy
+possibly intact data), while a file that really is short is read in full and
+fails in `decode_image` as `InvalidData`, so it stays rebuildable under the same
+coverage gate as any other damage. `truncated_image_is_refused_at_every_offset_and_never_rebuilt`
+injects the short read at seven offsets and asserts `UnexpectedEof`, a
+byte-identical image and no `.corrupt`/`.tmp` artifact;
+`really_truncated_image_is_rebuilt_only_when_coverage_permits` covers a real
+on-disk cut. One case does not recover: a crash inside `create` between
+`create_new` and the first write leaves a 0-byte image on a root the admission
+check counts as non-empty, and a fresh log reports `first_index: None` so
+`replays_from_start()` is false — `zero_byte_image_on_a_fresh_root_is_refused_because_the_log_is_empty`
+pins it, and it needs a create-completed marker rather than a decoder change.
+The seam compiles only under the `yadb-io` `test-faults` feature, enabled as a
+`yadb-metakv` dev-dependency.
+
 **Startup recovery is reported, not silent.** Both repairs above change durable
 state during `open`: a torn tail is truncated and a corrupt image is renamed
 aside and replaced. Neither was surfaced outside tests, so a daemon could start
@@ -2500,6 +2521,22 @@ rather than papered over — the drop now counts and logs instead of vanishing.
 Per-peer connection reuse remains the real fix, because it removes the pressure
 instead of raising the limit; until then the counter is what tells an operator
 "cap reached" apart from "peer down".
+
+**Updated 2026-11-19: a third variant was not a variant.** The two reverted
+changes altered *when* the global slot is acquired; both were guesses with no
+test that could fail. What was actually wrong is that one reachable address
+could take every slot and every byte, and that is now bounded by *partitioning*
+the same resources by source address rather than by changing their timing:
+`MAX_CONNECTIONS_PER_PEER` (half of the 64 slots, further divided by the voter
+count) and `MAX_IN_FLIGHT_REQUEST_BYTES_PER_PEER` (half of the 64 MiB budget,
+which is exactly one `MAX_FRAME`). Both are keyed by canonical IP, created on
+demand and removed at zero, and both were proved before the fix: with the slot
+sub-cap removed, one address held 64 of 64 slots; with the byte sub-cap removed,
+one address held all 67,108,864 bytes and a second address's request was starved.
+A frame over its address's byte share **waits** rather than being refused, since
+it is a valid frame that has already passed the `MAX_FRAME` and global-budget
+checks. Two colluding addresses can still fill the global budget; that is outside
+"one reachable peer" and is stated rather than implied fixed.
 
 ### A failed checkpoint fold is now reported (resolved)
 

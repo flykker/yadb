@@ -6,7 +6,7 @@ This section is a dated record, not a statement about the current tree. Since it
 was written the legacy multi-node Raft runtime was **removed** rather than kept as
 a default: `--metadata-runtime` is pinned to `openraft`, `--openraft-config` is
 mandatory, and there is no fallback runtime
-(`crates/yadbd/src/main.rs:76`, where the CLI value parser accepts only
+(`crates/yadbd/src/main.rs:77`, where the CLI value parser accepts only
 `openraft`, and `crates/yadb-metakv/src/raft.rs:4-21`). The
 only non-replicated store left is the single-node `LocalKv`, which is a test and
 library facility. Statements below about a "legacy default", a "legacy mode" or a
@@ -184,6 +184,9 @@ in the current term, which is the shape a lost or timed-out append leaves behind
 The `transport` object reports
 process-wide counters for events that otherwise leave no trace — connections
 dropped because all handler slots were busy (`connections_cap_dropped`),
+connections dropped because one source address already held its share of the
+slots (`connections_peer_cap_dropped`), frame reservations that waited for their
+address's share of the in-flight byte budget (`request_bytes_peer_waited`),
 connections that ended before dispatch or while reading the request frame
 (`connections_failed`), envelopes rejected by decode, signature or challenge
 (`envelopes_rejected`), outgoing RPCs that ended without a verified reply
@@ -196,7 +199,12 @@ precisely the append timeout worth seeing. A snapshot failure is counted once, i
 They are monotonic
 since process start and are not a health verdict: a nonzero `outgoing_rpc_failures`
 is expected under churn, while a nonzero `connections_cap_dropped` means the
-64-handler cap was reached and a peer was refused rather than delayed. Metrics,
+64-handler cap was reached and a peer was refused rather than delayed. A nonzero
+`connections_peer_cap_dropped` means one address tried to take more than its
+share — backpressure working, not a fault — and `request_bytes_peer_waited` is
+the same signal one layer down: a valid frame waited for its own address's bytes
+rather than being refused. `/metrics` exposes both alongside the pool, slot,
+collection and group rows described below. Metrics,
 authenticated operator controls and
 daemon integration validation remain incomplete. Protect the public diagnostics
 listener according to the deployment's existing access policy.

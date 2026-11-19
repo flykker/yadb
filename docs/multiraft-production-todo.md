@@ -449,9 +449,10 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   (`an_over_declared_snapshot_length_is_refused_before_the_assembly_reservation`);
   a chunk carrying more bytes than the manifest declares is refused
   (`a_chunk_carrying_more_bytes_than_the_manifest_declares_is_refused`); one
-  shared 32 MiB semaphore bounds the sum of live frame bodies across every
-  handler rather than per connection
-  (`concurrent_frames_share_one_in_flight_byte_budget`); an exhausted assembly
+  shared 64 MiB (`2 * MAX_FRAME`) semaphore bounds the sum of live frame bodies
+  across every handler rather than per connection
+  (`concurrent_frames_share_one_in_flight_byte_budget`), with a per-source-address
+  share of half that budget; an exhausted assembly
   budget blocks the manifest before allocation and dispatch
   (`an_exhausted_assembly_budget_blocks_the_manifest_before_allocation_or_dispatch`);
   a truncated stream never dispatches its valid prefix
@@ -561,17 +562,46 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   unchanged. The truncation test also shows the hazard it guards: the raw
   `read_at` returns 8 of 16 bytes without complaint. In-process injection proves
   the code path, not the disk.
-- [ ] Extend the injected-fault coverage to the state machine's own recovery
-  read and to cross-operation sequences, then pair it with the
-  separate-process crash/kill gate. `load_image` in
-  `crates/yadb-metakv/src/openraft_state_machine.rs` opens `state.json` with
-  `std::fs` and reads it with `take(...).read_to_end`, so the `yadb-io` seam
-  cannot reach it. Its content is validated — the header declares a length, the
-  length must match the bytes read, and a CRC covers the payload — and bit rot
-  is tested, but a *truncated* `state.json` has no test of its own and no
-  injectable short read at that syscall. Cross-operation sequences (a fault on
-  the second of two appends, a sync failure followed by a read failure) are also
-  not expressible as one per-call point.
+- [ ] Extend the injected-fault coverage to cross-operation sequences, then pair
+  it with the separate-process crash/kill gate. The state machine's own recovery
+  read now goes through the `yadb-io` seam: `load_image` opens `state.json`
+  through `OsFs` and `read_image` reads it with `VirtualFile::read_exact_at`, so
+  a positional-read fault reaches that syscall. The seam separates two failures
+  that used to be one. A read that stops before the length the filesystem
+  reported is `UnexpectedEof` and is refused, never rebuilt: a fault at the
+  syscall says nothing about the bytes, and rebuilding would rename a possibly
+  intact image aside. A file that really is shorter than its header or declared
+  length is `InvalidData`, exactly as before, and is rebuilt only when the log
+  coverage proves replaying from an empty image is lossless. Evidence:
+  `truncated_image_is_refused_at_every_offset_and_never_rebuilt` cuts the
+  injected read mid-header, at the header boundary, mid-payload and one byte
+  short, and asserts `UnexpectedEof`, a byte-identical image and no
+  `state.json.corrupt`/`state.json.tmp`;
+  `really_truncated_image_is_rebuilt_only_when_coverage_permits` covers a file
+  really cut on disk (empty, partial header, mid-payload) and asserts a rebuild
+  with the bytes preserved as evidence when coverage is `Some(0)` and
+  `InvalidData` with an untouched file when it is not;
+  `recovery_read_error_is_refused_and_not_rebuilt` covers a plain I/O error;
+  `legal_short_read_is_retried_at_recovery` shows a legal short read is retried.
+  The seam is compiled only under the `yadb-io` `test-faults` feature, which
+  `yadb-metakv` enables as a dev-dependency, so no shipped build contains it.
+  Cross-operation sequences (a fault on the second of two appends, a sync
+  failure followed by a read failure) are still not expressible as one per-call
+  point, and the separate-process crash/kill gate remains open.
+- [ ] Make a crash during `DurableMetaStateMachine::create` recoverable. `create`
+  makes `state.json` with `create_new`, drops the handle, then reopens with
+  `truncate` and writes; a crash in between leaves a 0-byte image in a root the
+  admission check already counts as non-empty (`yadbd/src/openraft.rs` refuses a
+  non-empty root), so `create` cannot be retried. `open` refuses it too, because
+  a fresh log reports `first_index: None` and `LogCoverage::replays_from_start`
+  deliberately rejects an empty log — it cannot be told apart from a replica
+  whose state came from a snapshot the log no longer repeats, and rebuilding that
+  one would come up empty and serve. Pinned by
+  `zero_byte_image_on_a_fresh_root_is_refused_because_the_log_is_empty`; the same
+  0-byte image rebuilds once coverage reports `Some(0)`. This predates the
+  `yadb-io` seam and is not a decoder problem: it needs a durable
+  create-completed marker or a `LogCoverage` distinction between "never had
+  entries" and "emptied after a snapshot".
 - [ ] Run separate-process crash/kill and OS/filesystem power-loss tests; document
   filesystem and hardware assumptions. In-process fault simulation is not proof.
   `three_process_mtls_power_loss_after_ack_keeps_acknowledged_writes` SIGKILLs
@@ -1177,14 +1207,32 @@ design; the removed draft is not kept in the tree.
   request bound to another connection's challenge, and a substituted reply
   (wrong nonce, wrong sequence, untrusted key, tampered payload). Opt-in
   TLS/mTLS is implemented separately below.
-- [ ] Bound the plaintext listener's exposure to one reachable peer. The
-  connection cap is a global semaphore, so a single host can hold all 64 slots
-  for up to `request_timeout` before authentication runs, and there is no
-  per-peer fairness. `MAX_FRAME` equals the 32 MiB in-flight budget, so one
-  request frame can reserve the whole budget even though the verified payload
-  limit is 16 MiB. Neither is changed here: no test shows the shipped defaults
-  unsafe, and raising or lowering them without evidence would trade a proven
-  bound for a guessed one.
+- [x] Bound the plaintext listener's exposure to one reachable peer. Two
+  per-address sub-caps mirror each other. Handler slots: one source address may
+  hold at most `ceil(MAX_CONNECTIONS / (voters - 1))` and never more than
+  `MAX_CONNECTIONS_PER_PEER` (half the 64 global slots); a refused connection is
+  closed and counted as `connections_peer_cap_dropped`. In-flight frame bytes:
+  one source address may hold at most `MAX_IN_FLIGHT_REQUEST_BYTES_PER_PEER`
+  (half of the 64 MiB budget, which is exactly `MAX_FRAME`), accounted like the
+  slot cap by canonical source IP, created on demand and removed at zero. A
+  frame over that share waits for the address's own reservations to drain and is
+  then admitted; it is never refused, because it already passed the `MAX_FRAME`
+  and global-budget checks, and a compile-time assertion proves every admissible
+  frame fits an empty share. Waits are counted as `request_bytes_peer_waited`
+  and logged first-eight-then-powers-of-two. The global budget stays
+  `2 * MAX_FRAME` (64 MiB), so peak live frame buffers are unchanged and one
+  address can leave at least one maximum frame for another. The ordinary case —
+  one maximum frame from one address — is admitted without waiting. Both hazards
+  were proved before the fix and pinned after it by
+  `one_source_address_cannot_hold_every_handler_slot`,
+  `one_source_address_cannot_hold_the_whole_in_flight_byte_budget`,
+  `one_maximum_frame_from_one_address_is_admitted_without_waiting` and the
+  end-to-end `one_address_stalling_maximum_frames_does_not_starve_another_peer`
+  in `crates/yadb-metakv/src/openraft_net.rs`; the existing global-cap recovery
+  test now fills the cap from several source addresses. Two colluding source
+  addresses can still fill the global 64 MiB budget: that is outside "one
+  reachable peer" and is not fixed here. Co-located replicas or several replicas
+  behind one NAT share one address's slot and byte shares.
 - [ ] Deploy and validate mandatory TLS/mTLS for operational Raft listeners.
   `TransportConfig::with_tls` implements TLS 1.3 with CA/time/hostname validation,
   ALPN, exact leaf SHA-256 pins bound to node IDs and no plaintext fallback.
@@ -1475,8 +1523,10 @@ or duplicated RPCs, multi-host deployments or OS/device power loss.
 
 Transport handlers now use owned `JoinSet` tasks and RAII connection permits;
 request vote-owner claims must match the authenticated sender. The client bounds
-the challenge frame to 32 bytes before allocating its body. A shared 32 MiB encoded
-inbound-request budget is reserved before allocating body buffers; this is not a
+the challenge frame to 32 bytes before allocating its body. A shared 64 MiB
+(`2 * MAX_FRAME`) encoded
+inbound-request budget is reserved before allocating body buffers, with a
+per-source-address share of half of it; this is not a
 bound on decoded JSON, responses, TLS or total process memory. `serve_until` stops
 accepts and aborts/drains handlers; dropping the future only requests cancellation.
 Byte-budget/cancellation/panic-permit and explicit-drain tests passed in the full
