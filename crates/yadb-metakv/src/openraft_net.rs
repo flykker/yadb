@@ -12,9 +12,9 @@
 
 use std::collections::BTreeMap;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use openraft::error::{
@@ -30,7 +30,7 @@ use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Semaphore;
+use tokio::sync::{Notify, Semaphore};
 use tokio::task::JoinSet;
 
 use crate::multiraft::ReplicaIdentity;
@@ -46,9 +46,50 @@ pub const MAX_FRAME: usize = 32 * 1024 * 1024;
 /// Maximum number of concurrently served connections.
 pub const MAX_CONNECTIONS: usize = 64;
 
+/// Largest number of handler slots one source address may hold at once.
+///
+/// The global cap is shared, so without a sub-cap a single reachable address
+/// can hold every slot and deny service to every other peer before either
+/// connection has authenticated. Half of [`MAX_CONNECTIONS`] is the largest
+/// sub-cap that still leaves an equal share for a second address, and it holds
+/// even for a two-voter group where there is only one configured peer.
+pub const MAX_CONNECTIONS_PER_PEER: usize = MAX_CONNECTIONS / 2;
+
 /// Aggregate encoded request bytes reserved across active server handlers.
 /// JSON decoding and response construction require additional memory.
-pub const MAX_IN_FLIGHT_REQUEST_BYTES: usize = 32 * 1024 * 1024;
+///
+/// Two maximum-size frames must fit at once. With a budget of exactly one
+/// [`MAX_FRAME`], a single unauthenticated peer could declare the maximum
+/// frame and hold every byte permit while it trickles or stalls the body,
+/// blocking every other handler until `request_timeout`. Two frames is the
+/// smallest multiple that lets one peer's maximum frame coexist with another
+/// peer's request; a third maximum frame waits. The reserved-byte ceiling
+/// therefore rises from 32 MiB to 64 MiB (64 MiB of live frame buffers, plus
+/// the decoded JSON the comment below already excludes), rather than being
+/// lowered to a frame size that a valid payload might exceed.
+pub const MAX_IN_FLIGHT_REQUEST_BYTES: usize = 2 * MAX_FRAME;
+
+/// Largest share of [`MAX_IN_FLIGHT_REQUEST_BYTES`] one source address may
+/// hold at once.
+///
+/// The global budget alone still lets one reachable address take every byte:
+/// with a budget of two frames, two stalled maximum frames from one address
+/// reserve all 64 MiB. Half the budget is the same "never everything" rule as
+/// [`MAX_CONNECTIONS_PER_PEER`]: one address can hold at most one maximum
+/// frame, so at least one maximum frame always remains for another address.
+/// The share equals [`MAX_FRAME`], so the ordinary case — one maximum-size
+/// frame from one peer — is admitted without waiting; only that peer's second
+/// simultaneous frame waits. Exceeding the share is *not* refused: the frame
+/// is valid and simply waits for its own address's share, unlike a frame above
+/// [`MAX_FRAME`], which is refused before any reservation.
+pub const MAX_IN_FLIGHT_REQUEST_BYTES_PER_PEER: usize = MAX_IN_FLIGHT_REQUEST_BYTES / 2;
+
+// Every admissible frame must fit one address's share, or a valid frame would
+// wait forever instead of being admitted or refused.
+const _: () = assert!(
+    MAX_IN_FLIGHT_REQUEST_BYTES_PER_PEER >= MAX_FRAME,
+    "one address's byte share must admit a maximum-size frame"
+);
 
 const REQUEST: u8 = 1;
 const RESPONSE: u8 = 2;
@@ -79,6 +120,12 @@ static SNAPSHOT_FAILURES: AtomicU64 = AtomicU64::new(0);
 struct TransportCounters {
     /// Accepted connections dropped because every handler slot was busy.
     cap_dropped: AtomicU64,
+    /// Accepted connections dropped because their source address already held
+    /// its share of the handler slots.
+    peer_cap_dropped: AtomicU64,
+    /// Frame reservations that had to wait for their source address's share of
+    /// the in-flight byte budget.
+    peer_bytes_waited: AtomicU64,
     /// Dispatched connections that ended in an I/O, TLS or frame-read error.
     failed: AtomicU64,
     /// Envelopes rejected by decoding, signature or challenge verification.
@@ -90,6 +137,8 @@ struct TransportCounters {
 
 static TRANSPORT: TransportCounters = TransportCounters {
     cap_dropped: AtomicU64::new(0),
+    peer_cap_dropped: AtomicU64::new(0),
+    peer_bytes_waited: AtomicU64::new(0),
     failed: AtomicU64::new(0),
     rejected: AtomicU64::new(0),
     rpc_failed: AtomicU64::new(0),
@@ -99,6 +148,8 @@ static TRANSPORT: TransportCounters = TransportCounters {
 pub fn transport_counters() -> serde_json::Value {
     serde_json::json!({
         "connections_cap_dropped": TRANSPORT.cap_dropped.load(Ordering::Relaxed),
+        "connections_peer_cap_dropped": TRANSPORT.peer_cap_dropped.load(Ordering::Relaxed),
+        "request_bytes_peer_waited": TRANSPORT.peer_bytes_waited.load(Ordering::Relaxed),
         "connections_failed": TRANSPORT.failed.load(Ordering::Relaxed),
         "envelopes_rejected": TRANSPORT.rejected.load(Ordering::Relaxed),
         "outgoing_rpc_failures": TRANSPORT.rpc_failed.load(Ordering::Relaxed),
@@ -138,11 +189,14 @@ impl Drop for RpcOutcome {
     }
 }
 
-/// Count one connection dropped by the handler cap, logging the first few.
+/// Count one connection dropped by the global handler cap, logging the first
+/// few, then powers of two.
 ///
-/// The cap itself is not changed here: two backpressure variants were tried and
-/// neither was shown to help (see `docs/multiraft-verification.md`). What was
-/// missing was evidence, so this is the smallest change that supplies it.
+/// The global cap itself is unchanged. The two backpressure variants recorded
+/// in `docs/multiraft-verification.md` moved *when* the global slot was
+/// acquired and neither was shown to help; the per-address sub-cap below is a
+/// different mechanism (it partitions the same slots) rather than a third
+/// variant of that timing change.
 fn cap_dropped(node: u32, group: u64, peer: Option<u32>) {
     let n = TRANSPORT.cap_dropped.fetch_add(1, Ordering::Relaxed) + 1;
     if n <= 8 || n.is_power_of_two() {
@@ -150,6 +204,245 @@ fn cap_dropped(node: u32, group: u64, peer: Option<u32>) {
             "openraft transport node={node} group={group} peer={peer:?} connection dropped: \
              all {MAX_CONNECTIONS} handler slots busy occurrence={n}"
         );
+    }
+}
+
+/// Slots per source address for a group with `voters` voters.
+///
+/// Each of the `voters - 1` other voters gets an equal share of the global
+/// cap, rounded up, so a larger group does not let one peer hold a share it
+/// could not legitimately need. The share is capped at
+/// [`MAX_CONNECTIONS_PER_PEER`] and floored at one, so the divisor is never
+/// zero and a group larger than the cap still admits one connection per
+/// address.
+///
+/// Trade-off: an address that legitimately needs more than its share is
+/// throttled. That includes several replicas behind one NAT, and test
+/// clusters that put every node on loopback. Every RPC opens a fresh
+/// connection, so the pressure this bounds is real; per-peer connection reuse
+/// would remove the pressure rather than divide it.
+fn per_peer_connection_cap(voters: usize) -> usize {
+    let peers = voters.saturating_sub(1).max(1);
+    MAX_CONNECTIONS
+        .div_ceil(peers)
+        .clamp(1, MAX_CONNECTIONS_PER_PEER)
+}
+
+/// Count one connection dropped by the per-address sub-cap.
+///
+/// Deliberately distinct from [`cap_dropped`]: the global counter means the
+/// node is saturated, while this one means a single address is holding its
+/// share and another address may still be admitted. Log volume is bounded the
+/// same way as the other counters (first eight, then powers of two).
+fn peer_cap_dropped(node: u32, group: u64, peer: Option<u32>, address: IpAddr, cap: usize) {
+    let n = TRANSPORT.peer_cap_dropped.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 8 || n.is_power_of_two() {
+        eprintln!(
+            "openraft transport node={node} group={group} peer={peer:?} address={address} \
+             connection dropped: source address holds all {cap} of its handler slots \
+             occurrence={n}"
+        );
+    }
+}
+
+/// Per-source-address handler-slot accounting.
+///
+/// The map is bounded by the number of addresses that currently hold a slot,
+/// which the global semaphore bounds at [`MAX_CONNECTIONS`]; an entry is
+/// removed when its count reaches zero, so it cannot grow without bound from
+/// addresses that connect once and leave. It is keyed by IP rather than
+/// `SocketAddr` because every RPC opens a new TCP connection from a fresh
+/// ephemeral port, and a port-keyed cap would never bind. IPv4-mapped IPv6
+/// addresses are canonicalised so one host cannot count itself twice by
+/// connecting through both families.
+struct PeerSlots {
+    counts: Mutex<BTreeMap<IpAddr, usize>>,
+}
+
+impl PeerSlots {
+    fn new() -> Self {
+        Self {
+            counts: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    /// Reserves one handler slot for `address`, or returns `None` when that
+    /// address already holds `cap` of them.
+    fn try_acquire(self: &Arc<Self>, address: IpAddr, cap: usize) -> Option<PeerSlot> {
+        let mut counts = self
+            .counts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let held = counts.entry(address).or_insert(0);
+        if *held >= cap {
+            return None;
+        }
+        *held += 1;
+        Some(PeerSlot {
+            slots: self.clone(),
+            address,
+        })
+    }
+}
+
+/// One reserved per-address handler slot, released when the handler ends.
+struct PeerSlot {
+    slots: Arc<PeerSlots>,
+    address: IpAddr,
+}
+
+impl Drop for PeerSlot {
+    fn drop(&mut self) {
+        let mut counts = self
+            .slots
+            .counts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(held) = counts.get_mut(&self.address) {
+            *held -= 1;
+            if *held == 0 {
+                counts.remove(&self.address);
+            }
+        }
+    }
+}
+
+/// Count one frame reservation that waited for its address's byte share.
+///
+/// This is backpressure, not a fault: the frame is valid and is admitted once
+/// its own address releases bytes. It is counted apart from the global budget
+/// so an operator can tell "this address is over its share" from "the node's
+/// whole in-flight budget is in use". Log volume is bounded like the other
+/// counters (first eight, then powers of two).
+fn peer_bytes_waited(address: IpAddr) {
+    let n = TRANSPORT.peer_bytes_waited.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 8 || n.is_power_of_two() {
+        eprintln!(
+            "openraft transport address={address} frame reservation waited for its \
+             per-address byte share occurrence={n}"
+        );
+    }
+}
+
+/// Per-source-address in-flight frame-byte accounting.
+///
+/// Mirrors [`PeerSlots`]: keyed by canonical IP for the same reason (every RPC
+/// opens a fresh ephemeral port), an entry is created on demand and removed
+/// when its reservation returns to zero, so the map is bounded by the number
+/// of addresses currently holding bytes rather than by addresses ever seen.
+///
+/// A reservation that does not fit is *waited for*, never refused: the frame
+/// has already passed the [`MAX_FRAME`] and global-budget checks, so it is
+/// valid and only needs its address's share to drain. `Notify` wakes every
+/// waiter on release because the freed bytes may not fit the first waiter.
+struct PeerBytes {
+    cap: usize,
+    reserved: Mutex<BTreeMap<IpAddr, usize>>,
+    released: Notify,
+}
+
+impl PeerBytes {
+    fn new(cap: usize) -> Self {
+        Self {
+            cap,
+            reserved: Mutex::new(BTreeMap::new()),
+            released: Notify::new(),
+        }
+    }
+
+    fn try_reserve(&self, address: IpAddr, bytes: usize) -> bool {
+        let mut reserved = self
+            .reserved
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let used = reserved.entry(address).or_insert(0);
+        if *used + bytes > self.cap {
+            return false;
+        }
+        *used += bytes;
+        true
+    }
+
+    /// Reserves `bytes` for `address`, waiting until its share has room.
+    ///
+    /// The compile-time assertion on [`MAX_IN_FLIGHT_REQUEST_BYTES_PER_PEER`]
+    /// proves every admissible frame fits an empty share, so this always
+    /// terminates once the address's own reservations drain.
+    async fn reserve(self: &Arc<Self>, address: IpAddr, bytes: usize) -> PeerBytesGuard {
+        let mut waited = false;
+        loop {
+            // Register interest before checking, so a release between the
+            // check and the await cannot be lost.
+            let released = self.released.notified();
+            tokio::pin!(released);
+            released.as_mut().enable();
+            if self.try_reserve(address, bytes) {
+                if waited {
+                    peer_bytes_waited(address);
+                }
+                return PeerBytesGuard {
+                    budget: self.clone(),
+                    address,
+                    bytes,
+                };
+            }
+            waited = true;
+            released.await;
+        }
+    }
+}
+
+/// Bytes reserved against one source address's share, released on drop.
+struct PeerBytesGuard {
+    budget: Arc<PeerBytes>,
+    address: IpAddr,
+    bytes: usize,
+}
+
+impl Drop for PeerBytesGuard {
+    fn drop(&mut self) {
+        {
+            let mut reserved = self
+                .budget
+                .reserved
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(used) = reserved.get_mut(&self.address) {
+                *used -= self.bytes;
+                if *used == 0 {
+                    reserved.remove(&self.address);
+                }
+            }
+        }
+        self.budget.released.notify_waiters();
+    }
+}
+
+/// One source address's view of the frame-byte budget.
+#[derive(Clone)]
+struct PeerFrameBudget {
+    shares: Arc<PeerBytes>,
+    address: IpAddr,
+}
+
+impl PeerFrameBudget {
+    async fn reserve(&self, bytes: usize) -> PeerBytesGuard {
+        self.shares.reserve(self.address, bytes).await
+    }
+}
+
+/// The bytes one frame reserved: its global budget permit and its address's
+/// share, released together once the body is no longer needed.
+struct FrameBytes {
+    _global: tokio::sync::OwnedSemaphorePermit,
+    _peer: Option<PeerBytesGuard>,
+}
+
+impl std::fmt::Debug for FrameBytes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FrameBytes")
+            .field("peer_bytes", &self._peer.as_ref().map(|peer| peer.bytes))
+            .finish_non_exhaustive()
     }
 }
 
@@ -769,6 +1062,9 @@ impl RaftPeerServer {
         let connections = Arc::new(Semaphore::new(MAX_CONNECTIONS));
         let request_bytes = Arc::new(Semaphore::new(MAX_IN_FLIGHT_REQUEST_BYTES));
         let snapshot_bytes = Arc::new(Semaphore::new(MAX_SNAPSHOT_BYTES));
+        let peer_slots = Arc::new(PeerSlots::new());
+        let peer_cap = per_peer_connection_cap(self.config.identity.voters().len());
+        let peer_bytes = Arc::new(PeerBytes::new(MAX_IN_FLIGHT_REQUEST_BYTES_PER_PEER));
         let mut tasks = JoinSet::new();
         tokio::pin!(shutdown);
         let result = loop {
@@ -808,12 +1104,33 @@ impl RaftPeerServer {
                 );
                 continue;
             };
+            // Reserve this address's share after the global slot, so a refused
+            // share cannot hold a slot another address could use. The guard is
+            // moved into the handler and released when the handler ends, which
+            // also covers abort and panic.
+            let address = peer.ip().to_canonical();
+            let Some(peer_slot) = peer_slots.try_acquire(address, peer_cap) else {
+                drop(permit);
+                peer_cap_dropped(
+                    self.config.identity.node(),
+                    self.config.identity.group().group,
+                    node_id,
+                    address,
+                    peer_cap,
+                );
+                continue;
+            };
             let config = self.config.clone();
             let handler = self.handler.clone();
             let request_bytes = request_bytes.clone();
             let snapshot_bytes = snapshot_bytes.clone();
+            let peer_frame_budget = PeerFrameBudget {
+                shares: peer_bytes.clone(),
+                address,
+            };
             tasks.spawn(async move {
                 let _permit = permit;
+                let _peer_slot = peer_slot;
                 let timeout = config.request_timeout;
                 let phase = Arc::new(AtomicU64::new(0));
                 let snapshot_peer = Arc::new(AtomicU64::new(0));
@@ -834,6 +1151,7 @@ impl RaftPeerServer {
                         handler,
                         request_bytes,
                         snapshot_bytes,
+                        Some(peer_frame_budget),
                         phase.clone(),
                         snapshot_peer.clone(),
                     ),
@@ -905,6 +1223,7 @@ async fn serve_peer(
     handler: Arc<dyn Fn(WireRequest) -> BoxFuture<WireResponse> + Send + Sync>,
     request_bytes: Arc<Semaphore>,
     snapshot_bytes: Arc<Semaphore>,
+    peer_frame_budget: Option<PeerFrameBudget>,
     phase: Arc<AtomicU64>,
     snapshot_peer: Arc<AtomicU64>,
 ) -> io::Result<()> {
@@ -930,6 +1249,7 @@ async fn serve_peer(
         handler,
         request_bytes,
         snapshot_bytes,
+        peer_frame_budget,
         phase,
         snapshot_peer,
     )
@@ -943,6 +1263,7 @@ async fn serve_connection(
     handler: Arc<dyn Fn(WireRequest) -> BoxFuture<WireResponse> + Send + Sync>,
     request_bytes: Arc<Semaphore>,
     snapshot_bytes: Arc<Semaphore>,
+    peer_frame_budget: Option<PeerFrameBudget>,
     phase: Arc<AtomicU64>,
     snapshot_peer: Arc<AtomicU64>,
 ) -> io::Result<()> {
@@ -951,22 +1272,27 @@ async fn serve_connection(
         .fill(&mut challenge)
         .map_err(|_| io::Error::other("challenge generation failed"))?;
     write_frame(&mut stream, CHALLENGE, &challenge).await?;
-    let (kind, body, bytes_permit) =
-        match read_request_frame(&mut stream, request_bytes.clone()).await {
-            Ok(value) => value,
-            Err(error) => {
-                // Counted before the return: the peer is gone and nothing can
-                // answer it, but a frame that never decoded is still an event
-                // this process observed and previously did not report.
-                request_frame_unreadable(
-                    config.identity.node(),
-                    config.identity.group().group,
-                    node_id,
-                    &error,
-                );
-                return Ok(());
-            }
-        };
+    let (kind, body, bytes_permit) = match read_request_frame(
+        &mut stream,
+        request_bytes.clone(),
+        peer_frame_budget.clone(),
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(error) => {
+            // Counted before the return: the peer is gone and nothing can
+            // answer it, but a frame that never decoded is still an event
+            // this process observed and previously did not report.
+            request_frame_unreadable(
+                config.identity.node(),
+                config.identity.group().group,
+                node_id,
+                &error,
+            );
+            return Ok(());
+        }
+    };
     if kind == SNAPSHOT_MANIFEST {
         phase.store(1, Ordering::Relaxed);
     }
@@ -1060,8 +1386,13 @@ async fn serve_connection(
         let mut data = Vec::with_capacity(manifest.length);
         let mut ordinal = 0;
         while data.len() < manifest.length {
-            let (_, frame, _frame_permit) =
-                read_budgeted_frame(&mut stream, request_bytes.clone(), false).await?;
+            let (_, frame, _frame_permit) = read_budgeted_frame(
+                &mut stream,
+                request_bytes.clone(),
+                peer_frame_budget.clone(),
+                false,
+            )
+            .await?;
             let chunk_envelope = SignedRaftEnvelope::decode_json(&frame)
                 .map_err(|_| io::Error::other("invalid chunk envelope"))?;
             if chunk_envelope.sender != sender || chunk_envelope.sequence != sequence {
@@ -1134,15 +1465,17 @@ async fn serve_connection(
 async fn read_request_frame<S: AsyncRead + Unpin>(
     stream: &mut S,
     budget: Arc<Semaphore>,
-) -> io::Result<(u8, Vec<u8>, tokio::sync::OwnedSemaphorePermit)> {
-    read_budgeted_frame(stream, budget, true).await
+    peer: Option<PeerFrameBudget>,
+) -> io::Result<(u8, Vec<u8>, FrameBytes)> {
+    read_budgeted_frame(stream, budget, peer, true).await
 }
 
 async fn read_budgeted_frame<S: AsyncRead + Unpin>(
     stream: &mut S,
     budget: Arc<Semaphore>,
+    peer: Option<PeerFrameBudget>,
     initial: bool,
-) -> io::Result<(u8, Vec<u8>, tokio::sync::OwnedSemaphorePermit)> {
+) -> io::Result<(u8, Vec<u8>, FrameBytes)> {
     let mut header = [0u8; 5];
     stream.read_exact(&mut header).await?;
     let length = u32::from_le_bytes(header[1..].try_into().unwrap()) as usize;
@@ -1163,13 +1496,30 @@ async fn read_budgeted_frame<S: AsyncRead + Unpin>(
             "invalid request frame",
         ));
     }
+    // Take the address's share before the global budget. Taking the global
+    // permits first would let one address park the global budget on frames
+    // that cannot proceed, which is the starvation this sub-cap exists to
+    // stop. Every handler takes them in this order, so the two resources
+    // cannot deadlock: a task waiting for the global budget already holds its
+    // own address's share and waits for nothing else.
+    let peer_permit = match &peer {
+        Some(peer) => Some(peer.reserve(length).await),
+        None => None,
+    };
     let permit = budget
         .acquire_many_owned(length as u32)
         .await
         .map_err(|_| io::Error::other("request budget closed"))?;
     let mut body = vec![0u8; length];
     stream.read_exact(&mut body).await?;
-    Ok((header[0], body, permit))
+    Ok((
+        header[0],
+        body,
+        FrameBytes {
+            _global: permit,
+            _peer: peer_permit,
+        },
+    ))
 }
 
 async fn write_frame<S: AsyncWrite + Unpin>(
@@ -1238,7 +1588,7 @@ mod reply_tests {
         let held = budget.clone().acquire_many_owned(4).await.unwrap();
         let (mut writer, mut reader) = tokio::io::duplex(16);
         writer.write_all(&[REQUEST, 4, 0, 0, 0]).await.unwrap();
-        let task = tokio::spawn(async move { read_request_frame(&mut reader, budget).await });
+        let task = tokio::spawn(async move { read_request_frame(&mut reader, budget, None).await });
         tokio::task::yield_now().await;
         assert!(!task.is_finished());
         drop(held);
@@ -1540,6 +1890,7 @@ mod reply_tests {
                     handler,
                     budget.clone(),
                     assembly.clone(),
+                    None,
                     Arc::new(AtomicU64::new(0)),
                     Arc::new(AtomicU64::new(0)),
                 ),
@@ -1766,6 +2117,7 @@ mod reply_tests {
                     recording_handler(received),
                     budget,
                     assembly,
+                    None,
                     phase,
                     Arc::new(AtomicU64::new(0)),
                 ),
@@ -2075,7 +2427,7 @@ mod reply_tests {
         let first = tokio::spawn({
             let budget = budget.clone();
             async move {
-                let (_, body, permit) = read_request_frame(&mut first_reader, budget).await?;
+                let (_, body, permit) = read_request_frame(&mut first_reader, budget, None).await?;
                 drop(permit);
                 Ok::<Vec<u8>, io::Error>(body)
             }
@@ -2083,7 +2435,8 @@ mod reply_tests {
         let second = tokio::spawn({
             let budget = budget.clone();
             async move {
-                let (_, body, permit) = read_request_frame(&mut second_reader, budget).await?;
+                let (_, body, permit) =
+                    read_request_frame(&mut second_reader, budget, None).await?;
                 drop(permit);
                 Ok::<Vec<u8>, io::Error>(body)
             }
@@ -2489,6 +2842,16 @@ mod protocol_tests {
         body.try_into().unwrap()
     }
 
+    /// Connects to `addr` from a specific loopback source address, so a test
+    /// can present two distinct source addresses to one listener. Every RPC
+    /// opens a fresh connection from a fresh ephemeral port, which is why the
+    /// server keys fairness by address and not by `SocketAddr`.
+    async fn connect_from(source: &str, addr: SocketAddr) -> io::Result<TcpStream> {
+        let socket = tokio::net::TcpSocket::new_v4()?;
+        socket.bind(SocketAddr::new(source.parse().unwrap(), 0))?;
+        socket.connect(addr).await
+    }
+
     // ---- 1. Frames: the declared length is bounded before reservation. ----
 
     #[tokio::test]
@@ -2509,7 +2872,7 @@ mod protocol_tests {
         writer.write_all(&header).await.unwrap();
         let error = tokio::time::timeout(
             Duration::from_secs(2),
-            read_budgeted_frame(&mut reader, budget.clone(), false),
+            read_budgeted_frame(&mut reader, budget.clone(), None, false),
         )
         .await
         .expect("the limit check must not wait for a body")
@@ -2531,12 +2894,189 @@ mod protocol_tests {
         writer.write_all(&header).await.unwrap();
         let error = tokio::time::timeout(
             Duration::from_secs(2),
-            read_budgeted_frame(&mut reader, budget.clone(), true),
+            read_budgeted_frame(&mut reader, budget.clone(), None, true),
         )
         .await
         .expect("a huge declared length must be refused immediately")
         .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(budget.available_permits(), MAX_IN_FLIGHT_REQUEST_BYTES);
+    }
+
+    #[tokio::test]
+    async fn a_single_frame_cannot_reserve_the_whole_in_flight_budget() {
+        // `read_budgeted_frame` reserves the declared length before it
+        // allocates or reads the body, so a peer that declares the maximum
+        // frame and stalls holds the reservation for `request_timeout`. If
+        // that reservation can equal the whole budget, one unauthenticated
+        // peer blocks every other handler on the shared byte semaphore.
+        let budget = Arc::new(Semaphore::new(MAX_IN_FLIGHT_REQUEST_BYTES));
+
+        let (mut writer, mut reader) = tokio::io::duplex(64);
+        let mut header = [0u8; 5];
+        header[0] = REQUEST;
+        header[1..].copy_from_slice(&(MAX_FRAME as u32).to_le_bytes());
+        writer.write_all(&header).await.unwrap();
+        let first = tokio::spawn({
+            let budget = budget.clone();
+            async move { read_budgeted_frame(&mut reader, budget, None, true).await }
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while budget.available_permits() == MAX_IN_FLIGHT_REQUEST_BYTES {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the first frame never reserved its bytes");
+        assert_eq!(
+            budget.available_permits(),
+            MAX_IN_FLIGHT_REQUEST_BYTES - MAX_FRAME,
+            "one frame must leave the rest of the budget available"
+        );
+
+        // A second, small frame from another handler must still be admitted
+        // while the first is stalled mid-body.
+        let (mut writer, mut reader) = tokio::io::duplex(64);
+        writer.write_all(&[REQUEST, 4, 0, 0, 0]).await.unwrap();
+        writer.write_all(&[1, 2, 3, 4]).await.unwrap();
+        let (_, body, permit) = tokio::time::timeout(
+            Duration::from_secs(2),
+            read_budgeted_frame(&mut reader, budget.clone(), None, true),
+        )
+        .await
+        .expect("a second frame was starved by the first frame's reservation")
+        .unwrap();
+        assert_eq!(body, [1, 2, 3, 4]);
+        drop(permit);
+
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        assert_eq!(budget.available_permits(), MAX_IN_FLIGHT_REQUEST_BYTES);
+    }
+
+    fn peer_frame_budget(shares: &Arc<PeerBytes>, address: &str) -> PeerFrameBudget {
+        PeerFrameBudget {
+            shares: shares.clone(),
+            address: address.parse().unwrap(),
+        }
+    }
+
+    #[tokio::test]
+    async fn one_source_address_cannot_hold_the_whole_in_flight_byte_budget() {
+        // Two maximum frames from one address: the first takes that address's
+        // whole share, the second must wait rather than take the rest of the
+        // global budget. If it could, one reachable peer would again reserve
+        // 100% of the budget and starve every other peer.
+        let budget = Arc::new(Semaphore::new(MAX_IN_FLIGHT_REQUEST_BYTES));
+        let shares = Arc::new(PeerBytes::new(MAX_IN_FLIGHT_REQUEST_BYTES_PER_PEER));
+        let first_address = "127.0.0.2";
+
+        let mut stalled = Vec::new();
+        let mut writers = Vec::new();
+        for _ in 0..2 {
+            let (mut writer, mut reader) = tokio::io::duplex(64);
+            let mut header = [0u8; 5];
+            header[0] = REQUEST;
+            header[1..].copy_from_slice(&(MAX_FRAME as u32).to_le_bytes());
+            writer.write_all(&header).await.unwrap();
+            // Keep the writer open: dropping it would end the stalled body
+            // read and release the reservation this test measures.
+            writers.push(writer);
+            let budget = budget.clone();
+            let peer = peer_frame_budget(&shares, first_address);
+            stalled.push(tokio::spawn(async move {
+                read_budgeted_frame(&mut reader, budget, Some(peer), true).await
+            }));
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while budget.available_permits() == MAX_IN_FLIGHT_REQUEST_BYTES {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the first frame never reserved its bytes");
+        // Give the second frame ample time to reserve if the sub-cap is gone.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            MAX_IN_FLIGHT_REQUEST_BYTES_PER_PEER,
+            MAX_IN_FLIGHT_REQUEST_BYTES / 2,
+            "one address must hold at most half the global byte budget"
+        );
+        assert_eq!(
+            budget.available_permits(),
+            MAX_IN_FLIGHT_REQUEST_BYTES / 2,
+            "one address reserved more than half of the global byte budget"
+        );
+
+        // Another address is served while the first is stalled at its share.
+        let (mut writer, mut reader) = tokio::io::duplex(64);
+        writer.write_all(&[REQUEST, 4, 0, 0, 0]).await.unwrap();
+        writer.write_all(&[1, 2, 3, 4]).await.unwrap();
+        let (_, body, permit) = tokio::time::timeout(
+            Duration::from_secs(2),
+            read_budgeted_frame(
+                &mut reader,
+                budget.clone(),
+                Some(peer_frame_budget(&shares, "127.0.0.3")),
+                true,
+            ),
+        )
+        .await
+        .expect("a second address was starved by one address's stalled frames")
+        .unwrap();
+        assert_eq!(body, [1, 2, 3, 4]);
+        drop(permit);
+
+        for task in stalled {
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+        }
+        assert_eq!(budget.available_permits(), MAX_IN_FLIGHT_REQUEST_BYTES);
+        assert!(
+            shares
+                .reserved
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
+            "per-address reservations must be released"
+        );
+    }
+
+    #[tokio::test]
+    async fn one_maximum_frame_from_one_address_is_admitted_without_waiting() {
+        // The sub-cap must not throttle the ordinary case: a single maximum
+        // frame from one address is exactly that address's share, so it is
+        // admitted immediately with nothing else holding bytes.
+        let budget = Arc::new(Semaphore::new(MAX_IN_FLIGHT_REQUEST_BYTES));
+        let shares = Arc::new(PeerBytes::new(MAX_IN_FLIGHT_REQUEST_BYTES_PER_PEER));
+        let (mut writer, mut reader) = tokio::io::duplex(64);
+        let mut header = [0u8; 5];
+        header[0] = REQUEST;
+        header[1..].copy_from_slice(&(MAX_FRAME as u32).to_le_bytes());
+        writer.write_all(&header).await.unwrap();
+        let task = tokio::spawn({
+            let budget = budget.clone();
+            let peer = peer_frame_budget(&shares, "127.0.0.2");
+            async move { read_budgeted_frame(&mut reader, budget, Some(peer), true).await }
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while budget.available_permits() != MAX_IN_FLIGHT_REQUEST_BYTES - MAX_FRAME {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("a maximum frame from one address waited for its own share");
+        assert_eq!(
+            *shares
+                .reserved
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&"127.0.0.2".parse::<IpAddr>().unwrap())
+                .expect("the frame must hold its address's share"),
+            MAX_FRAME
+        );
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
         assert_eq!(budget.available_permits(), MAX_IN_FLIGHT_REQUEST_BYTES);
     }
 
@@ -2576,6 +3116,56 @@ mod protocol_tests {
         write_frame(&mut stream, REQUEST, &body).await.unwrap();
         assert_eq!(read_frame(&mut stream).await.unwrap().0, RESPONSE);
         assert_eq!(count.load(Ordering::SeqCst), 1);
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn one_address_stalling_maximum_frames_does_not_starve_another_peer() {
+        // End-to-end proof that the per-address byte sub-cap is wired into the
+        // served path, not only into the read helper: one address declares two
+        // maximum frames and never sends either body, then a different address
+        // must still complete a signed RPC.
+        let f = fixture(20);
+        let count = Arc::new(AtomicUsize::new(0));
+        let (addr, task) =
+            spawn_server(&f, counting_handler(count.clone()), Duration::from_secs(10)).await;
+
+        let mut stalled = Vec::new();
+        for _ in 0..2 {
+            let mut stream = connect_from("127.0.0.2", addr).await.unwrap();
+            read_challenge(&mut stream).await;
+            let mut header = [0u8; 5];
+            header[0] = REQUEST;
+            header[1..].copy_from_slice(&(MAX_FRAME as u32).to_le_bytes());
+            stream.write_all(&header).await.unwrap();
+            stalled.push(stream);
+        }
+        // Let the server read both headers and reserve: one frame takes the
+        // address's share, the second waits for it.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let mut other = connect_from("127.0.0.3", addr).await.unwrap();
+        let (kind, body) = tokio::time::timeout(Duration::from_secs(3), read_frame(&mut other))
+            .await
+            .expect("a second address was starved by one address's stalled frames")
+            .expect("a second address was refused while another address stalled");
+        assert_eq!(kind, CHALLENGE);
+        let challenge: [u8; 32] = body.try_into().unwrap();
+        let body = signed_call(&f, 1, &challenge, [5; 32], vote(1, 1));
+        write_frame(&mut other, REQUEST, &body).await.unwrap();
+        let (kind, _) = tokio::time::timeout(Duration::from_secs(3), read_frame(&mut other))
+            .await
+            .expect("a second address's request was starved by one address's stalled frames")
+            .expect("a second address's connection failed while another address stalled");
+        assert_eq!(kind, RESPONSE);
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "a legitimate peer was not served while another address stalled its frames"
+        );
+
+        drop(stalled);
         task.abort();
         let _ = task.await;
     }
@@ -2646,21 +3236,34 @@ mod protocol_tests {
         let (addr, task) =
             spawn_server(&f, counting_handler(count.clone()), Duration::from_secs(5)).await;
 
-        // Hold exactly the cap. Reading each challenge proves the handler was
-        // spawned and its connection permit is held (the handler is blocked
-        // waiting for a request frame).
+        // Hold exactly the global cap. Reading each challenge proves the
+        // handler was spawned and its connection permit is held (the handler
+        // is blocked waiting for a request frame). The per-address sub-cap
+        // deliberately stops one address from taking every slot, so fill the
+        // cap from as many source addresses as its share requires. That is
+        // the situation this test is about: the *global* cap is reached.
+        let per_peer = per_peer_connection_cap(f.server.voters().len());
+        assert!(per_peer < MAX_CONNECTIONS);
         let mut held = Vec::new();
-        for _ in 0..MAX_CONNECTIONS {
-            let mut stream = TcpStream::connect(addr).await.unwrap();
-            read_challenge(&mut stream).await;
-            held.push(stream);
+        let mut source = 2u8;
+        while held.len() < MAX_CONNECTIONS {
+            let ip = format!("127.0.0.{source}");
+            for _ in 0..per_peer.min(MAX_CONNECTIONS - held.len()) {
+                let mut stream = connect_from(&ip, addr).await.unwrap();
+                read_challenge(&mut stream).await;
+                held.push(stream);
+            }
+            source += 1;
         }
+        assert_eq!(held.len(), MAX_CONNECTIONS);
 
         // The next connection is accepted at the TCP layer and then dropped
-        // without a handler. Reading EOF proves the server closed its end: a
-        // leaked descriptor would keep the socket open and this read would
-        // time out instead of returning EOF.
-        let mut refused = TcpStream::connect(addr).await.unwrap();
+        // without a handler. It comes from an address that holds no slot, so
+        // only the global cap can be the reason. Reading EOF proves the server
+        // closed its end: a leaked descriptor would keep the socket open and
+        // this read would time out instead of returning EOF.
+        let refused_source = format!("127.0.0.{source}");
+        let mut refused = connect_from(&refused_source, addr).await.unwrap();
         match tokio::time::timeout(Duration::from_secs(3), read_frame(&mut refused)).await {
             Ok(Err(error)) => assert_eq!(
                 error.kind(),
@@ -2681,7 +3284,7 @@ mod protocol_tests {
         drop(held);
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         loop {
-            let mut stream = TcpStream::connect(addr).await.unwrap();
+            let mut stream = connect_from(&refused_source, addr).await.unwrap();
             match tokio::time::timeout(Duration::from_millis(500), read_frame(&mut stream)).await {
                 Ok(Ok((kind, _))) => {
                     assert_eq!(kind, CHALLENGE);
@@ -2693,6 +3296,66 @@ mod protocol_tests {
                 other => panic!("the cap did not recover after its holders closed: {other:?}"),
             }
         }
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn one_source_address_cannot_hold_every_handler_slot() {
+        let f = fixture(19);
+        let count = Arc::new(AtomicUsize::new(0));
+        let (addr, task) =
+            spawn_server(&f, counting_handler(count.clone()), Duration::from_secs(10)).await;
+        let cap = per_peer_connection_cap(f.server.voters().len());
+
+        // One address asks for every slot. Only its share may be served; the
+        // rest must be closed rather than held, so another address still has
+        // slots to use.
+        let mut held = Vec::new();
+        for _ in 0..MAX_CONNECTIONS {
+            let Ok(mut stream) = connect_from("127.0.0.2", addr).await else {
+                continue;
+            };
+            match tokio::time::timeout(Duration::from_secs(2), read_frame(&mut stream)).await {
+                Ok(Ok((kind, _))) => {
+                    assert_eq!(kind, CHALLENGE);
+                    held.push(stream);
+                }
+                Ok(Err(_)) => {}
+                Err(_) => panic!("a connection was neither served nor closed"),
+            }
+        }
+        assert_eq!(
+            held.len(),
+            cap,
+            "one address held more than its share of the handler slots"
+        );
+        assert!(
+            held.len() < MAX_CONNECTIONS,
+            "one source address held {} of {} handler slots",
+            held.len(),
+            MAX_CONNECTIONS
+        );
+
+        // A second address is admitted while the first holds its whole share,
+        // and a signed request on it is answered.
+        let mut other = connect_from("127.0.0.3", addr).await.unwrap();
+        let (kind, body) = tokio::time::timeout(Duration::from_secs(3), read_frame(&mut other))
+            .await
+            .expect("the second address was starved by the first")
+            .expect("the second address was refused while the first held its share");
+        assert_eq!(kind, CHALLENGE);
+        let challenge: [u8; 32] = body.try_into().unwrap();
+        let body = signed_call(&f, 1, &challenge, [4; 32], vote(1, 1));
+        write_frame(&mut other, REQUEST, &body).await.unwrap();
+        assert_eq!(read_frame(&mut other).await.unwrap().0, RESPONSE);
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "a legitimate peer was not served while another address held its share"
+        );
+
+        drop(held);
         task.abort();
         let _ = task.await;
     }
