@@ -3240,6 +3240,7 @@ mod tests {
                 local_vdisks: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
                 last_scrub: Arc::new(std::sync::RwLock::new(None)),
                 reader_lease: Arc::new(Mutex::new(BTreeMap::new())),
+                reader_lease_ttl_ms: yadb_metakv::gc::DEFAULT_TTL_MS,
                 s3: ObjectStoreEngine::new(meta.clone(), 4096),
                 db: yadb_db::DatabaseEngine::new(meta.clone(), 100),
                 block: BlockVolumeEngine::new(meta, BLOCK_SIZE),

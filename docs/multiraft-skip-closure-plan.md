@@ -101,14 +101,29 @@ These stay unproven, and the text below must not be read as proving them:
 
 * a collector lease expiring in the middle of a pass — the daemon has no
   injection point, so only the storage-level drill covers the shape;
-* a reader lease expiring in the middle of a read — the live run observed the
-  record block a pass and then expire with no read in flight, not a read that
-  outlived its lease;
 * two concurrent collectors on one group;
 * a group leader dying between a fragment write and its manifest commit;
 * `block_pool_lookup` resolving through the local control-plane cache rather
   than the group snapshot: a stale cache can make the pass skip a blob, and can
   never make it repair or delete the wrong one.
+
+The item that used to head this list, a reader lease expiring in the middle of a
+read, is now **proven in-process at the handler, and still not proven on a live
+cluster**. `s3_get_refuses_bytes_when_the_read_outlives_its_reader_lease` in
+`crates/yadbd/src/main.rs` uses the real S3 `GET` handler over the real
+multi-group metadata fixture: it writes an object through the engine into the
+group that owns the project, sets the test-only `AppState::reader_lease_ttl_ms`
+to 1 ms, and observes the fenced fetch outlive the lease. The handler answers
+`503` with the `ensure_live` text (`expired at … unreaped`), not the bytes and
+not the acquire path's `reader lease unavailable`; the same `GET` with the
+shipped 30 s default answers `200` with the exact bytes. The field exists only
+so a test can shrink the TTL: there is no CLI flag, no internal route, and the
+shipped default is unchanged. A live proof would need a read that outlives 30 s
+or a runtime TTL knob, and neither was added because that would put a new
+operator surface in the hot read path; the live run only observed the record
+block a pass and then expire with no read in flight. At the method level,
+`end_read_lease_refuses_an_expired_lease_and_does_not_cache_it` asserts the
+same fence refuses and does not cache the dead record for the next read.
 
 The two SKIPs were the only remaining record of a capability the runtime does
 not have. They are not removed by deletion: either the capability is
