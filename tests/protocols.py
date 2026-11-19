@@ -21,13 +21,15 @@ than the project-group leader can therefore lag a commit; assertions that need
 read-your-writes poll with `eventually` instead of racing the apply loop.
 
 Unavailable capabilities are reported as `SKIP <scenario>: <reason>` instead
-of being turned into a pass. Reader leases are legacy-gated. Everything else
-runs: the repair scan repairs one metadata group at a time and refuses only the
-groups the scanning node does not lead, per-group garbage collection is driven
-through four live drills, and a cross-process `InstallSnapshot` is part of the
-normal run because the harness provisions the snapshot knobs instead of waiting
-for the 5000-entry default trigger. A skipped scenario is still a non-zero exit
-if anything else fails.
+of being turned into a pass. Reader leases are legacy-gated: Multi-Raft has no
+*metadata* read lease by design, so a read is fenced at the storage target
+instead and that pin is proved by a live drill. Everything else runs: the
+repair scan repairs one metadata group at a time and refuses only the groups
+the scanning node does not lead, garbage collection is driven through four live
+drills, and a cross-process `InstallSnapshot` is part of the normal run because
+the harness provisions the snapshot knobs instead of waiting for the 5000-entry
+default trigger. A skipped scenario is still a non-zero exit if anything else
+fails.
 """
 import argparse
 import datetime
@@ -723,6 +725,110 @@ def assert_multiraft_repair_drill(health, nodes, temp, env):
     for key, body in [(before_key, before_body)] + during:
         s3_visible(s3_port(leader), key, body, timeout=120)
     return summary
+
+
+def assert_reader_pin_drill(health):
+    """Observe the target-side pin a real S3 GET takes, and its drain.
+
+    Multi-Raft has no *metadata* read lease, but the read is still fenced:
+    `read_part` pins the slot's current epoch before it fetches a fragment and
+    releases the pin as soon as the bytes are copied, and `delete_collectable`
+    refuses while any pin is live. This drill watches the shipped
+    `/internal/vdisk/{pool}/{slot}/pins` route from one thread per slot while a
+    12 MiB object is read. A 1 MiB object is one chunk and finishes inside a
+    single pin window, which is why the payload is large enough to stripe.
+    """
+    pool = next(each for each in health["pools"] if each["pool_name"] == S3_POOL)
+    leader = wait_group_leader(BILLING_GROUP)
+    internal = {"x-yadb-raft-token": RAFT_TOKEN}
+
+    def pins_of(slot):
+        path = f"/internal/vdisk/{S3_POOL}/{slot['slot_index']}/pins"
+        status, _, body = request(http_port(slot["node_id"]), "GET", path,
+                                  headers=internal, timeout=5)
+        assert status == 200, (path, status, body)
+        return json.loads(body)["pins"]
+
+    key = "/invoices-2026/reader-pin/large.bin"
+    # 12 MiB: twelve 1 MiB chunks, six fragments each, and below the 16 MiB
+    # body limit. The default 30 s request budget is too small for this body on
+    # a debug build, so both calls set their own.
+    payload = bytes(range(256)) * (12 * 1024 * 1024 // 256)
+    status, _, body = signed(s3_port(leader), "PUT", key, payload, timeout=120)
+    assert status == 200, (status, body)
+    s3_visible(s3_port(leader), key, payload, timeout=120)
+
+    observations = []
+    lock = threading.Lock()
+    done = threading.Event()
+
+    def poll(slot):
+        # One keep-alive connection per slot: a pin window is a few
+        # milliseconds, so this polls far denser than the window, but a short
+        # sleep keeps nine threads from starving the read they are watching,
+        # and a fresh connection per attempt would burn through the ephemeral
+        # port range during a 12 MiB read.
+        port = http_port(slot["node_id"])
+        path = f"/internal/vdisk/{S3_POOL}/{slot['slot_index']}/pins"
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        try:
+            while not done.is_set():
+                try:
+                    conn.request("GET", path, headers=internal)
+                    response = conn.getresponse()
+                    body = response.read()
+                except (OSError, http.client.HTTPException):
+                    # A dropped keep-alive connection is reopened, and the
+                    # loop backs off slightly so a dead slot cannot spin.
+                    conn.close()
+                    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+                    time.sleep(.01)
+                    continue
+                if response.status == 200:
+                    pins = json.loads(body)["pins"]
+                    if pins:
+                        with lock:
+                            observations.append((slot["slot_index"], pins))
+                time.sleep(.002)
+        finally:
+            conn.close()
+
+    result = {}
+    def fetch():
+        try:
+            result["response"] = signed(s3_port(leader), "GET", key, timeout=120)
+        except BaseException as error:  # noqa: BLE001 - reported below
+            result["error"] = error
+
+    pollers = [threading.Thread(target=poll, args=(slot,), daemon=True)
+               for slot in pool["slots"]]
+    for thread in pollers:
+        thread.start()
+    reader = threading.Thread(target=fetch)
+    reader.start()
+    reader.join()
+    done.set()
+    for thread in pollers:
+        thread.join(10)
+    assert not any(thread.is_alive() for thread in pollers), "a pin poller did not stop"
+    assert "error" not in result, result["error"]
+    status, _, body = result["response"]
+    assert status == 200 and body == payload, (status, len(body))
+    # The pin window is per fragment and short, so this is "observed at least
+    # once", never an exact count.
+    assert observations, ("no live pin was observed during a 12 MiB GET; the "
+                          "pin surface or the read path is not wired as documented")
+    for slot_index, pins in observations:
+        for pin in pins:
+            assert isinstance(pin.get("pin_id"), int), (slot_index, pin)
+            assert isinstance(pin.get("epoch"), int), (slot_index, pin)
+            assert isinstance(pin.get("expires_at_ms"), int), (slot_index, pin)
+    # The pin is released as soon as the bytes are copied, so it must drain on
+    # its own: an abandoned pin would block collection until its TTL.
+    eventually(lambda: {slot["slot_index"]: len(pins_of(slot)) for slot in pool["slots"]},
+               lambda seen: all(count == 0 for count in seen.values()),
+               "reader pins drain after the GET", timeout=10)
+    return len(observations)
 
 
 def assert_vdisk_fence_rpc(port, pool_name, slot_index):
@@ -1778,6 +1884,9 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
             assert_multiraft_repair_drill(health, nodes, temp, env)
             print("PASS Multi-Raft repair scan repairs per group, refuses only "
                   "groups this node does not lead")
+            assert_reader_pin_drill(health)
+            print("PASS Multi-Raft S3 GET pins the fragment at the target and "
+                  "the pin drains")
             a, b = Pg(pg_port(2)), Pg(pg_port(3))
             a.query("CREATE TABLE wire (id INT PRIMARY KEY, balance INT);")
             a.query("INSERT INTO wire VALUES (1,100), (2,200);")
@@ -2019,12 +2128,23 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
             # runtime refused `?consistent=true` because it cannot take such a
             # snapshot, so that refusal became a success assertion. Nothing here
             # falls back to a locally applied manifest.
+            # Multi-Raft has no metadata read lease by design. What protects a
+            # read is the target-side pin, and `assert_reader_pin_drill` proves
+            # that pin live; what is absent is a lease record to acquire.
             skip("reader lease",
-                 "begin_read_lease is legacy-gated: the gate is `!st.app.meta."
-                 "is_openraft()` at crates/yadbd/src/protocols/s3.rs:683, and the "
-                 "lease itself is declared at crates/yadbd/src/main.rs:548, so "
-                 "Multi-Raft has no fenced read lease to acquire, renew or expire; "
-                 "consistent reads use the quorum snapshot instead")
+                 "Multi-Raft has no *metadata* read lease by design: the lease "
+                 "is legacy-gated by `!st.app.meta.is_openraft()` at "
+                 "crates/yadbd/src/protocols/s3.rs:683 and declared at "
+                 "crates/yadbd/src/main.rs:548, so there is no lease record to "
+                 "acquire, renew or expire across groups. A read is fenced at "
+                 "the point of use instead: `read_part` pins the fragment's "
+                 "slot before it fetches it (crates/yadb-blob/src/pool.rs:1136), "
+                 "the epoch advance refuses while a pin is live "
+                 "(crates/yadb-blob/src/volume.rs:588), and a collectable "
+                 "delete refuses for the same reason "
+                 "(crates/yadb-blob/src/volume.rs:858); "
+                 "crates/yadb-blob/src/pool.rs:750 is the pool-level accessor "
+                 "the live pin drill observes")
             # Multipart upload: the parts are real durable allocations, and the
             # completed object must be indistinguishable from a single PUT.
             # An option the object store cannot honour is refused at initiate,

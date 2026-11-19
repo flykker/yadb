@@ -33,6 +33,11 @@ ANCHOR_RE = re.compile(r"([A-Za-z0-9_./-]+\.(?:rs|py)):(\d+)")
 REQUIRED_SUBSTRINGS = {
     "crates/yadbd/src/protocols/s3.rs:683": ["is_openraft"],
     "crates/yadbd/src/main.rs:548": ["begin_read_lease"],
+    "crates/yadb-blob/src/pool.rs:1136": ["read_part"],
+    "crates/yadb-blob/src/pool.rs:750": ["live_pins"],
+    "crates/yadb-blob/src/volume.rs:588": ["live_pins"],
+    "crates/yadb-blob/src/volume.rs:858": ["live_pins"],
+    "crates/yadb-s3/src/lib.rs:17": ["INTENT_GRACE_SECS"],
 }
 
 # Every SKIP in tests/protocols.py, with the anchors its reason must keep.
@@ -44,7 +49,12 @@ EXPECTED_SKIPS = {
     "reader lease": [
         "crates/yadbd/src/protocols/s3.rs:683",
         "crates/yadbd/src/main.rs:548",
-        "Multi-Raft has no fenced read lease",
+        "crates/yadb-blob/src/pool.rs:1136",
+        "crates/yadb-blob/src/volume.rs:588",
+        "crates/yadb-blob/src/volume.rs:858",
+        "crates/yadb-blob/src/pool.rs:750",
+        "Multi-Raft has no *metadata* read lease by design",
+        "fenced at the point of use",
     ],
 }
 
