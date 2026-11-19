@@ -1,0 +1,159 @@
+# Alert rules over the `/metrics` exposition.
+#
+# Every expression names a family the daemon actually emits; the guard
+# `scripts/test_metrics_alert_rules.py` fails if one does not, so a renamed or
+# removed family cannot leave a silently dead alert behind.
+#
+# Two properties of the exposition shape these rules:
+#
+#   * A family that reports the *last* pass is a gauge and is emitted only when
+#     a pass has run. `*_last_pass_present` is always present and is 0 before
+#     the first pass, which is what the "no pass yet" alerts use.
+#   * Gauges describing the last pass can go down (a smaller pass deletes
+#     fewer fragments). Never wrap them in `rate()` or `increase()`; the
+#     cumulative counters are the ones whose names end in `_total`.
+
+groups:
+  - name: yadb
+    rules:
+      - alert: YadbNodeDown
+        expr: up{job="yadb"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "YADB node {{ $labels.instance }} is not answering scrapes"
+          description: >-
+            Scrapes have failed for two minutes. The daemon may be stopped,
+            crashed or unreachable; a failed scrape cannot distinguish those,
+            so confirm on the host before restarting anything.
+
+      - alert: YadbGcNoPass
+        expr: yadb_gc_last_pass_present == 0
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "No garbage-collection pass has run on {{ $labels.instance }}"
+          description: >-
+            `yadb_gc_last_pass_present` has been 0 since the process started.
+            Deleted fragments and aborted uploads are not being reclaimed.
+
+      - alert: YadbGcRefused
+        expr: yadb_gc_refused > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The last collection pass refused on {{ $labels.instance }}"
+          description: >-
+            A refusal is a correct outcome, not an error: the pass deleted
+            nothing because a live lease, a follower or an unreachable pool
+            made the deletion unsafe. Check `yadb_gc_leases_live`,
+            `yadb_gc_groups_refused` and `yadb_gc_pools_refused` to see which
+            fence held, and whether it clears.
+
+      - alert: YadbGcErrors
+        expr: yadb_gc_errors > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "A collection pass reported errors on {{ $labels.instance }}"
+          description: >-
+            Per-operation failures reported after the pass's refusal point.
+            These are operations that did not complete; the pass did not
+            silently treat them as success.
+
+      - alert: YadbPoolNoOnlineSlots
+        expr: yadb_pool_online_slots == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Pool {{ $labels.pool }} has no reachable slots on {{ $labels.instance }}"
+          description: >-
+            Every canonical slot failed its health probe, so the pool can
+            neither read nor write.
+
+      - alert: YadbPoolBelowWriteQuorum
+        expr: yadb_pool_online_slots < yadb_pool_min_write_slots
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Pool {{ $labels.pool }} cannot meet its write quorum"
+          description: >-
+            Fewer slots answer than a write must land fragments on, so writes
+            to this pool are refused. `yadb_pool_refused_puts_total` counts
+            them.
+
+      - alert: YadbSlotOffline
+        expr: yadb_slot_online == 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Slot {{ $labels.slot }} of pool {{ $labels.pool }} is offline"
+          description: >-
+            The slot has not answered its health probe for ten minutes. The
+            pool reports itself degraded while this holds; a repair pass can
+            only restore redundancy once the slot answers again.
+
+      - alert: YadbScrubNoPass
+        expr: yadb_scrub_last_pass_present == 0
+        for: 24h
+        labels:
+          severity: warning
+        annotations:
+          summary: "No repair scan has run on {{ $labels.instance }}"
+          description: >-
+            `yadb_scrub_last_pass_present` has been 0 for a day. Fragments
+            lost to a failed slot are not being rebuilt.
+
+      - alert: YadbScrubUnrecoverable
+        expr: yadb_scrub_blobs_unrecoverable > 0
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "The last repair scan could not prove blobs intact on {{ $labels.instance }}"
+          description: >-
+            At least one live blob did not decode or sat on an unreachable
+            target. This is the shape of real data loss; treat it as an
+            incident and read the scan's outcome, not only the count.
+
+      - alert: YadbScrubFailed
+        expr: yadb_scrub_repair_error > 0 or yadb_scrub_orphan_collection_error > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "A repair scan refused or an orphan collection failed on {{ $labels.instance }}"
+          description: >-
+            `yadb_scrub_repair_error` means the scan refused at least one
+            metadata group; `yadb_scrub_orphan_collection_error` means orphan
+            collection reported an error. Neither is a silent success.
+
+      - alert: YadbGroupObservationFailed
+        expr: yadb_group_observation_error > 0
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Metadata groups cannot be enumerated on {{ $labels.instance }}"
+          description: >-
+            The health surface could not list the node's metadata groups, so
+            every per-group row is missing. This is a local observation
+            failure, not a peer report.
+
+      - alert: YadbGroupError
+        expr: yadb_group_error > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Metadata group {{ $labels.group }} carries an observation error"
+          description: >-
+            One group's row exists but its observation failed, so its term,
+            commit index and applied index are absent rather than guessed.

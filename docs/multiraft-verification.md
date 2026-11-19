@@ -3033,6 +3033,47 @@ sample split across lines, and dropping one family from the completeness list
 fails with "the exposition declares 50 families but the list names 49". All
 restored.
 
-Open: nothing consumes the endpoint. No scrape config, alert rules or dashboard
-are shipped, and the families are this node's local observations — the role in
-`yadb_group_info` is not proof of quorum.
+### The shipped consumers (2026-11-19)
+
+`deploy/monitoring/` now consumes the endpoint: a Prometheus scrape config (one
+`yadb` job, 15 s interval, loading `yadb-alerts.yml`), the alert rules and a
+Grafana dashboard, plus a `README.md` that says what each alert means. The rules
+treat a refusal as a correct outcome — `YadbGcRefused` is a warning that points
+at the fence that held — and reserve `critical` for the states that mean data
+loss (`YadbScrubUnrecoverable`) or a pool that cannot meet its write quorum.
+
+`scripts/test_metrics_alert_rules.py` keeps the three files and the code
+agreeing without a running daemon:
+
+| Check | What it catches |
+| --- | --- |
+| every `yadb_*` token in an alert or panel expression is a declared family | a renamed or removed family leaving a silently dead rule behind |
+| no `rate`/`irate`/`increase`/`delta` wraps a family declared `gauge` | a rate over a per-pass value, which still returns a plausible-looking series |
+| a `counter`'s name ends in `_total`, and a `gauge`'s does not | a family advertising monotonicity it does not have |
+| the `up` alert's job exists in the scrape config, and every `rule_files` entry exists | a dashboard that watches nothing |
+| the `FAMILIES` table and the `family(...)` declarations name the same set | the unit test's completeness list drifting from the exposition |
+
+The guard unit-tests those checks against broken input, so it cannot silently
+stop catching anything. Three inversions on the real files, each restored:
+`rate(yadb_gc_fragments_deleted[5m])` in an alert fails with "applies a rate to
+yadb_gc_fragments_deleted, which is declared as a gauge"; adding a name that
+nothing declares to `FAMILIES` fails with "listed but not declared
+['yadb_never_declared']"; and renaming a family in an alert expression fails
+with "names yadb_gc_errors_total, which the exposition does not declare".
+
+Writing the guard found a real defect in the exposition. Three families
+describing the last pass were declared `counter` and named `*_total`, but their
+value is the last pass's count and goes down when a smaller pass runs. They are
+now the gauges `yadb_gc_fragments_deleted`, `yadb_gc_bytes_reclaimed` and
+`yadb_gc_barriers_applied`. Nothing shipped consumed the old names and no
+documentation cited them; a dashboard that wrapped the old names in `rate()`
+would have been wrong, which is why the alert file's header says not to.
+
+The guard proves agreement, not fitness: no rule has been run against a real
+multi-node cluster and the thresholds are untuned.
+
+Open: no rule has fired against live traffic, the runbooks in
+`multiraft-runtime-operations.md` are derived from the code and the single-host
+gates rather than rehearsed on production-shaped infrastructure, and structured
+logging is still absent. The families remain this node's local observations —
+the role in `yadb_group_info` is not proof of quorum.

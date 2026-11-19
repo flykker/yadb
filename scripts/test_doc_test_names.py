@@ -74,6 +74,15 @@ HISTORICAL = {
     "xml_validate_attribute_value": "loose completion parser, replaced in 2c73c60",
     "valid_char_reference": "loose completion parser, replaced in 2c73c60",
     "assert_multiraft_scrub_repair_refusal": "test helper removed in 9121448",
+    # The three `yadb_gc_*` families that describe a single collection pass.
+    # They were declared `counter` with a `_total` name although the value goes
+    # down between passes; the 2026-11-19 monitoring work renamed them to the
+    # gauges `yadb_gc_fragments_deleted`, `yadb_gc_bytes_reclaimed` and
+    # `yadb_gc_barriers_applied`. The docs name the old names only to record
+    # the rename, so a scraper author can map old samples to new ones.
+    "yadb_gc_fragments_deleted_total": "renamed to yadb_gc_fragments_deleted in the 2026-11-19 monitoring change",
+    "yadb_gc_bytes_reclaimed_total": "renamed to yadb_gc_bytes_reclaimed in the 2026-11-19 monitoring change",
+    "yadb_gc_barriers_applied_total": "renamed to yadb_gc_barriers_applied in the 2026-11-19 monitoring change",
     # The legacy RaftCore checkpoint/compaction suite. `multiraft-verification.md`
     # keeps the names on purpose: they are listed as history next to the current
     # coverage of the same shapes, not as current evidence.

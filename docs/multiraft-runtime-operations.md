@@ -636,6 +636,58 @@ These are still local observations with the same caveats as the JSON surface:
 the role in `yadb_group_info` is what this node last observed, not proof of
 quorum. The endpoint publishes no subject, key, bucket or object name.
 
+### Shipped monitoring configuration
+
+`deploy/monitoring/` now consumes that exposition instead of leaving it to the
+operator to write from scratch:
+
+| File | What it is |
+| --- | --- |
+| `prometheus.yml` | One `yadb` job, 15 s interval, loads `yadb-alerts.yml`. |
+| `yadb-alerts.yml` | Alert rules over the families above. |
+| `grafana-dashboard.json` | Pool/slot health, the last GC pass, the last repair scan, per-group progress. |
+| `README.md` | What each alert means and what a refusal is. |
+
+The rules treat a refusal as a correct outcome: `YadbGcRefused` is a warning
+whose response is to read which fence held (`yadb_gc_leases_live`,
+`yadb_gc_groups_refused`, `yadb_gc_pools_refused`), never to force the pass.
+`YadbScrubUnrecoverable` is the one that means data loss.
+
+Two properties of the exposition shape the rules, and a new rule that ignores
+them is wrong even though it parses:
+
+* The families describing the **last** pass are gauges. A smaller pass deletes
+  fewer fragments, so the value legitimately goes down; wrapping one in
+  `rate()`/`increase()` publishes a nonsense series that still looks plausible.
+  Only families whose name ends in `_total` are cumulative counters.
+* A last-pass family is emitted only after a pass has run, so freshness is the
+  always-present `yadb_gc_last_pass_present` / `yadb_scrub_last_pass_present`,
+  which are `0` before the first pass.
+
+The three `yadb_gc_*` families that describe one pass were therefore renamed
+from `yadb_gc_fragments_deleted_total`, `yadb_gc_bytes_reclaimed_total` and
+`yadb_gc_barriers_applied_total` to the `_total`-free names above, and their
+declared type changed from `counter` to `gauge`. This is a deliberate breaking
+change to the exposition: the old names advertised monotonicity the values do
+not have, and no shipped dashboard or rule used them. A scraper that recorded
+the old names keeps its data; only new samples change name.
+
+`scripts/test_metrics_alert_rules.py` keeps the configuration and the code
+agreeing offline: every `yadb_*` identifier in an alert or panel expression
+must be a family `metrics.rs` declares, no rate may wrap a gauge, a counter's
+name must end in `_total` (and a gauge's must not), the `up` alert must name a
+job the scrape config defines, and every `rule_files` entry must exist. The
+guard unit-tests those checks against broken input, so it cannot silently stop
+catching anything. It proves agreement, not that the thresholds are right: no
+rule here has been run against a real multi-node cluster, so the durations and
+severities are starting points to tune against observed traffic.
+
+The public listener is plain HTTP and `/metrics` is not authenticated. It
+publishes node, pool, slot and group identifiers, never a subject, key, bucket
+or object name. Scrape it from the same host, put an authenticating TLS
+terminator in front of it, or bound it with a firewall that admits only the
+scraper.
+
 ## Operator collection commands
 
 `yadbctl pool-gc` and `yadbctl pool-scrub` call `POST /v1/pools/gc` and
@@ -728,6 +780,101 @@ error would turn the consistent-read “map is not a GC fence” `503` into a `5
 Operationally: `404`/`NoSuchKey` means the object was never written or was
 deleted, while `422`/`500` with a corruption reason means it exists and must be
 repaired from a replica — never re-created silently.
+
+## Recovery runbook
+
+The matrix above says *what* is refused. This section says what an operator does
+next. Every step keeps the original bytes; nothing here authorizes deleting or
+rewriting a directory, log, image or descriptor to make a node start.
+
+**A. The node refuses to start and names a busy directory lock.** Something else
+holds the group directory. Find the holder (`fuser -v <dir>`, `lsof +D <dir>`),
+decide whether it is an old process of this node or a second daemon started
+against the same `--data-dir`, and stop it. Never remove a lock file, never
+copy the directory to a second path to get a second daemon: two processes
+appending to one log is how acknowledged entries are lost. If the holder cannot
+be identified, treat the node as suspect and do not start a replacement against
+the same directory.
+
+**B. The node refuses to start and names a partial bootstrap, an identity
+mismatch or an unsupported log version.** The directory does not describe the
+replica the command line asks for. Stop and compare the intended configuration
+with the directory's own descriptor: cluster and group identity, incarnation,
+node id, voter list. Do not rewrite the descriptor to fit the flags, and do not
+re-run initialization to fill in what looks missing. A partial bootstrap is
+evidence of an interrupted create; a fresh, empty root is the only safe way to
+retry, and only when the directory provably holds no acknowledged data. An
+unsupported log version means the binary is older than the data; upgrade the
+binary rather than replaying or converting the bytes.
+
+**C. The node refuses to start and names a corrupt or truncated log or state
+image.** Preserve the directory as evidence before anything else. The only
+automatic repair is truncation of a *torn final frame* in the Raft log or in
+`state.delta` — a frame that provably runs past the end of the file. A bad
+magic, a checksum mismatch, a delta gap, a zero-filled tail or any mid-file
+damage is refused, not repaired, and must be recovered from a validated
+replica through an approved procedure. Never apply a generic "delete `*.tmp`"
+or "truncate to the last good record" repair to production data.
+
+**D. The node starts but serves nothing because quorum is unavailable.**
+`yadb_group_observation_error 1` or a group row whose commit index does not
+advance is the shape. Restore legitimate peers and connectivity; a leader that
+cannot reach a majority must not be replaced by lowering the voter count,
+accepting a singleton write or treating a timeout as an abort. `POST
+/v1/pools/gc` and `/v1/pools/scrub` report `exit 1` in this state, and retrying
+before quorum returns cannot help.
+
+**E. The node reports a write, sync, rename or directory-sync error.** The
+outcome of that operation is unknown and the handle is poisoned; further
+participation requires a validated reopen. Stop the node, keep the directory,
+and restart it through case C rather than continuing to serve on the poisoned
+handle.
+
+**F. `yadb_scrub_blobs_unrecoverable` is non-zero.** Treat it as an incident.
+The scan could not prove at least one live blob intact: either no combination
+of fragments decodes or the only copies sit on unreachable targets. Do not
+re-create the object, and do not delete fragments to "clean up". Restore the
+unreachable replica first if that is the cause, then re-run the scan.
+
+## Upgrade runbook
+
+The on-disk formats are versioned and some upgrades are one-way, so an upgrade
+is a per-node procedure with a check between nodes, not a restart of everything.
+
+1. Read the release notes for format changes. The known one-way steps are the
+   volume WAL (`YADBWAL1` → `YADBWAL2`), the checkpoint-capable Raft log
+   (`YORLOG05`) and the GC generation barrier. A node that has written a newer
+   format cannot be rolled back to an older binary: the old binary does not
+   recognise the format and, for the WAL, treats the whole log as a tail and
+   truncates it. Rolling back means restoring a backup, not downgrading a
+   binary.
+2. Upgrade one node at a time, never a majority at once, and never two nodes of
+   the same group simultaneously.
+3. After a node restarts, wait for its `yadb_group_applied_index` to reach the
+   group's commit index on a peer before touching the next node. A node that is
+   up but not applying is not upgraded, it is stuck, and the next restart would
+   remove the quorum that could have caught it up.
+4. Confirm the group still has a leader and that `yadb_gc_refused` is `0` for a
+   pass before continuing. A refused pass is not a reason to roll back; a pass
+   that refuses on every node after the upgrade is.
+5. Check the credential surface after the upgrade. A new collector sending a
+   barrier to an older target succeeds only if both sides agree on the trust
+   material; rotate keys before, not during, a partial rollout.
+
+## Group reconfiguration
+
+Live membership changes are **not supported**. Memberships are fixed at
+provisioning time: OpenRaft reconfiguration is not implemented, and the voter
+list in the descriptor is not a configuration knob. Do not edit it, do not
+delete a replica directory to "remove" a voter, and do not start a replacement
+under the same node id and expect the group to adopt it.
+
+What is supported is provisioning a new group or incarnation and importing the
+data into it, which `multiraft-migration.md` describes: the new group
+bootstraps its own consensus and receives a committed import record. That is a
+migration with its own gates, not an in-place reconfiguration. Moving a project
+between groups, changing the number of replicas, or replacing a failed host are
+all migrations under that procedure.
 
 ## Required release integrations
 

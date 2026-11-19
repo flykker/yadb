@@ -1,0 +1,197 @@
+{
+  "uid": "yadb-health",
+  "title": "YADB",
+  "tags": ["yadb"],
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": { "from": "now-6h", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "label": "Prometheus",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {}
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Pool slots: online vs write quorum",
+      "description": "yadb_pool_online_slots below yadb_pool_min_write_slots means writes to that pool are refused.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "yadb_pool_online_slots",
+          "legendFormat": "{{pool}} online"
+        },
+        {
+          "refId": "B",
+          "expr": "yadb_pool_min_write_slots",
+          "legendFormat": "{{pool}} min write"
+        },
+        {
+          "refId": "C",
+          "expr": "yadb_pool_slots",
+          "legendFormat": "{{pool}} canonical"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Slot health",
+      "description": "1 when the slot answered its last health probe. A slot that stays at 0 keeps its pool degraded.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "fieldConfig": {
+        "defaults": { "unit": "short", "min": 0, "max": 1 },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "yadb_slot_online",
+          "legendFormat": "{{pool}}/{{slot}} node {{node_id}}"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Collection pass outcome",
+      "description": "A refusal is correct when a lease, follower or unreachable pool makes deletion unsafe. The pass deleted nothing in that case.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 8 },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "yadb_gc_refused", "legendFormat": "refused" },
+        { "refId": "B", "expr": "yadb_gc_errors", "legendFormat": "errors" },
+        { "refId": "C", "expr": "yadb_gc_leases_live", "legendFormat": "leases live" },
+        { "refId": "D", "expr": "yadb_gc_groups_refused", "legendFormat": "groups refused" },
+        { "refId": "E", "expr": "yadb_gc_pools_refused", "legendFormat": "pools refused" }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Last collection pass: fragments and bytes",
+      "description": "Per-pass gauges, not counters: a smaller pass legitimately goes down. Never apply rate() to them.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 8 },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "yadb_gc_fragments_deleted",
+          "legendFormat": "fragments deleted"
+        },
+        {
+          "refId": "B",
+          "expr": "yadb_gc_bytes_reclaimed",
+          "legendFormat": "bytes reclaimed"
+        },
+        {
+          "refId": "C",
+          "expr": "yadb_gc_barriers_applied",
+          "legendFormat": "barriers applied"
+        },
+        { "refId": "D", "expr": "yadb_gc_blobs_live", "legendFormat": "blobs live" }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Last repair scan",
+      "description": "Unrecoverable is the shape of real data loss. It is a count, not a rate.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 8 },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "yadb_scrub_blobs_checked", "legendFormat": "checked" },
+        { "refId": "B", "expr": "yadb_scrub_blobs_intact", "legendFormat": "intact" },
+        { "refId": "C", "expr": "yadb_scrub_blobs_repaired", "legendFormat": "repaired" },
+        {
+          "refId": "D",
+          "expr": "yadb_scrub_blobs_unrecoverable",
+          "legendFormat": "unrecoverable"
+        },
+        {
+          "refId": "E",
+          "expr": "yadb_scrub_fragments_repaired",
+          "legendFormat": "fragments repaired"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Metadata group progress",
+      "description": "Commit and applied index as this node last observed them. A gap that does not close means the follower is not catching up.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "yadb_group_commit_index",
+          "legendFormat": "group {{group}} commit"
+        },
+        {
+          "refId": "B",
+          "expr": "yadb_group_applied_index",
+          "legendFormat": "group {{group}} applied"
+        },
+        {
+          "refId": "C",
+          "expr": "yadb_group_term",
+          "legendFormat": "group {{group}} term"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "stat",
+      "title": "Node",
+      "description": "Always 1. Identifies the node and the metadata runtime it serves.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 16 },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "yadb_node_info",
+          "legendFormat": "node {{node_id}} {{metadata_runtime}}"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "stat",
+      "title": "Pass freshness",
+      "description": "0 means no pass has run since the process started. Pair it with the alerts that fire after a long silence.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 16 },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "yadb_gc_last_pass_present",
+          "legendFormat": "gc pass present"
+        },
+        {
+          "refId": "B",
+          "expr": "yadb_scrub_last_pass_present",
+          "legendFormat": "scrub pass present"
+        }
+      ]
+    }
+  ]
+}

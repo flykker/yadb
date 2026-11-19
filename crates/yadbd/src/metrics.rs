@@ -360,15 +360,15 @@ pub(crate) fn render(
     );
     family(
         &mut out,
-        "yadb_gc_fragments_deleted_total",
-        "counter",
-        "Physical fragments the last pass removed.",
+        "yadb_gc_fragments_deleted",
+        "gauge",
+        "Physical fragments the last pass removed. A per-pass value, so it can go down: it is a gauge, not a counter.",
     );
     family(
         &mut out,
-        "yadb_gc_bytes_reclaimed_total",
-        "counter",
-        "Bytes the last pass's compaction returned to the filesystem.",
+        "yadb_gc_bytes_reclaimed",
+        "gauge",
+        "Bytes the last pass's compaction returned to the filesystem. A per-pass value, so it can go down: it is a gauge, not a counter.",
     );
     family(
         &mut out,
@@ -378,9 +378,9 @@ pub(crate) fn render(
     );
     family(
         &mut out,
-        "yadb_gc_barriers_applied_total",
-        "counter",
-        "Durable generation barriers the last pass wrote.",
+        "yadb_gc_barriers_applied",
+        "gauge",
+        "Durable generation barriers the last pass wrote. A per-pass value, so it can go down: it is a gauge, not a counter.",
     );
     family(
         &mut out,
@@ -416,20 +416,20 @@ pub(crate) fn render(
         sample(&mut out, "yadb_gc_blobs_live", &[], gc.blobs_live);
         sample(
             &mut out,
-            "yadb_gc_fragments_deleted_total",
+            "yadb_gc_fragments_deleted",
             &[],
             gc.fragments_deleted,
         );
         sample(
             &mut out,
-            "yadb_gc_bytes_reclaimed_total",
+            "yadb_gc_bytes_reclaimed",
             &[],
             gc.bytes_reclaimed,
         );
         sample(&mut out, "yadb_gc_leases_live", &[], gc.leases_live);
         sample(
             &mut out,
-            "yadb_gc_barriers_applied_total",
+            "yadb_gc_barriers_applied",
             &[],
             gc.barriers_applied,
         );
@@ -763,10 +763,10 @@ mod tests {
         "yadb_slot_repairs_ok_total",
         "yadb_gc_last_pass_present",
         "yadb_gc_blobs_live",
-        "yadb_gc_fragments_deleted_total",
-        "yadb_gc_bytes_reclaimed_total",
+        "yadb_gc_fragments_deleted",
+        "yadb_gc_bytes_reclaimed",
         "yadb_gc_leases_live",
-        "yadb_gc_barriers_applied_total",
+        "yadb_gc_barriers_applied",
         "yadb_gc_refused",
         "yadb_gc_groups_refused",
         "yadb_gc_pools_refused",
@@ -898,8 +898,8 @@ mod tests {
         assert_eq!(line(&text, "yadb_gc_refused"), "yadb_gc_refused 1");
         assert_eq!(line(&text, "yadb_gc_blobs_live"), "yadb_gc_blobs_live 9");
         assert_eq!(
-            line(&text, "yadb_gc_fragments_deleted_total"),
-            "yadb_gc_fragments_deleted_total 0"
+            line(&text, "yadb_gc_fragments_deleted"),
+            "yadb_gc_fragments_deleted 0"
         );
         assert_eq!(line(&text, "yadb_gc_groups_refused"), "yadb_gc_groups_refused 1");
         assert_eq!(line(&text, "yadb_gc_leases_live"), "yadb_gc_leases_live 1");

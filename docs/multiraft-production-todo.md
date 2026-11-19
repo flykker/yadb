@@ -1395,10 +1395,11 @@ design; the removed draft is not kept in the tree.
   success; removing either recording line fails the test.
 - [ ] Complete the operational surface around that health data: logging,
   alerting and recovery/upgrade runbooks, and validate them across
-  multi-node deployments. Metrics export is done (next bullet) but nothing
-  consumes it: no alert rules, no dashboard and no scrape config are shipped,
-  and the runbooks for recovery, upgrade and group reconfiguration are still
-  unwritten.
+  multi-node deployments. Alerting, a scrape config, a dashboard and the
+  recovery, upgrade and group-reconfiguration runbooks now exist (next two
+  bullets), but no rule has been run against a real multi-node deployment,
+  structured logging is still absent, and every runbook procedure is derived
+  from the code and the single-host gates rather than rehearsed.
   - [x] Export that health data for a scraper. `GET /metrics` on the public
     listener renders the same rows `/v1/pools/health` serves — node and runtime,
     one family per pool, one per slot, the last collection pass, the last repair
@@ -1421,6 +1422,40 @@ design; the removed draft is not kept in the tree.
     route fails it with `404`) and that a scrape never runs a pass. It
     is a read-only surface on the public listener, not a new control plane, and
     it publishes no subject, key or object name.
+  - [x] Ship a scrape config, alert rules and a dashboard, and guard them
+    against drift. `deploy/monitoring/` carries a Prometheus scrape config
+    (one `yadb` job loading `yadb-alerts.yml`), the alert rules and a Grafana
+    dashboard. `scripts/test_metrics_alert_rules.py` parses every alert and
+    panel expression, every `family(...)` declaration and the `FAMILIES`
+    table, and fails when an expression names a family the exposition does not
+    declare, when a rate wraps a gauge, when a counter's name does not end in
+    `_total` (or a gauge's does), when the `up` alert names an undefined job,
+    or when a `rule_files` entry is missing; it unit-tests those checks against
+    broken input. Writing the guard found that three families describing the
+    last pass were declared `counter` with a `_total` name although their value
+    goes down between passes, so `yadb_gc_fragments_deleted_total`,
+    `yadb_gc_bytes_reclaimed_total` and `yadb_gc_barriers_applied_total` became
+    the gauges `yadb_gc_fragments_deleted`, `yadb_gc_bytes_reclaimed` and
+    `yadb_gc_barriers_applied`. Nothing shipped consumed the old names. The
+    guard proves the configuration matches the code, not that the thresholds
+    are right.
+  - [x] Write the recovery, upgrade and group-reconfiguration runbooks.
+    `multiraft-runtime-operations.md` now walks the fail-closed matrix as
+    procedures: a busy directory lock, a partial bootstrap or identity
+    mismatch, an unsupported log version, corrupt or truncated bytes, no
+    quorum, a poisoned write handle and an unrecoverable repair scan. The
+    upgrade runbook covers the one-way format steps (`YADBWAL1`→`YADBWAL2`,
+    `YORLOG05`, the GC barrier), one node at a time with an applied-index check
+    before the next, and why a rollback means restoring a backup rather than
+    downgrading a binary. The reconfiguration section states plainly that live
+    membership changes are unsupported and that moving a project, changing the
+    replica count or replacing a host is a migration under
+    `multiraft-migration.md`, not an edit of the voter list.
+  - [ ] Residual: run the alerts and the runbooks against a real multi-node
+    deployment. No rule has ever fired against live traffic, the thresholds
+    and `for:` durations are untuned, and every procedure above is derived from
+    the code and the single-host gates rather than rehearsed on
+    production-shaped infrastructure. Structured logging is still absent.
   Each group starts from strict bounded JSON configuration, explicit
   create/open/bootstrap, mandatory mTLS and a separate listener; its
   create/shutdown/reopen tests pass. The daemon now requires a version-2

@@ -1,0 +1,31 @@
+# Prometheus scrape configuration for one YADB node.
+#
+# The daemon serves `GET /metrics` on its public listener (`--listen`, default
+# `127.0.0.1:8420`) in the Prometheus text format (`version=0.0.4`). The
+# endpoint is read-only: a scrape performs the same slot health probe
+# `/v1/pools/health` performs and writes nothing.
+#
+# The public listener is plain HTTP today and `/metrics` is not authenticated,
+# so production deployments must reach it through their own TLS terminator or
+# a firewall that admits only the scraper. The exposition carries node, pool,
+# slot and group identifiers. See docs/multiraft-runtime-operations.md.
+#
+# Scrape every node; the per-node identity is the `node_id` label on
+# `yadb_node_info`, so several nodes may share one job.
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - yadb-alerts.yml
+
+scrape_configs:
+  - job_name: yadb
+    metrics_path: /metrics
+    scheme: http
+    static_configs:
+      - targets:
+          - 127.0.0.1:8420
+        labels:
+          cluster: yadb
