@@ -144,9 +144,23 @@ switched. See `docs/multiraft-verification.md`.
   Do not modify, import or erase old legacy directories; no automatic fallback.
 - [ ] Test actual adapter/engine paths, empty-root admission, persistence/reopen,
   follower write rejection and disabled legacy Raft endpoints in OpenRaft mode.
-- [ ] Preserve control-plane/RBAC watcher correctness across durable snapshot
+- [x] Preserve control-plane/RBAC watcher correctness across durable snapshot
   installation: notify installed-state deltas only after successful persistence,
   never on failed installation, and retain subscriptions for later applies.
+  The behaviour was already correct — `deliver_notifications` runs only after
+  `persist_locked` returns `Ok` — but nothing observed the boundary, so the
+  ordering is now pinned: `snapshot_install_notifies_watchers_only_after_durable_publication`
+  pauses the install after the temporary image is written and before it is
+  synced or renamed, asserts the watcher has received nothing there, then
+  releases it and asserts the installed delta arrives;
+  `snapshot_install_notifies_delta_only_after_durable_success` and
+  `a_failed_install_delivers_nothing_and_poisons_before_any_later_notification`
+  pin the failed-install silence, the poisoned handle and the subscription that
+  still receives later applies; `snapshot_install_notifies_only_the_values_it_changed`
+  pins the diff-only contract, so a replayed snapshot does not look like a
+  rewrite of every key. Moving the notification before persistence fails the
+  ordering test. In-process fault injection only; power loss is the separate
+  filesystem item.
 - [ ] Ensure a lost forwarded mutation response does not trigger automatic
   resubmission in the new runtime; retain explicit unknown-outcome semantics.
   - [x] Distinguish "not sent" from "outcome unknown" on the legacy forwarding
@@ -345,8 +359,19 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   ordering and unknown-outcome claims. Dropping the ancestor sync fails the
   nested-path test; moving the parent sync after publication fails the
   single-level one.
-- [ ] Make snapshot identity, membership, log pointers, concurrent build/install,
+- [x] Make snapshot identity, membership, log pointers, concurrent build/install,
   watchers and recovery correct; explicitly test stale and conflicting snapshots.
+  `snapshot_identity_binds_group_membership_and_log_pointer` refuses an image
+  built in another group and a metadata field that disagrees with the image
+  bytes; `stale_snapshot_install_cannot_roll_back_applied_state` and
+  `same_applied_snapshot_requires_identical_state_and_membership` pin the stale
+  and conflicting refusals; `concurrent_snapshot_build_and_install_serialise_on_the_inner_lock`
+  pauses a build inside `persist_locked` and shows an install on another handle
+  cannot finish until the build releases the same `Mutex`, then checks both
+  images are whole and that an apply continues at the installed log pointer;
+  `snapshot_install_simulated_failures_require_reopen` covers recovery at every
+  persistence phase. This is in-process serialisation and fault injection, not
+  power loss or cross-host install.
 - [x] Inject write, partial write, file sync, rename and directory sync faults for
   every durable log operation — bootstrap create, append for vote, append,
   truncate and purge, checkpoint rewrite and frame rotation, reopen — and assert

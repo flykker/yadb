@@ -1311,7 +1311,12 @@ boundary (`cargo test -p yadb-metakv`):
   `same_applied_snapshot_requires_identical_state_and_membership`,
   `stale_snapshot_install_cannot_roll_back_applied_state`,
   `snapshot_id_binds_bytes_not_just_last_applied_log`,
+  `snapshot_identity_binds_group_membership_and_log_pointer`,
   `snapshot_install_simulated_failures_require_reopen`;
+- concurrent build/install and watcher ordering:
+  `concurrent_snapshot_build_and_install_serialise_on_the_inner_lock`,
+  `snapshot_install_notifies_watchers_only_after_durable_publication`,
+  `snapshot_install_notifies_only_the_values_it_changed`;
 - catch-up through the durable image: `openraft_persistent_cluster_recovers_lagging_follower_via_snapshot`,
   `snapshot_can_install_on_another_replica_of_same_group`;
 - transfer resumption and bounds: `large_snapshot_stream_round_trip`,
