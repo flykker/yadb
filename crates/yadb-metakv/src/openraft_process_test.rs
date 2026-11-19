@@ -167,12 +167,32 @@ async fn child(config: Value) {
             )
         })
         .collect();
+    // A probe child opens an existing replica directory under a different
+    // incarnation to prove a mismatched-identity restart is refused. Every
+    // normal child uses `identity(node)`.
+    let replica_identity = match config["incarnation"].as_u64() {
+        Some(incarnation) => ReplicaIdentity::new(
+            GroupIdentity {
+                cluster: [61; 16],
+                group: 61,
+                incarnation,
+            },
+            node,
+            vec![1, 2, 3],
+        )
+        .unwrap(),
+        None => identity(node),
+    };
     let registry = Arc::new(
         PeerKeyRegistry::new((1..=3).map(|n| (n, key(n).public_key())).collect()).unwrap(),
     );
-    let transport =
-        TransportConfig::new(identity(node), Arc::new(key(node)), peers.clone(), registry)
-            .with_tls(Arc::new(crate::openraft_tls::test_support::config(node)));
+    let transport = TransportConfig::new(
+        replica_identity.clone(),
+        Arc::new(key(node)),
+        peers.clone(),
+        registry,
+    )
+    .with_tls(Arc::new(crate::openraft_tls::test_support::config(node)));
     let listen: SocketAddr = config["listen"].as_str().unwrap().parse().unwrap();
     let listener = tokio::net::TcpListener::bind(listen).await.unwrap();
     let config_raft = Arc::new(
@@ -204,14 +224,22 @@ async fn child(config: Value) {
     );
     let network = AuthenticatedTcpNetworkFactory::new(transport.clone());
     let dir = root.join(format!("node-{node}"));
-    let group = if config["open"].as_bool().unwrap() {
-        PersistentGroup::open(&dir, &identity(node), config_raft, network)
-            .await
-            .unwrap()
+    let group = match if config["open"].as_bool().unwrap() {
+        PersistentGroup::open(&dir, &replica_identity, config_raft, network).await
     } else {
-        PersistentGroup::create(&dir, &identity(node), config_raft, network)
-            .await
-            .unwrap()
+        PersistentGroup::create(&dir, &replica_identity, config_raft, network).await
+    } {
+        Ok(group) => group,
+        // A probe reports the refusal instead of panicking so the parent can
+        // assert the exact reason. Normal children still fail loudly.
+        Err(error) if config["report_startup_error"].as_bool().unwrap_or(false) => {
+            atomic_json(
+                &control.join("ready"),
+                &json!({"error": format!("{error}")}),
+            );
+            return;
+        }
+        Err(error) => panic!("replica startup failed: {error}"),
     };
     let snapshots = Arc::new(AtomicUsize::new(0));
     // The child owns this task for its entire lifetime; the parent kills and
@@ -293,6 +321,26 @@ impl Drop for Process {
     }
 }
 impl Process {
+    /// SIGKILL, reaped and checked. `Child::kill` sends SIGKILL on Unix; the
+    /// assertion keeps this distinct from a graceful shutdown or a proxy cut.
+    fn sigkill(&mut self) {
+        self.child.kill().unwrap();
+        let status = self.child.wait().unwrap();
+        #[cfg(unix)]
+        assert_eq!(
+            std::os::unix::process::ExitStatusExt::signal(&status),
+            Some(9),
+            "node {} was not killed by SIGKILL: {status:?}",
+            self.node
+        );
+        #[cfg(not(unix))]
+        assert!(
+            !status.success(),
+            "node {} exited successfully instead of being killed: {status:?}",
+            self.node
+        );
+    }
+
     async fn request(&mut self, req: Value) -> Value {
         let seq = self.seq;
         self.seq += 1;
@@ -325,9 +373,26 @@ fn start_with_listener(
     node: u32,
     generation: u32,
 ) -> Process {
+    start_with_options(root, peers, listen, node, generation, json!({}))
+}
+/// Spawns a child with extra config keys merged over the defaults. The child
+/// entry point is `TEST_NAME`, the failover test, whose `CHILD_ENV` branch runs
+/// `child` for every parent test in this file.
+fn start_with_options(
+    root: &Path,
+    peers: &BTreeMap<u32, SocketAddr>,
+    listen: SocketAddr,
+    node: u32,
+    generation: u32,
+    extra: Value,
+) -> Process {
     let control = root.join(format!("control-{node}-{generation}"));
     std::fs::create_dir(&control).unwrap();
-    let config = json!({"node": node, "root": root, "control": control, "listen": listen.to_string(), "peers": peers, "open": generation > 0});
+    let mut config = json!({"node": node, "root": root, "control": control, "listen": listen.to_string(), "peers": peers, "open": generation > 0});
+    config
+        .as_object_mut()
+        .unwrap()
+        .extend(extra.as_object().cloned().unwrap_or_default());
     let child = Command::new(std::env::current_exe().unwrap())
         .arg("--exact")
         .arg(TEST_NAME)
@@ -819,4 +884,152 @@ async fn three_process_mtls_failover_and_quorum_loss() {
     })
     .await
     .expect("multi-process test exceeded total timeout");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn three_process_mtls_leader_kill_elects_a_replacement_and_the_dead_leader_catches_up() {
+    // This parent kills a leader process with SIGKILL and restarts it; the
+    // partition and snapshot-install shapes live in the two tests above. The
+    // child entry point is still `TEST_NAME`, whose CHILD_ENV branch runs
+    // `child`, so this function is never a child.
+    if std::env::var_os(CHILD_ENV).is_some() {
+        panic!("leader-kill parent cannot be a child");
+    }
+    let _gate = super::test_gate::exclusive().await;
+    tokio::time::timeout(Duration::from_secs(120), async {
+        let base = std::env::var_os("YADB_TEST_TMPDIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let root = base.join(format!(
+            "yadb-leader-kill-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let dir = TestDir(root);
+        let reservations: Vec<_> = (0..3)
+            .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+            .collect();
+        let peers: BTreeMap<_, _> = reservations
+            .iter()
+            .enumerate()
+            .map(|(i, l)| ((i + 1) as u32, l.local_addr().unwrap()))
+            .collect();
+        drop(reservations);
+        let mut nodes: BTreeMap<_, _> = (1..=3).map(|n| (n, start(&dir.0, &peers, n, 0))).collect();
+        for node in nodes.values_mut() {
+            ready(node).await;
+        }
+        assert_eq!(
+            nodes
+                .get_mut(&1)
+                .unwrap()
+                .request(json!({"op":"initialize"}))
+                .await["ok"],
+            true
+        );
+        const BEFORE: [&str; 3] = [
+            "leader-kill-before-1",
+            "leader-kill-before-2",
+            "leader-kill-before-3",
+        ];
+        for key in BEFORE {
+            write(&mut nodes, key).await;
+        }
+        // Every pre-kill key is acknowledged and applied on all three replicas
+        // before the leader dies, so a later loss is a real loss.
+        check_values(&mut nodes, &BEFORE).await;
+
+        let old_leader = leader(&mut nodes).await;
+        let mut killed = nodes.remove(&old_leader).unwrap();
+        killed.sigkill();
+        drop(killed);
+        eprintln!("SIGKILLed leader {old_leader}; the two survivors must elect a replacement");
+
+        // `leader` polls within the same 20 s budget the other tests use.
+        let new_leader = leader(&mut nodes).await;
+        assert_ne!(
+            new_leader, old_leader,
+            "the survivors still report the killed leader {old_leader}"
+        );
+        assert_eq!(nodes.len(), 2);
+
+        let writer = write(&mut nodes, "leader-kill-after").await;
+        assert_ne!(writer, old_leader, "a killed process acknowledged a write");
+        let all_keys = [BEFORE.as_slice(), &["leader-kill-after"]].concat();
+        check_values(&mut nodes, &all_keys).await;
+
+        // A restart with the wrong identity must be refused before storage is
+        // opened. Probe the killed node's own directory under incarnation 2.
+        let mut probe = start_with_options(
+            &dir.0,
+            &peers,
+            "127.0.0.1:0".parse().unwrap(),
+            old_leader,
+            99,
+            json!({"incarnation": 2, "report_startup_error": true}),
+        );
+        let report = tokio::time::timeout(Duration::from_secs(10), async {
+            while !probe.control.join("ready").exists() {
+                assert!(
+                    probe.child.try_wait().unwrap().is_none(),
+                    "identity probe exited without reporting a refusal"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let report: Value =
+                serde_json::from_slice(&std::fs::read(probe.control.join("ready")).unwrap())
+                    .unwrap();
+            report
+        })
+        .await
+        .expect("identity probe timeout");
+        let refusal = report["error"]
+            .as_str()
+            .unwrap_or_else(|| panic!("wrong-identity restart was not refused: {report}"));
+        assert!(
+            refusal.contains("replica identity or bootstrap voters mismatch"),
+            "wrong-identity restart refused for another reason: {refusal}"
+        );
+        drop(probe);
+
+        // Restart the killed node with the same identity and directory. The
+        // poll-until-caught-up check is what proves the replacement leader
+        // replicated the post-kill write to it.
+        nodes.insert(old_leader, start(&dir.0, &peers, old_leader, 1));
+        ready(nodes.get_mut(&old_leader).unwrap()).await;
+        check_values(&mut nodes, &all_keys).await;
+        let status = nodes
+            .get_mut(&old_leader)
+            .unwrap()
+            .request(json!({"op":"status"}))
+            .await;
+        assert_ne!(
+            status["leader"].as_u64(),
+            Some(old_leader as u64),
+            "the restarted old leader is leader again: {status}"
+        );
+        assert_eq!(
+            status["leader"].as_u64(),
+            Some(new_leader as u64),
+            "the restarted old leader follows a different leader than the elected replacement: {status}"
+        );
+
+        drop(nodes);
+        // Read the persisted state with the adapter after every process is dead.
+        // No acknowledged key is absent from any replica.
+        for n in 1..=3 {
+            let state =
+                DurableMetaStateMachine::open(dir.0.join(format!("node-{n}/state")), &identity(n))
+                    .unwrap();
+            for &key in &all_keys {
+                assert_eq!(state.snapshot().get(key).unwrap().value, key.as_bytes());
+            }
+        }
+    })
+    .await
+    .expect("leader-kill test exceeded total timeout");
 }
