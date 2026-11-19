@@ -10,6 +10,34 @@ use crate::openraft_state_machine::DurableMetaStateMachine;
 use crate::{KvCommand, KvResult, MetaError, MetaSnapshot, RoleState, WatchEvent};
 use openraft::error::{CheckIsLeaderError, ClientWriteError, RaftError};
 
+/// How long one group's health observation waits for the Raft core to answer a
+/// local `committed` query before reporting the commit index as unavailable.
+///
+/// `RaftMetrics` carries no commit index, and a wedged core must not turn a
+/// read-only health request into a hang: the row then names the reason instead
+/// of a number.
+const COMMIT_OBSERVATION_BUDGET: Duration = Duration::from_millis(500);
+
+/// One metadata group's locally observed state.
+///
+/// Every field is this node's own view: the role, term and leader come from the
+/// metrics channel, `applied_index` is the last applied log index and
+/// `commit_index` is `RaftState::committed`. Nothing here is fetched from a
+/// peer, and reading it takes no lease and changes no metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupObservation {
+    pub group: u64,
+    pub node_id: u32,
+    pub role: RoleState,
+    pub term: u64,
+    pub leader_id: Option<u32>,
+    pub applied_index: u64,
+    /// `None` only when the Raft core did not answer within
+    /// [`COMMIT_OBSERVATION_BUDGET`]; `commit_error` then carries the reason.
+    pub commit_index: Option<u64>,
+    pub commit_error: Option<String>,
+}
+
 /// Control-scope idempotency records live here. It is byte-identical to the
 /// prefix `record_key` in `yadbd` builds, so existing records stay readable.
 ///
@@ -452,6 +480,17 @@ impl GroupRouter {
             .get(&group)
             .map(|client| client.role_info())
             .ok_or_else(|| MetaError::Routing(format!("unconfigured group: {group}")))
+    }
+    /// Every configured local group, observed from this node's own handles.
+    ///
+    /// Used by the daemon's read-only health surface, so it must stay a local
+    /// observation: no peer is contacted and no metadata key is read.
+    pub(crate) async fn observations(&self) -> Vec<GroupObservation> {
+        let mut rows = Vec::with_capacity(self.groups.len());
+        for (group, client) in &self.groups {
+            rows.push(client.observation(*group).await);
+        }
+        rows
     }
     /// Quorum-confirmed snapshot of exactly one group, named directly.
     pub(crate) fn linearizable_group_snapshot(
@@ -1179,5 +1218,50 @@ impl OpenRaftClient {
             metrics.current_leader,
             metrics.last_applied.map_or(0, |id| id.index),
         )
+    }
+
+    /// One group's locally observed state, including the commit index.
+    ///
+    /// `RaftMetrics` has no commit index: `last_applied` says how far this node
+    /// applied and `last_log_index` how much it appended, which is why a stalled
+    /// commit was previously indistinguishable from a stalled append. The commit
+    /// index lives in `RaftState`, reachable only through an in-process core
+    /// query. That query is bounded here so a wedged core cannot hang a health
+    /// response; a failed query leaves `commit_index` absent and the reason in
+    /// `commit_error` rather than inventing a number.
+    pub(crate) async fn observation(&self, group: u64) -> GroupObservation {
+        let metrics = self.raft.metrics().borrow().clone();
+        let role = match metrics.state {
+            openraft::ServerState::Leader => RoleState::Leader,
+            openraft::ServerState::Candidate => RoleState::Candidate,
+            _ => RoleState::Follower,
+        };
+        let (commit_index, commit_error) = match tokio::time::timeout(
+            COMMIT_OBSERVATION_BUDGET,
+            self.raft
+                .with_raft_state(|state| state.committed.map_or(0, |id| id.index)),
+        )
+        .await
+        {
+            Ok(Ok(index)) => (Some(index), None),
+            Ok(Err(fatal)) => (None, Some(format!("commit index unavailable: {fatal}"))),
+            Err(_) => (
+                None,
+                Some(format!(
+                    "commit index unavailable: the Raft core did not answer within {} ms",
+                    COMMIT_OBSERVATION_BUDGET.as_millis()
+                )),
+            ),
+        };
+        GroupObservation {
+            group,
+            node_id: metrics.id,
+            role,
+            term: metrics.current_term,
+            leader_id: metrics.current_leader,
+            applied_index: metrics.last_applied.map_or(0, |id| id.index),
+            commit_index,
+            commit_error,
+        }
     }
 }
