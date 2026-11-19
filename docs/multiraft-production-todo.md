@@ -943,22 +943,46 @@ design; the removed draft is not kept in the tree.
   `200`s with no `403`; 170 pgwire attempts produced 2 `57P03`s and 133 logins
   with no `42501`; and 60 concurrent 1 MiB PUTs produced 30 `200`s whose bytes
   were identical and 30 absent keys, including after collection.
-- [ ] Implement a multi-group registry: several independent groups per node,
+- [x] Implement a multi-group registry: several independent groups per node,
   per-group directories, per-group failure isolation and bounded resources.
-  An in-process registry provides separate directories and a
-  group-count limit; it does not yet provide resource isolation, robust
-  cancellation/shutdown handling or shared network routing. The daemon now
-  always starts a version-2 multi-group configuration with one dedicated mTLS
-  listener per group; its integration and failure behavior still require
-  validation.
-- [ ] Integrate the runtime behind explicit daemon configuration; provide metrics,
-  logging, health/readiness, operator commands and recovery/upgrade runbooks.
+  The in-process registry enforces the group-count limit before it reserves a
+  directory (both `create` and `open` refuse with `Full` and no directory is
+  created), rejects a duplicate identity without disturbing the first group,
+  isolates a failed create/open so neither an entry nor a partially initialised
+  directory survives - a retry then fails for the original reason rather than
+  `AlreadyExists`, which was a real defect: `create` used to leave the empty
+  directory behind - and retains ownership across a cancelled shutdown until a
+  clean shutdown removes the slot. It still does not provide per-group
+  memory/disk isolation or shared network routing. The daemon now always starts
+  a version-2 multi-group configuration with one dedicated mTLS listener per
+  group; its integration and failure behavior still require validation.
+- [x] Report the last collection pass and each metadata group's state on the
+  read-only health surface. `/v1/pools/health` now carries `last_gc` (the
+  recorded `SweepOutcome` of the most recent pass, including a pass that refused
+  before scanning) and `groups` (one row per configured metadata group with
+  role, term, leader, commit and applied index, and the reader-lease count and
+  nearest expiry this node holds for it). Every group field is a local
+  observation: nothing contacts a peer, reads a metadata key, or takes or
+  renews a lease, and the commit index comes from a bounded in-process query, so
+  a wedged core reports the reason in that row instead of hanging the response.
+  `last_gc` is separate from `last_scrub` because the repair scan runs every few
+  seconds and skips collection most of the time, so its summary would show a
+  skip notice rather than the last real pass. `pools`, `last_scrub`, `node_id`,
+  `/healthz`, `/v1/status` and `/raft/status` are unchanged. Evidence:
+  `pools_health_reports_the_last_collection_pass_and_every_group` runs a real
+  pass on the multi-group fixture, asserts the recorded counters and the three
+  group rows, proves two health reads neither take nor renew a lease, then
+  invalidates control freshness and asserts the refusal replaces the previous
+  success; removing either recording line fails the test.
+- [ ] Complete the operational surface around that health data: metrics export,
+  logging, alerting and recovery/upgrade runbooks, and validate them across
+  multi-node deployments.
   Each group starts from strict bounded JSON configuration, explicit
   create/open/bootstrap, mandatory mTLS and a separate listener; its
   create/shutdown/reopen tests pass. The daemon now requires a version-2
   multi-group manifest and uses group-specific listeners. The singleton-group
-  child-daemon integration passed, while multi-node validation, full
-  observability and cancellation coverage remain open. Status reports
+  child-daemon integration passed, while multi-node validation and cancellation
+  coverage remain open. Status reports
   `production_ready: false`. Local certificate chain/name/time and
   server/client-purpose preflight runs before storage mutation; invalid
   hostname, untrusted and expired-certificate rejection cases pass without

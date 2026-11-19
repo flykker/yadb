@@ -571,6 +571,30 @@ upload. A BlobId takes `owner_id` from the high 32 bits of the allocation id and
 `owner_id` increments; uniqueness comes from the pair, not from `generation`
 alone. `MAX_ALLOCATION` is `2^56-1`, so `owner_id` still fits 32 bits.
 
+`/v1/pools/health` reports collection and group state in two fields. `last_gc`
+is the recorded outcome of the most recent collection pass, including a pass
+that refused before it scanned anything; a refusal replaces the previous
+success, so a stale success is never read as the current answer, and the field
+is `null` before the first pass and after a restart until the next one.
+`last_scrub` answers a different question — the repair scan runs every few
+seconds and skips collection most of the time — so the two are recorded
+separately and one never overwrites the other. `groups` has one row per
+configured metadata group with `role`, `term`, `leader_id`, `commit_index`,
+`applied_index`, `reader_leases_live` and `reader_lease_nearest_expiry_ms` (the
+cached record's absolute `expires_at_ms`, not a remaining TTL).
+
+Every field is this node's own observation. `commit_index` comes from a bounded
+in-process query of the local Raft core, so a core that does not answer within
+500 ms leaves the number `null` and puts the reason in that row's `error`
+rather than hanging the response; `RaftMetrics` carries no commit index, which
+is why `/raft/status`'s `commit_index` is really the applied index and that
+route was left as it was. The two lease fields count the reader lease this node
+caches for that group only while its TTL has not passed. Reading the surface
+contacts no peer, reads no metadata key and neither takes nor renews a lease,
+so it is safe to poll. A legacy single-node store configures no groups and
+reports `"groups": []`. As with every local metric here, an observed leader or
+commit index is not proof of quorum, freshness or safe client routing.
+
 ## Operator collection commands
 
 `yadbctl pool-gc` and `yadbctl pool-scrub` call `POST /v1/pools/gc` and
