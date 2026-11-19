@@ -376,8 +376,46 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   and `server_state` fields, and `get_initial_state_last_log_lt_sm` asserts the
   public `committed` value instead of only the purge side effect. This is
   documented equivalent coverage, not suite compliance.
-- [ ] Audit vote, append, truncation, purge, callback ordering, concurrent readers,
+- [x] Audit vote, append, truncation, purge, callback ordering, concurrent readers,
   restart and bounds against OpenRaft contracts; test each boundary and replay.
+  Every row cites OpenRaft 0.9.25 and is pinned in
+  `crates/yadb-metakv/src/openraft_storage.rs` or `openraft_state_machine.rs`.
+  `save_vote` ordering (equal, greater and committed accepted; a decreasing term
+  or node id refused with the durable image unchanged, then surviving reopen) is
+  in `contract_save_vote_is_monotonic_and_durable`. The four truncate boundaries
+  — at the last index, above it, at the purge marker and below it — are in
+  `contract_truncate_boundaries_are_inclusive_and_reject_the_purged_prefix`, and
+  a range read spanning a purge boundary returns exactly the retained entries in
+  `contract_range_read_spanning_the_purge_boundary_returns_only_retained_entries`.
+  A concurrent reader is parked at the sync/publication boundary and cannot
+  observe the log between them in
+  `concurrent_reader_is_serialised_against_append_publication`; `get_log_state`
+  invariants (`last_purged <= last_log`, purge marker agreeing with the log's own
+  view, no entry at or below the marker, no index hole) hold after create, vote,
+  append, truncate, purge, automatic checkpoint and reopen in
+  `contract_log_state_invariants_hold_across_the_whole_lifecycle`. Callback
+  ordering through `blocking_append` is in
+  `contract_append_callback_reports_only_persisted_entries` — OpenRaft permits
+  the callback before or after `append` returns, and this pins that the entries
+  are durable at that moment. The adapter's stricter `MAX_LIVE_ENTRIES` and
+  16 MiB frame bounds are refused whole, with the file byte-identical and the
+  handle usable, in `contract_entry_count_bound_is_refused_without_truncation_or_poison`
+  and `contract_frame_payload_bound_is_refused_before_any_io`; OpenRaft states no
+  bound here, so this is a local rule, not an upstream one. The state machine
+  refuses a non-consecutive apply batch without publishing or appending to the
+  delta (`apply_refuses_a_non_consecutive_batch_without_publishing_or_persisting`);
+  OpenRaft only ever supplies the consecutive committed prefix, so that too is
+  recorded as a stricter adapter invariant rather than a contract. Two boundaries
+  are explicitly *not* attributed to OpenRaft: truncating above the last index is
+  accepted as a no-op because the source only requires no hole, and
+  `save_committed`/`read_committed` are unimplemented defaults, so restart
+  coverage comes from the adapted suite and the reopen assertions instead of a
+  direct test. Non-contiguous append, purge identity and purge-marker holes stay
+  covered by the existing `append_with_a_hole_is_rejected_without_changing_memory`,
+  `overlap_conflicts_and_purge_identity_are_rejected_across_reopen` and
+  `purge_boundary_survives_reopen_and_rejects_invalid_mutations`. This is
+  in-process contract coverage, not power loss or cross-host qualification, and
+  it does not add the separate-process crash/kill gate.
 - [ ] Bound memory, disk growth, startup replay and snapshot reception; introduce
   compaction and resource limits without losing acknowledged state.
   The checkpoint implementation is under validation: 32 MiB active-log limit,
@@ -395,7 +433,7 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   markers immediately before, within and beyond the suffix, conflicting identity,
   unchanged files after rejection and checkpoint/reopen of accepted states.
   All then 22 storage tests and the adapted suite passed after that fix (the
-  file now holds 37); broader storage-contract and combined-regression gates
+  file now holds 45); broader storage-contract and combined-regression gates
   remain open.
 - [x] Ensure file and parent-directory durability for create, rename and reopen,
   including partial bootstrap, directory sync failures and unknown outcomes.
@@ -416,8 +454,8 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   append as possibly applied and never infer from the error that the record is
   gone. A real crash is not observable in-process, so the nested-path test proves
   the ancestor sync is on the path before publication by failing it there;
-  supported-host power-loss qualification remains separate. Evidence: 37
-  storage tests, of which
+  supported-host power-loss qualification remains separate. Evidence: the
+  then-current 37 storage tests, of which
   `create_propagates_a_parent_directory_sync_failure`,
   `create_syncs_each_new_ancestor_before_publishing_the_log`,
   `bootstrap_faults_publish_nothing_or_a_reopenable_log` and
@@ -450,7 +488,7 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   instead of being repaired. Bootstrap failures are classified by what they
   publish: before the rename nothing `open` accepts and `create` is retried,
   after the rename a complete log that `open` accepts and re-syncs. Evidence:
-  37 storage tests, of which
+  45 storage tests, of which
   `append_path_faults_poison_and_reopen_to_a_complete_state`,
   `checkpoint_faults_poison_and_recover_valid_primary`,
   `bootstrap_faults_publish_nothing_or_a_reopenable_log` and
@@ -553,7 +591,17 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   (`ObjectStoreEngine::collect_orphans_all`, and per group
   `collect_orphans_in_group` on Multi-Raft), so block
   fragments from a refused or replaced write accumulate until a mark-and-sweep
-  pass reclaims them; see the garbage-collection item. SQL writes are
+  pass reclaims them; see the garbage-collection item. The block layer now
+  proves that contract directly: `crates/yadb-block/src/gc_tests.rs` models the
+  pass's decision (`present - live`, epoch advance, collectable delete or
+  generation barrier) over real `PoolStriper`/`VolumeStore` primitives for a
+  refused, conflicted, crashed, replaced and unmapped write, and asserts both
+  halves every time — the garbage is gone *and* the live extent still reads its
+  exact bytes — including a pass that runs between a refused write and the next
+  live write of the same block. That model reproduces `sweep_pool` rather than
+  calling it (the daemon crate is above `yadb-block`), and the daemon-layer
+  refused-write case is covered separately in `crates/yadbd/src/gc.rs`. SQL
+  writes are
   still **not** keyed: `POST /db/{project}/db/query` returns 501 for a keyed
   write script, because a script can mutate any number of tables, shards and
   secondary indexes through `DatabaseEngine::commit_tx_buffer_at_boundaries`,

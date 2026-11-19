@@ -567,11 +567,12 @@ The 21 and 22 figures above are historical run records, not the current
 inventory. The durable-fault work added a per-call failure point for each of the
 five fault classes on every durable operation and 14 tests that assert the
 on-disk bytes, the poisoned handle and the reopen contract, so
-`cargo test -p yadb-metakv openraft_storage` now runs **37**. The whole crate's
-count has moved with each merge since then and is **217** on the merged tree
-(orchestrator re-run, 35.13 s, no failures); the 201 recorded here was the same
-crate immediately after the durable-fault merge, before the transport, process,
-snapshot and cross-group tests landed.
+`cargo test -p yadb-metakv openraft_storage` now runs **45** and the whole crate
+**226** (orchestrator re-run on the merged tree, 34.67 s, no failures). The
+counts in this paragraph have moved with each merge — 201 after the durable-fault
+merge, 217 after the transport, process, snapshot and cross-group tests, 226
+after the storage-contract audit — so read them as checkpoints, not as one
+stable inventory.
 
 ### Local environment observed for these runs
 
