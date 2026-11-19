@@ -1576,16 +1576,17 @@ and `beta`) and the same control-group leader.
 
 ### GC and scrub refusal
 
-With Multi-Raft metadata, `POST /v1/pools/gc` and `POST /v1/pools/scrub` return
-**409** with `gc_refusal` set to `MULTIRAFT_GC_REFUSAL`: a writer lease can be
-renewed while a collector pass is in flight and collector RPCs can outlive their
-lease, so a reader lease alone does not fence collection. Both report zero
-deletions and zero reclaimed bytes and leave fragments intact.
+At this run, with Multi-Raft metadata, `POST /v1/pools/gc` and `POST
+/v1/pools/scrub` returned **409** with `gc_refusal` set to `MULTIRAFT_GC_REFUSAL`:
+a writer lease can be renewed while a collector pass is in flight and collector
+RPCs can outlive their lease, so a reader lease alone does not fence collection.
+Both reported zero deletions and zero reclaimed bytes and left fragments intact.
 
 (At `234d49a` the reason was `garbage collection disabled for Multi-Raft: no
 single atomic cross-group metadata snapshot`, and scrub answered 200. The
 per-group collector replaced that, was then disabled, and was re-enabled on
-2026-11-19; see "Per-group garbage collection on Multi-Raft" below. The refusal
+2026-11-19; scrub's repair half was still refused at this run and now runs per
+group too. See "Per-group garbage collection on Multi-Raft" below. The refusal
 above is what this 2026-11-16 run observed, not current behaviour.)
 
 ### Failure drills
@@ -1638,10 +1639,10 @@ returning 500 instead of the expected 501).
 
 ### Open items
 
-* Per-group GC on Multi-Raft is refused by design and unreachable, not absent:
-  `sweep` returns the refusal before `sweep_groups`, and `sweep_groups` is kept
-  under `#[allow(dead_code)]`. The refusal is the contract, not a gap in this
-  evidence.
+* Per-group GC on Multi-Raft was refused at this run, not absent: `sweep`
+  returned the refusal before `sweep_groups`, which was kept under
+  `#[allow(dead_code)]`. The per-group path has since been re-enabled; see
+  "Per-group garbage collection on Multi-Raft" below.
 * `production_ready` stays false: this run proves the runtime works on three
   processes, not that the durability and authorization gates for production are
   met.
@@ -1952,11 +1953,11 @@ consecutive runs after the fix.
 
 ## Per-group garbage collection on Multi-Raft (2026-11-17)
 
-Multi-Raft collection no longer refuses as a whole. `POST /v1/pools/gc` and the
-sweep phase of `POST /v1/pools/scrub` run one pass per metadata group, and each
-pass either completes under a fence it can prove or refuses that group and
-deletes nothing for it. Legacy metadata keeps its single-namespace pass byte for
-byte; nothing below changes legacy keys, ordering or behaviour.
+Multi-Raft collection no longer refuses as a whole. `POST /v1/pools/gc` and both
+halves of `POST /v1/pools/scrub` run one pass per metadata group, and each pass
+either completes under a fence it can prove or refuses that group and deletes
+nothing for it. Legacy metadata keeps its single-namespace pass byte for byte;
+nothing below changes legacy keys, ordering or behaviour.
 
 The design is the one in `multiraft-production-todo.md`: cross-group references
 are impossible (a fragment id carries its `project_id`, a manifest only names
@@ -1965,9 +1966,10 @@ the live set stays group-scoped and no cross-group snapshot is needed.
 
 **Updated 2026-11-19.** The per-group path was disabled after this section was
 written, because of lease-expiry fencing races, and has since been re-enabled:
-`sweep` routes to `sweep_groups`, `/v1/pools/gc` runs it (answering `409` with
-`gc_refusal` when any group or pool refused), and four live cluster drills in
-`tests/protocols.py` cover a live reader pin, a superseded collector epoch, a
+`sweep` routes to `sweep_groups`, the repair half routes to
+`gc::repair_scan_groups`, `/v1/pools/gc` and `/v1/pools/scrub` both answer `409`
+with the summary body when a group or pool refused, and four live cluster drills
+in `tests/protocols.py` cover a live reader pin, a superseded collector epoch, a
 non-leader refusal and a clean collection. The
 rules below therefore describe current behaviour again. What is still open is
 listed at the end of the section.
@@ -1976,17 +1978,44 @@ listed at the end of the section.
 | --- | --- |
 | Leadership | The pass runs only on the leader of group G, read through `role_info_for_group`. A follower refuses with the leader it knows. |
 | Snapshot | `try_linearizable_group_snapshot(G)` names the group directly and returns a quorum-confirmed snapshot. Followers and unavailable quorums are errors, never a fallback to local applied state. |
+| Repair | `gc::repair_scan_groups` takes a quorum-confirmed snapshot of each group over `/db/`, `/s3/` and `/block/`, builds the live set from those rows only (never `try_scan_prefix`), and runs `repair_blob` on each live blob of that group. A follower or a quorum-less group is refused by name; one group's refusal does not stop another group's pass. |
 | Collector lease | `/gc/g<group>/collector`, one key per group, held for `COLLECTOR_LEASE_MS` (120 s) and renewed before each pool. Two passes over different groups do not block each other. |
-| Lease fence | The collector checks `/gc/g<group>/writer/<id>` (TTL 300 s) and `/gc/g<group>/reader/<id>` (TTL 30 s); a live record in G refuses G only. Multi-Raft writers publish group leases, but readers do not currently publish them, so this check does not protect in-flight reads. The fence is checked before and after collector admission closes. |
+| Lease fence | The collector checks `/gc/g<group>/writer/<id>` (TTL 300 s) and `/gc/g<group>/reader/<id>` (TTL 30 s); a live record in G refuses G only. Multi-Raft writers publish group leases. Readers publish no metadata lease by design: `read_part` reads the slot epoch and pins it, and `delete_collectable` refuses while a pin is live, so an in-flight read is fenced per fragment at the point of use instead. The fence is checked before and after collector admission closes. |
 | S3 intent | An unexpired `Prepared` intent is part of the mark, so chunks appended before publication are kept. |
 | Deletion | Only ids whose `project_id` the group's scope covers, and only when the pool enumerated successfully. A refused pool is left untouched for every group. |
 | Refusal | Not leader, unreadable fence, collector lease held, snapshot failure or an unprovable live set refuses the group with the reason in `gc_groups_refused`; `/v1/pools/gc` answers `409` with that reason. Other groups are unaffected. |
 | Compaction | Physical and fenced by durable barriers, so it runs once after the groups. A pass in which every group refused touches no volume. |
 
-The repair (orphan) scan still refuses on Multi-Raft (`repair scan disabled for
-Multi-Raft: it needs one whole-deployment view of live manifests`): it needs one
-whole-deployment view, which Multi-Raft does not have. Orphan blob collection
-does not need that view and runs per group.
+Repair runs per group, and that is the correct boundary rather than a
+compromise. Every data namespace (`/db/`, `/s3/`, `/block/`) routes a project id
+to exactly one data group, so a project's manifests are never split across
+groups; a blob id embeds its project id, so one group's quorum-confirmed
+snapshot over those prefixes is the *complete* live set for that group's blobs,
+not a partial one. `repair_blob` consults no manifest: it reads the parts of one
+logical id, rebuilds the missing ones from the survivors and moves a handoff
+part back to its nominal slot. Repair deletes nothing except the handoff copy of
+a part it has already written to the nominal slot, and a tombstoned id refuses
+that write, so a pass cannot resurrect a blob a collector removed.
+
+`ScrubSummary.repair_error` is `None` when every group ran and otherwise names
+the groups that refused. `POST /v1/pools/scrub` answers `200` only when
+`repair_error` and `gc_refusal` are both `None`, and otherwise `409` with the
+summary body — the rule `/v1/pools/gc` already uses. On a multi-node cluster a
+node leads only some data groups, so its scrub is `409` and names the groups it
+does not lead while repairing the ones it does lead.
+
+Three repair limits stay stated. `block_pool_lookup` comes from the local
+control-plane cache, not from the group snapshot, so a stale cache can make a
+pass skip a blob; it never makes a pass repair or delete the wrong one. A blob
+published after the snapshot is not repaired by that pass; repair is idempotent,
+not atomic with publication. A group leader dying between a fragment write and
+its manifest commit still has no drill.
+
+The upload-intent grace is a per-engine knob,
+`ObjectStoreEngine::set_intent_grace_secs`, default 300 s (unchanged) and
+provisioned only by the test harness, which sets 1 s so an abandoned intent is
+collectable inside a run. A live drill leaves an abandoned intent through a pass
+inside the grace and observes it collected after it.
 
 ### Tests
 
@@ -2025,9 +2054,12 @@ passes when run alone (pre-existing timing sensitivity, not touched here).
   non-leader refusal and a clean collection. None kills a group leader between a
   fragment write and its manifest commit, and none runs two collectors
   concurrently on one group.
-* Readers on Multi-Raft take no reader lease (`begin_read_lease` is still
-  legacy-gated), so only the per-group writer lease and the S3 `Prepared` intent
-  fence in-flight writes there.
+* Readers on Multi-Raft take no *metadata* read lease, by design: `read_part`
+  reads the slot epoch and pins it, and `delete_collectable` refuses while any
+  pin is live. The fence is per fragment at the point of use, and it cannot
+  expire mid-read without the read failing closed. A positive drill holds an S3
+  `GET` open, observes the slot's live pin, then releases the response and
+  observes the pin drain with the object intact.
 * A pass over a group whose project set is empty still takes and releases its
   collector record; the cost is one round trip, not a correctness issue.
 
@@ -2163,8 +2195,9 @@ consecutive runs and 18/18 on four more before the merges;
 
 ### Open
 
-* No live drill of the per-group GC path or of an actual `InstallSnapshot`
-  transfer between processes; both are proven with in-process fixtures.
+* At this snapshot there was no live drill of the per-group GC path or of an
+  actual `InstallSnapshot` transfer between processes; both were proven with
+  in-process fixtures.
 * A pool with spares tolerates the loss of a whole node only while a spare slot
   lives on a surviving node and takes at most one part of the blob; a second
   simultaneous failure can still refuse the write with `RedundancyNotMet`.
@@ -2670,11 +2703,16 @@ not through an admin route, and the install is still initiated by an inbound
 
 ### Gates
 
-* `python3 tests/protocols.py` — 23 PASS / 2 SKIP, exit 0 on 2026-11-19. The two
-  SKIPs are `Multi-Raft repair scan` (repair needs one whole-deployment view of
-  live manifests) and `reader lease` (legacy-gated). `docs/multiraft-skip-closure-plan.md`
-  records what would close each one, what it would still not prove, and the gate
-  counts it expects. The cross-process
+* `python3 tests/protocols.py` — 23 PASS / 2 SKIP, exit 0 on 2026-11-19, the last
+  run before the two SKIP records changed. The `Multi-Raft repair scan` SKIP is
+  gone: the scenario now expects a per-group repair instead of a refusal. The
+  `reader lease` SKIP is narrowed to the metadata
+  mechanism that is genuinely absent — Multi-Raft has no metadata read lease,
+  because the fragment pin fences the read — and a positive drill observes a live
+  pin during an S3 `GET` and its drain afterwards. A live orphan-collection drill
+  sets the intent grace to 1 s and observes an abandoned intent survive a pass
+  inside the grace and be collected after it. No gate count for the changed suite
+  is claimed here; the next full run establishes it. The cross-process
   InstallSnapshot scenario runs in this gate and prints a PASS naming the
   installed snapshot's meta index; it is no longer a SKIP and the
   `--install-snapshot-live` flag no longer exists.

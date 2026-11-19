@@ -37,8 +37,9 @@ Local three-process verification on 2026-11-17: `tests/protocols.py` passed 3/3
 consecutive runs, each 20 PASS / 4 SKIP, on a binary built from a tree with no
 instrumentation, with zero `BRIDGE TIMEOUT`, `TLS CONNECT FAIL` and `REPLY WRITE
 FAILED` events. That run covers the delta-log apply path, the transport deadline
-floor and concurrent dispatch. It does not cover per-group GC, which is refused,
-or an `InstallSnapshot` transfer between processes, which stays a `SKIP`.
+floor and concurrent dispatch. It does not cover per-group GC, which was refused
+at that snapshot, or an `InstallSnapshot` transfer between processes, which
+stays a `SKIP`.
 
 Authorization freshness is now lease-bound. In OpenRaft mode a node accepts
 control state only after a quorum-confirmed linearizable barrier on the current
@@ -232,7 +233,8 @@ Multi-Raft mark-and-sweep runs per metadata group. Each pass is leader-only and
 marks from a quorum-confirmed snapshot of its group; a live writer lease refuses
 that group, and a pool whose epoch advance is refused (a live pin, or an
 unreadable slot) is refused by name and deletes nothing. Multi-Raft readers
-publish no lease; the target-side pin is what protects a read in flight.
+publish no *metadata* lease, by design; the target-side pin is what protects a
+read in flight.
 
 Storage-side fencing crosses the wire. A barrier carries the collector lease
 deadline, and a target refuses an expired one with `409` instead of evicting a
@@ -267,8 +269,9 @@ target-side fact, not a lease the target can evaluate; it only says which epoch 
 fragment belongs to.
 Manual GC runs per metadata group: it answers `200` when every group and pool
 completed, and `409` with `gc_refusal` naming any that refused. Scrub runs the
-same collection and always answers `409` on Multi-Raft, because its repair scan
-refuses (see below).
+same collection and then its own per-group repair scan: it answers `200` only
+when `repair_error` and `gc_refusal` are both `None`, and otherwise `409` with
+the summary body, the same rule `/v1/pools/gc` uses.
 Both report `blobs_live`, `fragments_deleted`, `bytes_reclaimed`, `leases_live`,
 `gc_groups_refused`, `gc_pools_refused` and an explicit `gc_refusal`. A group
 whose leadership, leases or storage fence cannot be proved is refused by name
@@ -277,17 +280,43 @@ or an unreadable slot) is refused by name and deletes nothing. The four live
 drills in `tests/protocols.py` cover a live pin, a superseded collector epoch,
 a non-leader refusal and a clean collection.
 
-Scrub's repair half still refuses on Multi-Raft and reports why in
-`repair_error`: repair asks which blobs should exist against every live manifest
-at once, and the groups share no atomic view. Orphan blob collection does not
-need that view and runs per group; a node reports the groups it does not lead in
-`orphan_collection_error` rather than treating them as collected. No live drill
-seeds an expired upload intent, because `INTENT_GRACE_SECS` is 300 s.
+Scrub's repair half runs per group too. `gc::repair_scan_groups` takes a
+quorum-confirmed snapshot of one group over `/db/`, `/s3/` and `/block/`, builds
+the live set from that snapshot only (never `try_scan_prefix`) and runs
+`repair_blob` on each live blob of the group. That boundary is exact, not a
+compromise: every data namespace routes a project id to exactly one data group,
+so a project's manifests are never split across groups, and a blob id embeds its
+project id, so one group's snapshot is the complete live set for that group's
+blobs. Repair deletes nothing except the handoff copy of a part already written
+to its nominal slot, and a tombstoned id refuses that write, so a pass cannot
+resurrect a collected blob. A follower group, or a group without a quorum, is
+refused by name in `repair_error`; one group's refusal does not stop another
+group's pass, so on a multi-node cluster a node leads only some data groups,
+repairs those, and answers `409` naming the ones it does not lead.
 
-Multi-Raft readers do not publish reader leases; a quorum-confirmed
-`consistent=true` snapshot does not fence fragment collection. Plain reads use
-the locally applied view, and collection is fenced by the target-side durable
-epoch instead.
+Three limits stay stated. `block_pool_lookup` comes from the local control-plane
+cache, so a stale cache can make a pass skip a blob; it never repairs or deletes
+the wrong one. A blob published after the snapshot is not repaired by that pass
+— repair is idempotent, not atomic with publication. A group leader dying
+between a fragment write and its manifest commit still has no drill.
+
+The upload-intent grace is a per-engine knob,
+`ObjectStoreEngine::set_intent_grace_secs`, default 300 s (unchanged) and
+provisioned only by the test harness, which sets 1 s so an abandoned intent is
+collectable inside a run. A live drill leaves an abandoned intent through a pass
+inside the grace and observes it collected after it. Orphan collection also runs
+per group; a group the node does not lead is named in `orphan_collection_error`
+rather than counted as collected. Orphan collection still needs an enumerable
+project set: a scope that covers every project (`project_ids == None`, as in a
+single-group deployment) is refused instead of scanned partially.
+
+Multi-Raft readers take no *metadata* read lease, by design: `read_part` reads
+the slot epoch and pins it, and `delete_collectable` refuses while any pin is
+live. The fence is per fragment at the point of use; it cannot expire mid-read
+without the read failing closed, and it does not depend on the reader
+re-checking a metadata record around each fetch. A positive drill holds an S3
+`GET` open, observes the slot's live pin, then releases the response and
+observes the pin drain with the object intact.
 
 `PersistentGroup::create` requires a new replica directory. It reserves that
 directory, syncs its parent, writes a versioned `replica.json` binding the exact
