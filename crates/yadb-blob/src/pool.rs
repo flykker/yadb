@@ -40,24 +40,6 @@ impl<FS: StorageFs> Drop for ReadPin<'_, FS> {
     }
 }
 
-/// Whether a failed pin means "the target refused to be read" rather than
-/// "the target did not answer".
-///
-/// The distinction decides what a read reports when no candidate supplied the
-/// part. A refusal is evidence about the fence and must not be flattened into
-/// `NotFound`; a transport failure is the same unavailability a down slot
-/// already produces, and the pool has always read around it.
-fn is_read_refusal(error: &BlobError) -> bool {
-    matches!(
-        error,
-        BlobError::PinEpochNotCurrent { .. }
-            | BlobError::PinClockUnreadable { .. }
-            | BlobError::PinIdsExhausted
-            | BlobError::StorageUnavailable
-            | BlobError::RemoteFenceRefused { .. }
-    )
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepairReport {
     /// Fragments readable after the repair, i.e. including the ones just rewritten.
@@ -1138,7 +1120,10 @@ impl<FS: StorageFs> PoolStriper<FS> {
     /// candidate held the part. `Err` means at least one candidate could not be
     /// pinned and no other candidate supplied the part, so absence was never
     /// proved - reporting that as `NotFound` would turn "the target refused to
-    /// be read" into "the bytes do not exist".
+    /// be read" into "the bytes do not exist". A read that cannot record its
+    /// pin fails here rather than proceeding unprotected: the pin is a durable
+    /// append, so a target whose syncs are failing cannot promise to hold the
+    /// bytes still.
     ///
     /// A `CorruptData` answer is remembered but does not stop the search: a
     /// bit-rotted nominal copy must not hide a healthy handoff copy.
@@ -1172,13 +1157,13 @@ impl<FS: StorageFs> PoolStriper<FS> {
                     // and pin table, so it is still worth trying; the reason is
                     // kept in case none of them supplies the part.
                     //
-                    // Only a refusal is kept. A transport failure is the same
-                    // unavailability a down slot already produces, and turning
-                    // it into the read's result would report a network fault as
-                    // a statement about the fence.
-                    if is_read_refusal(&error) {
-                        refusal.get_or_insert(error);
-                    }
+                    // Every failure is kept, transport included. "The target
+                    // could not be asked" and "the target refused" are
+                    // different reasons but the same conclusion for this read:
+                    // absence was not proved. Reporting `NotFound` here would
+                    // turn an unreachable or poisoned target into a statement
+                    // about the data.
+                    refusal.get_or_insert(error);
                     continue;
                 }
             };

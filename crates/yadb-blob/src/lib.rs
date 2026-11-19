@@ -3226,6 +3226,30 @@ mod tests {
         }
     }
 
+    /// An unreachable target is not evidence that the bytes are gone either.
+    ///
+    /// The pin is the read's first contact with the target, so a target that
+    /// cannot be reached fails there. Reporting that as `NotFound` would answer
+    /// a question about the data from a failure that says nothing about it.
+    #[test]
+    fn an_unreachable_slot_is_not_reported_as_absence() {
+        // Port 1 on the loopback interface has no listener: the pin's connection
+        // is refused, which is the transport failure a down node produces.
+        let slot =
+            PoolSlot::<SimFs>::remote("pool", 0, "az0", 1, "127.0.0.1:1".to_string(), None);
+        let striper =
+            PoolStriper::from_slots("pool", ErasureScheme::Mirror { replicas: 1 }, vec![slot])
+                .unwrap();
+        let id = BlobId::new(12, 47, 1, 1, 2, 0);
+        match striper.get_blob(id) {
+            Err(BlobError::Io(_)) => {}
+            Err(BlobError::NotFound(_)) => {
+                panic!("an unreachable target was reported as absence")
+            }
+            other => panic!("expected the transport failure, got {other:?}"),
+        }
+    }
+
     /// A refused pin is a refusal to read, not evidence that the bytes are gone.
     ///
     /// Every target refuses here, so no part can be read. Reporting
