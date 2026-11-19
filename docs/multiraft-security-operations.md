@@ -36,8 +36,11 @@ seeds, and never treat a fixture's long validity period as a credential policy.
 
 `PUT|GET|DELETE /internal/vdisk/<pool>/<slot>/blob/<blob_hex>`,
 `GET .../stats`, `POST .../barrier`, `GET .../blobs` and `POST .../compact` are
-served on the same public listener as the client API. They are peer traffic: a slot whose data lives on another node is
-reached through them by `crates/yadb-blob/src/pool.rs`. Two of them are
+served on the same public listener as the client API unless `--internal-listen`
+moves them to a dedicated peer listener, which then makes the public listener
+answer `404` for every one of them. They are peer traffic: a slot whose data
+lives on another node is reached through them by
+`crates/yadb-blob/src/pool.rs`. Two of them are
 destructive by design — `DELETE` installs a permanent exact-ID tombstone, and
 `barrier` durably fences writes at or below a generation and evicts matching live
 fragments (`crates/yadb-blob/src/volume.rs`).
@@ -146,7 +149,7 @@ deployment cannot reach the unauthenticated branch.
   records a summary) and therefore requires the same signed, allowlisted admin
   subject as `/v1/apply`. There is no unauthenticated deployment to preserve: a
   daemon with an empty `--admin-subject` refuses to start, so every reachable
-  scrub is checked. (`crates/yadbd/src/main.rs:7818` enforces the allowlist; the
+  scrub is checked. (`crates/yadbd/src/main.rs:7911` enforces the allowlist; the
   comment above the handler states that `require_admin`'s empty-allowlist branch
   is kept for library callers and tests, not as a reachable daemon mode.)
 

@@ -6,7 +6,7 @@ This section is a dated record, not a statement about the current tree. Since it
 was written the legacy multi-node Raft runtime was **removed** rather than kept as
 a default: `--metadata-runtime` is pinned to `openraft`, `--openraft-config` is
 mandatory, and there is no fallback runtime
-(`crates/yadbd/src/main.rs:58`, where the CLI value parser accepts only
+(`crates/yadbd/src/main.rs:76`, where the CLI value parser accepts only
 `openraft`, and `crates/yadb-metakv/src/raft.rs:4-21`). The
 only non-replicated store left is the single-node `LocalKv`, which is a test and
 library facility. Statements below about a "legacy default", a "legacy mode" or a

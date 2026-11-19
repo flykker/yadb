@@ -829,7 +829,8 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   revision against the group's applied index). `sweep` reaches this path on
   Multi-Raft, and the four cluster drills run. What is still missing: no route
   verifies a *signed* fence token (the internal routes authenticate with the
-  shared Raft token, which is only reachable on the internal listener), and no
+  shared Raft token, which is reachable only on the internal listener when
+  `--internal-listen` is set and on the public one otherwise), and no
   drill runs two collectors concurrently on one group or expires a collector
   lease in the middle of a pass - the daemon has no injection point for the
   latter, and the storage-level drills cover it instead. The repair scan is no
@@ -1005,11 +1006,33 @@ design; the removed draft is not kept in the tree.
   the daemon's 401 rather than acting as an anonymous administrator.
 - [ ] Replace the client-supplied subject header entirely with a verified
   credential once the protocol listeners share one identity model.
-- [ ] Split the internal Raft listener from the public client listener so the
-  Raft port is not reachable from client networks.
+- [x] Split the internal listener from the public client listener so the peer
+  routes are not reachable from client networks. `--internal-listen <addr>`
+  serves every `/internal/...` route on a dedicated listener; the public
+  listener then answers axum's own `404` for them, with no token challenge and
+  no handler body, so a firewall can bound the peer network. Leaving the flag
+  unset keeps the historical single-listener shape, so no existing deployment
+  changes. The Raft token check is unchanged and still runs in every handler:
+  the listener narrows who can attempt a call, it does not authenticate it. The
+  internal listener serves only those routes - `/v1/apply`, the status routes
+  and the rest of the client surface are absent from it - so it cannot become
+  an unauthenticated path to the control plane, and no request is trusted
+  because of the port it arrived on. In a cluster `--internal-peers
+  <id=addr,...>` is required alongside the flag: startup refuses a shape where
+  a peer RPC or the follower-to-leader control snapshot would 404.
+  `crates/yadbd/tests/internal_listener.rs` asserts both halves against real
+  daemons - absent on the client port with the flag, present and
+  token-protected without it - plus a three-node cluster that replicates over
+  the internal listeners. Serving `/internal/...` on both listeners fails two of
+  those tests. Residual: the default is still one listener, so a deployment that
+  does not set the flag keeps the exposure and still relies on firewall rules.
+  This split also fixed a real second caller: `fetch_fresh_control` dialled the
+  leader's public port for `/internal/control/snapshot`, so with the flag on
+  every follower would have failed closed with no control image and therefore no
+  pool materialisation or authorization; it now uses the peer address.
 - [x] Protect the remote VDisk RPCs. `PUT|GET|DELETE
   /internal/vdisk/{pool}/{slot}/blob/{blob_hex}`, `GET .../stats`, `POST
-  .../barrier`, `GET .../blobs` and `POST .../compact` are served on the public
+  .../barrier`, `GET .../blobs` and `POST .../compact` were served on the public
   listener and were unauthenticated: an unauthenticated caller could install a
   permanent exact-ID tombstone or a garbage-collection barrier that evicts live
   fragments and fences future writes, repeated per replica slot to defeat
@@ -1023,8 +1046,9 @@ design; the removed draft is not kept in the tree.
   shared cluster secret, so it authenticates the cluster rather than an
   individual peer; and the routes are still reachable by anything that can
   reach the listener, so only the dedicated internal listener plus verified
-  firewall rules actually bound who can attempt them. Separating that listener
-  is the item above.
+  firewall rules actually bound who can attempt them. That listener now exists
+  behind `--internal-listen`; the exposure remains only in the default
+  single-listener deployment.
 
 ## 3. Runtime and operations
 
