@@ -3572,6 +3572,152 @@ mod tests {
             .expect("s3-intent test timed out");
         }
 
+        /// A scope that covers every project (`project_ids == None`) enumerates
+        /// its projects from the same quorum-confirmed snapshot the pass already
+        /// takes, so a single-group deployment collects orphans without a
+        /// project list.
+        ///
+        /// The fixture is a real single-group OpenRaft deployment: singleton
+        /// metadata over one group, which reports exactly one scope with no
+        /// project list. Project 1 has a live object and an aborted upload;
+        /// project 2 has only an aborted upload, so a walk over `/s3/` alone
+        /// would leave project 2's fragment behind while reporting a pass.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_scope_covering_every_project_collects_from_its_own_snapshot() {
+            let dir = temp_dir("orphan-none");
+            let (control, _control_state) = single_group(&dir, 1).await;
+            let (group, group_state) = single_group(&dir, 2).await;
+            let meta = LocalMetaKv::from_openraft(
+                group.clone(),
+                group_state,
+                BTreeMap::new(),
+                tokio::runtime::Handle::current(),
+            );
+            let scopes = meta.gc_group_scopes().unwrap();
+            assert_eq!(scopes.len(), 1, "{scopes:?}");
+            assert_eq!(
+                scopes[0].project_ids, None,
+                "the single-group deployment has no project list: {scopes:?}"
+            );
+            let mut f = GroupFixture::new(dir, meta, vec![control, group]);
+            let s3 = f.s3();
+
+            let payload = vec![0x11u8; 32 * 1024];
+            let live = s3
+                .put_object(1, "store", POOL, "bucket", "live", "text/plain", &payload)
+                .unwrap();
+            let live_chunks: BTreeSet<BlobId> = live
+                .chunks
+                .iter()
+                .map(|chunk| chunk.blob_id.with_part(0))
+                .collect();
+            assert_eq!(live_chunks.len(), 4);
+
+            // An aborted multipart upload leaves its part's fragment on disk
+            // and its intent `Aborted`, which is exactly what the collector
+            // reclaims. No manifest references the part's fragment.
+            let aborted = |project: u32, key: &str, byte: u8| {
+                let upload = s3
+                    .create_multipart_upload(project, "store", POOL, "bucket", key, "text/plain")
+                    .unwrap();
+                s3.upload_part(
+                    project,
+                    "store",
+                    "bucket",
+                    key,
+                    &upload,
+                    1,
+                    &vec![byte; 8 * 1024],
+                )
+                .unwrap();
+                s3.abort_multipart_upload(project, "store", "bucket", key, &upload)
+                    .unwrap();
+            };
+            aborted(1, "aborted-1", 0x22);
+            aborted(2, "aborted-2", 0x33);
+
+            // The fragments each aborted upload left behind, named by its own
+            // part intent.
+            let mut orphans = BTreeSet::new();
+            for project in [1u32, 2] {
+                let rows = f
+                    .meta
+                    .scan_prefix_or_panic(&format!("/s3-intent/{project}/"));
+                assert_eq!(rows.len(), 1, "{rows:?}");
+                orphans.extend(
+                    yadb_s3::intent_chunk_ids(&rows[0].1.value)
+                        .unwrap()
+                        .into_iter()
+                        .map(|(_, id)| id.with_part(0)),
+                );
+            }
+            assert_eq!(orphans.len(), 2, "one fragment per aborted upload");
+            assert!(live_chunks.is_disjoint(&orphans));
+
+            let before = f.distinct_ids();
+            assert!(
+                live_chunks.iter().all(|id| before.contains(id)),
+                "the live object's fragments must be on disk"
+            );
+            assert!(
+                orphans.iter().all(|id| before.contains(id)),
+                "the aborted uploads' fragments must be on disk"
+            );
+
+            // A group this deployment does not own has nothing to collect.
+            assert_eq!(s3.collect_orphans_in_group(9).unwrap(), 0);
+
+            // The pass derives projects 1 and 2 from its own snapshot and
+            // collects exactly the two aborted uploads' fragments.
+            assert_eq!(s3.collect_orphans_in_group(0).unwrap(), 2);
+
+            let (manifest, bytes) = s3.get_object(1, "store", "bucket", "live").unwrap();
+            assert_eq!(bytes, payload);
+            assert!(
+                manifest
+                    .chunks
+                    .iter()
+                    .all(|chunk| f.pool.get_blob(chunk.blob_id).is_ok()),
+                "the live object's fragments must survive"
+            );
+            let after = f.distinct_ids();
+            assert!(
+                orphans.iter().all(|id| !after.contains(id)),
+                "every aborted upload's fragment must be reclaimed"
+            );
+            assert!(f.meta.scan_prefix_or_panic("/s3-intent/1/").is_empty());
+            assert!(f.meta.scan_prefix_or_panic("/s3-intent/2/").is_empty());
+
+            // A fresh aborted upload, then the group is stopped: no leader and
+            // no quorum. The pass must refuse through the fence and delete
+            // nothing, even though the fragment is collectable in every other
+            // respect.
+            aborted(1, "aborted-3", 0x44);
+            let pending_rows = f.meta.scan_prefix_or_panic("/s3-intent/1/");
+            assert_eq!(pending_rows.len(), 1, "{pending_rows:?}");
+            let pending: BTreeSet<BlobId> = yadb_s3::intent_chunk_ids(&pending_rows[0].1.value)
+                .unwrap()
+                .into_iter()
+                .map(|(_, id)| id.with_part(0))
+                .collect();
+            assert_eq!(pending.len(), 1);
+
+            let stopped = f.rafts.remove(1);
+            stopped.shutdown().await.unwrap();
+            let held = f.distinct_ids();
+            assert!(pending.iter().all(|id| held.contains(id)));
+            let refused = s3.collect_orphans_in_group(0);
+            assert!(
+                matches!(refused, Err(S3Error::Meta(_))),
+                "a group without a leader must refuse through the fence: {refused:?}"
+            );
+            assert_eq!(f.distinct_ids(), held, "a refused pass deletes nothing");
+            assert_eq!(f.meta.scan_prefix_or_panic("/s3-intent/1/").len(), 1);
+
+            drop(s3);
+            shutdown(f).await;
+        }
+
         // -----------------------------------------------------------------
         // Two collectors on one group.
         //

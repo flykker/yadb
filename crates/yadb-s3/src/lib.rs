@@ -14,6 +14,10 @@ use yadb_metakv::{
 /// Blob channel of S3 object chunks. The collector needs it to know that this
 /// channel's generation space is monotonic, so a generation barrier is safe.
 pub const S3_CHANNEL: u8 = 4;
+/// Every namespace that can name a blob, and whose first key segment is a
+/// project id. A walk over these is how a project set is derived without a
+/// project list.
+const S3_GC_PREFIXES: [&str; 3] = ["/s3/", "/s3-intent/", "/s3-retired/"];
 const INTENT_GRACE_SECS: u64 = 300;
 const INTENT_GRACE_REVISIONS: u64 = 32;
 const MAX_ALLOCATION: u64 = (1u64 << 56) - 1;
@@ -1555,18 +1559,14 @@ impl<FS: StorageFs> ObjectStoreEngine<FS> {
         // snapshot across project groups.  Never scan/delete from a mixed
         // view: callers must disable the namespace-wide operation instead.
         Self::namespace_scan_refused(self.meta.is_openraft())?;
-        let mut projects = std::collections::BTreeSet::new();
-        for prefix in ["/s3/", "/s3-intent/", "/s3-retired/"] {
+        let mut keys = Vec::new();
+        for prefix in S3_GC_PREFIXES {
             for (key, _) in self.meta.try_scan_prefix(prefix)? {
-                if let Some(project) = key.strip_prefix(prefix).and_then(|v| v.split('/').next()) {
-                    if let Ok(project_id) = project.parse::<u32>() {
-                        projects.insert(project_id);
-                    }
-                }
+                keys.push(key);
             }
         }
         let mut removed = 0;
-        for project_id in projects {
+        for project_id in Self::projects_in_keys(keys.iter().map(String::as_str)) {
             removed += self.collect_orphans(project_id)?;
         }
         Ok(removed)
@@ -1575,10 +1575,13 @@ impl<FS: StorageFs> ObjectStoreEngine<FS> {
     /// Collects orphans for exactly one metadata group.
     ///
     /// Only the projects the deployment routes to `group` are visited, taken
-    /// from [`LocalMetaKv::gc_group_scopes`]. A group whose scope covers every
-    /// project (`project_ids == None`) cannot be enumerated, so it refuses
-    /// instead of scanning a partial view. A group with no scope at all is not
-    /// this deployment's, so there is nothing to collect.
+    /// from [`LocalMetaKv::gc_group_scopes`]. A group whose scope names its
+    /// projects visits exactly those. A group whose scope covers every project
+    /// (`project_ids == None`) has no list to read, so its project set is
+    /// derived from the same leader-fenced snapshot the pass takes: a group's
+    /// state machine holds only that group's keys, so a walk over its snapshot
+    /// is complete for the group. A group with no scope at all is not this
+    /// deployment's, so there is nothing to collect.
     ///
     /// Before any project is collected, a linearizable snapshot of `group` over
     /// the S3 manifest prefixes must succeed. That proves the group's leader has
@@ -1600,28 +1603,54 @@ impl<FS: StorageFs> ObjectStoreEngine<FS> {
         self.collect_orphans_in_scopes_with(scopes, group, || self.require_group_view(group))
     }
 
-    /// One group's pass. `prove_view` is the leader fence: production always
-    /// passes the linearizable snapshot, and it runs before any project is
-    /// collected. The parameter exists so a single-node test can exercise
-    /// scope selection and the per-project loop, which the fixture cannot
-    /// fence because it has no OpenRaft group to ask.
+    /// One group's pass. `prove_view` is the leader fence: production passes the
+    /// linearizable snapshot, and it runs before any project is collected or
+    /// enumerated. It returns the keys of that snapshot, which are the complete
+    /// enumeration for a scope with no project list. The parameter exists so a
+    /// single-node test can exercise scope selection and the per-project loop,
+    /// which the fixture cannot fence because it has no OpenRaft group to ask.
     fn collect_orphans_in_scopes_with(
         &self,
         scopes: &[GcGroupScope],
         group: u64,
-        prove_view: impl FnOnce() -> Result<(), S3Error>,
+        prove_view: impl FnOnce() -> Result<Vec<String>, S3Error>,
     ) -> Result<usize, S3Error> {
         let Some(scope) = Self::group_scope(scopes, group) else {
             // Nothing in this group is this deployment's.
             return Ok(0);
         };
-        let Some(project_ids) = &scope.project_ids else {
-            // The group covers every project, so its project set cannot be
-            // enumerated. Refuse rather than scan a partial view.
-            return Err(S3Error::NamespaceScanUnavailable);
+        // The fence runs before anything is enumerated or deleted, for every
+        // scope shape. A follower or a group without quorum refuses here.
+        let view = prove_view()?;
+        let project_ids = match &scope.project_ids {
+            Some(project_ids) => project_ids.clone(),
+            // The group covers every project, so there is no list to read. The
+            // group's own snapshot is complete for the group; derive the set
+            // from it instead of scanning a view that could lag.
+            None => Self::projects_in_keys(view.iter().map(String::as_str)),
         };
-        prove_view()?;
-        self.collect_orphans_in_projects(project_ids)
+        self.collect_orphans_in_projects(&project_ids)
+    }
+
+    /// Project ids named by S3 keys, one per key under the namespaces that can
+    /// name a blob. This is the only definition of "which projects exist", used
+    /// both by the legacy namespace pass and by a group with no project list.
+    fn projects_in_keys<'a>(keys: impl Iterator<Item = &'a str>) -> BTreeSet<u32> {
+        let mut projects = BTreeSet::new();
+        for key in keys {
+            for prefix in S3_GC_PREFIXES {
+                let Some(rest) = key.strip_prefix(prefix) else {
+                    continue;
+                };
+                if let Some(project) = rest.split('/').next() {
+                    if let Ok(project_id) = project.parse::<u32>() {
+                        projects.insert(project_id);
+                    }
+                }
+                break;
+            }
+        }
+        projects
     }
 
     fn group_scope<'a>(scopes: &'a [GcGroupScope], group: u64) -> Option<&'a GcGroupScope> {
@@ -1631,18 +1660,20 @@ impl<FS: StorageFs> ObjectStoreEngine<FS> {
     /// Leader-fenced, quorum-confirmed read of one group's applied state.
     ///
     /// There is no fallback to local state: a follower, or a group without a
-    /// quorum, returns the error and the pass deletes nothing.
-    fn require_group_view(&self, group: u64) -> Result<(), S3Error> {
-        self.meta.try_linearizable_group_snapshot(
+    /// quorum, returns the error and the pass deletes nothing. The returned
+    /// keys are that snapshot's rows under the S3 manifest prefixes, so a scope
+    /// with no project list can be enumerated from the same proof.
+    fn require_group_view(&self, group: u64) -> Result<Vec<String>, S3Error> {
+        let snapshot = self.meta.try_linearizable_group_snapshot(
             group,
             &[],
-            &[
-                "/s3/".to_string(),
-                "/s3-intent/".to_string(),
-                "/s3-retired/".to_string(),
-            ],
+            &S3_GC_PREFIXES.map(str::to_string),
         )?;
-        Ok(())
+        let mut keys = Vec::new();
+        for prefix in S3_GC_PREFIXES {
+            keys.extend(snapshot.scan_prefix(prefix).into_iter().map(|(key, _)| key));
+        }
+        Ok(keys)
     }
 
     fn collect_orphans_in_projects(&self, project_ids: &BTreeSet<u32>) -> Result<usize, S3Error> {
@@ -1898,7 +1929,10 @@ mod tests {
         // No scope for this group means nothing here is this deployment's.
         assert_eq!(s3.collect_orphans_in_scopes(&[], 7).unwrap(), 0);
 
-        // A scope that covers every project cannot be enumerated: refuse.
+        // A scope that covers every project is enumerated from its own
+        // leader-fenced snapshot, so it still needs one. Single-node metadata
+        // cannot provide it, so the pass refuses and deletes nothing rather
+        // than enumerating from local applied state.
         assert!(matches!(
             s3.collect_orphans_in_scopes(
                 &[GcGroupScope {
@@ -1907,7 +1941,7 @@ mod tests {
                 }],
                 7
             ),
-            Err(S3Error::NamespaceScanUnavailable)
+            Err(S3Error::Meta(MetaError::Routing(_)))
         ));
 
         // A known project set still needs a leader-fenced view. Single-node
@@ -1971,7 +2005,8 @@ mod tests {
 
         // With the view proven, group 7 collects its own project only.
         assert_eq!(
-            s3.collect_orphans_in_scopes_with(&scopes, 7, || Ok(())).unwrap(),
+            s3.collect_orphans_in_scopes_with(&scopes, 7, || Ok(Vec::new()))
+                .unwrap(),
             1
         );
         assert!(s3.meta.get_or_panic(&key1).is_none());
@@ -1986,7 +2021,8 @@ mod tests {
 
         // A group this deployment does not own has nothing to collect.
         assert_eq!(
-            s3.collect_orphans_in_scopes_with(&scopes, 9, || Ok(())).unwrap(),
+            s3.collect_orphans_in_scopes_with(&scopes, 9, || Ok(Vec::new()))
+                .unwrap(),
             0
         );
 
@@ -1995,6 +2031,72 @@ mod tests {
             ObjectStoreEngine::<SimFs>::namespace_scan_refused(true),
             Err(S3Error::NamespaceScanUnavailable)
         ));
+    }
+
+    #[test]
+    fn a_scope_covering_every_project_enumerates_from_its_fenced_view() {
+        let meta_fs = SimFs::new(6350);
+        let disks = [SimFs::new(6351), SimFs::new(6352), SimFs::new(6353)];
+        let s3 = engine(&meta_fs, &disks);
+        // Two projects, each with one expired upload intent and its fragment on
+        // disk. Only project 1 has a manifest, so a walk over `/s3/` alone
+        // would leave project 2's orphan behind while reporting a pass.
+        let (key1, _, manifest1) = prepared_for(&s3, 1);
+        let (key2, _, manifest2) = prepared_for(&s3, 2);
+        for manifest in [&manifest1, &manifest2] {
+            let blob = manifest.chunks[0].blob_id;
+            s3.get_pool("pool")
+                .unwrap()
+                .put_blob(blob, b"payload")
+                .unwrap();
+        }
+        advance_revisions(&s3);
+        let scopes = [GcGroupScope {
+            group_id: 7,
+            project_ids: None,
+        }];
+
+        // The enumeration is the fenced view, not "everything": an empty view
+        // collects nothing even though both orphans are collectable.
+        assert_eq!(
+            s3.collect_orphans_in_scopes_with(&scopes, 7, || Ok(Vec::new()))
+                .unwrap(),
+            0
+        );
+        assert!(s3.meta.get_or_panic(&key1).is_some());
+        assert!(s3.meta.get_or_panic(&key2).is_some());
+
+        // Without a view the pass refuses and deletes nothing.
+        assert!(matches!(
+            s3.collect_orphans_in_scopes_with(&scopes, 7, || Err(
+                S3Error::NamespaceScanUnavailable
+            )),
+            Err(S3Error::NamespaceScanUnavailable)
+        ));
+        assert!(s3.meta.get_or_panic(&key1).is_some());
+        assert!(s3.meta.get_or_panic(&key2).is_some());
+
+        // With the view proven, both projects are derived from its keys and
+        // both orphans are collected.
+        let view = || {
+            let mut keys = Vec::new();
+            for prefix in S3_GC_PREFIXES {
+                keys.extend(
+                    s3.meta
+                        .try_scan_prefix(prefix)
+                        .unwrap()
+                        .into_iter()
+                        .map(|(key, _)| key),
+                );
+            }
+            Ok(keys)
+        };
+        assert_eq!(
+            s3.collect_orphans_in_scopes_with(&scopes, 7, view).unwrap(),
+            2
+        );
+        assert!(s3.meta.get_or_panic(&key1).is_none());
+        assert!(s3.meta.get_or_panic(&key2).is_none());
     }
 
     #[test]
