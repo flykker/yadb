@@ -180,8 +180,13 @@ enum Fault {
     BootstrapRename,
     /// Bootstrap: `rename` succeeded but the directory sync fails.
     BootstrapDirSync,
-    /// Bootstrap: the parent-directory sync fails before anything is created.
+    /// Bootstrap: syncing the replica directory's parent fails, after
+    /// `create_dir_all` created the directory but before any log is published.
     BootstrapParentSync,
+    /// Bootstrap: syncing the parent of a directory created between an existing
+    /// ancestor and the replica directory fails. Only a nested `create_dir_all`
+    /// reaches this sync; a single-level path never does.
+    BootstrapAncestorSync,
 
     /// Reopen: the post-recovery `sync_data` fails.
     OpenSync,
@@ -223,7 +228,46 @@ fn sync_parent_dir(dir: &Path, fault: Option<Fault>) -> io::Result<()> {
             "simulated bootstrap parent-directory sync failure",
         ));
     }
+    if matches!(fault, Some(Fault::BootstrapAncestorSync)) {
+        return Err(io::Error::other(
+            "simulated bootstrap ancestor-directory sync failure",
+        ));
+    }
     File::open(parent)?.sync_all()
+}
+
+/// Create `dir` and make every directory entry this call creates durable.
+///
+/// A nested path whose parents did not exist makes `create_dir_all` create more
+/// than one level. Syncing only the leaf's immediate parent leaves each new
+/// intermediate directory's own entry unsynced in *its* parent, so a crash can
+/// make the whole chain unreachable even though the leaf's entry is durable.
+/// Every directory created here therefore has its parent synced before a handle
+/// is returned, and the immediate parent is synced even when `dir` already
+/// existed so a replica directory is never handed out without that barrier.
+fn create_dir_all_durable(dir: &Path, fault: Option<Fault>) -> io::Result<()> {
+    // Record what `create_dir_all` is about to create before it exists; after
+    // the call there is no way to tell a new directory from a pre-existing one.
+    let mut created = Vec::new();
+    for ancestor in dir.ancestors() {
+        if ancestor.as_os_str().is_empty() || ancestor.exists() {
+            break;
+        }
+        created.push(ancestor.to_path_buf());
+    }
+    fs::create_dir_all(dir)?;
+    let parent_fault =
+        matches!(fault, Some(Fault::BootstrapParentSync)).then_some(Fault::BootstrapParentSync);
+    sync_parent_dir(dir, parent_fault)?;
+    let ancestor_fault =
+        matches!(fault, Some(Fault::BootstrapAncestorSync)).then_some(Fault::BootstrapAncestorSync);
+    // `created` starts with `dir` itself, whose entry the sync above covered.
+    // Each remaining entry is an intermediate directory that must itself become
+    // reachable through its own parent.
+    for path in created.iter().skip(1) {
+        sync_parent_dir(path, ancestor_fault)?;
+    }
+    Ok(())
 }
 
 struct LimitedBuffer {
@@ -701,17 +745,22 @@ impl DurableOpenRaftLog {
     /// (the directory sync) leaves a complete log whose name is not yet proven
     /// durable; `open` accepts it and re-syncs the directory, so recovery from
     /// that outcome is a reopen, not a retry of `create`.
+    ///
+    /// Directory durability comes first: every directory this call creates has
+    /// its parent synced, including intermediates of a nested path, before the
+    /// header is written. The header is then written and synced, renamed into
+    /// place, and the directory that holds it is synced before the append handle
+    /// is opened.
     fn create_with_fault(
         dir: impl AsRef<Path>,
         identity: &ReplicaIdentity,
         fault: Option<Fault>,
     ) -> io::Result<Self> {
         let dir = dir.as_ref().to_path_buf();
-        fs::create_dir_all(&dir)?;
-        // The directory must itself be durable before a log inside it can be
-        // acknowledged; otherwise a crash can leave the log while its directory
-        // entry is gone.
-        sync_parent_dir(&dir, fault)?;
+        // The directory chain must itself be durable before a log inside it can
+        // be acknowledged; otherwise a crash can leave the log while the
+        // directory entries that reach it are gone.
+        create_dir_all_durable(&dir, fault)?;
         let lock = OsDirectoryLock::try_acquire(&dir)?;
         let path = dir.join("openraft.log");
         if path.try_exists()? {
@@ -774,6 +823,11 @@ impl DurableOpenRaftLog {
     }
 
     /// Reopen only an existing log for the same group incarnation and node.
+    ///
+    /// Reopen creates no directory entries, so the parent-of-directory barrier
+    /// belongs to `create`: the replica directory and the chain that reaches it
+    /// must already be durable. The syncs here cover the log file's contents,
+    /// the directory that holds it, and the removal of a leftover temporary.
     pub fn open(dir: impl AsRef<Path>, identity: &ReplicaIdentity) -> io::Result<Self> {
         Self::open_with_fault(dir, identity, None)
     }
@@ -854,6 +908,20 @@ impl DurableOpenRaftLog {
         }
     }
 
+    /// Append one record and sync it before the caller is told it succeeded.
+    ///
+    /// Any failure poisons the handle: reads, state queries and further writes
+    /// are refused until a validated [`Self::open`].
+    ///
+    /// A failed `sync_data` is an *unknown outcome*, not an abort: the whole
+    /// frame was written, but it may or may not have reached the platter. The
+    /// adapter therefore refuses the handle and forces a reopen rather than
+    /// guessing. On reopen the frame is either present and complete — accepted
+    /// and re-synced, which can make the failed record durable after all — or
+    /// absent/torn and dropped as never acknowledged. Callers must treat a
+    /// failed append as "possibly applied" and rely on OpenRaft re-appending the
+    /// same record idempotently after recovery; they must never infer that the
+    /// record is gone from the error.
     fn append_durable(&self, record: &Record) -> Result<(), StorageError<u32>> {
         let mut inner = self.inner.lock().unwrap();
         if inner.failed {
@@ -947,6 +1015,7 @@ impl DurableOpenRaftLog {
                 | Fault::BootstrapRename
                 | Fault::BootstrapDirSync
                 | Fault::BootstrapParentSync
+                | Fault::BootstrapAncestorSync
                 | Fault::OpenSync
                 | Fault::OpenDirSync,
             )
@@ -2511,11 +2580,63 @@ mod tests {
             error.to_string(),
             "simulated bootstrap parent-directory sync failure"
         );
+        assert!(dir.0.is_dir(), "create_dir_all ran before the sync failed");
         assert!(!dir.0.join("openraft.log").exists());
+        assert!(
+            !dir.0.join("openraft.log.tmp").exists(),
+            "the parent sync is a barrier before any temporary header is written"
+        );
 
         // Only the sync failed: the same call succeeds without the injection.
         let store = DurableOpenRaftLog::create(&dir.0, &identity()).unwrap();
         drop(store);
         assert!(DurableOpenRaftLog::open(&dir.0, &identity()).is_ok());
+    }
+
+    /// A nested replica path makes `create_dir_all` create more than one level.
+    /// Syncing only the leaf's immediate parent would leave the new
+    /// intermediate directories' own entries unsynced in *their* parents, so a
+    /// crash could make the whole chain unreachable. Every created level must
+    /// have its parent synced before a handle is returned.
+    ///
+    /// An in-process test cannot observe a real crash, so the closest
+    /// observable evidence is the failure path: a fault at an ancestor sync —
+    /// which the single-level `create_propagates_a_parent_directory_sync_failure`
+    /// never reaches — must make `create` refuse even though the whole chain
+    /// exists, and no log may be published.
+    #[test]
+    fn create_syncs_each_new_ancestor_before_publishing_the_log() {
+        let root = TempDir::new();
+        let dir = root.0.join("a/b/c");
+        let error = match DurableOpenRaftLog::create_with_fault(
+            &dir,
+            &identity(),
+            Some(Fault::BootstrapAncestorSync),
+        ) {
+            Ok(_) => panic!("create succeeded despite an injected ancestor-directory sync failure"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.to_string(),
+            "simulated bootstrap ancestor-directory sync failure"
+        );
+        assert!(
+            dir.is_dir() && root.0.join("a/b").is_dir() && root.0.join("a").is_dir(),
+            "create_dir_all created the chain before the ancestor sync failed"
+        );
+        assert!(
+            !dir.join("openraft.log").exists(),
+            "a failed ancestor sync must not publish a log"
+        );
+        assert!(
+            DurableOpenRaftLog::open(&dir, &identity()).is_err(),
+            "a failed ancestor sync must not leave an openable log"
+        );
+
+        // Only the sync failed: the same nested path bootstraps and reopens
+        // without the injection.
+        let store = DurableOpenRaftLog::create(&dir, &identity()).unwrap();
+        drop(store);
+        assert!(DurableOpenRaftLog::open(&dir, &identity()).is_ok());
     }
 }
