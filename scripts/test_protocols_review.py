@@ -32,8 +32,8 @@ ANCHOR_RE = re.compile(r"([A-Za-z0-9_./-]+\.(?:rs|py)):(\d+)")
 # rejected: an unverifiable anchor is not allowed to pass.
 REQUIRED_SUBSTRINGS = {
     "crates/yadbd/src/protocols/s3.rs:683": ["is_openraft"],
-    "crates/yadbd/src/main.rs:524": ["begin_read_lease"],
-    "crates/yadbd/src/main.rs:7636": ["CONFLICT"],
+    "crates/yadbd/src/main.rs:535": ["begin_read_lease"],
+    "crates/yadbd/src/main.rs:7630": ["CONFLICT"],
     "crates/yadbd/src/gc.rs:149": ["MULTIRAFT_GC_REFUSAL"],
 }
 
@@ -44,16 +44,13 @@ REQUIRED_SUBSTRINGS = {
 # is compared exactly, in both directions.
 EXPECTED_SKIPS = {
     "VDisk orphan collection": [
-        "repair/orphan scan is disabled on Multi-Raft",
-        "crates/yadbd/src/main.rs:7636",
-    ],
-    "per-group GC collection": [
-        "mark-and-sweep is disabled for Multi-Raft",
-        "crates/yadbd/src/gc.rs:149",
+        "repair and orphan scan are disabled on Multi-Raft",
+        "crates/yadbd/src/main.rs:7630",
+        "the per-group collector exists in yadb-s3",
     ],
     "reader lease": [
         "crates/yadbd/src/protocols/s3.rs:683",
-        "crates/yadbd/src/main.rs:524",
+        "crates/yadbd/src/main.rs:535",
         "Multi-Raft has no fenced read lease",
     ],
     "cross-process InstallSnapshot": [
@@ -423,7 +420,7 @@ class SkipAnchorGuardTest(unittest.TestCase):
                   "crates/yadbd/src/main.rs:524")
         required = {
             "crates/yadbd/src/protocols/s3.rs:683": ["definitely_gone"],
-            "crates/yadbd/src/main.rs:524": ["begin_read_lease"],
+            "crates/yadbd/src/main.rs:535": ["begin_read_lease"],
         }
         with self.assertRaisesRegex(AssertionError, "no longer contains"):
             check_reason_anchors(

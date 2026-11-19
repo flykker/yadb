@@ -2806,7 +2806,8 @@ mod tests {
             );
             assert_eq!(
                 summary["orphan_collection_error"],
-                "scrub disabled for Multi-Raft"
+                crate::SCRUB_MULTIRAFT_REFUSAL,
+                "the repair half must name the whole-deployment view it lacks"
             );
 
             // The periodic scan's sweep half takes the same per-group path.

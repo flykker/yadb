@@ -356,21 +356,216 @@ def request(port, method, path, body=b"", headers=None, timeout=30):
     return status, hs, data
 
 
-def assert_multiraft_gc_refusal(port, path, fragments):
-    """Check the HTTP refusal and verify each seeded fragment remains readable."""
-    status, _, body = request(port, "POST", path, headers=admin_headers())
-    assert status == 409, (path, status, body)
+def assert_multiraft_scrub_repair_refusal(port, fragments):
+    """Scrub's repair half still refuses on Multi-Raft; its collection half runs.
+
+    The repair scan needs one whole-deployment view of every live manifest,
+    which Multi-Raft does not have. The refusal is reported in the summary and
+    nothing is repaired or orphan-collected, while the per-group collection half
+    is exercised by `assert_multiraft_gc_drills` separately.
+    """
+    status, _, body = request(port, "POST", "/v1/pools/scrub",
+                              headers=admin_headers())
     summary = json.loads(body)
-    reason = summary.get("gc_refusal")
-    assert isinstance(reason, str) and "mark-and-sweep disabled for Multi-Raft" in reason, summary
-    assert summary["fragments_deleted"] == 0 and summary["bytes_reclaimed"] == 0, summary
-    if path == "/v1/pools/scrub":
-        assert summary["orphan_collection_error"] == "scrub disabled for Multi-Raft", summary
-        assert summary["orphan_blobs_collected"] == 0, summary
+    reason = summary["orphan_collection_error"] or ""
+    assert "repair and orphan scan disabled for Multi-Raft" in reason, summary
+    assert summary["orphan_blobs_collected"] == 0, summary
+    assert summary["blobs_repaired"] == 0 and summary["fragments_repaired"] == 0, summary
     for fragment_port, fragment_path, expected in fragments:
         result = request(fragment_port, "GET", fragment_path,
                          headers={"x-yadb-raft-token": RAFT_TOKEN})
         assert result[0] == 200 and result[2] == expected, (fragment_path, result)
+
+
+def vdisk_blob_id(project, owner, generation, step, channel, part=1):
+    """One physical fragment id, laid out as `BlobId` packs it."""
+    return ((project << 96) | (owner << 64) | (generation << 40)
+            | (step << 16) | (channel << 8) | part)
+
+
+def vdisk_put(port, pool, slot, blob, payload):
+    path = f"/internal/vdisk/{pool}/{slot}/blob/{blob:032x}"
+    status, _, body = request(port, "PUT", path, payload,
+                              {"x-yadb-raft-token": RAFT_TOKEN})
+    assert status == 200, (path, status, body)
+    return path
+
+
+def vdisk_get(port, pool, slot, blob):
+    path = f"/internal/vdisk/{pool}/{slot}/blob/{blob:032x}"
+    return request(port, "GET", path, headers={"x-yadb-raft-token": RAFT_TOKEN})
+
+
+def assert_multiraft_gc_drills(health, control_fragments):
+    """Run the collection drills against the live Multi-Raft cluster.
+
+    Each drill proves one property of a *real* per-group pass, through the
+    shipped HTTP surface and the real on-disk epoch and pin table:
+
+    1. A live reader pin stops the pass on the pool that holds it: the target
+       refuses the epoch advance, so the group deletes nothing, and every
+       fragment on the pinned pool stays readable.
+    2. A collector whose epoch is behind the target's is refused on every slot:
+       a fragment written at the current epoch is not "older", so a superseded
+       pass cannot delete it.
+    3. A node that is not the group's leader refuses that group and deletes
+       nothing from it.
+    4. After the pin is released the same fragments are collected, and a scrub
+       pass reports no degraded and no refused puts.
+
+    What these do not prove: they do not run two collectors concurrently on the
+    same group, and they do not expire a collector lease in the middle of a
+    pass - the daemon has no injection point for that, so the case stays
+    unproven at cluster level. The storage-level drills cover a superseded epoch
+    and a pass that stops at its first refusal directly.
+    """
+    internal = {"x-yadb-raft-token": RAFT_TOKEN}
+    json_headers = {**internal, "Content-Type": "application/json"}
+    project_group = {int(project): group for project, group in PROJECT_GROUPS.items()}
+    pool = health["pools"][0]
+    pool_name = pool["pool_name"]
+    slot = pool["slots"][0]
+    slot_index = slot["slot_index"]
+    slot_port = http_port(slot["node_id"])
+    base = f"/internal/vdisk/{pool_name}/{slot_index}"
+
+    def slot_epoch():
+        status, _, body = request(slot_port, "GET", base + "/epoch", headers=internal)
+        assert status == 200, ("epoch", status, body)
+        return json.loads(body)["epoch"]
+
+    def pin(epoch, ttl_ms=60_000):
+        status, _, body = request(
+            slot_port, "POST", base + "/pin",
+            json.dumps({"epoch": epoch, "ttl_ms": ttl_ms}).encode(), json_headers)
+        return status, json.loads(body) if body else {}
+
+    def unpin(pin_id):
+        status, _, body = request(
+            slot_port, "POST", base + "/unpin",
+            json.dumps({"pin_id": pin_id}).encode(), json_headers)
+        return status, json.loads(body) if body else {}
+
+    def gc(group):
+        """One pass on the group's leader; returns (leader, status, summary)."""
+        leader = wait_group_leader(group)
+        status, _, body = request(http_port(leader), "POST", "/v1/pools/gc",
+                                  headers=admin_headers())
+        return leader, status, json.loads(body)
+
+    def control_fragments_intact():
+        """The control fragments are in no scope, so no pass may touch them."""
+        for fragment_port, fragment_path, expected in control_fragments:
+            result = request(fragment_port, "GET", fragment_path, headers=internal)
+            assert result[0] == 200 and result[2] == expected, (fragment_path, result)
+
+    # ---- Drill 1: a live pin stops the pass that would delete its pool ----
+    project = 1
+    group = project_group[project]
+    # Three dead fragments on the pinned slot. One would only prove "the
+    # fragment the pin names survived"; three prove the whole pool was left
+    # alone, which is what a refused advance is supposed to mean.
+    dead = [vdisk_blob_id(project, 900, generation, 1, 251) for generation in (1, 2, 3)]
+    for blob in dead:
+        vdisk_put(slot_port, pool_name, slot_index, blob, b"gc-drill-pinned-fragment")
+    epoch_before = slot_epoch()
+    status, grant = pin(epoch_before)
+    assert status == 200 and grant["epoch"] == epoch_before, (status, grant)
+
+    # Only the group that owns the pinned project has a dead fragment in this
+    # pool. A group whose dead set is empty never enters `sweep_pool`, so it
+    # neither advances nor refuses; that is why this is one group and not a loop
+    # over every group.
+    leader, status, summary = gc(group)
+    # The refusal is a pool refusal, not a group one: the group is fine, the
+    # storage under it is not provable.
+    assert any("epoch advance" in reason and "refused" in reason
+               for reason in summary.get("gc_pools_refused", [])), \
+        (group, leader, summary)
+    assert any("no fragment was deleted" in reason
+               for reason in summary.get("gc_pools_refused", [])), summary
+    assert slot_epoch() == epoch_before, "a pinned slot must not advance"
+    for blob in dead:
+        assert vdisk_get(slot_port, pool_name, slot_index, blob)[0] == 200, \
+            "a refused pass deleted a fragment on the pinned pool"
+    control_fragments_intact()
+
+    status, body = unpin(grant["pin_id"])
+    assert status == 200 and body == {"released": True}, (status, body)
+
+    # ---- Drill 2: a superseded collector's epoch is refused on every slot ----
+    # The pass below advances every slot of the pool, so each slot's value
+    # before that pass is the epoch a superseded collector would still name.
+    slots_before = {}
+    for each in pool["slots"]:
+        port = http_port(each["node_id"])
+        path = f"/internal/vdisk/{pool_name}/{each['slot_index']}/epoch"
+        status, _, body = request(port, "GET", path, headers=internal)
+        assert status == 200, (path, status, body)
+        slots_before[each["slot_index"]] = json.loads(body)["epoch"]
+
+    leader, status, summary = gc(group)
+    assert summary["fragments_deleted"] > 0, (leader, summary)
+    for blob in dead:
+        assert vdisk_get(slot_port, pool_name, slot_index, blob)[0] == 404, \
+            "an unpinned fragment must be collected"
+
+    for each in pool["slots"]:
+        index = each["slot_index"]
+        port = http_port(each["node_id"])
+        path = f"/internal/vdisk/{pool_name}/{index}/epoch"
+        status, _, body = request(port, "GET", path, headers=internal)
+        assert status == 200, (path, status, body)
+        current = json.loads(body)["epoch"]
+        assert current > slots_before[index], (index, current, slots_before[index])
+        # A fragment written at the current epoch is not older than a collector
+        # that named the previous one, so the target refuses it. Both the owner
+        # and the slot vary: a blob id names one part on one slot, and drill 1
+        # already left tombstones on owner 900.
+        fresh = vdisk_blob_id(project, 910 + index, 2, 1, 251)
+        vdisk_put(port, pool_name, index, fresh, b"gc-drill-superseded")
+        status, _, body = request(
+            port, "DELETE",
+            f"/internal/vdisk/{pool_name}/{index}/blob/{fresh:032x}"
+            f"?collector_epoch={slots_before[index]}", headers=internal)
+        assert status == 409 and json.loads(body)["error"] == "fragment_not_older", \
+            (index, status, body)
+        assert request(port, "GET",
+                       f"/internal/vdisk/{pool_name}/{index}/blob/{fresh:032x}",
+                       headers=internal)[0] == 200, index
+        # A strictly newer epoch does collect it, so the refusal above was about
+        # the epoch and not a general inability to delete.
+        status, _, body = request(
+            port, "DELETE",
+            f"/internal/vdisk/{pool_name}/{index}/blob/{fresh:032x}"
+            f"?collector_epoch={current + 1}", headers=internal)
+        assert status == 200 and body == b"deleted", (index, status, body)
+    control_fragments_intact()
+
+    # ---- Drill 3: a non-leader refuses its group and deletes nothing ----
+    leader = wait_group_leader(group)
+    follower = next(node for node in NODES if node != leader)
+    alive = vdisk_blob_id(project, 920, 1, 1, 251)
+    vdisk_put(slot_port, pool_name, slot_index, alive, b"gc-drill-follower")
+    status, _, body = request(http_port(follower), "POST", "/v1/pools/gc",
+                              headers=admin_headers())
+    summary = json.loads(body)
+    refused = summary.get("gc_groups_refused", [])
+    assert any(f"group {group}" in reason and "not the leader" in reason
+               for reason in refused), (follower, leader, summary)
+    assert vdisk_get(slot_port, pool_name, slot_index, alive)[0] == 200, \
+        "a follower must not delete a group's fragments"
+
+    # ---- Drill 4: the leader collects, and nothing is degraded ----
+    leader, status, summary = gc(group)
+    assert vdisk_get(slot_port, pool_name, slot_index, alive)[0] == 404, \
+        (leader, summary)
+    status, _, body = request(http_port(leader), "POST", "/v1/pools/scrub",
+                              headers=admin_headers())
+    scrub = json.loads(body)
+    assert scrub["degraded_puts"] == 0, scrub
+    assert scrub["refused_puts"] == 0, scrub
+    control_fragments_intact()
 
 
 def assert_vdisk_fence_rpc(port, pool_name, slot_index):
@@ -1388,17 +1583,19 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None,
                     before = request(port, "GET", gc_path, headers=internal)
                     assert before[0] == 200 and before[2] == payload, before
                     gc_fragments.append((port, gc_path, payload))
-            assert gc_fragments, "no VDisk fragments seeded for GC refusal"
+            assert gc_fragments, "no VDisk fragments seeded for the GC drills"
             control_leader = wait_group_leader(CONTROL_GROUP)
-            for path in ("/v1/pools/gc", "/v1/pools/scrub"):
-                assert_multiraft_gc_refusal(http_port(control_leader), path, gc_fragments)
-            print("PASS Multi-Raft GC and scrub explicitly refuse without deleting fragments")
+            assert_multiraft_scrub_repair_refusal(http_port(control_leader), gc_fragments)
+            print("PASS Multi-Raft scrub refuses its repair half and deletes nothing")
             skip("VDisk orphan collection",
-                 "scrub's repair/orphan scan is disabled on Multi-Raft: "
-                 "crates/yadbd/src/main.rs:7636 answers 409 instead of 200")
-            skip("per-group GC collection",
-                 "mark-and-sweep is disabled for Multi-Raft: "
-                 "crates/yadbd/src/gc.rs:149 refuses before any pass")
+                 "scrub's repair and orphan scan are disabled on Multi-Raft: "
+                 "both need one whole-deployment view of live manifests, so "
+                 "crates/yadbd/src/main.rs:7630 answers 409 instead of 200; the "
+                 "per-group collector exists in yadb-s3 but the daemon does not "
+                 "call it yet")
+            assert_multiraft_gc_drills(health, gc_fragments)
+            print("PASS Multi-Raft GC: live-pin fence, per-group leadership, "
+                  "superseded epoch, clean collection")
             print("PASS VDisk exact DELETE, idempotent tombstone and delayed PUT fencing")
             # The epoch and pin surface is wired into the shipped router, not
             # only into the handler functions the unit test calls. One slot is
@@ -1655,7 +1852,7 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None,
             skip("reader lease",
                  "begin_read_lease is legacy-gated: the gate is `!st.app.meta."
                  "is_openraft()` at crates/yadbd/src/protocols/s3.rs:683, and the "
-                 "lease itself is declared at crates/yadbd/src/main.rs:524, so "
+                 "lease itself is declared at crates/yadbd/src/main.rs:535, so "
                  "Multi-Raft has no fenced read lease to acquire, renew or expire; "
                  "consistent reads use the quorum snapshot instead")
             # Multipart upload: the parts are real durable allocations, and the

@@ -336,6 +336,17 @@ struct AppState {
     block: BlockVolumeEngine<OsFs>,
 }
 
+/// Why the repair and orphan half of a scrub refuses on Multi-Raft.
+///
+/// Both answer "is this fragment still referenced" against every live manifest,
+/// and Multi-Raft has no single atomic view across its groups: a node's applied
+/// state can lag a committed manifest in another group, so a scan would call a
+/// referenced blob unreferenced. Collection does not need that view and runs
+/// per group instead, through `/v1/pools/gc` and this summary's sweep fields.
+const SCRUB_MULTIRAFT_REFUSAL: &str =
+    "repair and orphan scan disabled for Multi-Raft: both need one whole-deployment view of \
+     live manifests";
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct ScrubSummary {
     pub pools_checked: usize,
@@ -822,7 +833,9 @@ impl AppState {
     /// fence rules as [`Self::scrub_all_pools`]; a refusal is returned to the
     /// caller as an error response, not hidden in a 200 body.
     ///
-    /// Multi-Raft collection is temporarily refused until its fencing is safe.
+    /// Collection runs on both metadata runtimes. On Multi-Raft the pass is
+    /// per metadata group and refuses a group whose leadership, leases or
+    /// storage fence cannot be proved; a refusal is reported, never swallowed.
     fn gc_all_pools(&self) -> gc::SweepOutcome {
         let control = self.control.read().unwrap().clone();
         let pools = self.pools.read().unwrap().clone();
@@ -843,9 +856,11 @@ impl AppState {
         // bit-rotted fragment), which is a different failure and needs the manifest
         // scan to know which blobs should exist.
         if self.meta.is_openraft() {
-            // The global repair scan needs one whole-deployment view, which
-            // Multi-Raft does not have. Collection also refuses until its
-            // lease fencing is safe.
+            // The repair scan needs one whole-deployment view of every live
+            // manifest, which Multi-Raft does not have: its groups have no
+            // shared revision, so "this fragment is unreferenced" cannot be
+            // decided from any single node's applied state. Collection does
+            // not need that view and runs below, per metadata group.
             let sweep_outcome = if sweep {
                 let control = self.control.read().unwrap().clone();
                 let pools = self.pools.read().unwrap().clone();
@@ -870,7 +885,12 @@ impl AppState {
                     .values()
                     .map(|striper| striper.degraded_put_count() as usize)
                     .sum(),
-                orphan_collection_error: Some("scrub disabled for Multi-Raft".into()),
+                // Orphan collection is part of the repair scan: it answers
+                // "is this blob still referenced" against the same
+                // whole-deployment view, so it is refused with it. The
+                // per-group collector in `yadb-s3` exists but the daemon does
+                // not call it yet.
+                orphan_collection_error: Some(SCRUB_MULTIRAFT_REFUSAL.into()),
                 blobs_live: sweep_outcome.blobs_live,
                 fragments_deleted: sweep_outcome.fragments_deleted,
                 bytes_reclaimed: sweep_outcome.bytes_reclaimed,
@@ -7602,8 +7622,10 @@ async fn handle_pools_scrub(State(st): State<AppState>, headers: HeaderMap) -> R
     let res = tokio::task::spawn_blocking(move || st_clone.scrub_all_pools(true)).await;
     match res {
         Ok(summary) => {
-            // Preserve legacy scrub responses; Multi-Raft cannot perform either
-            // repair or collection, so do not report a successful manual run.
+            // Preserve legacy scrub responses. On Multi-Raft the repair and
+            // orphan halves of a scrub cannot run, so a 200 would claim a
+            // repair scan that did not happen; collection is available through
+            // `/v1/pools/gc` and runs inside this summary regardless.
             let status = if st.meta.is_openraft() {
                 StatusCode::CONFLICT
             } else {
