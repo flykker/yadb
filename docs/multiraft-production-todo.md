@@ -591,13 +591,22 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   `PoolHealthSnapshot::refused_puts` / `ScrubSummary::refused_puts`, and mapped to
   `503` on the SQL, S3 and block paths. Nothing is published for a refused write, so
   the caller holds no reference to the fragments that did land; those fragments are
-  garbage, not corruption, and are **not** reclaimed automatically - the only
-  orphan collection implemented is scoped to the S3 namespace and is disabled on
-  Multi-Raft, so they accumulate until a pool-wide collector exists (see the
-  garbage-collection item). An earlier version of this paragraph said the
-  mark-and-sweep collector reclaimed them; that was wrong, and the new fixture
-  makes the difference observable by asserting the fragments are still on disk
-  after the refusal. The consequence is deliberate: a pool with any slot offline
+  garbage, not corruption: a pool-wide mark-and-sweep pass reclaims them. That
+  pass is not S3-scoped and is not disabled on Multi-Raft — `yadbd::gc::sweep`
+  dispatches to `sweep_groups`, marks from each group's quorum-confirmed
+  snapshot and sweeps every mounted pool, and the background scrubber runs it
+  every five minutes on the control-group leader. The narrower S3 intent
+  collector is a second mechanism, not the only one. An earlier version of this
+  paragraph said the only collector was S3-scoped and disabled on Multi-Raft and
+  then that no collector reclaimed them; both were wrong, and
+  `gc::tests::openraft_tests::a_refused_block_write_is_reclaimed_by_a_multigroup_pass`
+  now pins the multi-group behaviour: a refused block write stages fragments, a
+  `sweep_groups` pass deletes exactly those, and the committed bytes still read
+  back byte for byte. The real residual is timing, not scope: until a pass runs
+  a refused write's fragments stay readable by id, and a pool that is not
+  mounted, a group this node does not lead and a project routed to no data group
+  are refused and delete nothing. The consequence is deliberate: a pool with any
+  slot offline
   refuses new writes instead of accepting unprotected ones, so write
   availability now follows full redundancy. The three-node daemon test asserts
   this: a write while one replica is stopped is refused with `503` and stays
@@ -613,9 +622,10 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   `degraded_puts`, and still reads the exact bytes from the survivors with one
   server down. Open: that fixture runs on loopback, so separate hosts, network
   partitions and power loss remain unproven; a refused write's landed fragments
-  are still readable by id until a collection pass, which no test yet shows
-  reclaiming them; and refusal is per pool, so one offline domain stops writes
-  for every volume on it.
+  are still readable by id until the next collection pass, which
+  `a_refused_block_write_is_reclaimed_by_a_multigroup_pass` now shows reclaiming
+  them on a multi-group fixture; and refusal is per pool, so one offline domain
+  stops writes for every volume on it.
 - [ ] Idempotency and read-consistency contracts. A keyed `POST /v1/apply` is
   implemented (`Idempotency-Key`, the outcome record committed in the same
   `RevisionTxn` as the mutation, `POST /v1/idempotency/resolve`, and a replicated
@@ -646,7 +656,11 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   exact bytes — including a pass that runs between a refused write and the next
   live write of the same block. That model reproduces `sweep_pool` rather than
   calling it (the daemon crate is above `yadb-block`), and the daemon-layer
-  refused-write case is covered separately in `crates/yadbd/src/gc.rs`. SQL
+  refused-write case is covered separately in `crates/yadbd/src/gc.rs`: the
+  legacy `fragments_of_a_refused_write_are_reclaimed_and_the_old_data_survives`
+  and the multi-group
+  `openraft_tests::a_refused_block_write_is_reclaimed_by_a_multigroup_pass`,
+  which drives `sweep_groups` over three real OpenRaft groups. SQL
   writes are
   still **not** keyed: `POST /db/{project}/db/query` returns 501 for a keyed
   write script, because a script can mutate any number of tables, shards and

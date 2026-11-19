@@ -1189,13 +1189,23 @@ impl<FS: StorageFs> PoolStriper<FS> {
     /// single failure domain still leaves the payload reconstructible. A short
     /// write is refused with `BlobError::RedundancyNotMet` and counted in
     /// `refused_puts`; the fragments that did land are never published, so a
-    /// caller that saw the error holds no reference to them. They are *not*
-    /// reclaimed automatically: the only orphan collection implemented is scoped
-    /// to the S3 namespace and is disabled on Multi-Raft, so unreferenced
-    /// fragments from a refused write — like those from a copy-on-write block
-    /// replacement — accumulate until a pool-wide collector exists. Refusing is
-    /// deliberate: an ack that only means "readable" would let a client believe
-    /// data survived a node loss when it cannot.
+    /// caller that saw the error holds no reference to them. They are garbage,
+    /// not a leak: the pool-wide mark-and-sweep (`yadbd::gc::sweep`) deletes
+    /// every fragment that is present in a pool and named by no live manifest,
+    /// so a refused write's landed parts — like those from a copy-on-write block
+    /// replacement — are reclaimed by the next pass. That pass is not S3-scoped
+    /// and is not disabled on Multi-Raft: `sweep` dispatches to `sweep_groups`,
+    /// which marks from each group's quorum-confirmed snapshot and sweeps every
+    /// mounted pool, and the background scrubber runs it every five minutes
+    /// (`BACKGROUND_SWEEP_INTERVAL`) on the control-group leader. The narrower S3
+    /// intent collector is a second mechanism, not the only one. The real
+    /// residual is timing, not scope: until a pass runs, a refused write's
+    /// fragments stay readable by physical id, and a pool that is not mounted, a
+    /// group this node does not lead, and a project routed to no data group are
+    /// refused and delete nothing, so their garbage waits for a pass that can
+    /// prove the live set. Refusing is deliberate: an ack that only means
+    /// "readable" would let a client believe data survived a node loss when it
+    /// cannot.
     ///
     /// A slot that *refuses* the write — `ImmutableConflict`,
     /// `FencedByBarrier`, `Tombstoned`, or any other non-`Io` failure — is not a

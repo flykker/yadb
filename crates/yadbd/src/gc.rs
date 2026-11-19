@@ -3483,6 +3483,101 @@ mod tests {
             .expect("multigroup sweep timed out");
         }
 
+        /// The Multi-Raft counterpart of
+        /// `fragments_of_a_refused_write_are_reclaimed_and_the_old_data_survives`.
+        ///
+        /// `PoolStriper::put_blob`'s comment claims a refused write's landed
+        /// fragments are garbage a pool-wide pass reclaims. That claim was
+        /// proved on the legacy runtime only, while the comment says the pass is
+        /// S3-scoped and disabled on Multi-Raft. This asserts the opposite on a
+        /// real multi-group fixture: `sweep_groups` reaches the pool pass for the
+        /// group that owns the project, removes exactly the refused write's
+        /// fragments, and leaves every committed fragment readable.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_refused_block_write_is_reclaimed_by_a_multigroup_pass() {
+            tokio::time::timeout(Duration::from_secs(30), async {
+                let f = multigroup("refused-block").await;
+                let engine = f.engine();
+                engine
+                    .write_at(1, "disk", POOL, 1 << 20, 0, b"committed-before")
+                    .unwrap();
+                let before = f.distinct_ids();
+
+                // The fragments are appended, then the publication is refused:
+                // exactly the state a client-visible "write did not commit"
+                // leaves behind.
+                let refused =
+                    engine.write_at_with(1, "disk", POOL, 1 << 20, 0, b"never-published", |_| {
+                        Err(BlockError::Conflict)
+                    });
+                assert!(matches!(refused, Err(BlockError::Conflict)), "{refused:?}");
+
+                // Without this the reclaim assertion below would pass vacuously
+                // on a fixture that staged nothing.
+                let after_failure = f.distinct_ids();
+                let staged: BTreeSet<BlobId> =
+                    after_failure.difference(&before).copied().collect();
+                assert!(
+                    !staged.is_empty(),
+                    "a refused write must stage fragments before its publication is refused"
+                );
+                assert!(
+                    staged.iter().all(|id| id.project_id() == 1),
+                    "the staged garbage must belong to the refused project: {staged:?}"
+                );
+
+                // A normal read never returns them: the extent map still names
+                // the committed generation, so the refused bytes are reachable
+                // only by physical id.
+                let read = engine
+                    .read_at(1, "disk", POOL, 1 << 20, 0, b"committed-before".len())
+                    .unwrap();
+                assert_eq!(read, b"committed-before");
+
+                let outcome = f.sweep();
+                assert!(outcome.refusal.is_none(), "{outcome:?}");
+                assert!(outcome.groups_refused.is_empty(), "{outcome:?}");
+                assert!(outcome.errors.is_empty(), "{outcome:?}");
+                assert!(
+                    outcome.fragments_deleted >= staged.len(),
+                    "the pass deleted {} fragments, fewer than the {} a refused write staged: {outcome:?}",
+                    outcome.fragments_deleted,
+                    staged.len()
+                );
+
+                // Both halves: the garbage is gone *and* nothing live was lost.
+                let after_sweep = f.distinct_ids();
+                for id in &staged {
+                    assert!(
+                        !after_sweep.contains(id),
+                        "the pass left a refused write's fragment behind: {id:?}"
+                    );
+                }
+                for id in &before {
+                    assert!(
+                        after_sweep.contains(id),
+                        "the pass deleted a committed fragment: {id:?}"
+                    );
+                }
+                let read = engine
+                    .read_at(1, "disk", POOL, 1 << 20, 0, b"committed-before".len())
+                    .unwrap();
+                assert_eq!(read, b"committed-before");
+
+                // A second pass deletes nothing and changes nothing: a collector
+                // that kept deleting live data would be caught here.
+                let again = f.sweep();
+                assert!(again.refusal.is_none(), "{again:?}");
+                assert_eq!(again.fragments_deleted, 0, "{again:?}");
+                assert_eq!(f.distinct_ids(), after_sweep);
+
+                drop(engine);
+                shutdown(f).await;
+            })
+            .await
+            .expect("multigroup refused-write sweep timed out");
+        }
+
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn a_follower_group_refuses_and_deletes_nothing() {
             tokio::time::timeout(Duration::from_secs(30), async {

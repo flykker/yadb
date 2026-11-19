@@ -1776,8 +1776,13 @@ every start instead of only in the `stopped` branch.
 * A part is capped at 16 MiB (AWS allows 5 GiB); a larger part is refused, not
   streamed.
 * There is no `ListMultipartUploads` and no `UploadPartCopy`/server-side copy.
-* Orphan collection stays disabled on Multi-Raft, so an aborted or expired
-  upload's fragments are not reclaimed there.
+* The namespace-wide orphan collector (`collect_orphans_all`) refuses on
+  Multi-Raft because it cannot take one leader-fenced snapshot across project
+  groups, but orphan collection itself is not disabled: the daemon runs the
+  per-group form (`collect_orphans_in_group`) for every metadata group in its
+  repair pass, so an aborted or expired upload's fragments are reclaimed there
+  too. The residual is that the two forms are separate entry points, so the
+  per-group one is only reached through the daemon's pass.
 * After an ambiguous `503` completion the client must `HEAD`/`GET` to learn the
   outcome; the server does not resume an upload on its own.
 * A full `?consistent=true` read of an object above 16 MiB is refused; use
@@ -2071,6 +2076,7 @@ inside the grace and observes it collected after it.
 | Test | Proves |
 | --- | --- |
 | `gc::tests::openraft_tests::a_multigroup_pass_reclaims_each_groups_dead_fragments` | Two data groups over projects 1 and 2 each keep exactly the newest generation (16 fragments) and serve their newest bytes after the pass. |
+| `gc::tests::openraft_tests::a_refused_block_write_is_reclaimed_by_a_multigroup_pass` | A block write whose publication is refused stages fragments that no manifest names. A multi-group `sweep_groups` pass deletes exactly those staged fragments, keeps every committed one, and the committed bytes still read back byte for byte; a second pass deletes nothing and changes nothing. This is the Multi-Raft counterpart of the legacy refused-write test, and it is what makes `put_blob`'s comment about refused fragments true rather than assumed. |
 | `gc::tests::openraft_tests::a_follower_group_refuses_and_deletes_nothing` | Group 2 is a two-node cluster whose local node is a follower. The pass refuses group 2, deletes nothing, and the group 2 leader then reclaims the same fragments — so the refusal, not the data, kept them. |
 | `gc::tests::openraft_tests::a_group_writer_lease_protects_an_unpublished_fragment` | An unexpired writer lease in group 2 keeps an appended, unpublished fragment alive and refuses group 2, while group 3 still reclaims its own garbage. Releasing the lease makes the fragment provably dead. |
 | `gc::tests::openraft_tests::a_group_leader_death_before_publication_keeps_the_fragment_leased_and_unreadable` | A fragment is appended for project 1 (group 2) with a writer lease published exactly as the block write path does, then every group is stopped and reopened from its durable directories. After the restart a quorum-confirmed read is `ObjectNotFound`, the recovered live lease refuses group 2 and deletes nothing, and after the record is deterministically expired the pass reaps it, collects the fragment and reports `fragments_deleted > 0`. |
@@ -2092,6 +2098,13 @@ Disabling the post-admission fence re-check (`if !live.is_empty()` →
 `groups_refused` is empty and the pass deletes 483 fragments while a writer
 lease is live (`left: 0, right: 1`). The check was restored; the suite is green
 with it.
+
+Treating every present fragment as live in `sweep_group`'s dead-set filter
+(`&& false` on the `!live.contains(*id)` term) makes
+`a_refused_block_write_is_reclaimed_by_a_multigroup_pass` fail with
+`the pass deleted 0 fragments, fewer than the 1 a refused write staged`;
+restored, green. That is the inversion that shows the test is about the
+collector's live set and not about the fixture having nothing to delete.
 
 Disabling the pre-admission collector-record check (treating a live
 `live_collector_in` result as absent in `sweep_group` step 3) makes

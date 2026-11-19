@@ -255,7 +255,7 @@ The refusal conflated two questions:
 1. **Which blobs should exist?** This is answered from live manifests.
 2. **What is wrong with one blob?** This is answered from the fragments alone.
 
-`repair_blob` (`crates/yadb-blob/src/pool.rs:1590`) only does (2). It reads the
+`repair_blob` (`crates/yadb-blob/src/pool.rs:1600`) only does (2). It reads the
 parts of one logical id, rebuilds the ones that are missing from the surviving
 parts, and moves a part that lives on a handoff slot back to its nominal slot.
 It never consults a manifest. The whole-deployment view is needed only for (1),
