@@ -893,7 +893,11 @@ def assert_orphan_collection_drill(health):
             status, _, body = request(http_port(slot["node_id"]), "GET", path,
                                       headers=internal)
             assert status == 200, (path, status, body)
-            ids[slot["slot_index"]] = set(json.loads(body)["ids"])
+            # The route reports each id as hex (`BlobId::to_hex`); every other
+            # fragment helper in this file takes the integer id, so convert once
+            # here rather than at each call.
+            ids[slot["slot_index"]] = {int(value, 16)
+                                       for value in json.loads(body)["ids"]}
         return ids
 
     # The difference across the part upload is exactly the abandoned part's
