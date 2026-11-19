@@ -340,6 +340,11 @@ pub struct ObjectStoreEngine<FS: StorageFs> {
     /// increasing, so skipping is safe, while reuse would alias two uploads
     /// after a restart.
     allocation_cache: Arc<Mutex<BTreeMap<u32, (u64, u64)>>>,
+    /// How long a prepared upload intent stays protected from the collector.
+    ///
+    /// Shared behind an `Arc` so a setter on one clone is observed by every
+    /// clone the daemon hands to handlers. Defaults to [`INTENT_GRACE_SECS`].
+    intent_grace_secs: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl<FS: StorageFs> Clone for ObjectStoreEngine<FS> {
@@ -349,6 +354,7 @@ impl<FS: StorageFs> Clone for ObjectStoreEngine<FS> {
             pools: self.pools.clone(),
             chunk_size: self.chunk_size,
             allocation_cache: self.allocation_cache.clone(),
+            intent_grace_secs: self.intent_grace_secs.clone(),
         }
     }
 }
@@ -360,7 +366,27 @@ impl<FS: StorageFs> ObjectStoreEngine<FS> {
             pools: Arc::new(RwLock::new(BTreeMap::new())),
             chunk_size: chunk_size.max(4096),
             allocation_cache: Arc::new(Mutex::new(BTreeMap::new())),
+            intent_grace_secs: Arc::new(std::sync::atomic::AtomicU64::new(INTENT_GRACE_SECS)),
         }
+    }
+
+    /// Seconds an upload intent created or renewed now stays protected from the
+    /// orphan collector. See [`Self::set_intent_grace_secs`] for the contract.
+    pub fn intent_grace_secs(&self) -> u64 {
+        // Relaxed is enough: this is a configuration knob, read once per intent
+        // and never used to order other memory.
+        self.intent_grace_secs
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Overrides [`Self::intent_grace_secs`] for this engine and every clone.
+    ///
+    /// The default is 300 s and must stay 300 s. The harness overrides it only
+    /// to make an abandoned intent collectable inside a run; shortening it is a
+    /// test-only knob and must not be provisioned by default.
+    pub fn set_intent_grace_secs(&self, secs: u64) {
+        self.intent_grace_secs
+            .store(secs, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn register_pool(&self, name: impl Into<String>, striper: Arc<PoolStriper<FS>>) {
@@ -556,7 +582,7 @@ impl<FS: StorageFs> ObjectStoreEngine<FS> {
             state: UploadState::Prepared,
             created_revision: self.meta.revision_for_key(&intent_key)?,
             lease_until_revision: intent_lease,
-            lease_until_unix_secs: unix_seconds().saturating_add(INTENT_GRACE_SECS),
+            lease_until_unix_secs: unix_seconds().saturating_add(self.intent_grace_secs()),
             allocation_id: Some(allocation_id),
             ..UploadIntent::default()
         };
@@ -619,7 +645,7 @@ impl<FS: StorageFs> ObjectStoreEngine<FS> {
             state: UploadState::Prepared,
             created_revision: revision,
             lease_until_revision: revision.saturating_add(INTENT_GRACE_REVISIONS),
-            lease_until_unix_secs: unix_seconds().saturating_add(INTENT_GRACE_SECS),
+            lease_until_unix_secs: unix_seconds().saturating_add(self.intent_grace_secs()),
             multipart: true,
             content_type: content_type.to_string(),
             ..UploadIntent::default()
@@ -722,7 +748,7 @@ impl<FS: StorageFs> ObjectStoreEngine<FS> {
             state: UploadState::Prepared,
             created_revision: part_revision,
             lease_until_revision: part_revision.saturating_add(INTENT_GRACE_REVISIONS),
-            lease_until_unix_secs: unix_seconds().saturating_add(INTENT_GRACE_SECS),
+            lease_until_unix_secs: unix_seconds().saturating_add(self.intent_grace_secs()),
             allocation_id: Some(allocation),
             ..UploadIntent::default()
         };
@@ -807,14 +833,15 @@ impl<FS: StorageFs> ObjectStoreEngine<FS> {
             record.parts.sort_by_key(|p| p.part_number);
             let revision = self.meta.revision_for_key(upload_key)?;
             record.lease_until_revision = revision.saturating_add(INTENT_GRACE_REVISIONS);
-            record.lease_until_unix_secs = unix_seconds().saturating_add(INTENT_GRACE_SECS);
+            record.lease_until_unix_secs = unix_seconds().saturating_add(self.intent_grace_secs());
             // The part intent is refreshed in the same transaction. Its own
             // lease may have lapsed while this call was stalled; extending it
             // here is what makes the acknowledged part survive the collector
             // that is allowed to abort an expired, unregistered part.
             let mut live_intent: UploadIntent = serde_json::from_slice(&live_part.value)?;
             live_intent.lease_until_revision = revision.saturating_add(INTENT_GRACE_REVISIONS);
-            live_intent.lease_until_unix_secs = unix_seconds().saturating_add(INTENT_GRACE_SECS);
+            live_intent.lease_until_unix_secs =
+                unix_seconds().saturating_add(self.intent_grace_secs());
             let result = self.meta.execute(KvCommand::RevisionTxn {
                 guards: vec![
                     RevisionGuard {
@@ -2944,6 +2971,68 @@ mod tests {
         // (and its fragments) once its grace elapses.
         advance_revisions(&s3);
         assert_eq!(s3.collect_orphans_at(1, u64::MAX).unwrap(), 1);
+    }
+
+    // The grace is a per-engine knob so a harness can make an abandoned intent
+    // collectable inside a run. Inversion proves it is the knob (not the
+    // revision lease, which is exhausted here) that protects a fresh intent.
+    #[test]
+    fn intent_grace_is_configurable_and_protects_a_fresh_intent_until_it_expires() {
+        let meta_fs = SimFs::new(6124);
+        let disks = [SimFs::new(6125), SimFs::new(6126), SimFs::new(6127)];
+        let s3 = engine(&meta_fs, &disks);
+        // The shipped default is the documented 300 s.
+        assert_eq!(s3.intent_grace_secs(), INTENT_GRACE_SECS);
+        assert_eq!(s3.intent_grace_secs(), 300);
+        // A handler clone (the daemon hands clones out) sees the override.
+        let handler = s3.clone();
+        s3.set_intent_grace_secs(1);
+        assert_eq!(handler.intent_grace_secs(), 1);
+
+        let now = unix_seconds();
+        let record = "/s3-put/1/store/bucket/key/never".to_string();
+        let result = s3.put_object_with(
+            1,
+            "store",
+            "pool",
+            "bucket",
+            "key",
+            "text/plain",
+            b"refused",
+            |_| {
+                Ok(ObjectPublication {
+                    guards: vec![RevisionGuard {
+                        key: record.clone(),
+                        expected_mod_revision: 1,
+                    }],
+                    ops: vec![TxnOp::Put {
+                        key: record.clone(),
+                        value: b"done".to_vec(),
+                    }],
+                })
+            },
+        );
+        assert!(matches!(result, Err(S3Error::ConcurrentModification)));
+        let intents = s3
+            .meta
+            .scan_prefix_or_panic(&ObjectStoreEngine::<SimFs>::intent_prefix(1));
+        assert_eq!(intents.len(), 1);
+        let (intent_key, kv) = intents.into_iter().next().unwrap();
+        let intent: UploadIntent = serde_json::from_slice(&kv.value).unwrap();
+        let lease = intent.lease_until_unix_secs;
+        // The one-second override is what the record itself carries.
+        assert!(
+            lease > now && lease <= now + 2,
+            "lease {lease} is not the creation second plus one (now {now})"
+        );
+        // Exhaust the revision grace so only the record's own time lease can
+        // protect it; the constant is then the sole difference between the two
+        // collection points below.
+        advance_revisions(&s3);
+        assert_eq!(s3.collect_orphans_at(1, now).unwrap(), 0);
+        assert!(s3.meta.get_or_panic(&intent_key).is_some());
+        assert_eq!(s3.collect_orphans_at(1, now + 2).unwrap(), 1);
+        assert!(s3.meta.get_or_panic(&intent_key).is_none());
     }
 
     #[test]
