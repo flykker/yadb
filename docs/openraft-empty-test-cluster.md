@@ -209,6 +209,13 @@ listeners. Corresponding voter inventories and addresses must agree across nodes
    plus the node's explicit `--data-dir`, `--node-id`, `--listen` and `--peers`
    public HTTP map. Use a feature-enabled build. The manifest and group configs
    are node-specific; the routing map must agree throughout the test cluster.
+   To keep the token-authenticated `/internal/...` peer routes off the client
+   network, add `--internal-listen <addr>` and the matching
+   `--internal-peers <id=addr,...>` map: the public listener then answers `404`
+   for those routes, and startup refuses a shape where a peer RPC or the
+   follower-to-leader control snapshot would 404. Without the flags the
+   historical single-listener shape is kept, so the exposure is bounded only by
+   firewall rules.
 4. For a normal restart, first stop cleanly, then set **each** group config to
    `mode: "open", initialize: false`; retain the same root, identities, voters,
    replica paths and route map. Open is not create. A partial create or marker

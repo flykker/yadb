@@ -339,9 +339,11 @@ it is not proven to be the cause and no mitigation is implemented.
 ### Heavy-test serialization gate (2026-11-15)
 
 `crates/yadb-metakv/src/openraft_test_gate.rs` serializes the OpenRaft tests that
-assert wall-clock progress: the multigroup independent-leader test, both
-three-process mTLS tests, the child-process kill/reopen test and the two persistent
-three-node catch-up tests. Each acquires a process-global `tokio::sync::Mutex`
+assert wall-clock progress: the multigroup independent-leader test, the five
+three-process mTLS tests (partition, failover/quorum loss, leader kill,
+delayed/duplicated RPCs and power loss after ack), the child-process kill/reopen
+test and the two persistent three-node catch-up tests - nine call sites. Each
+acquires a process-global `tokio::sync::Mutex`
 through `exclusive()`; the process tests take it in the parent only. That skip is
 not a deadlock fix — the mutex is process-local, so a child re-executing the
 binary would get a private copy — it just keeps child mode honest. Both full
