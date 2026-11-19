@@ -10984,15 +10984,17 @@ mod security_tests {
 mod raft_status_tests {
     use super::*;
     use ::openraft::error::{
-        Fatal, RPCError, RaftError, ReplicationClosed, StreamingError, Unreachable,
+        Fatal, RPCError, RaftError, RemoteError, ReplicationClosed, StreamingError, Unreachable,
     };
     use ::openraft::network::RPCOption;
     use ::openraft::raft::{
         AppendEntriesRequest, AppendEntriesResponse, SnapshotResponse, VoteRequest, VoteResponse,
     };
     use ::openraft::{BasicNode, RaftNetwork, RaftNetworkFactory, Snapshot, Vote};
-    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
+    use yadb_control::{MemberBinding, ProjectSpec};
     use yadb_metakv::multiraft::{GroupIdentity, ReplicaIdentity};
     use yadb_metakv::openraft_runtime::{YadbRaft, YadbRaftTypeConfig as C};
     use yadb_metakv::openraft_state_machine::DurableMetaStateMachine;
@@ -11215,6 +11217,680 @@ mod raft_status_tests {
             block: BlockVolumeEngine::new(meta.clone(), DEFAULT_BLOCK_SIZE),
         };
         (state, dir, vec![control, group2, group3])
+    }
+
+    /// In-process Raft transport for a group that spans several nodes inside one
+    /// test process. A client resolves its target in the shared map at call
+    /// time, so a leadership change moves no bytes and binds no ports.
+    #[derive(Clone)]
+    struct MeshNetwork {
+        nodes: Arc<Mutex<BTreeMap<u32, YadbRaft>>>,
+        target: u32,
+    }
+
+    impl MeshNetwork {
+        fn peer(&self) -> Result<YadbRaft, Unreachable> {
+            self.nodes
+                .lock()
+                .unwrap()
+                .get(&self.target)
+                .cloned()
+                .ok_or_else(|| {
+                    Unreachable::new(&std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "no such replica in this test group",
+                    ))
+                })
+        }
+    }
+
+    impl RaftNetworkFactory<C> for MeshNetwork {
+        type Network = Self;
+        async fn new_client(&mut self, target: u32, _: &BasicNode) -> Self {
+            Self {
+                target,
+                ..self.clone()
+            }
+        }
+    }
+
+    impl RaftNetwork<C> for MeshNetwork {
+        async fn append_entries(
+            &mut self,
+            rpc: AppendEntriesRequest<C>,
+            _: RPCOption,
+        ) -> Result<AppendEntriesResponse<u32>, RPCError<u32, BasicNode, RaftError<u32>>> {
+            let peer = self.peer()?;
+            peer.append_entries(rpc)
+                .await
+                .map_err(|e| RPCError::RemoteError(RemoteError::new(self.target, e)))
+        }
+        async fn vote(
+            &mut self,
+            rpc: VoteRequest<u32>,
+            _: RPCOption,
+        ) -> Result<VoteResponse<u32>, RPCError<u32, BasicNode, RaftError<u32>>> {
+            let peer = self.peer()?;
+            peer.vote(rpc)
+                .await
+                .map_err(|e| RPCError::RemoteError(RemoteError::new(self.target, e)))
+        }
+        async fn full_snapshot(
+            &mut self,
+            vote: Vote<u32>,
+            snapshot: Snapshot<C>,
+            cancel: impl std::future::Future<Output = ReplicationClosed> + Send + 'static,
+            _: RPCOption,
+        ) -> Result<SnapshotResponse<u32>, StreamingError<C, Fatal<u32>>> {
+            let peer = self.peer().map_err(StreamingError::from)?;
+            tokio::select! {
+                result = peer.install_full_snapshot(vote, snapshot) => result
+                    .map_err(|e| StreamingError::RemoteError(RemoteError::new(self.target, e))),
+                closed = cancel => Err(StreamingError::Closed(closed)),
+            }
+        }
+    }
+
+    /// A stand-in for a group leader that lives in another process: it answers a
+    /// forwarded request with its own node name, so the test can observe *which*
+    /// node the gateway addressed. It speaks only the HTTP the forwarding client
+    /// needs; the real leader is a separate process in a deployment.
+    struct FakeLeader {
+        addr: String,
+        stop: Arc<AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl FakeLeader {
+        fn start(name: &'static str) -> Self {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let addr = listener.local_addr().unwrap().to_string();
+            let stop = Arc::new(AtomicBool::new(false));
+            let flag = stop.clone();
+            let thread = std::thread::spawn(move || {
+                while !flag.load(Ordering::SeqCst) {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            // The request is small and the client only waits for
+                            // the reply; a single read is enough to let it finish
+                            // writing without deadlocking on a full socket.
+                            let mut scratch = [0u8; 4096];
+                            let _ = stream.read(&mut scratch);
+                            let body = name.as_bytes();
+                            let head = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                body.len()
+                            );
+                            let _ = stream.write_all(head.as_bytes());
+                            let _ = stream.write_all(body);
+                            let _ = stream.flush();
+                            let _ = stream.shutdown(std::net::Shutdown::Both);
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+            Self {
+                addr,
+                stop,
+                thread: Some(thread),
+            }
+        }
+    }
+
+    impl Drop for FakeLeader {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    fn raft_config(
+        election_timeout_min: u64,
+        election_timeout_max: u64,
+    ) -> Arc<::openraft::Config> {
+        Arc::new(
+            ::openraft::Config {
+                election_timeout_min,
+                election_timeout_max,
+                ..Default::default()
+            }
+            .validate()
+            .unwrap(),
+        )
+    }
+
+    /// One replica of a group that spans nodes in this test process.
+    async fn mesh_replica(
+        dir: &std::path::Path,
+        cluster: [u8; 16],
+        group: u64,
+        node: u32,
+        voters: &[u32],
+        mesh: &Arc<Mutex<BTreeMap<u32, YadbRaft>>>,
+        config: Arc<::openraft::Config>,
+        tag: &str,
+    ) -> (YadbRaft, DurableMetaStateMachine) {
+        let identity = ReplicaIdentity::new(
+            GroupIdentity {
+                cluster,
+                group,
+                incarnation: 1,
+            },
+            node,
+            voters.to_vec(),
+        )
+        .unwrap();
+        let log = DurableOpenRaftLog::create(dir.join(format!("{tag}-log")), &identity).unwrap();
+        let state =
+            DurableMetaStateMachine::create(dir.join(format!("{tag}-state")), &identity).unwrap();
+        let raft = YadbRaft::new(
+            node,
+            config,
+            MeshNetwork {
+                nodes: mesh.clone(),
+                target: 0,
+            },
+            log,
+            state.clone(),
+        )
+        .await
+        .unwrap();
+        mesh.lock().unwrap().insert(node, raft.clone());
+        (raft, state)
+    }
+
+    /// A deployment whose control group and project groups have *different*
+    /// leaders, so a test can tell which one a routing or fencing decision used.
+    ///
+    /// * control group 1 (`{1,2}`) is led by node 2, so node 1 is a control
+    ///   follower and its control snapshot lease is pre-seeded: the point under
+    ///   test is group selection, not snapshot acquisition.
+    /// * data group 2 (`{1,3}`) is led by node 1 at first and moves to node 3 on
+    ///   demand, with the control group left untouched.
+    /// * data group 3 (`{1}`) stays led by node 1 throughout.
+    /// * project `alpha` (id 1) lives in group 2, project `beta` (id 2) in group 3.
+    ///
+    /// Nodes 2 and 3 answer forwarded HTTP as their own node id, which makes the
+    /// addressed leader observable without a second process.
+    struct SplitLeadership {
+        state: AppState,
+        dir: std::path::PathBuf,
+        rafts: Vec<YadbRaft>,
+        control_node1: YadbRaft,
+        group2_node3: YadbRaft,
+        _control_peer: FakeLeader,
+        _group2_peer: FakeLeader,
+    }
+
+    async fn split_leadership_state(tag: &str) -> SplitLeadership {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("yadb-{tag}-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cluster = [93u8; 16];
+
+        // Every replica gets a long election timeout, so no group ever campaigns
+        // on a timer: leadership starts at `initialize` and moves only when the
+        // test explicitly asks a replica to campaign. Without that, a replica
+        // with a short timeout could take the lead back mid-assertion and make
+        // the observed leader a race.
+        let control_mesh = Arc::new(Mutex::new(BTreeMap::new()));
+        let (control1, control1_state) = mesh_replica(
+            &dir,
+            cluster,
+            1,
+            1,
+            &[1, 2],
+            &control_mesh,
+            raft_config(2_000, 3_000),
+            "control-n1",
+        )
+        .await;
+        let (control2, _control2_state) = mesh_replica(
+            &dir,
+            cluster,
+            1,
+            2,
+            &[1, 2],
+            &control_mesh,
+            raft_config(2_000, 3_000),
+            "control-n2",
+        )
+        .await;
+        control2
+            .initialize(BTreeMap::from([
+                (1, BasicNode::new("one")),
+                (2, BasicNode::new("two")),
+            ]))
+            .await
+            .unwrap();
+        control2
+            .wait(Some(Duration::from_secs(5)))
+            .current_leader(2, "control-group leader")
+            .await
+            .unwrap();
+        // Node 1 learns the control leader from node 2's first append. Wait for
+        // its own observation too, so the test does not read a pre-append view.
+        control1
+            .wait(Some(Duration::from_secs(5)))
+            .current_leader(2, "control-group leader as seen by node 1")
+            .await
+            .unwrap();
+
+        // Data group 2 {1,3}: node 1 leads to begin with; node 3 takes over only
+        // when the test asks it to campaign.
+        let group2_mesh = Arc::new(Mutex::new(BTreeMap::new()));
+        let (group2_node1, group2_node1_state) = mesh_replica(
+            &dir,
+            cluster,
+            2,
+            1,
+            &[1, 3],
+            &group2_mesh,
+            raft_config(2_000, 3_000),
+            "group2-n1",
+        )
+        .await;
+        let (group2_node3, _group2_node3_state) = mesh_replica(
+            &dir,
+            cluster,
+            2,
+            3,
+            &[1, 3],
+            &group2_mesh,
+            raft_config(2_000, 3_000),
+            "group2-n3",
+        )
+        .await;
+        group2_node1
+            .initialize(BTreeMap::from([
+                (1, BasicNode::new("one")),
+                (3, BasicNode::new("three")),
+            ]))
+            .await
+            .unwrap();
+        group2_node1
+            .wait(Some(Duration::from_secs(5)))
+            .current_leader(1, "group-2 leader")
+            .await
+            .unwrap();
+
+        // Data group 3 {1}: this node leads it throughout.
+        let (group3, group3_state) = singleton_group(&dir, 3).await;
+
+        let control_peer = FakeLeader::start("control-leader-2");
+        let group2_peer = FakeLeader::start("group-2-leader-3");
+
+        let meta: LocalMetaKv<OsFs> = LocalMetaKv::from_openraft_groups(
+            1,
+            BTreeMap::from([
+                (1, (control1.clone(), control1_state)),
+                (2, (group2_node1.clone(), group2_node1_state)),
+                (3, (group3.clone(), group3_state)),
+            ]),
+            BTreeMap::from([(1, 2), (2, 3)]),
+            BTreeMap::from([
+                (2, control_peer.addr.clone()),
+                (3, group2_peer.addr.clone()),
+            ]),
+            tokio::runtime::Handle::current(),
+        )
+        .unwrap();
+
+        let mut control = ControlPlaneState::new();
+        control.generation = 1;
+        control.next_project_id = 3;
+        for (name, id) in [("alpha", 1u32), ("beta", 2u32)] {
+            control.projects.insert(
+                name.to_string(),
+                (
+                    id,
+                    ProjectSpec {
+                        quotas: Default::default(),
+                        members: vec![MemberBinding {
+                            subject: "tester".into(),
+                            role: Role::ReadWrite,
+                        }],
+                    },
+                ),
+            );
+        }
+        let fs = OsFs::new(&dir).unwrap();
+        let state = AppState {
+            openraft: None,
+            listen_addr: "127.0.0.1:0".into(),
+            internal_peer_addrs: None,
+            fs,
+            meta: meta.clone(),
+            raft_token: Some("secret".into()),
+            subject_secret: None,
+            admin_subjects: vec![],
+            control: Arc::new(RwLock::new(control)),
+            control_refresh: Arc::new(std::sync::Mutex::new(())),
+            control_freshness: Arc::new(std::sync::Mutex::new(ControlFreshness::default())),
+            pools: Arc::new(RwLock::new(BTreeMap::new())),
+            local_vdisks: Arc::new(RwLock::new(BTreeMap::new())),
+            last_scrub: Arc::new(RwLock::new(None)),
+            last_gc: Arc::new(RwLock::new(None)),
+            reader_lease: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
+            reader_lease_ttl_ms: yadb_metakv::gc::DEFAULT_TTL_MS,
+            s3: ObjectStoreEngine::new(meta.clone(), 4096),
+            db: DatabaseEngine::new(meta.clone(), 100),
+            block: BlockVolumeEngine::new(meta.clone(), DEFAULT_BLOCK_SIZE),
+        };
+        // A quorum-confirmed control snapshot was just obtained, as it would be
+        // at the end of a real refresh; the test is about group selection, not
+        // about how the snapshot travelled.
+        state.control_freshness.lock().unwrap().accept_at(
+            1,
+            Instant::now(),
+            Duration::from_secs(120),
+        );
+
+        // A freshly elected leader applies its membership entry asynchronously,
+        // so its reported applied index can still move for a moment. Wait until
+        // it settles: the test compares a reader lease's revision to this index
+        // and a moving value would make that comparison a race.
+        let mut applied = meta.role_info_for_group(2).unwrap().4;
+        for _ in 0..200 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            let next = meta.role_info_for_group(2).unwrap().4;
+            if next == applied {
+                break;
+            }
+            applied = next;
+        }
+
+        SplitLeadership {
+            state,
+            dir,
+            rafts: vec![
+                control1.clone(),
+                control2,
+                group2_node1,
+                group2_node3.clone(),
+                group3,
+            ],
+            control_node1: control1,
+            group2_node3,
+            _control_peer: control_peer,
+            _group2_peer: group2_peer,
+        }
+    }
+
+    /// Status, headers and body of a gateway response.
+    async fn response_parts(response: Response) -> (StatusCode, HeaderMap, Vec<u8>) {
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap()
+            .to_vec();
+        (status, headers, body)
+    }
+
+    /// Run the gateway's write-routing decision for one request.
+    async fn route_write(
+        st: &AppState,
+        headers: &HeaderMap,
+        project: Option<&str>,
+    ) -> Option<Response> {
+        let path = match project {
+            Some(project) => format!("/db/{project}/db/query"),
+            None => "/v1/apply".to_string(),
+        };
+        maybe_forward_write(
+            st,
+            headers,
+            project,
+            "POST",
+            path,
+            "application/json".to_string(),
+            Bytes::from_static(b"{}"),
+        )
+        .await
+    }
+
+    /// The gateway must address a project write to the leader of *that project's*
+    /// metadata group, and must read the leadership and term that fence it from
+    /// the same group.
+    ///
+    /// The fixture gives the control group and data group 2 different leaders, so
+    /// "control leader" and "project-group leader" are distinguishable by node id:
+    ///
+    /// * a write for a project whose group this node leads runs locally even
+    ///   though this node is not the control leader (a control-group change alone
+    ///   does not fence a project write);
+    /// * a control-plane write still goes to the control group's leader;
+    /// * the reader lease is published in the project's group and carries that
+    ///   group's applied index;
+    /// * after data group 2 moves its leader to node 3, the project write is
+    ///   addressed to node 3 and a forwarded copy reaching this non-leader is
+    ///   refused naming node 3; when the control group alone moves here, the
+    ///   project write still addresses node 3 and control traffic runs locally.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn forwarding_and_fencing_follow_the_project_group_not_the_control_group() {
+        let fixture = split_leadership_state("split-leaders").await;
+        let st = &fixture.state;
+        let empty = HeaderMap::new();
+
+        // The control group is led by node 2; this node is a control follower.
+        let (_, control_role, control_term, control_leader, _) = st.meta.role_info();
+        assert_eq!(control_role, RoleState::Follower);
+        assert_eq!(control_leader, Some(2));
+        // Data group 2 is led by this node, and the control leader is observably
+        // a different node.
+        let (_, group2_role, group2_term, group2_leader, group2_applied) =
+            st.meta.role_info_for_group(2).unwrap();
+        assert_eq!(group2_role, RoleState::Leader);
+        assert_eq!(group2_leader, Some(1));
+        assert_ne!(
+            control_leader, group2_leader,
+            "the fixture must place the control leader and the group-2 leader on different nodes"
+        );
+        let (_, group3_role, _, group3_leader, _) = st.meta.role_info_for_group(3).unwrap();
+        assert_eq!(group3_role, RoleState::Leader);
+        assert_eq!(group3_leader, Some(1));
+
+        // Both project groups are led here, so neither project write is fenced by
+        // the control group's leadership: they run locally on this node.
+        assert!(
+            route_write(st, &empty, Some("alpha")).await.is_none(),
+            "group 2 is led by this node, so alpha must run locally rather than be fenced by the control group"
+        );
+        assert!(
+            route_write(st, &empty, Some("beta")).await.is_none(),
+            "group 3 is led by this node, so beta must run locally"
+        );
+
+        // A control-plane write has no project group and still goes to the
+        // control group's leader, node 2.
+        let (status, headers, body) = response_parts(
+            route_write(st, &empty, None)
+                .await
+                .expect("a control-plane write must be forwarded to the control leader"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            headers.get("x-yadb-leader-id").unwrap(),
+            "2",
+            "control-plane traffic must address the control group's leader"
+        );
+        assert_eq!(body, b"control-leader-2");
+
+        // The reader lease is published in the group that owns the project and
+        // carries that group's applied index, not the control group's revision.
+        let lease = st.begin_read_lease(1).unwrap();
+        assert_eq!(lease.group, Some(2));
+        assert_eq!(lease.revision, group2_applied);
+        assert!(
+            yadb_metakv::gc::live_leases_in(&st.meta, 2)
+                .unwrap()
+                .iter()
+                .any(|record| record.id == lease.id),
+            "the read fence must be published in the project's group"
+        );
+        assert!(
+            yadb_metakv::gc::live_leases_in(&st.meta, 3)
+                .unwrap()
+                .is_empty(),
+            "a group-2 read must not publish a fence in group 3"
+        );
+        st.end_read_lease(&lease).unwrap();
+
+        // Move only data group 2's leader: node 3 campaigns and wins. The control
+        // group is not touched.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let group2_term_after = loop {
+            let (_, role, term, leader, _) = st.meta.role_info_for_group(2).unwrap();
+            if leader == Some(3) && role == RoleState::Follower {
+                assert!(term > group2_term, "the new leader must have a newer term");
+                break term;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "data group 2 did not move its leader to node 3"
+            );
+            fixture.group2_node3.trigger().elect().await.ok();
+            std::thread::sleep(Duration::from_millis(200));
+        };
+        let (_, control_role_after, control_term_after, control_leader_after, _) =
+            st.meta.role_info();
+        assert_eq!(
+            (control_role_after, control_term_after, control_leader_after),
+            (control_role, control_term, control_leader),
+            "a project-group leader change must not change the control group"
+        );
+
+        // Each project reports its own group's leader and term; one control-group
+        // leader/term for every project would make these agree.
+        let alpha = st.meta.role_info_for_key("/db/1/").unwrap();
+        let beta = st.meta.role_info_for_key("/db/2/").unwrap();
+        assert_eq!(alpha.2, group2_term_after);
+        assert_eq!(
+            alpha.3,
+            Some(3),
+            "the project key must report group 2's leader, not the control leader"
+        );
+        assert_eq!(beta.2, st.meta.role_info_for_group(3).unwrap().2);
+        assert_ne!(
+            alpha.2, beta.2,
+            "per-project terms must come from each project's own group"
+        );
+
+        // The write for alpha is no longer served locally: it is addressed to
+        // group 2's new leader, node 3, not to the control leader, node 2.
+        let (status, headers, body) = response_parts(
+            route_write(st, &empty, Some("alpha"))
+                .await
+                .expect("alpha is no longer led here, so it must be forwarded"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            headers.get("x-yadb-leader-id").unwrap(),
+            "3",
+            "the project-group write must address group 2's leader, not the control leader"
+        );
+        assert_eq!(body, b"group-2-leader-3");
+
+        // A forwarded copy that reaches this non-leader is refused outright and
+        // the refusal names the project group's leader. Control is unchanged and
+        // still healthy, so only group 2's leadership can explain the refusal.
+        let mut forwarded = HeaderMap::new();
+        forwarded.insert("x-yadb-forwarded", HeaderValue::from_static("1"));
+        let refusal = route_write(st, &forwarded, Some("alpha"))
+            .await
+            .expect("a forwarded project-group write on a non-leader must be refused");
+        assert_eq!(refusal.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            refusal.headers().get("x-yadb-leader-id").unwrap(),
+            "3",
+            "the refusal must name the project group's leader"
+        );
+
+        // Group 3 did not move, so beta is still served locally.
+        assert!(
+            route_write(st, &empty, Some("beta")).await.is_none(),
+            "a group-2 leader change must not fence a group-3 write"
+        );
+
+        // Move the *control* group's leader onto this node while group 2 stays
+        // with node 3. A decision that consulted the control group would now see
+        // this node as leader and serve alpha locally; it must still address
+        // node 3, and the forwarded copy must still be refused.
+        let control_term_before = st.meta.role_info().2;
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let (_, role, term, leader, _) = st.meta.role_info();
+            if role == RoleState::Leader && leader == Some(1) {
+                assert!(
+                    term > control_term_before,
+                    "the new leader must have a newer term"
+                );
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the control group did not move its leader to node 1"
+            );
+            fixture.control_node1.trigger().elect().await.ok();
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        assert_eq!(
+            st.meta.role_info_for_group(2).unwrap().2,
+            group2_term_after,
+            "a control-group leadership change must not change the project group"
+        );
+        let (status, headers, body) = response_parts(
+            route_write(st, &empty, Some("alpha"))
+                .await
+                .expect("alpha is not led by this node, so it must still be forwarded"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            headers.get("x-yadb-leader-id").unwrap(),
+            "3",
+            "a control-group leadership change must not redirect a project-group write"
+        );
+        assert_eq!(body, b"group-2-leader-3");
+        let refusal = route_write(st, &forwarded, Some("alpha"))
+            .await
+            .expect("a forwarded project-group write on a non-leader must still be refused");
+        assert_eq!(refusal.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            refusal.headers().get("x-yadb-leader-id").unwrap(),
+            "3",
+            "the refusal must name the project group's leader, not this node"
+        );
+        assert!(
+            route_write(st, &empty, Some("beta")).await.is_none(),
+            "group 3 is still led here, so beta must still run locally"
+        );
+
+        // The control group *is* now led by this node, so control-plane traffic
+        // runs locally: the control plane follows its own group, exactly as the
+        // project write above follows group 2.
+        assert!(
+            route_write(st, &empty, None).await.is_none(),
+            "the control group is now led here, so a control-plane write must run locally"
+        );
+
+        for raft in &fixture.rafts {
+            raft.shutdown().await.unwrap();
+        }
+        let _ = std::fs::remove_dir_all(&fixture.dir);
     }
 
     /// A reader lease is published in the group that owns the project, carries
