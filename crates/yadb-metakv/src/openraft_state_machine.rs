@@ -1595,6 +1595,96 @@ mod tests {
         }
     }
 
+    /// A failed installation must deliver no delta at all, and the refusal must
+    /// poison the handle rather than leave it able to notify a watcher from a
+    /// state whose durability was never proved. `snapshot_install_notifies_
+    /// delta_only_after_durable_success` already checks the two outcomes on
+    /// separate targets and that a *successful* install keeps the subscription;
+    /// this is the install-path counterpart of
+    /// `failed_apply_does_not_notify_watchers_and_poisoned_handle_fails_closed`,
+    /// which covers the apply path only.
+    ///
+    /// After the validated reopen the watcher set is empty by design (watchers
+    /// are runtime-only), and a fresh subscription must still receive later
+    /// applies: that is the "retain subscriptions for later applies" clause in
+    /// the only form that survives a poisoning.
+    #[tokio::test]
+    async fn a_failed_install_delivers_nothing_and_poisons_before_any_later_notification() {
+        let source_dir = TempDir::new();
+        let mut source = DurableMetaStateMachine::create(&source_dir.0, &identity()).unwrap();
+        source
+            .apply(vec![
+                put(1, "control", b"installed"),
+                put(2, "extra", b"only-in-snapshot"),
+            ])
+            .await
+            .unwrap();
+        let snapshot = source
+            .get_snapshot_builder()
+            .await
+            .build_snapshot()
+            .await
+            .unwrap();
+        let bytes = snapshot.snapshot.into_inner();
+
+        let dir = TempDir::new();
+        let mut target = DurableMetaStateMachine::create(&dir.0, &identity()).unwrap();
+        target.apply(vec![put(1, "control", b"before")]).await.unwrap();
+        let rx = target.try_watch_prefix("".into()).unwrap();
+
+        target.inner.lock().unwrap().fault = Some(PersistFault::AfterWrite);
+        assert!(
+            target
+                .install_snapshot(&snapshot.meta, Box::new(Cursor::new(bytes.clone())))
+                .await
+                .is_err(),
+            "the injected fault must refuse the installation"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "a refused installation must not deliver a delta"
+        );
+        // The refusal is not "retry in place": the handle is poisoned, so no
+        // later apply can feed the subscription from a state whose durability
+        // was never established.
+        assert!(
+            target.applied_state().await.is_err(),
+            "a failed installation must poison the handle"
+        );
+        assert!(
+            target.apply(vec![put(3, "control", b"poisoned")]).await.is_err(),
+            "a poisoned handle must refuse a later apply, not notify from it"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "a poisoned handle must not deliver the refused apply either"
+        );
+        drop(target);
+
+        let mut reopened = DurableMetaStateMachine::open(&dir.0, &identity()).unwrap();
+        assert_eq!(
+            reopened.inner.lock().unwrap().state.watcher_count(),
+            0,
+            "watchers are runtime-only and must not survive a reopen"
+        );
+        assert_eq!(
+            reopened.snapshot().get("control").unwrap().value,
+            b"before",
+            "the refused installation must not have become durable"
+        );
+        assert!(reopened.snapshot().get("extra").is_none());
+
+        let rx = reopened.try_watch_prefix("".into()).unwrap();
+        reopened
+            .apply(vec![put(2, "control", b"after reopen")])
+            .await
+            .unwrap();
+        assert!(
+            matches!(rx.try_recv().unwrap(), WatchEvent::Put { key, value, .. } if key == "control" && value == b"after reopen"),
+            "a subscription taken after the reopen must receive later applies"
+        );
+    }
+
     #[tokio::test]
     async fn failed_apply_does_not_publish_and_recovery_accepts_unknown_outcome() {
         // An apply has two durability phases: the frame write and the file

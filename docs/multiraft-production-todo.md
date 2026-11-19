@@ -722,8 +722,9 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
     now met for the write path:** the function keeps its name but always
     publishes a writer lease (`acquire_writer(...).map(Some)`,
     `crates/yadb-metakv/src/gc.rs:790`), and the SQL and block write paths call
-    it unconditionally (`crates/yadb-db/src/lib.rs:832`,
-    `crates/yadb-db/src/tablet.rs:913`, `:979`, `crates/yadb-block/src/lib.rs:311`);
+    it unconditionally (`crates/yadb-db/src/lib.rs:844`, the flush and merge
+    paths at `crates/yadb-db/src/tablet.rs:916` and
+    `crates/yadb-db/src/tablet.rs:982`, and `crates/yadb-block/src/lib.rs:311`);
     S3 keeps using its `Prepared` intent. What is still missing is the collector
     side: the per-group sweep that would honour those leases is unreachable while
     `sweep` refuses.
