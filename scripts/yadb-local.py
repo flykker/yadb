@@ -331,6 +331,11 @@ def prepare(root=None, http_base=DEFAULT_HTTP_BASE):
                          # appends the follower had already written. 750 ms keeps
                          # the budget above the transport cost; the daemon requires
                          # `election_min_ms >= 3 x heartbeat_ms`.
+                         # Test/tuning knob: add `'snapshot_after_logs': N`
+                         # to this dict to snapshot (and InstallSnapshot to a
+                         # follower) after N log entries instead of the daemon
+                         # default of 5000. It is omitted so the provisioned
+                         # config stays byte-identical to earlier versions.
                          'raft_timing': {'heartbeat_ms': 750, 'election_min_ms': 2250,
                                          'nonpreferred_election_min_ms': 3000, 'election_max_ms': 3500},
                         'listen': peers[node-1]['address'], 'signing_key_der': str(cred / f'signing-{node}.der'),
