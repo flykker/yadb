@@ -354,8 +354,17 @@ def daemon_env(root):
     return env
 
 
-def provision(root, base):
-    """Create credentials, group configs and manifests in a fresh root."""
+def provision(root, base, raft_tuning=None):
+    """Create credentials, group configs and manifests in a fresh root.
+
+    `raft_tuning` is merged into each group's `raft_timing` object. It exists
+    for test deployments that need a cheaper log-compaction schedule, such as
+    `{'snapshot_after_logs': 64, 'max_in_snapshot_log_to_keep': 1}` to make a
+    cross-process InstallSnapshot reachable without a 5000-entry burst. It is
+    `None` by default, so the provisioned config is byte-identical to what
+    earlier versions wrote; nothing here changes a fence, only when the leader
+    snapshots and how many already-snapshotted logs it keeps.
+    """
     os.umask(0o077)
     validate_base(base)
     for directory in ('credentials', 'config', 'metadata', 'data', 'logs'):
@@ -433,13 +442,13 @@ def provision(root, base):
                 # for seconds. 750 ms keeps the budget far above the transport
                 # cost while staying well below election_min (the constraint is
                 # election_min >= 3 x heartbeat).
-                # Test/tuning knob: add `'snapshot_after_logs': N` to the
-                # `raft_timing` dict to snapshot (and InstallSnapshot to a
-                # follower) after N log entries instead of the daemon default
-                # of 5000. It is omitted here so the provisioned config is
+                # Test/tuning knobs (`snapshot_after_logs`,
+                # `max_in_snapshot_log_to_keep`) arrive through `raft_tuning`
+                # and are omitted by default, so the provisioned config stays
                 # byte-identical to what earlier versions wrote.
                 'raft_timing': {'heartbeat_ms': 750, 'election_min_ms': 2250,
-                                'nonpreferred_election_min_ms': 3000, 'election_max_ms': 3500},
+                                'nonpreferred_election_min_ms': 3000,
+                                'election_max_ms': 3500, **(raft_tuning or {})},
                 'listen': peers[node - 1]['address'],
                 'signing_key_der': str(credential_dir / f'signing-{node}.der'),
                 'tls': {'roots_der': [str(credential_dir / 'ca.der')],

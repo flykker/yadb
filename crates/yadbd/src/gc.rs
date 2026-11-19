@@ -2805,10 +2805,15 @@ mod tests {
                 "{summary}"
             );
             assert_eq!(
-                summary["orphan_collection_error"],
+                summary["repair_error"],
                 crate::SCRUB_MULTIRAFT_REFUSAL,
                 "the repair half must name the whole-deployment view it lacks"
             );
+            // Orphan blob collection is per group and every group here is a
+            // single-node leader on this node, so it runs and finds nothing
+            // rather than refusing.
+            assert!(summary["orphan_collection_error"].is_null(), "{summary}");
+            assert_eq!(summary["orphan_blobs_collected"], 0, "{summary}");
 
             // The periodic scan's sweep half takes the same per-group path.
             write_generations(&engine, 1, 20);

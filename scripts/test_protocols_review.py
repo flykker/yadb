@@ -32,8 +32,8 @@ ANCHOR_RE = re.compile(r"([A-Za-z0-9_./-]+\.(?:rs|py)):(\d+)")
 # rejected: an unverifiable anchor is not allowed to pass.
 REQUIRED_SUBSTRINGS = {
     "crates/yadbd/src/protocols/s3.rs:683": ["is_openraft"],
-    "crates/yadbd/src/main.rs:535": ["begin_read_lease"],
-    "crates/yadbd/src/main.rs:7630": ["CONFLICT"],
+    "crates/yadbd/src/main.rs:539": ["begin_read_lease"],
+    "crates/yadbd/src/main.rs:7661": ["CONFLICT"],
     "crates/yadbd/src/gc.rs:149": ["MULTIRAFT_GC_REFUSAL"],
 }
 
@@ -43,37 +43,23 @@ REQUIRED_SUBSTRINGS = {
 # appear in the reason.  Adding a SKIP means adding it here: the scenario set
 # is compared exactly, in both directions.
 EXPECTED_SKIPS = {
-    "VDisk orphan collection": [
-        "repair and orphan scan are disabled on Multi-Raft",
-        "crates/yadbd/src/main.rs:7630",
-        "the per-group collector exists in yadb-s3",
+    "Multi-Raft repair scan": [
+        "repair asks which blobs should exist against every live manifest at once",
+        "crates/yadbd/src/main.rs:7661",
+        "Per-group garbage collection runs",
+        "no live drill",
     ],
     "reader lease": [
         "crates/yadbd/src/protocols/s3.rs:683",
-        "crates/yadbd/src/main.rs:535",
+        "crates/yadbd/src/main.rs:539",
         "Multi-Raft has no fenced read lease",
-    ],
-    "cross-process InstallSnapshot": [
-        "Config::default",
-        "since_last:5000",
-        "--install-snapshot-live",
-    ],
-    "cross-process InstallSnapshot (attempted)": [
-        "did not reach the daemon's default snapshot trigger",
-        "no install was attempted",
-        "no PASS is claimed",
     ],
 }
 
-# The two InstallSnapshot reasons interpolate runtime numbers, so they are
-# f-strings.  They may not be checked as one literal, so each is registered
-# here and its static text is checked against EXPECTED_SKIPS instead.  Any
-# other f-string (or any non-string expression) is an unverifiable SKIP and is
-# rejected by collect_skips().
-DYNAMIC_SKIP_SCENARIOS = {
-    "cross-process InstallSnapshot",
-    "cross-process InstallSnapshot (attempted)",
-}
+# No SKIP reason is built from an f-string today.  The set stays empty so the
+# mechanism that would allow one is still exercised by its own tests: an
+# f-string SKIP that is not registered here is rejected as unverifiable.
+DYNAMIC_SKIP_SCENARIOS = set()
 
 
 class UnverifiableSkip(Exception):
@@ -369,15 +355,19 @@ class SkipAnchorGuardTest(unittest.TestCase):
                 self.assertEqual(pass_claims(reason), [],
                                  f"{scenario}: a SKIP must not claim success")
 
-    def test_install_snapshot_skip_cites_the_trigger_and_opt_in_flag(self):
-        reason = self.reason("cross-process InstallSnapshot")
-        for anchor in ("Config::default", "since_last:5000",
-                       "--install-snapshot-live"):
-            with self.subTest(anchor=anchor):
-                self.assertIn(anchor, reason)
-        burst = assigned_constant(self.tree, "SNAPSHOT_BURST_ENTRIES")
-        self.assertIsNotNone(burst, "SNAPSHOT_BURST_ENTRIES is gone")
-        self.assertEqual(ast.literal_eval(burst), 5000)
+    def test_install_snapshot_is_no_longer_skipped(self):
+        # It used to be an opt-in SKIP because the default trigger needs a
+        # 5000-entry burst. The harness now provisions the snapshot knobs, so
+        # the scenario runs every time; a SKIP reappearing here would mean the
+        # capability silently regressed to "not run".
+        names = set(EXPECTED_SKIPS) | set(self.dynamic_skips)
+        self.assertFalse([name for name in names if "InstallSnapshot" in name],
+                         names)
+        tuning = assigned_constant(self.tree, "SNAPSHOT_LIVE_TUNING")
+        self.assertIsNotNone(tuning, "SNAPSHOT_LIVE_TUNING is gone")
+        self.assertEqual(ast.literal_eval(tuning),
+                         {"snapshot_after_logs": 128,
+                          "max_in_snapshot_log_to_keep": 1})
 
     def test_skip_function_appends_to_skips_list(self):
         appended = [
@@ -420,7 +410,7 @@ class SkipAnchorGuardTest(unittest.TestCase):
                   "crates/yadbd/src/main.rs:524")
         required = {
             "crates/yadbd/src/protocols/s3.rs:683": ["definitely_gone"],
-            "crates/yadbd/src/main.rs:535": ["begin_read_lease"],
+            "crates/yadbd/src/main.rs:539": ["begin_read_lease"],
         }
         with self.assertRaisesRegex(AssertionError, "no longer contains"):
             check_reason_anchors(
