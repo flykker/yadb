@@ -341,6 +341,20 @@ still the finer fence: `read_part` reads the slot epoch and pins it, and
 `delete_collectable` refuses while any pin is live, so a read that outlives its
 metadata lease is still fenced per fetch by the pin at the point of use.
 
+That a read which outlives its metadata lease is *refused rather than answered*
+is **proven in-process at the handler with a real multi-group metadata store,
+and not proven on a live cluster**. `s3_get_refuses_bytes_when_the_read_outlives_its_reader_lease`
+in `crates/yadbd/src/main.rs` runs the real S3 `GET` handler over the real
+multi-group fixture, writes the object through the engine, and shrinks the
+test-only `AppState::reader_lease_ttl_ms` to 1 ms: the fenced fetch outlives the
+lease, `end_read_lease` refuses, and the handler answers `503` with the
+`ensure_live` expiry text instead of the bytes. The same `GET` at the shipped
+30 s default answers `200` with the exact bytes. The field has no CLI flag and
+no internal route, and the default is unchanged; a live proof would need a read
+longer than 30 s or a runtime TTL knob, and adding that would put a new operator
+surface in the hot read path. `end_read_lease_refuses_an_expired_lease_and_does_not_cache_it`
+covers the method-level refusal and that the dead record is not cached.
+
 The operational consequence is deliberate: `POST /v1/pools/gc` and the
 collection half of `POST /v1/pools/scrub` refuse a group whose reader lease is
 live, for up to the 30 s TTL after the last read in that group. A collector

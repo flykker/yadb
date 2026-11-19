@@ -343,6 +343,12 @@ struct AppState {
     /// group is not a fence for this read, so one slot for the whole node
     /// cannot describe Multi-Raft.
     reader_lease: Arc<std::sync::Mutex<BTreeMap<Option<u64>, yadb_metakv::GcLease>>>,
+    /// TTL used when a reader lease is published or renewed. The shipped value
+    /// is `yadb_metakv::gc::DEFAULT_TTL_MS` (30 s) and does not change; this is
+    /// a field rather than a constant only so a test can shrink it. There is
+    /// deliberately no CLI flag and no internal route: the hot read path keeps
+    /// one operator surface, and a live proof of expiry needs a real 30 s read.
+    reader_lease_ttl_ms: u64,
     s3: ObjectStoreEngine<OsFs>,
     db: DatabaseEngine<OsFs>,
     block: BlockVolumeEngine<OsFs>,
@@ -585,7 +591,7 @@ impl AppState {
         let group = self.meta.gc_group_for_project(project_id)?;
         let mut cached = self.reader_lease.lock().unwrap();
         if let Some(lease) = cached.remove(&group) {
-            match yadb_metakv::gc::renew(&self.meta, &lease, yadb_metakv::gc::DEFAULT_TTL_MS) {
+            match yadb_metakv::gc::renew(&self.meta, &lease, self.reader_lease_ttl_ms) {
                 Ok(renewed) => return Ok(renewed),
                 Err(error) => {
                     // The record expired — reaped or not — or was taken over:
@@ -611,7 +617,7 @@ impl AppState {
             yadb_metakv::gc::LeaseKind::Reader,
             project_id,
             revision,
-            yadb_metakv::gc::DEFAULT_TTL_MS,
+            self.reader_lease_ttl_ms,
         )?;
         // The durable watermark is a single-namespace fence. On Multi-Raft the
         // lease publication above is itself a committed write in the owning
@@ -7894,6 +7900,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         local_vdisks: Arc::new(RwLock::new(BTreeMap::new())),
         last_scrub: Arc::new(RwLock::new(None)),
         reader_lease: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
+        reader_lease_ttl_ms: yadb_metakv::gc::DEFAULT_TTL_MS,
         s3,
         db,
         block,
@@ -8798,6 +8805,7 @@ mod security_tests {
             local_vdisks: Arc::new(RwLock::new(BTreeMap::new())),
             last_scrub: Arc::new(RwLock::new(None)),
             reader_lease: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
+            reader_lease_ttl_ms: yadb_metakv::gc::DEFAULT_TTL_MS,
             s3: ObjectStoreEngine::new(meta.clone(), 4096),
             db: DatabaseEngine::new(meta.clone(), 100),
             block: BlockVolumeEngine::new(meta, DEFAULT_BLOCK_SIZE),
@@ -8951,6 +8959,7 @@ mod security_tests {
             local_vdisks: Arc::new(RwLock::new(BTreeMap::new())),
             last_scrub: Arc::new(RwLock::new(None)),
             reader_lease: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
+            reader_lease_ttl_ms: yadb_metakv::gc::DEFAULT_TTL_MS,
             s3: ObjectStoreEngine::new(meta.clone(), 4096),
             db: DatabaseEngine::new(meta.clone(), 100),
             block: BlockVolumeEngine::new(meta, DEFAULT_BLOCK_SIZE),
@@ -9428,6 +9437,7 @@ mod security_tests {
             local_vdisks: Arc::new(RwLock::new(BTreeMap::new())),
             last_scrub: Arc::new(RwLock::new(None)),
             reader_lease: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
+            reader_lease_ttl_ms: yadb_metakv::gc::DEFAULT_TTL_MS,
             s3: ObjectStoreEngine::new(meta.clone(), 4096),
             db: DatabaseEngine::new(meta.clone(), 100),
             block,
@@ -10302,6 +10312,7 @@ mod security_tests {
             local_vdisks: Arc::new(RwLock::new(BTreeMap::new())),
             last_scrub: Arc::new(RwLock::new(None)),
             reader_lease: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
+            reader_lease_ttl_ms: yadb_metakv::gc::DEFAULT_TTL_MS,
             s3: ObjectStoreEngine::new(meta.clone(), 4096),
             db: DatabaseEngine::new(meta.clone(), 100),
             block: BlockVolumeEngine::new(meta, DEFAULT_BLOCK_SIZE),
@@ -10753,6 +10764,7 @@ mod raft_status_tests {
             local_vdisks: Arc::new(RwLock::new(BTreeMap::new())),
             last_scrub: Arc::new(RwLock::new(None)),
             reader_lease: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
+            reader_lease_ttl_ms: yadb_metakv::gc::DEFAULT_TTL_MS,
             s3: ObjectStoreEngine::new(meta.clone(), 4096),
             db: DatabaseEngine::new(meta.clone(), 100),
             block: BlockVolumeEngine::new(meta.clone(), DEFAULT_BLOCK_SIZE),
@@ -10871,6 +10883,7 @@ mod raft_status_tests {
             local_vdisks: Arc::new(RwLock::new(BTreeMap::new())),
             last_scrub: Arc::new(RwLock::new(None)),
             reader_lease: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
+            reader_lease_ttl_ms: yadb_metakv::gc::DEFAULT_TTL_MS,
             s3: ObjectStoreEngine::new(meta.clone(), 4096),
             db: DatabaseEngine::new(meta.clone(), 100),
             block: BlockVolumeEngine::new(meta.clone(), DEFAULT_BLOCK_SIZE),
@@ -10956,6 +10969,159 @@ mod raft_status_tests {
         assert!(
             !refusal.contains("group 2 refused"),
             "group 2 has no live record, so its pass must not refuse: {refusal}"
+        );
+
+        drop(st);
+        for raft in rafts {
+            let _ = raft.shutdown().await;
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    async fn response_bytes(response: Response) -> Vec<u8> {
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec()
+    }
+
+    /// The end-of-read fence, not the acquire path, is what refuses a read that
+    /// outlived its reader lease. The GET is the real handler over a real
+    /// multi-group metadata store; only the TTL is shrunk, and only through the
+    /// test-only `AppState::reader_lease_ttl_ms` field.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn s3_get_refuses_bytes_when_the_read_outlives_its_reader_lease() {
+        use yadb_control::{MemberBinding, ObjectStoreSpec, ProjectQuotas, ProjectSpec};
+
+        let (mut st, dir, rafts) = multigroup_state("reader-lease-expiry").await;
+
+        // Project 1 is routed to group 2. Give the fixture a real mirror pool
+        // and the control entries the GET path authorizes against.
+        let stores = (0..3)
+            .map(|i| {
+                VolumeStore::open(
+                    st.fs.clone(),
+                    format!("pool/data-{i}"),
+                    VolumeConfig::default(),
+                )
+                .unwrap()
+            })
+            .collect();
+        let pool = Arc::new(
+            PoolStriper::new(yadb_blob::ErasureScheme::Mirror { replicas: 3 }, stores).unwrap(),
+        );
+        st.pools
+            .write()
+            .unwrap()
+            .insert("data".to_string(), pool.clone());
+        st.s3 = ObjectStoreEngine::new(st.meta.clone(), 4096);
+        st.s3.register_pool("data", pool);
+        {
+            let mut control = st.control.write().unwrap();
+            control.generation = 1;
+            control.projects.insert(
+                "proj".into(),
+                (
+                    1,
+                    ProjectSpec {
+                        quotas: ProjectQuotas::default(),
+                        members: vec![MemberBinding {
+                            subject: "anonymous".into(),
+                            role: Role::ReadWrite,
+                        }],
+                    },
+                ),
+            );
+            control.object_stores.insert(
+                "proj/store".into(),
+                ObjectStoreSpec {
+                    pool: "data".into(),
+                    isolation: Default::default(),
+                    buckets: vec![],
+                },
+            );
+        }
+        st.control_freshness
+            .lock()
+            .unwrap()
+            .accept_at(0, Instant::now(), Duration::from_secs(60));
+
+        // The engine chunks at 4096 bytes, so this object is a thousand
+        // fragment fetches: comfortably longer than the 1 ms lease on any
+        // machine, without a test-only delay in the read path.
+        let payload: Vec<u8> = (0..4 * 1024 * 1024)
+            .map(|i| b'a' + (i % 26) as u8)
+            .collect();
+        st.s3
+            .put_object(1, "store", "data", "bucket", "obj", "text/plain", &payload)
+            .unwrap();
+
+        let get = |st: AppState| async move {
+            handle_s3_get(
+                Method::GET,
+                State(st),
+                HeaderMap::new(),
+                Path((
+                    "proj".to_string(),
+                    "store".to_string(),
+                    "bucket".to_string(),
+                    "obj".to_string(),
+                )),
+                Query(S3GetQuery { consistent: false }),
+            )
+            .await
+        };
+
+        // Inversion first: with the shipped default TTL the same GET returns
+        // the exact bytes, so the refusal below is the short TTL and not a
+        // fixture that cannot serve the object at all.
+        let response = get(st.clone()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response_bytes(response).await, payload);
+
+        // Shrink the lease for this test only. The handler renews the cached
+        // record (or publishes a fresh one) with 1 ms, then the fenced fetch
+        // outlives it and `end_read_lease` refuses.
+        st.reader_lease_ttl_ms = 1;
+        let response = get(st.clone()).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = String::from_utf8(response_bytes(response).await).unwrap();
+        assert!(
+            body.contains("expired at") && body.contains("unreaped"),
+            "the refusal must be the end-of-read liveness fence: {body}"
+        );
+        assert!(
+            !body.contains("reader lease unavailable"),
+            "the refusal must not be the acquire path: {body}"
+        );
+        let prefix = std::str::from_utf8(&payload[..32]).unwrap();
+        assert!(
+            !body.contains(prefix),
+            "a read refused by the fence must not return the bytes: {body}"
+        );
+
+        drop(st);
+        for raft in rafts {
+            let _ = raft.shutdown().await;
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `end_read_lease` proves the record is live before caching it. A dead
+    /// record is refused and never kept for the next read to renew.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn end_read_lease_refuses_an_expired_lease_and_does_not_cache_it() {
+        let (mut st, dir, rafts) = multigroup_state("reader-lease-expired-end").await;
+        st.reader_lease_ttl_ms = 1;
+        let lease = st.begin_read_lease(1).unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+
+        let error = st.end_read_lease(&lease).unwrap_err().to_string();
+        assert!(error.contains("expired at"), "{error}");
+        assert!(error.contains("unreaped"), "{error}");
+        assert!(
+            st.reader_lease.lock().unwrap().is_empty(),
+            "a dead record must not be cached: the next read would renew a fence that no longer holds"
         );
 
         drop(st);

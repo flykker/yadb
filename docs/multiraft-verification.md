@@ -1146,7 +1146,17 @@ its reader lease for reuse instead of deleting it per statement; a
 continuously busy node refuses instead of waiting. A read that
 outlives its own lease is not refreshed mid-read, so a query longer than 30 s is
 refused with `503` after it finishes rather than returning bytes a pass may have
-reclaimed; the client must re-issue it. `/s3-retired/` records are kept
+reclaimed; the client must re-issue it. That refusal is **proven in-process at
+the handler with a real multi-group metadata store**, and is **not proven on a
+live cluster**: `s3_get_refuses_bytes_when_the_read_outlives_its_reader_lease`
+in `crates/yadbd/src/main.rs` writes an object into the project's group, shrinks
+the test-only `AppState::reader_lease_ttl_ms` to 1 ms, and asserts the real S3
+`GET` answers `503` carrying the `ensure_live` expiry text instead of the bytes,
+with the same `GET` answering `200` with the exact bytes at the shipped 30 s
+default. A live proof would need a read longer than 30 s or a runtime TTL knob;
+neither was added, because that would add an operator surface to the hot read
+path. `end_read_lease_refuses_an_expired_lease_and_does_not_cache_it` covers the
+same fence at the method level. `/s3-retired/` records are kept
 indefinitely; the 300 s writer TTL is the only bound on a crashed writer blocking
 collection; and the tests use an in-process pool, so remote slot enumeration,
 remote barriers and remote compaction run through the same code paths without a

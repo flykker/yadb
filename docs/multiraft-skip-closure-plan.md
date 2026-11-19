@@ -98,10 +98,12 @@ run inside the one-second intent grace. The set comparison was not weakened.
 ## What this record still does not claim
 
 The following are not claimed at live-cluster level, and the text below must not
-be read as proving them there. Two were subsequently proved at sweep level
-against real single-node OpenRaft groups and real volume directories, and one
-was closed in the daemon by taking its map from a confirmed control snapshot;
-each entry says what the proof is and what the live cluster still lacks.
+be read as proving them there. Three were subsequently proved elsewhere: two at
+sweep level against real single-node OpenRaft groups and real volume directories,
+and one in-process at the S3 handler over the real multi-group metadata store.
+One more was closed in the daemon by taking its map from a confirmed control
+snapshot. Each entry says what the proof is and what the live cluster still
+lacks.
 
 * a collector lease expiring in the middle of a live cluster pass — the daemon
   still has no injection point, so the live cluster cannot produce it. The
@@ -111,9 +113,22 @@ each entry says what the proof is and what the live cluster still lacks.
   observes that the earlier range is evicted and counted, the later range is
   untouched and uncounted, and the outcome names the stop. What stays unproven
   is the same failure through `POST /v1/pools/gc` on a cluster;
-* a reader lease expiring in the middle of a read — the live run observed the
-  record block a pass and then expire with no read in flight, not a read that
-  outlived its lease;
+* a reader lease expiring in the middle of a *live cluster* read — proved
+  in-process instead, at the handler: `s3_get_refuses_bytes_when_the_read_outlives_its_reader_lease`
+  in `crates/yadbd/src/main.rs` runs the real S3 `GET` over the real multi-group
+  metadata store, writes an object through the engine into the group that owns
+  the project, and shrinks the test-only `AppState::reader_lease_ttl_ms` to
+  1 ms. The fenced fetch outlives the lease, `end_read_lease` refuses, and the
+  handler answers `503` carrying the `ensure_live` text (`expired at …
+  unreaped`) instead of the bytes — not the acquire path's `reader lease
+  unavailable`. The same `GET` at the shipped 30 s default answers `200` with
+  the exact bytes. The field exists only so a test can shrink the TTL: no CLI
+  flag, no internal route, default unchanged. A live proof would need a read
+  longer than 30 s or a runtime TTL knob, and neither was added because that
+  would put a new operator surface in the hot read path; the live run only
+  observed the record block a pass and then expire with no read in flight.
+  `end_read_lease_refuses_an_expired_lease_and_does_not_cache_it` covers the
+  same fence at the method level and that the dead record is not cached;
 * two concurrent collectors on one group on a live cluster — a concurrent
   `POST /v1/pools/gc` pair is inherently racy, so there is no deterministic
   drill. The shape is proved at sweep level against a real single-node
