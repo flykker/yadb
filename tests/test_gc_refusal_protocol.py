@@ -132,6 +132,23 @@ class RepairScanProtocolTest(unittest.TestCase):
         with self.assertRaises(AssertionError):
             self.check(orphan_error="whole-deployment view is unavailable")
 
+    def test_rejects_an_extra_refused_group_name(self):
+        # The body names the group it should refuse and then an extra one that
+        # is not a scope at all. Set comparison is what makes this fail: a
+        # one-name-at-a-time presence check would accept it.
+        with self.assertRaises(AssertionError):
+            self.check(refusal=(
+                "repair scan refused for 1 of 2 metadata group(s): "
+                "group 3 refused: not the leader; "
+                "group 99 refused: not the leader"))
+
+    def test_rejects_an_extra_group_name_in_the_sweep_refusal(self):
+        with self.assertRaises(AssertionError):
+            self.check(sweep=(
+                "garbage collection refused for 1 of 2 metadata group(s): "
+                "group 3 refused: not the leader; "
+                "group 99 refused: not the leader"))
+
     def test_rejects_a_fragment_that_disappeared_or_changed(self):
         for fragment in ((404, {}, b""), (200, {}, b"changed")):
             with self.subTest(fragment=fragment), self.assertRaises(AssertionError):

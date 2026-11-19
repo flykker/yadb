@@ -353,6 +353,23 @@ def request(port, method, path, body=b"", headers=None, timeout=30):
     return status, hs, data
 
 
+def refused_group_names(text):
+    """The metadata group ids a per-group refusal names, as a set.
+
+    The daemon builds both refusals the same way (`crates/yadbd/src/gc.rs`,
+    `repair_scan_groups` and `sweep_groups`): one
+    `format!("group {} refused: {reason}", scope.group_id)` per refused group,
+    joined with `"; "`. So the ids are matched on the `group N refused:` form.
+
+    Deliberately not split on `"; "` first: a reason can contain it
+    (`... (leader is Some(3)); a lagging view ...`), so the marker itself is the
+    only safe delimiter. If that form ever changes the result becomes empty,
+    which cannot pass silently - callers compare it against a non-empty
+    expected set.
+    """
+    return {int(group) for group in re.findall(r"group (\d+) refused:", text)}
+
+
 def assert_multiraft_repair_scan(port, node, fragments=(), checked_at_least=0,
                                  live_nodes=NODES):
     """Scrub repairs per group and refuses only the groups this node does not lead.
@@ -373,11 +390,13 @@ def assert_multiraft_repair_scan(port, node, fragments=(), checked_at_least=0,
     Which groups the node leads is read from the live election, not assumed:
     the launcher places one replica of every group on every node, but it is
     OpenRaft that elects a leader, and the point of the assertion is that the
-    body names exactly the groups this *particular* node does not lead. Only
-    groups that own a project are scopes (`gc_group_scopes`), so the control
-    group is never in the total and a node that leads no data group refuses
-    every scope - which is the control leader's case here, and still a `409`
-    while every node is up.
+    body names exactly the groups this *particular* node does not lead. Both
+    refusals are compared as a *set* of names, so an extra `group 99 refused:`
+    fails just as a missing name or a name for a group the node leads does.
+    Only groups that own a project are scopes (`gc_group_scopes`), so the
+    control group is never in the total and a node that leads no data group
+    refuses every scope - which is the control leader's case here, and still a
+    `409` while every node is up.
 
     `checked_at_least` is the number of live blobs the caller knows the led
     group holds. It cannot be asserted for a group whose manifests name no
@@ -411,15 +430,20 @@ def assert_multiraft_repair_scan(port, node, fragments=(), checked_at_least=0,
         assert refusal.startswith(
             f"repair scan refused for {len(refused)} of {len(data_groups)} "
             f"metadata group(s): "), summary
-        for group in refused:
-            assert f"group {group} refused:" in refusal, summary
-        for group in led:
-            assert f"group {group} refused:" not in refusal, summary
+        # Names are compared as a set, not one at a time: a body that names
+        # every group it should *and* an extra `group 99 refused:` must fail,
+        # just as a missing or substituted name does. This also covers the
+        # groups this node leads, since a led group is a data group and naming
+        # it would change the set.
+        named = refused_group_names(refusal)
+        assert named == set(refused), (named, set(refused), summary)
+        swept = refused_group_names(sweep_refusal)
+        assert swept == set(refused), (swept, set(refused), summary)
     else:
         assert refusal is None, summary
-    if sweep_refusal:
-        for group in refused:
-            assert f"group {group}" in sweep_refusal, summary
+        # A node that leads every data group has nothing to refuse, so a sweep
+        # refusal naming groups contradicts the repair result.
+        assert not refused_group_names(sweep_refusal or ""), summary
     # Orphan collection is per group too: no group is refused for lacking a
     # whole-deployment view, and an unproven group is named rather than counted
     # as collected. The deletion path is exercised by the orphan-collection
