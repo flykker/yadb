@@ -1398,7 +1398,7 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None,
                  "crates/yadbd/src/main.rs:7636 answers 409 instead of 200")
             skip("per-group GC collection",
                  "mark-and-sweep is disabled for Multi-Raft: "
-                 "crates/yadbd/src/gc.rs:144 refuses before any pass")
+                 "crates/yadbd/src/gc.rs:149 refuses before any pass")
             print("PASS VDisk exact DELETE, idempotent tombstone and delayed PUT fencing")
             # The epoch and pin surface is wired into the shipped router, not
             # only into the handler functions the unit test calls. One slot is

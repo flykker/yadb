@@ -1,17 +1,22 @@
 # Plan: storage-side fencing for Multi-Raft garbage collection
 
-**Status: the mechanism below is design only and is not implemented**, apart from
-four narrow pieces of storage-side fencing: a barrier carries the collector
-lease deadline and the target refuses an expired one, a target keeps a durable
-epoch it can refuse an exact delete against (see "What the target epoch now
-establishes"), a target keeps a durable pin table it can refuse an epoch
-advance and a collectable delete against (see "What the pin table now
-establishes"), and a remote slot can reach all of it over the internal VDisk
-surface (see "What the fence transport now establishes"). The last one is
-transport: no collector calls it and no reader pins before a fetch. None of the
-four establishes the invariant, and Multi-Raft mark-and-sweep stays refused
-(`409` on `/v1/pools/gc` and `/v1/pools/scrub`, periodic task logged and skipped)
-until the mechanism below exists and is proven.
+**Status: the mechanism below is implemented for the legacy metadata runtime and
+is still refused on Multi-Raft.** Six pieces exist in `main`: a barrier carries
+the collector lease deadline and the target refuses an expired one; a target
+keeps a durable epoch it can refuse an exact delete against (see "What the target
+epoch now establishes"); a target keeps a durable pin table it can refuse an
+epoch advance and a collectable delete against (see "What the pin table now
+establishes"); a remote slot reaches all of it over the internal VDisk surface
+(see "What the fence transport now establishes"); the read path pins a slot
+before every fragment fetch and fails closed when the pin is refused (see "The
+read path now pins"); and the legacy sweep advances every slot of a pool before
+its first deletion and deletes through the collectable form (see "The collector
+pass now advances first").
+
+Multi-Raft mark-and-sweep stays refused (`409` on `/v1/pools/gc` and
+`/v1/pools/scrub`, periodic task logged and skipped). Its `sweep` returns the
+refusal before reaching any of the above, no per-group pass exists, and the four
+cluster drills in "What would prove it" have not run.
 Garbage accumulates in the meantime; that cost was accepted deliberately.
 
 ## Why the current refusal exists
@@ -188,11 +193,17 @@ What exists now:
   any unexpired pin exists, with `EpochPinned`, which names the epoch and the
   number of pins. Both are stop-the-pass.
 * `delete_collectable(id, collector_epoch)` implements "fragment epoch <
-  collector epoch, and no unexpired pin names the fragment's epoch". A fragment
-  that is not older is refused with `FragmentNotOlder`; one whose epoch is pinned
-  is refused with `FragmentPinned`; both name the fragment's epoch and the
-  collector's, and both happen before any record is appended. `delete_fenced` is
-  unchanged: still the strict equality primitive, still documented as such.
+  collector epoch, and no live pin on the slot". A fragment that is not older is
+  refused with `FragmentNotOlder`; one protected by a live pin is refused with
+  `FragmentPinned`; both name the fragment's epoch and the collector's, and both
+  happen before any record is appended. The pin rule is deliberately "any live
+  pin", not "a pin that names this fragment's epoch". `pin` accepts only the
+  target's current epoch, so a pin naming an older fragment's epoch cannot exist
+  - and the first version of this rule, which asked for one, therefore admitted
+  deleting the very fragments it was meant to protect. The cost of the wider rule
+  is that one live pin pauses every collectable delete on the slot until its TTL,
+  which is the direction that deletes less. `delete_fenced` is unchanged: still
+  the strict equality primitive, still documented as such.
 * Liveness is `now < expires_at_ms`. Recovery and every read of the table go
   through one helper, and an unreadable clock refuses there
   (`PinClockUnreadable`) instead of reading as zero - the same failure direction
@@ -213,35 +224,90 @@ What exists now:
 
 What it does **not** establish, and why the invariant still does not hold:
 
-* Nothing carries a pin over the wire. There is no `/internal/pin` route, no
-  `x-yadb-fence-*` header, and no change to `BarrierRequest`, `apply_barrier`,
-  `collect_garbage_barrier`, `PoolSlot::delete` or the daemon.
-* No reader takes a pin before a fetch, and no reader path fails closed when a
-  pin is refused. The pin table has no client.
-* No collector advances an epoch, re-reads the pin set, or calls
-  `delete_collectable`. Nothing forces the collector path to use it, and the
-  unfenced `delete` is still callable.
-* GC enablement is still refused (`409` on `/v1/pools/gc` and `/v1/pools/scrub`),
-  and none of the four live drills in "What would prove it" has run.
+* No route verifies the signed fence token. The pin routes authenticate the
+  connection with the shared internal Raft token, so "a superseded collector
+  cannot delete" still rests on the epoch compare-and-swap, not on a token.
+* A pin is taken per candidate fetch, not per client request. A multi-part read
+  takes and releases one pin per candidate it tries, and a pin cannot be
+  extended: the TTL is the maximum the target accepts, so a fetch that outlives
+  five minutes loses its protection. No read path can extend a pin.
+* Only the legacy collector path advances epochs and calls
+  `delete_collectable`. On Multi-Raft nothing does, and the unfenced `delete`
+  remains callable from any caller that has a `PoolSlot`.
+* GC enablement is still refused on Multi-Raft (`409` on `/v1/pools/gc` and
+  `/v1/pools/scrub`), and none of the four live drills in "What would prove it"
+  has run.
 * `crates/yadb-blob/tests/epoch_fence_drills.rs` is the storage-side precursor
   of those drills. It drives `VolumeStore` directly and proves four storage
-  invariants: a live pin refuses both the advance and the collectable delete of
-  the fragment it protects; a superseded collector's epoch is refused by the
-  advance and by the exact-epoch delete without changing the volume; a pass
-  that stops at its first refusal leaves the later fragments intact; and a
-  tombstone survives seal, compaction and a power-cut reopen, so a late write
-  cannot resurrect a collected fragment. It proves no wire format, no collector
-  loop, no reader path and nothing about a cluster, and it does not stand in
-  for the four cluster drills.
+  invariants: a live pin refuses the advance and the collectable delete of every
+  fragment older than the collector, including one written under an older epoch
+  than the pin names; a superseded collector's epoch is refused by the advance
+  and by the exact-epoch delete without changing the volume; a pass that stops at
+  its first refusal leaves the later fragments intact; and a tombstone survives
+  seal, compaction and a power-cut reopen, so a late write cannot resurrect a
+  collected fragment. It proves no wire format, no collector loop, no reader
+  path and nothing about a cluster, and it does not stand in for the four cluster
+  drills.
 
-The lock-then-read ordering the collector protocol depends on is therefore not
-established here either: it is a property of the caller holding the volume's
-directory lock across "read the pin set" and "advance the epoch". What the target
-provides is the two operations the caller must bracket, plus the guarantee that a
-pin which lands between them is either seen (the advance refuses) or lands after
-the advance (and then names the new epoch).
+The atomicity the collector protocol depends on is target-side, not caller-side:
+`advance_epoch` re-reads the pin table and compares the expected epoch under the
+same lock it appends under, so "no pins" and "epoch advanced" are one step from
+the target's point of view. A pin that lands first makes the advance refuse; a
+pin that lands afterwards names the new epoch and is covered by the "any live
+pin" delete rule. The caller brackets two operations rather than holding a
+directory lock across both.
 
-### Why the reader lease is not the next increment
+## The read path now pins
+
+`PoolStriper::get_blob` and `repair_blob` fetch every candidate part through
+`read_part`, which for each candidate slot:
+
+1. reads the slot's durable epoch,
+2. takes a pin on exactly that epoch with `READ_PIN_TTL_MS` (the maximum the
+   target accepts), and
+3. fetches the fragment under a guard that releases the pin in `Drop`.
+
+The epoch is read before it is named on purpose: a collector that advances in
+between makes `pin` fail with `PinEpochNotCurrent`, and the read treats that as
+a refusal rather than pinning an epoch the target no longer holds.
+
+A failed pin is never "the fragment is absent". `read_part` returns the failure
+to the caller, `get_blob` reports it instead of `NotFound` or
+`InsufficientFragments`, and `repair_blob` stops instead of reconstructing a
+fragment it could not prove missing. Reading around a down replica is unchanged:
+the failure is only reported when no other candidate supplied the part, and a
+successful reconstruction never consults it. This includes transport failures -
+an unreachable or poisoned target cannot prove absence either.
+
+What this does not establish: there is no *request-level* pin (one pin covering a
+whole S3 GET or SQL scan), no renewal, and no reader-lease publication on
+Multi-Raft. The pin protects one candidate fetch at a time, which is what the
+delete rule needs, and nothing more.
+
+## The collector pass now advances first
+
+`crates/yadbd/src/gc.rs::sweep_pool` is generic over the storage filesystem and,
+on the legacy runtime, does the following before its first deletion:
+
+1. `advance_pool_epochs` reads every slot's epoch, then advances every slot with
+   the value it read. A read failure or an advance refusal records a pool
+   refusal in `pools_refused` and `errors` and stops the pool with nothing
+   deleted. There is no retry and no "advance the others and continue".
+2. Exact deletions go through `delete_collectable_parts`, which asks every slot
+   of the pool for every part with that slot's new epoch. `FragmentNotOlder`,
+   `FragmentPinned` and `FencedByEpoch` stop the pool immediately; only an
+   unavailable target (`Io`) is recorded and stepped over, matching how the pool
+   treats a down slot elsewhere.
+3. Barriers still carry the collector lease deadline and not the epoch, and the
+   fence is still checked before the first deletion, before every barrier group
+   and every 32 exact tombstones.
+
+What this does not establish: the ordering is enforced structurally (the advance
+is the first statement), not observed as a write sequence; no concurrent reader
+fetches while a pass runs in any test; and none of it runs on Multi-Raft, where
+`sweep` still returns the refusal first.
+
+## Why the reader lease is not the next increment
 
 There is a parked branch (`feat/reader-lease`, rebased onto `main` and building)
 that publishes a per-group reader lease on Multi-Raft: `reader_lease` becomes a
@@ -318,18 +384,18 @@ are.
 A reader that fetches fragments takes a pin on the epoch it is reading:
 
 ```
-POST /internal/pin  {epoch, lease_id, ttl_ms}  -> {pin_id, expires_at_ms}
-POST /internal/unpin {pin_id}
+POST /internal/vdisk/{pool}/{slot}/pin    {epoch, ttl_ms} -> {pin_id, epoch, expires_at_ms}
+POST /internal/vdisk/{pool}/{slot}/unpin  {pin_id}        -> {released}
 ```
 
-The target refuses to advance its epoch while any pin on the current epoch is
-unexpired, and refuses to delete fragments of an epoch that still has a live pin.
-Pins are held by the *reader's* process, not by the metadata group, so no
-metadata ordering is involved: the target is the single arbiter.
+The target refuses to advance its epoch while any pin is unexpired, and refuses
+to delete any fragment older than the collector while any pin is live. Pins are
+held by the *reader's* process, not by the metadata group, so no metadata
+ordering is involved: the target is the single arbiter.
 
-Pins must be taken before the fragment is fetched and released after the last
-byte is handed to the client. A read that cannot take a pin fails closed with the
-existing "reader lease unavailable" class of error rather than reading unfenced.
+Pins are taken before the fragment is fetched and released as soon as the bytes
+are copied. A read that cannot take a pin fails closed instead of reading
+unfenced. (Implemented: see "The read path now pins".)
 
 #### Exact semantics the target must implement
 
@@ -356,8 +422,10 @@ the ordering above and from the same fail-closed rule the barrier uses.
   maximum is clamped or refused rather than honoured, so one buggy reader cannot
   hold collection off indefinitely.
 * **The delete rule becomes "older, and unpinned"**: a collector at epoch `C` may
-  delete a fragment of epoch `f` only when `f < C` and no unexpired pin names `f`.
-  This is the step that makes the epoch useful at all — the equality rule now in
+  delete a fragment of epoch `f` only when `f < C` and no unexpired pin is live
+  on the slot. Not "no pin names `f`": only the current epoch can be pinned, so
+  the narrower form admits deleting the fragments a reader is actually holding.
+  This is the step that makes the epoch useful at all — the equality rule in
   `delete_fenced` refuses everything older, so a collector using it would delete
   nothing. Keep `delete_fenced` as the strict, equality-checked primitive and add
   the collectable form next to it rather than loosening it.
@@ -368,19 +436,23 @@ the ordering above and from the same fail-closed rule the barrier uses.
 #### How one pin protects fragments the reader did not write
 
 A reader pins the target's current epoch, but the fragment it fetches may have
-been written under an older one. The per-fragment rule ("no unexpired pin names
-`f`") does not cover that case on its own: nothing can pin an older epoch, so a
-fragment from epoch `N-1` has no pin of its own and looks collectable at
-collector epoch `N+1`.
+been written under an older one. A per-fragment rule of "no unexpired pin names
+`f`" does not cover that case: nothing can pin an older epoch, so a fragment from
+epoch `N-1` has no pin of its own and would look collectable at collector epoch
+`N+1`. That was the first implementation's rule, and the hole was real: a reader
+pinned epoch 1 and the collector deleted the epoch-0 fragment underneath it.
 
-The protection is the advance refusal, and it only works because the collector
-advances before it deletes:
+The rule is therefore "any live pin on the slot", which covers the older fragment
+directly, plus the advance refusal as a second layer:
 
 1. A reader reads epoch `N` and pins it. A collector's `advance_epoch(N)` is now
    refused, so the collector's pass stops with nothing deleted — including the
    older fragments, which were never reached.
 2. If the collector advanced to `N+1` first, the reader's `pin(N)` is refused as
-   not-current, and the read must fail closed rather than fetch unfenced.
+   not-current, and the read fails closed rather than fetch unfenced.
+3. If the pin lands after the advance, it names `N+1`, and the "any live pin"
+   delete rule refuses every fragment older than `N+1` — which is every fragment
+   the reader could be holding.
 
 So the ordering is load-bearing in both directions, and a reader that treats a
 refused pin as "retry with the new epoch" would silently read a fragment the
@@ -391,16 +463,24 @@ in flight.
 ## Epoch advance protocol (collector)
 
 1. Read the group's applied index and the target list.
-2. Take the target's directory lock, then re-read the pin set. If any pin is
-   unexpired, abort the pass and delete nothing.
-3. Increment `epoch`, sync it durably, release the lock.
-4. Mark-and-sweep using deletes that carry the new epoch.
-5. Fragments of older epochs that no pin referenced are now collectable.
+2. For each target, read the epoch, then advance it with that value. The target
+   re-reads its pin table and refuses if any pin is unexpired, so "no pins" and
+   "epoch advanced" is one target-side step. Abort the pass and delete nothing
+   on any refusal.
+3. Mark-and-sweep using deletes that carry the new epoch.
+4. Fragments of older epochs are now collectable, and the target refuses any
+   fragment that is not older or that any live pin still protects.
 
-The lock-then-read ordering is the whole point: it makes "no pins" and "epoch
-advanced" a single atomic step from the target's point of view. A pin taken
-concurrently either lands before the check (pass aborts) or after the advance
-(it names the new epoch and fences only the new epoch's fragments).
+The check-and-advance being one target-side step is the whole point: a pin taken
+concurrently either lands before it (the advance refuses, the pass aborts) or
+after it (it names the new epoch, and the "any live pin" delete rule then
+protects everything older than that epoch).
+
+Implemented for the legacy runtime in `advance_pool_epochs`; see "The collector
+pass now advances first". The plan's earlier "take the target's directory lock"
+is not how it is done: the caller does not hold a lock across two operations, it
+issues one operation the target makes atomic. That is a narrower interface and
+the same guarantee.
 
 The unit of the protocol is one VDisk slot, not one pool. Each slot has its own
 durable epoch and pin table, so the collector reads and advances every slot that

@@ -34,7 +34,7 @@ REQUIRED_SUBSTRINGS = {
     "crates/yadbd/src/protocols/s3.rs:683": ["is_openraft"],
     "crates/yadbd/src/main.rs:524": ["begin_read_lease"],
     "crates/yadbd/src/main.rs:7636": ["CONFLICT"],
-    "crates/yadbd/src/gc.rs:144": ["MULTIRAFT_GC_REFUSAL"],
+    "crates/yadbd/src/gc.rs:149": ["MULTIRAFT_GC_REFUSAL"],
 }
 
 # Every SKIP in tests/protocols.py, with the anchors its reason must keep.
@@ -49,7 +49,7 @@ EXPECTED_SKIPS = {
     ],
     "per-group GC collection": [
         "mark-and-sweep is disabled for Multi-Raft",
-        "crates/yadbd/src/gc.rs:144",
+        "crates/yadbd/src/gc.rs:149",
     ],
     "reader lease": [
         "crates/yadbd/src/protocols/s3.rs:683",

@@ -668,26 +668,29 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   nothing, reclaim nothing and leave fragments intact; the periodic task logs
   the same reason. The fence is not safe: a writer lease can be renewed while a
   collector pass is in flight, and collector RPCs can continue past lease
-  expiry, so a reader lease alone is not a sufficient fence. Storage-side fencing
-  is partial: the versioned delete RPC does not exist, and nothing carries an
-  epoch or a pin over the wire. Three target-side pieces do exist. A barrier
-  carries the collector lease deadline and the target refuses an expired one with
-  `409` (`BlobError::BarrierLeaseExpired`), which bounds the barrier path to the
-  target's own write-and-fsync window plus clock skew instead of leaving it
-  unchecked; an unreadable target clock refuses with `409` too
-  (`BarrierClockUnreadable`) instead of defaulting to the epoch. A volume keeps a
-  durable, monotonic epoch (`VolumeStore::epoch`, advanced only by
-  `advance_epoch`) and stamps every fragment with the epoch it was written under,
-  so `delete_fenced(id, epoch)` refuses to unlink a fragment from another epoch.
-  And a volume keeps a durable pin table (`pin`, `unpin`, `live_pins`), so
-  `advance_epoch` refuses while an unexpired pin exists (`EpochPinned`) and
+  expiry, so a reader lease alone is not a sufficient fence. Storage-side
+  fencing exists end to end on the legacy runtime. A barrier carries the
+  collector lease deadline and the target refuses an expired one with `409`
+  (`BlobError::BarrierLeaseExpired`), and an unreadable target clock refuses
+  with `BarrierClockUnreadable` instead of defaulting to a live deadline. A
+  volume keeps a durable, monotonic epoch and stamps every fragment with the
+  epoch it was written under, so `delete_fenced(id, epoch)` refuses to unlink a
+  fragment from another epoch. A volume also keeps a durable pin table, so
+  `advance_epoch` refuses while any pin is unexpired (`EpochPinned`) and
   `delete_collectable(id, epoch)` refuses a fragment that is not older
-  (`FragmentNotOlder`) or whose epoch is still pinned (`FragmentPinned`). None of
-  the three establishes the invariant: nothing carries the epoch over the wire,
-  `PoolSlot::delete` is still unfenced, the pin table has no client (no reader
-  takes a pin before a fetch, no collector checks one), and no collector advances
-  an epoch. Collection therefore stays refused, and garbage accumulates and can
-  fill the disk;
+  (`FragmentNotOlder`) or that any live pin protects (`FragmentPinned`; the rule
+  is "any live pin", because only the current epoch can be pinned). Those
+  primitives are reachable over `/internal/vdisk/{pool}/{slot}/...` (epoch,
+  pins, pin, unpin, advance, and a delete carrying `fence_epoch` or
+  `collector_epoch`), and `PoolStriper` uses them: the read path pins a slot
+  before every fragment fetch and fails closed when the pin is refused, and the
+  legacy `sweep_pool` advances every slot of a pool before its first deletion
+  and deletes through `delete_collectable`. What is still missing is the
+  Multi-Raft side: `sweep` returns the refusal before reaching any of it, no
+  per-group pass exists, no route verifies the signed fence token (the routes
+  authenticate with the shared internal Raft token), and the four cluster drills
+  have not run. Collection therefore stays refused, and garbage accumulates and
+  can fill the disk;
   this is a knowingly accepted temporary measure. The repair (orphan) scan is
   also still refused, because it needs one whole-deployment view.
 
