@@ -504,6 +504,29 @@ fn sweep_group(
             ));
         }
     };
+    // The group's applied index is re-read after admission closed: the
+    // collector's own write is applied, so every record published before this
+    // point is covered by it. A lease that names another group or claims an
+    // index this group has not applied is not a record this collector can
+    // attribute to its own fence, so the group refuses instead of sweeping
+    // under it.
+    let applied = match meta.role_info_for_group(group) {
+        Ok(info) => info.4,
+        Err(error) => {
+            let _ = collector.release();
+            return Err(format!(
+                "applied revision is unreadable: {error}; no fragment of group {group} was deleted"
+            ));
+        }
+    };
+    for lease in &live {
+        if let Err(error) = yadb_metakv::gc::lease_belongs_to_group(lease, group, applied) {
+            let _ = collector.release();
+            return Err(format!(
+                "lease record is not valid for group {group}: {error}; no fragment of that group was deleted"
+            ));
+        }
+    }
     if !live.is_empty() {
         outcome.leases_live += live.len();
         let _ = collector.release();

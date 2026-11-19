@@ -982,6 +982,44 @@ pub fn live_leases_in<FS: StorageFs>(
     live_leases_in_scope(meta, LeaseScope::Group(group))
 }
 
+/// Checks that a record found under `group`'s lease prefix could have been
+/// published by that group.
+///
+/// Multi-Raft has no global metadata revision, so a group-scoped lease carries
+/// the owning group's applied log index at publication (the value
+/// `role_info_for_group` reports) instead of a whole-deployment revision. The
+/// collector re-reads that index after it has closed admission and requires the
+/// record to name this group and not claim an index the group has not applied.
+/// A record that fails this check is a record whose provenance cannot be
+/// verified, so the group is refused rather than swept under it.
+///
+/// This is a provenance check, not the admission rule: any live lease refuses
+/// the pass. It is what keeps the `revision` field from being a decorative
+/// number a caller could fill with anything.
+pub fn lease_belongs_to_group(
+    lease: &GcLease,
+    group: u64,
+    group_applied: u64,
+) -> Result<(), MetaError> {
+    if lease.group != Some(group) {
+        return Err(MetaError::Routing(format!(
+            "gc {} lease {} found in group {group} names group {:?}",
+            kind_name(lease.kind),
+            lease.id,
+            lease.group
+        )));
+    }
+    if lease.revision > group_applied {
+        return Err(MetaError::Routing(format!(
+            "gc {} lease {} claims applied revision {} but group {group} has applied {group_applied}",
+            kind_name(lease.kind),
+            lease.id,
+            lease.revision
+        )));
+    }
+    Ok(())
+}
+
 /// The current collector lease, if one is live. An expired record is reaped and
 /// reported as absent so a crashed pass cannot block collection forever.
 ///
@@ -1640,6 +1678,75 @@ mod tests {
             grouped,
             r#"{"id":"abc","kind":"writer","project_id":7,"group":2,"revision":5,"expires_at_ms":1700000000000,"mod_revision":0}"#
         );
+    }
+
+    /// A group-scoped lease is only usable as a fence by the group that could
+    /// have published it.
+    ///
+    /// The record carries two claims a collector can check: which group wrote it,
+    /// and which applied index it was written at. Neither is self-enforcing - the
+    /// `group` field is a number in a JSON blob and `revision` is filled by the
+    /// writer - so the collector re-reads the group's applied index and compares.
+    /// A record that names another group, or that claims an index this group has
+    /// not applied, cannot be attributed to this fence; the group refuses instead
+    /// of sweeping under it.
+    #[test]
+    fn a_group_lease_must_name_its_group_and_an_index_the_group_has_applied() {
+        let lease = GcLease {
+            id: "l1".into(),
+            kind: LeaseKind::Reader,
+            project_id: 1,
+            group: Some(2),
+            revision: 10,
+            expires_at_ms: 1,
+            mod_revision: 0,
+        };
+
+        // Names the group and claims an index the group has applied: usable.
+        lease_belongs_to_group(&lease, 2, 10).unwrap();
+        lease_belongs_to_group(&lease, 2, 99).unwrap();
+
+        // A record under group 2's prefix that names group 3 is not group 2's.
+        let error = lease_belongs_to_group(&lease, 3, 10).unwrap_err().to_string();
+        assert!(error.contains("names group Some(2)"), "{error}");
+        assert!(error.contains("group 3"), "{error}");
+
+        // A legacy record has no group at all; it must not be accepted as a
+        // group-scoped fence record.
+        let legacy = GcLease {
+            group: None,
+            ..lease.clone()
+        };
+        let error = lease_belongs_to_group(&legacy, 2, 10)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("names group None"), "{error}");
+
+        // A revision the group has not applied is a claim the collector cannot
+        // verify, so it is refused rather than believed.
+        let error = lease_belongs_to_group(&lease, 2, 9).unwrap_err().to_string();
+        assert!(
+            error.contains("claims applied revision 10") && error.contains("applied 9"),
+            "{error}"
+        );
+    }
+
+    /// The revision check is the only thing that ties the record to an index the
+    /// group actually reached. A collector that trusted the field would accept a
+    /// lease from a writer that never got its publication committed.
+    #[test]
+    fn a_lease_ahead_of_the_group_applied_index_is_not_attributable() {
+        let lease = GcLease {
+            id: "l2".into(),
+            kind: LeaseKind::Writer,
+            project_id: 4,
+            group: Some(5),
+            revision: 1_000,
+            expires_at_ms: 1,
+            mod_revision: 0,
+        };
+        assert!(lease_belongs_to_group(&lease, 5, 999).is_err());
+        assert!(lease_belongs_to_group(&lease, 5, 1_000).is_ok());
     }
 
     #[test]
