@@ -4,5 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# Compiles the thread-local, one-shot syscall fault seam into `fault` so a
+# dependent crate's own tests can inject faults at the open-time read and lock
+# syscalls. Off by default; a dev-dependency enables it for test builds only.
+test-faults = []
+
 [dependencies]
 thiserror.workspace = true

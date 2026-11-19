@@ -21,6 +21,10 @@ tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring
 tokio = { workspace = true, features = ["io-util"] }
 
 [dev-dependencies]
+# Turns on `yadb_io::fault` for this crate's tests, so the state machine's
+# recovery read can be faulted at its own syscall. Not part of any shipped
+# build: dev-dependencies are not built for normal or release targets.
+yadb-io = { path = "../yadb-io", features = ["test-faults"] }
 tokio.workspace = true
 ring.workspace = true
 tracing.workspace = true

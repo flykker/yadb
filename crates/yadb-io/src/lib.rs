@@ -7,6 +7,18 @@ use std::sync::{Arc, Mutex};
 
 mod sys;
 
+/// The syscall fault seam, exposed to a dependent crate's own tests.
+///
+/// Enabled only by the `test-faults` feature, which is pulled in through a
+/// dev-dependency, so no shipped build compiles it. It is deliberately not
+/// part of the supported API: arming is per-thread, one-shot and cleared by
+/// the returned guard, exactly as in `yadb-io`'s own tests.
+#[cfg(feature = "test-faults")]
+#[doc(hidden)]
+pub mod fault {
+    pub use crate::sys::fault::{lock, reads, Armed, LockFault, ReadFault};
+}
+
 pub type IoResult<T> = Result<T, io::Error>;
 
 /// Positional file handle suitable for concurrent reads and append-only volume writes.
