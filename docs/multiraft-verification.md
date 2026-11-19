@@ -1623,7 +1623,10 @@ above is what this 2026-11-16 run observed, not current behaviour.)
    read paths already skipped the lease when `meta.is_openraft()`; the S3 path
    now does too, and skips the corresponding release. Without this, a
    non-`consistent=true` S3 GET answered `500 task ... panicked with message
-   "multi-group metadata has no global revision"`.
+   "multi-group metadata has no global revision"`. (This skip was itself
+   reversed on 2026-11-19: every S3 `GET` now publishes a group reader lease;
+   see the reader-lease record in `multiraft-skip-closure-plan.md`. The
+   paragraph above describes the 2026-11-16 run.)
 5. **A stale daemon-test assertion.** `openraft_daemon` expected `501` for a
    keyed block write, from before keyed block writes were implemented. On the
    base commit the same assertion saw `500` (defect 2); with defect 2 fixed the
@@ -1980,7 +1983,7 @@ listed at the end of the section.
 | Snapshot | `try_linearizable_group_snapshot(G)` names the group directly and returns a quorum-confirmed snapshot. Followers and unavailable quorums are errors, never a fallback to local applied state. |
 | Repair | `gc::repair_scan_groups` takes a quorum-confirmed snapshot of each group over `/db/`, `/s3/` and `/block/`, builds the live set from those rows only (never `try_scan_prefix`), and runs `repair_blob` on each live blob of that group. A follower or a quorum-less group is refused by name; one group's refusal does not stop another group's pass. |
 | Collector lease | `/gc/g<group>/collector`, one key per group, held for `COLLECTOR_LEASE_MS` (120 s) and renewed before each pool. Two passes over different groups do not block each other. |
-| Lease fence | The collector checks `/gc/g<group>/writer/<id>` (TTL 300 s) and `/gc/g<group>/reader/<id>` (TTL 30 s); a live record in G refuses G only. Multi-Raft writers publish group leases. Readers publish no metadata lease by design: `read_part` reads the slot epoch and pins it, and `delete_collectable` refuses while a pin is live, so an in-flight read is fenced per fragment at the point of use instead. The fence is checked before and after collector admission closes. |
+| Lease fence | The collector checks `/gc/g<group>/writer/<id>` (TTL 300 s) and `/gc/g<group>/reader/<id>` (TTL 30 s); a live record in G refuses G only. Multi-Raft readers publish a group lease: `AppState::begin_read_lease` resolves the owning group with `gc_group_for_project`, caches one record per group, and carries the group's applied log index as its revision; `lease_belongs_to_group` checks that provenance after admission closes. The target-side pin still fences each fragment; the lease is the coarser, collector-visible fence. The fence is checked before and after collector admission closes. |
 | S3 intent | An unexpired `Prepared` intent is part of the mark, so chunks appended before publication are kept. |
 | Deletion | Only ids whose `project_id` the group's scope covers, and only when the pool enumerated successfully. A refused pool is left untouched for every group. |
 | Refusal | Not leader, unreadable fence, collector lease held, snapshot failure or an unprovable live set refuses the group with the reason in `gc_groups_refused`; `/v1/pools/gc` answers `409` with that reason. Other groups are unaffected. |
@@ -2054,12 +2057,18 @@ passes when run alone (pre-existing timing sensitivity, not touched here).
   non-leader refusal and a clean collection. None kills a group leader between a
   fragment write and its manifest commit, and none runs two collectors
   concurrently on one group.
-* Readers on Multi-Raft take no *metadata* read lease, by design: `read_part`
-  reads the slot epoch and pins it, and `delete_collectable` refuses while any
-  pin is live. The fence is per fragment at the point of use, and it cannot
-  expire mid-read without the read failing closed. A positive drill holds an S3
-  `GET` open, observes the slot's live pin, then releases the response and
-  observes the pin drain with the object intact.
+* Readers on Multi-Raft now publish a per-group metadata lease as well as
+  pinning the fragment at the target. The lease blocks `POST /v1/pools/gc` and
+  scrub's collection half for up to its 30 s TTL after the last read in the
+  group, so a collector against a recently read group refuses rather than
+  collects; it is coarser than the pin (whole group, not the fragment being
+  read). The pin remains the finer, point-of-use fence and is still proved by
+  its own drill. A live three-node run observed `leases_live: 0` before a read,
+  then `409` with `leases_live: 1` and `fragments_deleted: 0` after a `PUT` +
+  `GET`; the lease was live at +15 s and had expired by +35 s with no
+  intervening reads, after which the reader-lease clause left the refusal.
+  What this does not cover: a pass that starts before the lease and continues
+  after it expires, and two concurrent collectors on one group.
 * A pass over a group whose project set is empty still takes and releases its
   collector record; the cost is one round trip, not a correctness issue.
 
@@ -2703,23 +2712,26 @@ not through an admin route, and the install is still initiated by an inbound
 
 ### Gates
 
-* `python3 tests/protocols.py` — **26 PASS / 1 SKIP**, exit 0 on 2026-11-19,
-  after the two SKIP records changed. The `Multi-Raft repair scan` SKIP is gone:
-  the scenario now asserts a per-group repair instead of a refusal, and prints
-  `PASS Multi-Raft repair scan repairs per group, refuses only groups this node
-  does not lead`. The `reader lease` SKIP is narrowed to the metadata
-  mechanism that is genuinely absent — Multi-Raft has no metadata read lease,
-  because the fragment pin fences the read — and a positive drill observes live
-  pins during a 12 MiB S3 `GET` and their drain afterwards. A live
-  orphan-collection drill sets the intent grace to 1 s and observes an abandoned
-  intent survive a pass inside the grace and be collected after it. The 26
-  counts the three new drills that report separately. The first run of this
-  suite failed in the orphan drill on a hex-vs-integer id mismatch
-  (`Unknown format code 'x'`), which the offline guards could not see; the
-  26/1 result is from the run after that fix. The cross-process InstallSnapshot
-  scenario runs in this gate and prints a PASS naming the installed snapshot's
-  meta index; it is no longer a SKIP and the `--install-snapshot-live` flag no
-  longer exists.
+* `python3 tests/protocols.py` — the last recorded run was **26 PASS / 1 SKIP**,
+  exit 0 on 2026-11-19, *before* the reader-lease reversal. The `Multi-Raft
+  repair scan` SKIP is gone: the scenario asserts a per-group repair instead of
+  a refusal, and prints `PASS Multi-Raft repair scan repairs per group, refuses
+  only groups this node does not lead`. In that run the `reader lease` SKIP was
+  still the narrowed record. The implementation closes it: every S3 `GET` on
+  Multi-Raft publishes and renews a per-group lease, and the drill observes
+  `POST /v1/pools/gc` refusing with `leases_live: 1` after a read, then the
+  reader-lease clause leaving the refusal once the 30 s lease expires. The
+  exact PASS/SKIP total after the implementation lands is not stated here
+  because that run has not been recorded; the 26/1 above is the pre-reversal
+  observation. A live orphan-collection drill sets the intent grace to 1 s and
+  observes an abandoned intent survive a pass inside the grace and be collected
+  after it. The 26 counts the three new drills that report separately. The
+  first run of this suite failed in the orphan drill on a hex-vs-integer id
+  mismatch (`Unknown format code 'x'`), which the offline guards could not see;
+  the 26/1 result is from the run after that fix. The cross-process
+  InstallSnapshot scenario runs in this gate and prints a PASS naming the
+  installed snapshot's meta index; it is no longer a SKIP and the
+  `--install-snapshot-live` flag no longer exists.
 * The InstallSnapshot PASS from that run: node 3 was stopped at log index 571,
   the leader purged past it under the provisioned 128-entry snapshot interval,
   and the restarted node installed a snapshot at meta index 1802 and served its

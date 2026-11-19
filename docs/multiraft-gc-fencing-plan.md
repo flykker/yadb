@@ -28,7 +28,7 @@ repair pass takes no collector lease (see "The repair pass takes no collector
 lease"); what the plan does not yet establish is a collector lease expiring
 mid-pass at cluster level, which the daemon cannot inject.
 
-## Why the current refusal exists
+## Why a reader lease alone is not a fence
 
 A reader lease is published as a metadata record and a collector refuses to run
 while one is live. That is not a fence, for three reasons found in review:
@@ -47,7 +47,11 @@ while one is live. That is not a fence, for three reasons found in review:
 Only (3) is fundamental. A lease can be made airtight inside the metadata group
 — that is a local ordering problem — but it cannot reach the process that
 actually unlinks the fragment. Collection is only safe if the target itself can
-tell a safe delete from an unsafe one.
+tell a safe delete from an unsafe one. This is why the plan did not rely on a
+reader lease alone; it is not why the lease is forbidden. The lease implemented
+later (see "The reader lease: rejected first, then implemented") is an additional
+coarse fence the collector consults, while the pin is what the target can
+evaluate.
 
 ### What has since been closed
 
@@ -292,9 +296,10 @@ successful reconstruction never consults it. This includes transport failures -
 an unreachable or poisoned target cannot prove absence either.
 
 What this does not establish: there is no *request-level* pin (one pin covering a
-whole S3 GET or SQL scan), no renewal, and no reader-lease publication on
-Multi-Raft. The pin protects one candidate fetch at a time, which is what the
-delete rule needs, and nothing more.
+whole S3 GET or SQL scan) and no pin renewal. A per-group reader lease is now
+published on Multi-Raft (see "The reader lease: rejected first, then implemented"),
+but it is a metadata back-off signal, not a substitute for the pin: the pin
+protects one candidate fetch at a time, which is what the delete rule needs.
 
 ## The collector pass now advances first
 
@@ -381,16 +386,15 @@ fragment a live pin protects" is not a claim this plan makes - the claim is only
 that the fragment it deletes is a duplicate of one already durable at the
 nominal slot.
 
-## Why the reader lease is not the next increment
+## The reader lease: rejected first, then implemented
 
-There is a parked branch (`feat/reader-lease`, rebased onto `main` and building)
-that publishes a per-group reader lease on Multi-Raft: `reader_lease` becomes a
-map keyed by metadata group, the record carries the group's applied log index
-instead of a deployment-wide revision, and S3 and block reads forward to the
-group leader so they can publish one. It is not merged, and it should not be
-merged before the pin protocol exists.
-
-Two reasons, both from the design above:
+This section was written before the reversal and is kept as the record of the
+decision. It said the parked branch (`feat/reader-lease`, rebased onto `main`
+and building) should not be merged before the pin protocol existed. The branch
+publishes a per-group reader lease on Multi-Raft: `reader_lease` becomes a map
+keyed by metadata group, the record carries the group's applied log index
+instead of a deployment-wide revision, and reads forward to the group leader so
+they can publish one. The reasons to wait were:
 
 * **It is the mechanism this plan demotes, not the one it depends on.** The
   component table demotes the lease to an optimisation once pins exist. Building
@@ -399,14 +403,26 @@ Two reasons, both from the design above:
 * **It costs a committed write per read and buys nothing yet.** `renew` is a CAS
   through `extend`, so every fenced read is a Raft round trip; and every read is
   forced onto the group leader, which is the read-scaling property Multi-Raft
-  exists to provide. The only consumer of a reader lease is `sweep_group`, and
-  `sweep` returns its refusal before reaching it, so on Multi-Raft the record is
-  published and never consulted.
+  exists to provide. The only consumer of a reader lease was `sweep_group`, and
+  `sweep` returned its refusal before reaching it, so on Multi-Raft the record
+  was published and never consulted.
 
-The branch is worth keeping for its per-group keying and its provenance check
-(`lease_belongs_to_group`), both of which the collector will need. It becomes
-mergeable when the collector exists to read the records, or when the lease is
-retired in favour of pins - whichever comes first.
+Both reasons were true when written, and the second was the decisive one: a
+record nobody consults is not a fence. They stopped being decisive when the
+per-group collector was enabled. `sweep_group` now reaches the lease check,
+consults the group's reader records after closing admission, and refuses the
+group while one is live; the lease is therefore a collector-visible back-off
+signal, not a write that is ignored. The branch was rebased, its per-group
+keying and `lease_belongs_to_group` provenance check were kept, and the
+implementation is `e4555c5` on `feat/reader-lease` (2026-11-19).
+
+What the reversal does not change: the pin is still the correctness mechanism,
+and the lease is still coarser. It fences the whole metadata group rather than
+the fragment being read, and it blocks collection for up to its 30 s TTL after
+the last read. The reasons above are the cost, and the cost was accepted
+because the collector can now be told to back off without inspecting every
+target. A collector that loses its lease mid-pass is still not injectable at
+cluster level; that gap is unchanged.
 
 
 ## Invariant to establish
@@ -431,9 +447,11 @@ epoch it was created under, so a target can always say which epoch a fragment
 belongs to.
 
 The storage half of this is implemented (see "What the target epoch now
-establishes"). What is not implemented is the collector side: no pass takes the
-directory lock, reads a pin set, or advances an epoch, so nothing advances an
-epoch today except a test.
+establishes"). When this design was written, the collector side was not: no
+pass took the directory lock, read a pin set, or advanced an epoch. That is no
+longer the state of the tree — "The collector pass now advances first" records
+the collector side — but the ordering argument below is the one that made the
+advance a requirement.
 
 ### 2. A delete that names its epoch
 
