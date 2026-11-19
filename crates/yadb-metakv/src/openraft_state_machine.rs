@@ -11,7 +11,7 @@
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Cursor, Read, Seek, Write};
+use std::io::{self, Cursor, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -20,7 +20,7 @@ use openraft::{
     BasicNode, Entry, EntryPayload, ErrorSubject, ErrorVerb, LogId, StorageError, StoredMembership,
 };
 use serde::{Deserialize, Serialize};
-use yadb_io::OsDirectoryLock;
+use yadb_io::{OsDirectoryLock, OsFile, OsFs, StorageFs, VirtualFile};
 
 use crate::kv::{MetaSnapshot, MetaStateMachine};
 use crate::multiraft::{GroupIdentity, ReplicaIdentity};
@@ -176,6 +176,20 @@ fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
 
+/// A recovery read that ended before the bytes its header declared.
+///
+/// This is deliberately not [`io::ErrorKind::InvalidData`], which is the one
+/// kind [`load_image`] treats as corruption: a short read means the complete
+/// image was never observed, so the reader has no proof the bytes on disk are
+/// bad. Rebuilding would rename those bytes away and replace them with an
+/// empty image, destroying evidence that a transient short read may have
+/// hidden; a refusal keeps the file and asks for a retry. A file that really
+/// is truncated is refused for the same reason, and only a complete image that
+/// fails its own header, length or CRC checks is rebuilt.
+fn truncated(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::UnexpectedEof, message.into())
+}
+
 fn identity_header(identity: &ReplicaIdentity) -> (GroupIdentity, u32) {
     (identity.group().clone(), identity.node())
 }
@@ -218,7 +232,10 @@ fn snapshot_image_bytes(image: &SnapshotImage) -> io::Result<Vec<u8>> {
 
 fn decode_image(bytes: &[u8]) -> io::Result<Image> {
     const HEADER: usize = 8 + 4 + 8 + 4;
-    if bytes.len() < HEADER || &bytes[..8] != MAGIC {
+    if bytes.len() < HEADER {
+        return Err(truncated("state-machine image is shorter than its header"));
+    }
+    if &bytes[..8] != MAGIC {
         return Err(invalid("invalid state-machine image header"));
     }
     let version = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
@@ -227,12 +244,22 @@ fn decode_image(bytes: &[u8]) -> io::Result<Image> {
     }
     let len = usize::try_from(u64::from_le_bytes(bytes[12..20].try_into().unwrap()))
         .map_err(|_| invalid("state-machine image length overflow"))?;
-    if len > MAX_IMAGE
-        || bytes.len()
-            != HEADER
-                .checked_add(len)
-                .ok_or_else(|| invalid("image length overflow"))?
-    {
+    if len > MAX_IMAGE {
+        return Err(invalid("invalid state-machine image length"));
+    }
+    let end = HEADER
+        .checked_add(len)
+        .ok_or_else(|| invalid("image length overflow"))?;
+    // Fewer bytes than the header declared is a truncated file, not a
+    // corrupt-but-complete one: see `truncated`. More bytes than declared is a
+    // complete image followed by trailing bytes; that is still a length
+    // mismatch the bounded read always rejected, so it stays `InvalidData`.
+    if bytes.len() < end {
+        return Err(truncated(
+            "state-machine image is shorter than its declared length",
+        ));
+    }
+    if bytes.len() != end {
         return Err(invalid("invalid state-machine image length"));
     }
     let payload = &bytes[HEADER..];
@@ -274,13 +301,22 @@ fn decode_snapshot_image(bytes: &[u8]) -> io::Result<SnapshotImage> {
     Ok(image)
 }
 
-fn read_image(file: &mut File) -> io::Result<Image> {
-    let mut bytes = Vec::new();
-    file.take((MAX_IMAGE + IMAGE_HEADER_LEN + 1) as u64)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() > MAX_IMAGE + IMAGE_HEADER_LEN {
+/// Read and validate the recovery image through the injectable `yadb-io` seam.
+///
+/// The whole file is read with [`VirtualFile::read_exact_at`], so the read is a
+/// positional `sys::read_at` the test seam can fault. A legal short read is
+/// retried; a read that stops before the file ends returns `UnexpectedEof`,
+/// which stays distinct from `InvalidData` (see [`truncated`]) so a short read
+/// is refused rather than rebuilt. The size bound is checked before allocating,
+/// exactly as the previous bounded `take(...)` read enforced it.
+fn read_image(file: &OsFile) -> io::Result<Image> {
+    let disk_len =
+        usize::try_from(file.len()?).map_err(|_| invalid("state-machine image length overflow"))?;
+    if disk_len > MAX_IMAGE + IMAGE_HEADER_LEN {
         return Err(invalid("state-machine image exceeds limit"));
     }
+    let mut bytes = vec![0u8; disk_len];
+    file.read_exact_at(0, &mut bytes)?;
     decode_image(&bytes)
 }
 
@@ -679,25 +715,31 @@ fn publish_image(dir: &Path, image: &Image) -> io::Result<()> {
 /// be decoded with a fresh empty one.
 ///
 /// Only `InvalidData` from [`read_image`] counts as corruption. A missing file,
-/// an I/O error, an identity mismatch and invalid nested snapshot metadata all
-/// keep failing: rebuilding them would either create state for a directory that
-/// never had any or adopt another replica's data. The returned file handle is
-/// the published image, so the caller can re-sync it as `open` always has.
+/// an I/O error, a *short read* (a truncated file or a fault at the recovery
+/// syscall, which surfaces as `UnexpectedEof`), an identity mismatch and
+/// invalid nested snapshot metadata all keep failing: rebuilding them would
+/// either create state for a directory that never had any, adopt another
+/// replica's data, or destroy bytes that were never fully read. The returned
+/// handle is the published image, so the caller can re-sync it as `open`
+/// always has.
 fn load_image(
     dir: &Path,
     identity: &ReplicaIdentity,
     rebuild_allowed: bool,
-) -> io::Result<(File, Image, Option<ImageRebuild>)> {
+) -> io::Result<(OsFile, Image, Option<ImageRebuild>)> {
     let path = dir.join("state.json");
-    let mut file = OpenOptions::new().read(true).write(true).open(&path)?;
-    let image = match read_image(&mut file) {
+    // The directory lock was acquired before this call, so the root exists;
+    // `OsFs` is only a path resolver plus the faultable positional read here.
+    let fs = OsFs::new(dir)?;
+    let file = fs.open_rw("state.json", false)?;
+    let image = match read_image(&file) {
         Ok(image) => image,
         Err(error) if rebuild_allowed && error.kind() == io::ErrorKind::InvalidData => {
             drop(file);
             let rebuilt = preserve_corrupt_image(dir, &path)?;
             let image = empty_image(identity);
             publish_image(dir, &image)?;
-            let file = OpenOptions::new().read(true).write(true).open(&path)?;
+            let file = fs.open_rw("state.json", false)?;
             return Ok((file, image, Some(rebuilt)));
         }
         Err(error) => return Err(error),
@@ -2207,6 +2249,160 @@ mod tests {
         assert!(DurableMetaStateMachine::open(&dir.0, &identity()).is_err());
     }
 
+    fn rebuild_coverage() -> LogCoverage {
+        LogCoverage {
+            last_purged: None,
+            first_index: Some(0),
+        }
+    }
+
+    /// An image with one applied entry, left on disk, and its bytes.
+    async fn applied_image(dir: &TempDir) -> Vec<u8> {
+        let mut sm = DurableMetaStateMachine::create(&dir.0, &identity()).unwrap();
+        sm.apply(vec![put(1, "a", b"one")]).await.unwrap();
+        drop(sm);
+        fs::read(dir.0.join("state.json")).unwrap()
+    }
+
+    /// A recovery read that stops short is refused at every offset, even when
+    /// the log coverage would permit a rebuild.
+    ///
+    /// The file on disk stays complete: the `Truncate` fault models a file the
+    /// reader cannot see past a chosen offset, which is exactly what a
+    /// truncated `state.json` or a device that lost its tail looks like. A
+    /// rebuild here would rename the (possibly intact) bytes aside and replace
+    /// them with an empty image, so the only safe answer is `UnexpectedEof`.
+    #[tokio::test]
+    async fn truncated_image_is_refused_at_every_offset_and_never_rebuilt() {
+        use yadb_io::fault::{reads, ReadFault};
+
+        let dir = TempDir::new();
+        let before = applied_image(&dir).await;
+        let payload = before.len() - IMAGE_HEADER_LEN;
+        assert!(payload > 4, "image payload is too small to cut in two");
+        let cuts = [
+            1,
+            IMAGE_HEADER_LEN / 2,
+            IMAGE_HEADER_LEN - 1,
+            IMAGE_HEADER_LEN,
+            IMAGE_HEADER_LEN + 1,
+            IMAGE_HEADER_LEN + payload / 2,
+            before.len() - 1,
+        ];
+
+        for cut in cuts {
+            assert!(cut < before.len(), "cut {cut} must shorten the image");
+            let armed = reads(&[ReadFault::Truncate(cut)]);
+            let error =
+                DurableMetaStateMachine::open_or_rebuild(&dir.0, &identity(), rebuild_coverage())
+                    .err()
+                    .unwrap_or_else(|| panic!("a read that stops at byte {cut} must be refused"));
+            drop(armed);
+
+            assert_eq!(
+                error.kind(),
+                io::ErrorKind::UnexpectedEof,
+                "a short read at {cut} must be an end of file, not InvalidData"
+            );
+            assert_eq!(
+                fs::read(dir.0.join("state.json")).unwrap(),
+                before,
+                "a refused read at {cut} must not touch the image"
+            );
+            assert!(!dir.0.join("state.json.corrupt").exists());
+            assert!(!dir.0.join("state.json.tmp").exists());
+        }
+
+        // Without the fault the same bytes are a valid image: the refusal came
+        // from the short read, not from an image that was already bad.
+        let mut reopened = DurableMetaStateMachine::open(&dir.0, &identity()).unwrap();
+        assert_eq!(reopened.snapshot().get("a").unwrap().value, b"one");
+        assert_eq!(reopened.applied_state().await.unwrap().0.unwrap().index, 1);
+    }
+
+    /// A file that really is shorter than its header declares is refused for
+    /// the same reason: the reader never saw a complete image, so there is no
+    /// proof of corruption to justify discarding it. An empty file, a partial
+    /// header and a cut inside the payload all take the same path.
+    #[test]
+    fn really_truncated_image_is_refused_not_rebuilt() {
+        for which in 0..3 {
+            let dir = TempDir::new();
+            let sm = DurableMetaStateMachine::create(&dir.0, &identity()).unwrap();
+            drop(sm);
+            let path = dir.0.join("state.json");
+            let full = fs::read(&path).unwrap();
+            let cut = match which {
+                0 => 0,
+                1 => IMAGE_HEADER_LEN - 1,
+                _ => IMAGE_HEADER_LEN + (full.len() - IMAGE_HEADER_LEN) / 2,
+            };
+            let file = OpenOptions::new().write(true).open(&path).unwrap();
+            file.set_len(cut as u64).unwrap();
+            drop(file);
+
+            let error =
+                DurableMetaStateMachine::open_or_rebuild(&dir.0, &identity(), rebuild_coverage())
+                    .err()
+                    .unwrap_or_else(|| panic!("a {cut}-byte image must be refused"));
+            assert_eq!(
+                error.kind(),
+                io::ErrorKind::UnexpectedEof,
+                "a {cut}-byte image must be an end of file, not InvalidData"
+            );
+            assert_eq!(fs::metadata(&path).unwrap().len(), cut as u64);
+            assert!(!dir.0.join("state.json.corrupt").exists());
+            assert!(!dir.0.join("state.json.tmp").exists());
+        }
+    }
+
+    /// A plain I/O error at the recovery read is not corruption: it fails the
+    /// open without renaming the image or publishing a replacement.
+    #[tokio::test]
+    async fn recovery_read_error_is_refused_and_not_rebuilt() {
+        use yadb_io::fault::{reads, ReadFault};
+
+        let dir = TempDir::new();
+        let before = applied_image(&dir).await;
+
+        let armed = reads(&[ReadFault::Error(io::ErrorKind::Other)]);
+        let error =
+            DurableMetaStateMachine::open_or_rebuild(&dir.0, &identity(), rebuild_coverage())
+                .err()
+                .expect("a failed recovery read must fail the open");
+        drop(armed);
+
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(fs::read(dir.0.join("state.json")).unwrap(), before);
+        assert!(!dir.0.join("state.json.corrupt").exists());
+        assert!(!dir.0.join("state.json.tmp").exists());
+
+        // The error was transient: a later open reads the untouched image.
+        let reopened = DurableMetaStateMachine::open(&dir.0, &identity()).unwrap();
+        assert_eq!(reopened.snapshot().get("a").unwrap().value, b"one");
+    }
+
+    /// A legal short read is retried, not refused: `read_exact_at` only treats
+    /// a zero-byte read before the buffer is full as an early end of file.
+    #[tokio::test]
+    async fn legal_short_read_is_retried_at_recovery() {
+        use yadb_io::fault::{reads, ReadFault};
+
+        let dir = TempDir::new();
+        let before = applied_image(&dir).await;
+
+        let armed = reads(&[ReadFault::Partial(16)]);
+        let mut reopened =
+            DurableMetaStateMachine::open_or_rebuild(&dir.0, &identity(), rebuild_coverage())
+                .unwrap();
+        drop(armed);
+
+        assert_eq!(reopened.snapshot().get("a").unwrap().value, b"one");
+        assert_eq!(reopened.applied_state().await.unwrap().0.unwrap().index, 1);
+        assert_eq!(fs::read(dir.0.join("state.json")).unwrap(), before);
+        assert!(!dir.0.join("state.json.corrupt").exists());
+    }
+
     /// Flip one bit in `state.json`'s payload, which the header CRC covers, so
     /// the image fails validation the way bit rot would. Returns the corrupted
     /// bytes as they were left on disk.
@@ -2432,7 +2628,8 @@ mod tests {
             .unwrap();
         drop(sm);
         let path = dir.0.join("state.json");
-        let mut image = read_image(&mut File::open(&path).unwrap()).unwrap();
+        let fs = OsFs::new(&dir.0).unwrap();
+        let mut image = read_image(&fs.open_rw("state.json", false).unwrap()).unwrap();
         image.current_snapshot.as_mut().unwrap().version += 1;
         let bytes = image_bytes(&image).unwrap();
         fs::write(&path, &bytes).unwrap();
