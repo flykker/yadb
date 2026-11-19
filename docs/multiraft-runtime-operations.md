@@ -302,11 +302,19 @@ pool-scrub` cannot express that distinction — it prints the body and exits `1`
 on any non-`200` — so a scripted scrub must inspect `repair_error` rather than
 the exit status.
 
-Three limits stay stated. `block_pool_lookup` comes from the local control-plane
-cache, so a stale cache can make a pass skip a blob; it never repairs or deletes
-the wrong one. A blob published after the snapshot is not repaired by that pass
-— repair is idempotent, not atomic with publication. A group leader dying
-between a fragment write and its manifest commit still has no drill.
+Two repair limits stay stated. A blob published after the snapshot is not
+repaired by that pass — repair is idempotent, not atomic with publication. A
+group leader dying between a fragment write and its manifest commit still has no
+drill.
+
+The volume-to-pool map is no longer a limit: the pass takes it from a control
+snapshot proved against the control group's quorum
+(`AppState::control_for_collection`), not from this node's cache, and refuses —
+`409` from `POST /v1/pools/gc`, a `repair_error` from scrub — when no snapshot
+can be confirmed. The narrower limit that remains is that the map is the control
+group's confirmed applied state, so a volume created after it is not seen by that
+pass, and a node that cannot reach the control group's quorum refuses to collect
+even the groups it leads.
 
 The upload-intent grace is a per-engine knob,
 `ObjectStoreEngine::set_intent_grace_secs`, default 300 s (unchanged) and

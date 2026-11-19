@@ -509,6 +509,33 @@ impl AppState {
         Ok(cp)
     }
 
+    /// The control-plane snapshot a repair or collection pass is allowed to use.
+    ///
+    /// Such a pass needs the control plane for exactly one thing: the
+    /// `project/volume` to pool map that turns a BlockVolume extent map into
+    /// live fragments (`gc::mark_snapshot`). Reading it from this node's local
+    /// cache is what the pass used to do, and a stale map is not harmless: a
+    /// volume remapped to another pool would make the pass mark the *wrong*
+    /// pool's fragments live and collect the real ones. So the map comes from a
+    /// snapshot this node has proved against the control group's quorum, and a
+    /// pass that cannot obtain that proof refuses rather than scanning with an
+    /// unproven map.
+    ///
+    /// Legacy metadata has no quorum to prove and its cache *is* the authority,
+    /// so it is returned unchanged.
+    fn control_for_collection(&self) -> Result<ControlPlaneState, String> {
+        if !self.meta.is_openraft() {
+            return Ok(self.control.read().unwrap().clone());
+        }
+        match self.control_for_authorization() {
+            Ok(control) => Ok(control.clone()),
+            Err(error) => Err(format!(
+                "the control-plane snapshot a pass needs for its volume-to-pool \
+                 map is unavailable ({error}); nothing was scanned or collected"
+            )),
+        }
+    }
+
     /// Run the blocking refresh path off the async runtime. A panic or runtime
     /// shutdown is not treated as freshness: the caller re-checks the lease and
     /// fails closed if it is still expired.
@@ -880,8 +907,19 @@ impl AppState {
     /// Collection runs on both metadata runtimes. On Multi-Raft the pass is
     /// per metadata group and refuses a group whose leadership, leases or
     /// storage fence cannot be proved; a refusal is reported, never swallowed.
+    /// The volume-to-pool map it marks against comes from a control snapshot
+    /// proved against the control group's quorum, so a pass that cannot obtain
+    /// that proof refuses the whole run instead of sweeping on this node's cache
+    /// ([`Self::control_for_collection`]).
     fn gc_all_pools(&self) -> gc::SweepOutcome {
-        let control = self.control.read().unwrap().clone();
+        // The volume-to-pool map this pass uses is taken from a proven control
+        // snapshot, not from the local cache; see `control_for_collection`.
+        let control = match self.control_for_collection() {
+            Ok(control) => control,
+            Err(reason) => {
+                return gc::SweepOutcome::refuse(format!("collection refused: {reason}"))
+            }
+        };
         let pools = self.pools.read().unwrap().clone();
         gc::sweep(&self.meta, &pools, &control)
     }
@@ -931,9 +969,27 @@ impl AppState {
             // A group this node does not lead, or one whose quorum does not
             // answer, is refused and named; it does not stop another group's
             // pass. There is no fallback to locally applied state.
+            //
+            // The pass needs the control plane's volume-to-pool map, and a stale
+            // map is not merely conservative: it can name the wrong pool for a
+            // volume, which would mark the wrong fragments live and collect the
+            // real ones. It is therefore taken from a snapshot proved fresh
+            // against the control group's quorum, and the pass refuses before
+            // touching any group when that proof is unavailable. See
+            // `control_for_collection`.
+            let control = match self.control_for_collection() {
+                Ok(control) => control,
+                Err(reason) => {
+                    let summary = ScrubSummary {
+                        repair_error: Some(format!("repair scan refused: {reason}")),
+                        ..ScrubSummary::default()
+                    };
+                    *self.last_scrub.write().unwrap() = Some(summary.clone());
+                    return summary;
+                }
+            };
             let (orphan_blobs_collected, orphan_collection_error) =
                 self.collect_orphans_per_group();
-            let control = self.control.read().unwrap().clone();
             let pools = self.pools.read().unwrap().clone();
             let repair = gc::repair_scan_groups(&self.meta, &pools, &control);
             let sweep_outcome = if sweep {
@@ -10900,6 +10956,113 @@ mod raft_status_tests {
         assert!(
             !refusal.contains("group 2 refused"),
             "group 2 has no live record, so its pass must not refuse: {refusal}"
+        );
+
+        drop(st);
+        for raft in rafts {
+            let _ = raft.shutdown().await;
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A collection pass reads the volume-to-pool map from a control snapshot
+    /// this node has proved against the control group's quorum, never from its
+    /// local cache.
+    ///
+    /// The map decides which pool's fragments are *live* for a BlockVolume
+    /// extent map. A stale map is not merely conservative: after a volume is
+    /// remapped, the stale map marks the old pool live and the new pool's
+    /// fragments garbage, so a pass running on the cache can delete data that is
+    /// still referenced. That is why the cache is not an input at all, and why
+    /// the pass refuses when no snapshot can be confirmed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_collection_pass_reads_the_control_map_from_a_confirmed_snapshot() {
+        use yadb_control::{BlockVolumeSpec, ProjectQuotas, ProjectSpec};
+
+        let (st, dir, rafts) = multigroup_state("collection-control").await;
+
+        let authoritative = |pool: &str, generation: u64| {
+            let mut cp = ControlPlaneState::new();
+            cp.generation = generation;
+            cp.next_project_id = 2;
+            cp.projects.insert(
+                "acme".into(),
+                (
+                    1,
+                    ProjectSpec {
+                        quotas: ProjectQuotas::default(),
+                        members: vec![],
+                    },
+                ),
+            );
+            cp.block_volumes.insert(
+                "acme/vol".into(),
+                BlockVolumeSpec {
+                    pool: pool.into(),
+                    size_bytes: 1 << 20,
+                },
+            );
+            cp
+        };
+
+        // The cache holds an older map, as a node that stayed up across a
+        // remap would. Nothing marks it stale.
+        *st.control.write().unwrap() = authoritative("pool-old", 1);
+        // The control group's map names another pool.
+        st.meta
+            .execute(KvCommand::Put {
+                key: CONTROL_STATE_KEY.into(),
+                value: serde_json::to_vec(&authoritative("pool-new", 2)).unwrap(),
+            })
+            .unwrap();
+
+        // The pass is handed the group's map, not the cached one, and the cache
+        // is replaced by the snapshot that confirmed it: a request that later
+        // observes a fresh lease must also observe this map.
+        let seen = st
+            .control_for_collection()
+            .expect("a reachable control group must confirm its snapshot");
+        assert_eq!(seen.generation, 2);
+        assert_eq!(seen.block_volumes["acme/vol"].pool, "pool-new");
+        assert_eq!(st.control.read().unwrap().generation, 2);
+
+        // With no image this node can act on, both passes refuse instead of
+        // falling back to the cache, and neither deletes anything. This is the
+        // inversion: the same cache is present and complete in both halves, so
+        // the refusal follows the missing proof, not the map's content.
+        st.meta
+            .execute(KvCommand::Delete {
+                key: CONTROL_STATE_KEY.into(),
+            })
+            .unwrap();
+        st.control_freshness.lock().unwrap().invalidate();
+        let error = st
+            .control_for_collection()
+            .expect_err("an empty control plane is not a proven map");
+        assert!(error.contains("nothing was scanned or collected"), "{error}");
+
+        let outcome = st.gc_all_pools();
+        assert_eq!(outcome.fragments_deleted, 0, "{outcome:?}");
+        let refusal = outcome
+            .refusal
+            .expect("a collection pass without a proven map must refuse");
+        assert!(
+            refusal.contains("nothing was scanned or collected"),
+            "{refusal}"
+        );
+
+        let summary = st.scrub_all_pools(true);
+        assert_eq!(summary.fragments_deleted, 0, "{summary:?}");
+        let reason = summary
+            .repair_error
+            .expect("a repair scan without a proven map must refuse");
+        assert!(
+            reason.contains("nothing was scanned or collected"),
+            "{reason}"
+        );
+        assert!(
+            st.last_scrub.read().unwrap().is_some(),
+            "a refused pass is recorded, not silently dropped"
         );
 
         drop(st);

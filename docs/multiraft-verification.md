@@ -2007,12 +2007,21 @@ summary body — the rule `/v1/pools/gc` already uses. On a multi-node cluster a
 node leads only some data groups, so its scrub is `409` and names the groups it
 does not lead while repairing the ones it does lead.
 
-Three repair limits stay stated. `block_pool_lookup` comes from the local
-control-plane cache, not from the group snapshot, so a stale cache can make a
-pass skip a blob; it never makes a pass repair or delete the wrong one. A blob
-published after the snapshot is not repaired by that pass; repair is idempotent,
-not atomic with publication. A group leader dying between a fragment write and
-its manifest commit still has no drill.
+Two repair limits stay stated. A blob published after the snapshot is not
+repaired by that pass; repair is idempotent, not atomic with publication. A
+group leader dying between a fragment write and its manifest commit still has no
+drill.
+
+The volume-to-pool map is no longer one of them. `block_pool_lookup` used to be
+read from this node's local control-plane cache; a pass now takes it only from a
+control snapshot proved against the control group's quorum
+(`AppState::control_for_collection`) and refuses, deleting nothing, when that
+proof is unavailable — `409` from `POST /v1/pools/gc` and a `repair_error` from
+scrub. `a_collection_pass_reads_the_control_map_from_a_confirmed_snapshot` in
+`crates/yadbd/src/main.rs` proves both halves. The narrower limit that remains is
+that the map is the control group's confirmed applied state: a volume created
+after that snapshot is not seen by that pass, and a node that cannot reach the
+control group's quorum refuses to collect even the groups it leads.
 
 The upload-intent grace is a per-engine knob,
 `ObjectStoreEngine::set_intent_grace_secs`, default 300 s (unchanged) and

@@ -105,10 +105,22 @@ These stay unproven, and the text below must not be read as proving them:
   record block a pass and then expire with no read in flight, not a read that
   outlived its lease;
 * two concurrent collectors on one group;
-* a group leader dying between a fragment write and its manifest commit;
-* `block_pool_lookup` resolving through the local control-plane cache rather
-  than the group snapshot: a stale cache can make the pass skip a blob, and can
-  never make it repair or delete the wrong one.
+* a group leader dying between a fragment write and its manifest commit.
+
+`block_pool_lookup` used to be on this list: the pass read the
+`project/volume` to pool map from this node's local control-plane cache rather
+than from a snapshot of the control group, so a stale map could name the wrong
+pool for a volume. A pass now takes that map only from a control snapshot this
+node has proved against the control group's quorum (`AppState::control_for_collection`),
+and refuses before touching any group when that proof is unavailable — `409`
+from `POST /v1/pools/gc`, a `repair_error` from scrub — instead of sweeping on
+an unproven map. `a_collection_pass_reads_the_control_map_from_a_confirmed_snapshot`
+proves both halves: a pass is handed the control group's newer map while the
+cache still holds the old one, and both routes refuse and delete nothing when no
+snapshot can be confirmed. The remaining limit is narrower: the map is the
+control group's confirmed applied state, so a volume created after that
+snapshot is not seen by that pass, and a node that cannot reach the control
+group's quorum now refuses to collect even the groups it leads.
 
 The two SKIPs were the only remaining record of a capability the runtime does
 not have. They are not removed by deletion: either the capability is
@@ -225,10 +237,14 @@ in the repair path crosses groups.
 
 ### What this still does not prove
 
-* `block_pool_lookup` comes from the local control-plane cache, not from the
-  group snapshot. A stale cache makes the pass skip a blob; it can never make
-  it repair or delete the wrong one. The code says this instead of implying
-  the whole pass is quorum-derived.
+* The volume-to-pool map is now taken from a control snapshot this node has
+  proved against the control group's quorum, not from the local cache, so a
+  stale cache can no longer name the wrong pool for a volume
+  (`AppState::control_for_collection`, proven by
+  `a_collection_pass_reads_the_control_map_from_a_confirmed_snapshot`). What
+  remains is that the snapshot is the control group's confirmed applied state:
+  a volume created after it is not seen by that pass, and a node that cannot
+  reach the control group's quorum refuses to collect at all.
 * A blob published after the snapshot is not repaired by that pass; the next
   pass sees it. Repair is idempotent, not atomic with publication.
 * There is still no drill for a group leader dying between a fragment write and

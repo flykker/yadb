@@ -3221,7 +3221,10 @@ mod tests {
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn manual_gc_route_sweeps_and_scrub_repairs_per_group() {
-            let f = multigroup("refuse-routes").await;
+            let mut f = multigroup("refuse-routes").await;
+            // A control image that has been applied is not generation 0; the
+            // pass refuses to act on an unapplied image.
+            f.control.generation = 1;
             let engine = f.engine();
             write_generations(&engine, 1, 0);
             let meta = f.meta.clone();
@@ -3244,6 +3247,15 @@ mod tests {
                 db: yadb_db::DatabaseEngine::new(meta.clone(), 100),
                 block: BlockVolumeEngine::new(meta, BLOCK_SIZE),
             };
+            // A repair or collection pass may use the control plane only while
+            // this node holds a confirmed snapshot of it, because the
+            // volume-to-pool map decides which fragments are live
+            // (`AppState::control_for_collection`). The fixture installs the
+            // snapshot and the lease it would have got from the writer path.
+            st.control_freshness
+                .lock()
+                .unwrap()
+                .accept_at(1, std::time::Instant::now(), std::time::Duration::from_secs(60));
             let mut headers = axum::http::HeaderMap::new();
             headers.insert("x-yadb-subject", "operator".parse().unwrap());
             headers.insert(

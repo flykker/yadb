@@ -727,10 +727,14 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   lease in the middle of a pass - the daemon has no injection point for the
   latter, and the storage-level drills cover it instead. The repair scan is no
   longer refused: it runs per group on the same boundary as the sweep, because a
-  group's quorum-confirmed snapshot is complete for that group's blobs. What
-  that does not cover is the local control-plane cache behind
-  `block_pool_lookup`: a stale cache can make the pass skip a blob, and cannot
-  make it repair or delete the wrong one.
+  group's quorum-confirmed snapshot is complete for that group's blobs. The
+  volume-to-pool map behind `block_pool_lookup` is now read from a control
+  snapshot proved against the control group's quorum, not from this node's cache
+  (`AppState::control_for_collection`), and a pass refuses before touching any
+  group when that proof is unavailable. The remaining limit is narrower: the map
+  is the control group's confirmed applied state, so a volume created after it is
+  not seen by that pass, and a node that cannot reach the control group's quorum
+  refuses to collect even the groups it leads.
 
   The per-group design, from the read-only analysis of the primitives, is now
   implemented and runs:
