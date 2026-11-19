@@ -615,17 +615,17 @@ pub async fn handle(State(st): State<S3State>, request: Request) -> Response {
                 }
                 return map_error(response).await;
             }
-            // A legacy read is fenced by a reader lease, and only the
-            // metadata leader can publish one. A follower therefore forwards
-            // the request it has already authenticated, together with the
-            // `Range` and conditional headers, to the leader's gateway. The
-            // leader decides existence, `If-Match`/`If-None-Match`, the range
-            // and the 16 MiB rule from the one manifest it reads under its
-            // lease, so a follower's lagging metadata cannot refuse or
-            // mis-slice a read the leader can serve. On the leader this returns
-            // `None` and the read runs locally under the lease taken below.
-            // HEAD reads no fragments, so it needs no fence and stays local.
-            if method == Method::GET && !st.app.meta.is_openraft() {
+            // Every GET is fenced by a reader lease, and only the metadata
+            // group leader can publish one. A follower therefore forwards the
+            // request it has already authenticated, together with the `Range`
+            // and conditional headers, to the leader's gateway. The leader
+            // decides existence, `If-Match`/`If-None-Match`, the range and the
+            // 16 MiB rule from the one manifest it reads under its lease, so a
+            // follower's lagging metadata cannot refuse or mis-slice a read the
+            // leader can serve. On the leader this returns `None` and the read
+            // runs locally under the lease taken below. HEAD reads no
+            // fragments, so it needs no fence and stays local.
+            if method == Method::GET {
                 let mut forwarded = gateway_headers.clone();
                 if let Some(secret) = st.app.subject_secret.as_deref() {
                     match subject_signature(secret, &subject).parse() {
@@ -680,7 +680,7 @@ pub async fn handle(State(st): State<S3State>, request: Request) -> Response {
             let store = st.store.clone();
             let b = bucket.to_string();
             let k = key.to_string();
-            let mut read_lease = if method == Method::GET && !st.app.meta.is_openraft() {
+            let mut read_lease = if method == Method::GET {
                 let app = st.app.clone();
                 match tokio::task::spawn_blocking(move || app.begin_read_lease(pid)).await {
                     Ok(Ok(lease)) => Some(lease),
@@ -695,9 +695,9 @@ pub async fn handle(State(st): State<S3State>, request: Request) -> Response {
             } else {
                 None
             };
-            // The legacy lease covers both the manifest read and chunk fetch;
-            // OpenRaft does not need this fence because its collection path is
-            // not raced by the legacy collector.
+            // The lease covers both the manifest read and the chunk fetch, in
+            // both metadata modes: the collector consults the same group-scoped
+            // reader records on Multi-Raft.
             let head =
                 match tokio::task::spawn_blocking(move || engine.head_object(pid, &store, &b, &k))
                     .await
