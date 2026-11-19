@@ -419,7 +419,11 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   `UploadPartCopy`. Orphan blob collection runs per metadata group (see the
   GC item below); aborted or expired upload fragments are reclaimed by the
   group that owns the project, and a node that does not lead that group reports
-  it instead of collecting from a lagging view.
+  it instead of collecting from a lagging view. An abandoned intent becomes
+  collectable only after the intent grace, now the per-engine knob
+  `ObjectStoreEngine::set_intent_grace_secs` (default 300 s, unchanged, and
+  provisioned to 1 s only by the harness so the collection and its inversion
+  can be drilled).
 - [x] Garbage collection on the legacy metadata runtime. `POST /v1/pools/gc`
   runs one bounded mark-and-sweep pass, and `POST /v1/pools/scrub` runs the same
   pass after its repair scan; the leader's periodic repair scan runs the sweep
@@ -669,8 +673,16 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   lease `/gc/g<group>/collector` and writer leases `/gc/g<group>/writer/<id>`.
   `POST /v1/pools/gc` answers `200` when every group and pool completed, and
   `409` with `gc_refusal` naming any that refused; the sweep inside
-  `POST /v1/pools/scrub` runs the same pass, while the scrub route always
-  answers `409` on Multi-Raft because its repair scan refuses. A group whose leadership, leases or storage fence cannot
+  `POST /v1/pools/scrub` runs the same pass, after a per-group repair scan.
+  `repair_scan_groups` takes one quorum-confirmed snapshot per group over
+  `/db/`, `/s3/` and `/block/`, builds that group's live set from the snapshot
+  only, and repairs each live blob through `repair_blob`; `repair_error` is
+  `None` when every group ran and otherwise names the refused groups. The scrub
+  route answers `200` only when `repair_error` and `gc_refusal` are both `None`,
+  and `409` otherwise - the `/v1/pools/gc` rule. On a multi-node cluster a node
+  leads only some groups, so its scrub is `409` while the groups it leads are
+  repaired; that is the expected shape, not a missing capability. A group whose
+  leadership, leases or storage fence cannot
   be proved is named in `gc_groups_refused` and deletes nothing; a pool whose
   epoch advance is refused is named in `gc_pools_refused` and deletes nothing.
   Four live drills in `tests/protocols.py` cover a live reader pin, a superseded
@@ -700,9 +712,12 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   shared Raft token, which is only reachable on the internal listener), and no
   drill runs two collectors concurrently on one group or expires a collector
   lease in the middle of a pass - the daemon has no injection point for the
-  latter, and the storage-level drills cover it instead. The repair scan is
-  still refused, because it needs one whole-deployment view; orphan blob
-  collection does not and runs per group.
+  latter, and the storage-level drills cover it instead. The repair scan is no
+  longer refused: it runs per group on the same boundary as the sweep, because a
+  group's quorum-confirmed snapshot is complete for that group's blobs. What
+  that does not cover is the local control-plane cache behind
+  `block_pool_lookup`: a stale cache can make the pass skip a blob, and cannot
+  make it repair or delete the wrong one.
 
   The per-group design, from the read-only analysis of the primitives, is now
   implemented and runs:
@@ -746,6 +761,24 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
     between fragment write and manifest commit and proves nothing is reclaimed.
     The first two are done. The third is not: no drill kills a group leader
     between a fragment write and its manifest commit.
+
+- [ ] Orphan blob collection refuses a scope whose `project_ids` is `None`.
+  `collect_orphans_in_scopes_with` enumerates a group's projects before it
+  collects, so a group that covers every project - a single-group Multi-Raft
+  deployment - has no enumerable project set and is refused with
+  `NamespaceScanUnavailable`. The refusal is deliberate: collecting from a
+  partial project list would leave the unlisted projects' orphans behind while
+  reporting a completed pass, so the gap is "cannot collect", not "collects
+  wrongly". The repair pass does **not** inherit the guard: `repair_scan_groups`
+  is prefix-scoped over `/db/`, `/s3/` and `/block/` and never enumerates
+  projects, so the same deployment repairs normally while orphan collection
+  over it still refuses. That asymmetry is why this is its own item rather than
+  a note on the repair scan. Closing it needs an enumeration that is complete
+  without a project list - a prefix walk that does not assume the scope is a
+  subset of a known project set - or an explicit all-projects scope in the
+  deployment manifest; until then the refusal is the honest answer. A unit test
+  pins the refusal; no live drill exercises the single-group shape and no run
+  has collected orphans from a `project_ids == None` scope.
 
 Backup and restore are **out of scope by owner decision**, not an oversight: no
 command, artifact format, fence or validator exists, and none is planned. A lost

@@ -18,10 +18,15 @@ pass now advances first").
 
 Multi-Raft mark-and-sweep runs: `POST /v1/pools/gc` calls `sweep`, which routes
 to `sweep_groups`, one leader-only pass per data group, reaching all of the
-above; the route answers `409` only when a group or pool refused. `POST /v1/pools/scrub` still answers `409`, but only because its
-repair scan needs one whole-deployment view; its collection half runs. What the
-plan does not yet establish is a collector lease expiring mid-pass at cluster
-level, which the daemon cannot inject.
+above; the route answers `409` only when a group or pool refused.
+`POST /v1/pools/scrub` runs a per-group repair scan and then the same sweep. It
+answers `200` only when `repair_error` and `gc_refusal` are both `None`, and
+`409` otherwise - the `/v1/pools/gc` rule. A node leads only some groups on a
+multi-node cluster, so its scrub is `409` while the groups it leads are
+repaired; the refusal names the groups rather than a missing capability. The
+repair pass takes no collector lease (see "The repair pass takes no collector
+lease"); what the plan does not yet establish is a collector lease expiring
+mid-pass at cluster level, which the daemon cannot inject.
 
 ## Why the current refusal exists
 
@@ -240,7 +245,8 @@ What it does **not** establish, and why the invariant still does not hold:
   routes to `sweep_groups` on Multi-Raft. The unfenced `delete` remains callable
   from any caller that has a `PoolSlot`.
 * GC runs on Multi-Raft (`/v1/pools/gc`; `409` only when a group or pool
-  refuses); scrub's repair half still refuses (`409`). Three of the four live
+  refuses), and scrub runs the per-group repair scan and then the same sweep,
+  answering `200` only when neither refused. Three of the four live
   drills in "What would prove it" run at cluster level; the fourth is not
   injectable there.
 * `crates/yadb-blob/tests/epoch_fence_drills.rs` is the storage-side precursor
@@ -322,6 +328,58 @@ is the first statement), not observed as a write sequence; no test has a
 concurrent reader fetching while a pass runs; and no drill runs two collectors on
 one group. The provenance check does have a runtime caller now: `sweep_groups`
 runs it on Multi-Raft.
+
+## The repair pass takes no collector lease
+
+`repair_scan_groups` takes no collector lease and publishes no lease of its own.
+It advances no epoch and never calls `delete_collectable`; the only pin in its
+path is the one `read_part` takes around each candidate fetch, exactly as a
+client read does. It is not fenced by the collector lease, and nothing here
+should be read as saying it is. What makes it safe next to the collection fence
+is narrower and structural:
+
+* **It reads under the same target-side fence as any client.** Every candidate
+  part is fetched through `read_part`, which reads the slot's epoch and pins it
+  before the fetch. A slot that refuses the pin stops the repair instead of
+  being treated as a missing part, so repair never reads bytes a collector is
+  reclaiming, and it never reconstructs a part it could not prove missing.
+* **Its only deletion is a duplicate.** For each part, repair writes the bytes
+  to the part's nominal slot and, only after that `put` succeeded, removes the
+  handoff copy. The deleted fragment is the same part id that is already durable
+  at its nominal slot, so the delete can only take redundancy from two copies to
+  one - never the last good copy. The delete is the unfenced `delete`, its
+  result is ignored, and a collector that removed the handoff copy first is
+  indistinguishable from success: the object still reads back, and the next pass
+  retries whatever is left. This is assimilation, not collection.
+* **It cannot resurrect a blob a collector removed.** A tombstoned id refuses
+  the nominal write, so the handoff delete is not reached; and a blob whose
+  manifest the group's snapshot does not name is never handed to `repair_blob`
+  at all.
+* **It needs no lease because it has no append-then-publish window.** A writer
+  holds a writer lease between the fragment append and the publication that
+  names it, because a mark taken before that publication would omit the blob. A
+  repair writes fragments only for blobs that are *already published* in the
+  quorum-confirmed snapshot of the group that owns them. `sweep_group` checks the
+  writer fence and only then takes the group's collector lease before it marks,
+  so a concurrent pass either sees the publication's writer lease live and
+  refuses, or has already closed admission - and a publication attempted after
+  that loses its CAS on the collector record and is refused. A blob repair can
+  see is therefore in every mark a concurrent pass can compute, and the repaired
+  fragments are named live rather than swept. The worst case runs the other way:
+  the manifest is deleted after repair's snapshot, so the next mark omits the
+  blob and collects the fragments repair just wrote - deleting more, not less.
+
+Two repair passes over one group are also safe without coordination: the write
+target is a deterministic nominal slot for a content-addressed part, so the
+writes are identical and the handoff deletes are idempotent.
+
+What this does not establish: no drill runs a repair pass concurrently with a
+sweep, so the interleavings above are reasoned from the ordering of the
+statements, not observed; and no drill runs two repair passes on one group at
+once. The handoff delete is unfenced by design, so "repair cannot delete a
+fragment a live pin protects" is not a claim this plan makes - the claim is only
+that the fragment it deletes is a duplicate of one already durable at the
+nominal slot.
 
 ## Why the reader lease is not the next increment
 
