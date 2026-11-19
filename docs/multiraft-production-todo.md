@@ -281,10 +281,21 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
 
 ## 1. Contracts and durable storage
 
-- [ ] Run the OpenRaft 0.9.25 storage suite on the actual adapters. Its test
-  harness requires `NodeId: From<u64>`, unlike YADB's `u32`; adapt the harness
-  without changing production semantics or implement and document equivalent
-  coverage with a case-by-case mapping. Do not claim suite compliance otherwise.
+- [x] Run the OpenRaft 0.9.25 storage suite on the actual adapters. Its test
+  harness requires `NodeId: From<u64>`, unlike YADB's `u32`, so the harness is
+  adapted rather than run unmodified, which is the second branch the item
+  allowed: documented equivalent coverage with a case-by-case mapping.
+  `scripts/test_openraft_suite_mapping.py` machine-checks all 35 upstream
+  `Suite::test_store` cases against the adapted functions, pins the case order
+  and set, pins `Cargo.lock` to `openraft 0.9.25`, and records every upstream
+  assertion that is not observed verbatim together with the reason. It fails
+  when the upstream case set changes, a mapped function disappears, a case stops
+  being run, one adapted function stands for two cases, or an unchanged case
+  loses an assertion. Two adapted cases were strengthened while building the
+  mapping: `get_initial_state_without_init` now asserts the public `committed`
+  and `server_state` fields, and `get_initial_state_last_log_lt_sm` asserts the
+  public `committed` value instead of only the purge side effect. This is
+  documented equivalent coverage, not suite compliance.
 - [ ] Audit vote, append, truncation, purge, callback ordering, concurrent readers,
   restart and bounds against OpenRaft contracts; test each boundary and replay.
 - [ ] Bound memory, disk growth, startup replay and snapshot reception; introduce
@@ -1165,10 +1176,13 @@ in a fresh store and passes; this is an additional setup substitution, not proof
 of equivalence to the unmodified case. The full workspace run passed with it.
 The harness reconstructs the key-log-ID view from public storage methods rather
 than inspecting OpenRaft's private cache; the recovery test for a state machine
-ahead of the log checks the purge side effect rather than private `RaftState`
-fields; and `last_applied_state` inserts a blank entry to avoid an apply gap.
-These substitutions do not demonstrate equivalent coverage of the private
-state assertions. Purged-prefix append behavior and conflicting boundary
+ahead of the log checks the public `committed` field and the purge side effect
+rather than private `RaftState` fields; and `last_applied_state` inserts a blank
+entry to avoid an apply gap. `scripts/test_openraft_suite_mapping.py` records
+each substitution and fails when an unchanged case loses an assertion, so a
+mapped case cannot silently lose coverage; it does not turn a substitution into
+proof of the private assertion it replaced, so these differences remain open as
+contract questions. Purged-prefix append behavior and conflicting boundary
 identities require explicit contract reconciliation and regression coverage,
 not a production-readiness claim.
 
@@ -1206,9 +1220,9 @@ claimed to reproduce inaccessible upstream internal assertions.
 | `delete_logs_since_0/11`, `append_to_log` | `contract_truncate_and_append_after_purge_survive_reopen` |
 | `save_vote`, parts of `get_log_entries` | `contract_vote_and_range_reads_survive_reopen` |
 | Membership scans and `get_membership_*` | Adapted suite retains observable membership assertions; numeric node-ID construction and blocking append helper differ |
-| `get_initial_state_without_init` | Replaces whole private `RaftState` equality with public vote, membership, snapshot and store log/purge observations; private fields remain uncovered |
-| `get_initial_state_with_state`, `get_initial_state_last_log_gt_sm` | Checks store log state and state-machine applied state instead of private recovered-state log/commit fields; not equivalent private-cache evidence |
-| `get_initial_state_last_log_lt_sm` | Checks recovery's purge side effect and retained suffix rather than private recovered-state last-log value |
+| `get_initial_state_without_init` | Replaces whole private `RaftState` equality with every observable public field (vote, `committed`, server state, membership, snapshot) plus the store's empty log/purge state; the remaining private fields are uncovered |
+| `get_initial_state_with_state`, `get_initial_state_last_log_gt_sm` | Checks the public `committed` field and store log state instead of the private recovered-state log cache; not equivalent private-cache evidence |
+| `get_initial_state_last_log_lt_sm` | Checks the public `committed` field (which holds the private last-log value here), the purge side effect and the retained suffix rather than the private cache accessor |
 | `get_initial_state_membership_from_log_and_sm` | Moves the initial empty-log recovery to a fresh store so that its purge does not precede the later below-boundary append; sequential setup differs |
 | `get_initial_state_log_ids` | Reconstructs key log IDs from public reads; does not inspect OpenRaft's internal cache |
 | `get_initial_state_re_apply_committed` | Retains applied-state observation but replaces private `io_applied` assertion; the no-op committed-persistence default also limits this case's coverage |
@@ -1216,6 +1230,9 @@ claimed to reproduce inaccessible upstream internal assertions.
 | `last_applied_state` | Adds blank index 4 before index 5 to satisfy this adapter's consecutive-apply rule; input differs |
 
 The direct contract tests above add reopen checks but do not close these private-
-state and changed-input differences. Full equivalence requires preserving the
-original assertions through an appropriate upstream harness or proving and testing
-each replacement independently; a green adapted runner alone is insufficient.
+state and changed-input differences. `scripts/test_openraft_suite_mapping.py`
+machine-checks the case-by-case mapping, the substitutions and every assertion
+that is not observed verbatim, so a mapped case cannot silently lose coverage.
+Full equivalence requires preserving the original assertions through an
+appropriate upstream harness or proving and testing each replacement
+independently; a green adapted runner alone is insufficient.

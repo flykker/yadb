@@ -474,6 +474,9 @@ cargo test --offline --locked -p yadb-metakv openraft_tls::tests -- --nocapture
 
 The suite adapter uses public-state substitutions and one modified apply input.
 Passing it is not equivalent to passing every unmodified upstream assertion.
+`scripts/test_openraft_suite_mapping.py` machine-checks the case-by-case mapping
+and every assertion that is not observed verbatim, and fails when an unchanged
+case loses one; it records the substitutions, it does not prove them equivalent.
 Treat any failing suite case as a failing regression until the exact contract and
 adapter difference are explained and covered; do not silently skip the case.
 
@@ -488,7 +491,8 @@ adapter difference are explained and covered; do not silently skip the case.
   rerun, superseded by the later full gates described above.
 * The adapted suite pass includes additional recovery-setup substitutions after
   enforcing rejection of appends into a purged prefix. This is still not an
-  upstream-equivalence claim; retain the precise adaptation notes in its source.
+  upstream-equivalence claim; the precise adaptation notes live in its source
+  and in `scripts/test_openraft_suite_mapping.py`, which machine-checks them.
 
 These entries describe an intermediate dirty working tree, not a tagged release
 or final independent review. No OS/device power-loss qualification has run here.
