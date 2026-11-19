@@ -77,7 +77,20 @@ enum Command {
     /// Show distributed VDisk / StoragePool slot placement and online health across nodes
     PoolHealth,
     /// Run a deep CRC32 scrub & self-healing repair pass across all StoragePools
-    PoolScrub,
+    PoolScrub {
+        /// Signed subject used for the daemon's admin gate
+        #[arg(long, default_value = "yadbctl")]
+        subject: String,
+    },
+    /// Run a garbage-collection pass across all StoragePools on a live node
+    PoolGc {
+        /// Signed subject used for the daemon's admin gate
+        #[arg(long, default_value = "yadbctl")]
+        subject: String,
+        /// Print the daemon response verbatim
+        #[arg(long)]
+        json: bool,
+    },
     /// Verify local zero-hop RBAC authorization for a subject on a project
     AuthCheck {
         #[arg(long)]
@@ -291,6 +304,294 @@ fn resolve_request_scoped(
 fn resolve_success(code: u16, outcome: &str) -> bool {
     // Only definite answers are success; unknown must not be mistaken for a failed write.
     code == 200 && matches!(outcome, "committed" | "not_committed")
+}
+
+/// Which collection handler produced a response body.
+///
+/// The two bodies are not interchangeable: `/v1/pools/gc` returns
+/// `SweepOutcome` with `barriers_applied`, while `/v1/pools/scrub` returns
+/// `ScrubSummary`, which carries `refused_puts` and `repair_error` but not
+/// `barriers_applied`. A counter absent from the body is printed as `n/a`
+/// rather than invented.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CollectionCommand {
+    Gc,
+    Scrub,
+}
+
+impl CollectionCommand {
+    fn display_name(self) -> &'static str {
+        match self {
+            CollectionCommand::Gc => "Pool GC",
+            CollectionCommand::Scrub => "Pool scrub",
+        }
+    }
+
+    /// The field that names a refusal. Scrub's repair half reports groups it
+    /// could not scan in `repair_error`; GC uses `gc_refusal`. A scrub can also
+    /// answer 409 because its collection half refused, so `gc_refusal` is a
+    /// fallback there.
+    fn refusal_field(self) -> &'static str {
+        match self {
+            CollectionCommand::Gc => "gc_refusal",
+            CollectionCommand::Scrub => "repair_error",
+        }
+    }
+}
+
+/// What an operator should see for one collection response: the process exit
+/// code and the exact lines, in order.
+#[derive(Debug, PartialEq, Eq)]
+struct CollectionReport {
+    exit_code: i32,
+    lines: Vec<String>,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct CollectionCounters {
+    blobs_live: Option<u64>,
+    fragments_deleted: Option<u64>,
+    barriers_applied: Option<u64>,
+    leases_live: Option<u64>,
+    refused_puts: Option<u64>,
+    pools_refused: Vec<String>,
+    groups_refused: Vec<String>,
+}
+
+impl CollectionCounters {
+    fn line(&self, groups_refused: usize) -> String {
+        fn count(value: Option<u64>) -> String {
+            value
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "n/a".to_string())
+        }
+        format!(
+            "Counters: blobs live {}, fragments deleted {}, barriers applied {}, leases live {}, \
+             refused puts {}, pools refused {}, groups refused {}",
+            count(self.blobs_live),
+            count(self.fragments_deleted),
+            count(self.barriers_applied),
+            count(self.leases_live),
+            count(self.refused_puts),
+            self.pools_refused.len(),
+            groups_refused,
+        )
+    }
+}
+
+/// Read a collection response into an exit code and printable lines.
+///
+/// Three daemon shapes matter:
+///
+/// * `200` - the pass ran; print its counters and exit `0`.
+/// * `409` naming groups - this node leads only some metadata groups. The
+///   counters cover the groups it did run, so this is a partial pass: list the
+///   named groups, say the same command must run on their leaders, exit `2`.
+/// * `409` with no named groups and every counter zero - no group ran. When the
+///   refusal names the unavailable control-plane snapshot, say so and that the
+///   node must reach the control group's quorum; exit `1`.
+///
+/// Anything else is an error. A malformed body is reported, never guessed at
+/// and never allowed to panic.
+fn interpret_collection_response(
+    command: CollectionCommand,
+    status_code: u16,
+    body: &[u8],
+) -> CollectionReport {
+    let raw = String::from_utf8_lossy(body);
+    let raw = raw.trim_end();
+
+    if status_code != 200 && status_code != 409 {
+        return CollectionReport {
+            exit_code: 1,
+            lines: vec![format!(
+                "{} failed (HTTP {status_code}): {raw}",
+                command.display_name()
+            )],
+        };
+    }
+
+    let value: serde_json::Value = match serde_json::from_slice::<serde_json::Value>(body) {
+        Ok(value) if value.is_object() => value,
+        _ => {
+            return CollectionReport {
+                exit_code: 1,
+                lines: vec![format!(
+                    "Malformed {} response (HTTP {status_code}): {raw}",
+                    command.display_name()
+                )],
+            }
+        }
+    };
+
+    let counters = CollectionCounters {
+        blobs_live: value.get("blobs_live").and_then(|v| v.as_u64()),
+        fragments_deleted: value.get("fragments_deleted").and_then(|v| v.as_u64()),
+        barriers_applied: value.get("barriers_applied").and_then(|v| v.as_u64()),
+        leases_live: value.get("leases_live").and_then(|v| v.as_u64()),
+        refused_puts: value.get("refused_puts").and_then(|v| v.as_u64()),
+        pools_refused: string_array(&value, "gc_pools_refused"),
+        groups_refused: string_array(&value, "gc_groups_refused"),
+    };
+
+    let mut refusal = value
+        .get(command.refusal_field())
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    if command == CollectionCommand::Scrub && refusal.is_none() {
+        refusal = value
+            .get("gc_refusal")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+    }
+
+    if status_code == 200 {
+        return CollectionReport {
+            exit_code: 0,
+            lines: vec![
+                format!("{} completed.", command.display_name()),
+                counters.line(counters.groups_refused.len()),
+            ],
+        };
+    }
+
+    // 409. Named groups mean the pass ran for the groups this node leads; that
+    // is a partial result, not a failed pass.
+    let mut named = group_ids_in(refusal.as_deref().unwrap_or(""));
+    for entry in &counters.groups_refused {
+        for id in group_ids_in(entry) {
+            if !named.contains(&id) {
+                named.push(id);
+            }
+        }
+    }
+
+    if !named.is_empty() {
+        let mut lines = vec![
+            format!(
+                "{} partially completed: {} metadata group(s) were refused.",
+                command.display_name(),
+                named.len()
+            ),
+            counters.line(named.len()),
+            format!("Refused groups: {}", named.join(", ")),
+            "Run the same command on the leader of each named group; the counters above cover only \
+             the groups this node leads."
+                .to_string(),
+        ];
+        if let Some(reason) = &refusal {
+            lines.push(format!("Daemon refusal: {reason}"));
+        }
+        return CollectionReport {
+            exit_code: 2,
+            lines,
+        };
+    }
+
+    // No group was named. If every counter is zero, nothing ran: this is the
+    // whole-pass refusal, distinct from a partial pass.
+    let nothing_ran = counters.blobs_live.unwrap_or(0) == 0
+        && counters.fragments_deleted.unwrap_or(0) == 0
+        && counters.barriers_applied.unwrap_or(0) == 0
+        && counters.leases_live.unwrap_or(0) == 0
+        && counters.refused_puts.unwrap_or(0) == 0
+        && counters.pools_refused.is_empty()
+        && counters.groups_refused.is_empty();
+
+    let reason = refusal.as_deref().unwrap_or("no reason given");
+    if nothing_ran && reason.contains("control-plane snapshot") {
+        return CollectionReport {
+            exit_code: 1,
+            lines: vec![
+                format!(
+                    "{}: nothing was scanned or collected.",
+                    command.display_name()
+                ),
+                "The control-plane snapshot the pass needs for its volume-to-pool map is \
+                 unavailable; the node must reach the control group's quorum before running this \
+                 command again."
+                    .to_string(),
+                counters.line(0),
+                format!("Daemon refusal: {reason}"),
+            ],
+        };
+    }
+
+    if nothing_ran {
+        return CollectionReport {
+            exit_code: 1,
+            lines: vec![
+                format!(
+                    "{}: nothing was scanned or collected.",
+                    command.display_name()
+                ),
+                format!("Daemon refusal: {reason}"),
+                counters.line(0),
+            ],
+        };
+    }
+
+    // Counters moved but the daemon named no group. Do not report success: the
+    // pass refused something, and the counters cover only what did run.
+    CollectionReport {
+        exit_code: 2,
+        lines: vec![
+            format!("{} partially completed: the daemon refused part of the pass.", command.display_name()),
+            counters.line(counters.groups_refused.len()),
+            "The daemon did not name the refused groups; inspect its body before assuming the pass \
+             is complete."
+                .to_string(),
+            format!("Daemon refusal: {reason}"),
+        ],
+    }
+}
+
+fn string_array(value: &serde_json::Value, field: &str) -> Vec<String> {
+    value
+        .get(field)
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Group ids in text the daemon writes as `group {id} refused: ...`.
+fn group_ids_in(text: &str) -> Vec<String> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i + 6 <= bytes.len() {
+        if &bytes[i..i + 6] == b"group " {
+            let start = i + 6;
+            let mut end = start;
+            while end < bytes.len() && bytes[end].is_ascii_digit() {
+                end += 1;
+            }
+            if end > start && bytes[end..].starts_with(b" refused") {
+                let id = text[start..end].to_string();
+                if !out.contains(&id) {
+                    out.push(id);
+                }
+            }
+            i = end.max(start);
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+fn print_collection_report(report: &CollectionReport) {
+    for line in &report.lines {
+        println!("{line}");
+    }
+    if report.exit_code != 0 {
+        std::process::exit(report.exit_code);
+    }
 }
 
 fn decode_base64(input: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
@@ -767,18 +1068,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let val: serde_json::Value = serde_json::from_slice(&body)?;
             println!("{}", serde_json::to_string_pretty(&val)?);
         }
-        Command::PoolScrub => {
+        Command::PoolScrub { subject } => {
             let srv = cli.server.as_deref().unwrap_or("http://127.0.0.1:8420");
-            let (code, body) = http_request(srv, "POST", "/v1/pools/scrub", &[], &[])?;
-            if code != 200 {
-                eprintln!(
-                    "Pool scrub failed ({code}): {}",
-                    String::from_utf8_lossy(&body)
-                );
-                std::process::exit(1);
+            let (code, body) = http_subject_request(
+                srv,
+                "POST",
+                "/v1/pools/scrub",
+                &[],
+                &[],
+                &subject,
+                cli.subject_secret.as_deref(),
+            )?;
+            let report = interpret_collection_response(CollectionCommand::Scrub, code, &body);
+            print_collection_report(&report);
+        }
+        Command::PoolGc { subject, json } => {
+            let srv = cli.server.as_deref().unwrap_or("http://127.0.0.1:8420");
+            let (code, body) = http_subject_request(
+                srv,
+                "POST",
+                "/v1/pools/gc",
+                &[],
+                &[],
+                &subject,
+                cli.subject_secret.as_deref(),
+            )?;
+            let report = interpret_collection_response(CollectionCommand::Gc, code, &body);
+            if json {
+                std::io::stdout().write_all(&body)?;
+            } else {
+                print_collection_report(&report);
             }
-            let val: serde_json::Value = serde_json::from_slice(&body)?;
-            println!("{}", serde_json::to_string_pretty(&val)?);
+            if report.exit_code != 0 {
+                std::process::exit(report.exit_code);
+            }
         }
         Command::AuthCheck {
             project,
@@ -1098,8 +1421,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_request, decode_base64, resolve_request, resolve_request_scoped, resolve_success,
-        subject_headers, subject_signature, validate_idempotency_key,
+        apply_request, decode_base64, interpret_collection_response, resolve_request,
+        resolve_request_scoped, resolve_success, subject_headers, subject_signature,
+        validate_idempotency_key, CollectionCommand, CollectionReport,
     };
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -1271,5 +1595,189 @@ mod tests {
     fn empty_subject_has_no_signature() {
         let headers = subject_headers("", Some("key"));
         assert_eq!(headers, vec![("x-yadb-subject".into(), "".into())]);
+    }
+
+    fn collection_body(value: serde_json::Value) -> Vec<u8> {
+        serde_json::to_vec(&value).unwrap()
+    }
+
+    fn gc_body(
+        blobs_live: u64,
+        fragments_deleted: u64,
+        barriers_applied: u64,
+        leases_live: u64,
+        refusal: Option<&str>,
+        groups_refused: &[&str],
+    ) -> Vec<u8> {
+        collection_body(serde_json::json!({
+            "blobs_live": blobs_live,
+            "fragments_deleted": fragments_deleted,
+            "bytes_reclaimed": 4096,
+            "leases_live": leases_live,
+            "barriers_applied": barriers_applied,
+            "gc_refusal": refusal,
+            "gc_pools_refused": [],
+            "gc_groups_refused": groups_refused,
+            "gc_errors": [],
+        }))
+    }
+
+    fn scrub_body(
+        blobs_live: u64,
+        fragments_deleted: u64,
+        leases_live: u64,
+        refused_puts: u64,
+        repair_error: Option<&str>,
+        groups_refused: &[&str],
+    ) -> Vec<u8> {
+        collection_body(serde_json::json!({
+            "pools_checked": 1,
+            "blobs_checked": blobs_live,
+            "blobs_intact": blobs_live,
+            "blobs_repaired": 0,
+            "fragments_repaired": 0,
+            "blobs_unrecoverable": 0,
+            "refused_puts": refused_puts,
+            "degraded_puts": 0,
+            "orphan_blobs_collected": 0,
+            "orphan_collection_error": null,
+            "repair_error": repair_error,
+            "blobs_live": blobs_live,
+            "fragments_deleted": fragments_deleted,
+            "bytes_reclaimed": 0,
+            "leases_live": leases_live,
+            "gc_refusal": null,
+            "gc_pools_refused": [],
+            "gc_groups_refused": groups_refused,
+            "gc_errors": [],
+            "pools": [],
+        }))
+    }
+
+    fn assert_report(report: &CollectionReport, exit_code: i32, expected: &[&str]) {
+        assert_eq!(report.exit_code, exit_code, "{report:?}");
+        let expected: Vec<String> = expected.iter().map(|line| line.to_string()).collect();
+        assert_eq!(report.lines, expected, "{report:?}");
+    }
+
+    #[test]
+    fn collection_gc_success_prints_counters_and_exits_zero() {
+        let body = gc_body(7, 3, 2, 0, None, &[]);
+        let report = interpret_collection_response(CollectionCommand::Gc, 200, &body);
+        assert_report(
+            &report,
+            0,
+            &[
+                "Pool GC completed.",
+                "Counters: blobs live 7, fragments deleted 3, barriers applied 2, leases live 0, refused puts n/a, pools refused 0, groups refused 0",
+            ],
+        );
+    }
+
+    #[test]
+    fn collection_scrub_success_prints_counters_and_exits_zero() {
+        let body = scrub_body(5, 0, 0, 1, None, &[]);
+        let report = interpret_collection_response(CollectionCommand::Scrub, 200, &body);
+        assert_report(
+            &report,
+            0,
+            &[
+                "Pool scrub completed.",
+                "Counters: blobs live 5, fragments deleted 0, barriers applied n/a, leases live 0, refused puts 1, pools refused 0, groups refused 0",
+            ],
+        );
+    }
+
+    #[test]
+    fn collection_gc_group_refusal_is_a_partial_pass_exit_two() {
+        let refusal = "garbage collection refused for 1 of 2 metadata group(s): group 5 refused: node 2 is not the leader of metadata group 5 (leader is Some(1)); a lagging view could delete a fragment the committed state still references";
+        let body = gc_body(4, 2, 1, 0, Some(refusal), &[refusal]);
+        let report = interpret_collection_response(CollectionCommand::Gc, 409, &body);
+        assert_eq!(report.exit_code, 2, "{report:?}");
+        assert_eq!(
+            report.lines[1],
+            "Counters: blobs live 4, fragments deleted 2, barriers applied 1, leases live 0, refused puts n/a, pools refused 0, groups refused 1"
+        );
+        assert_eq!(report.lines[2], "Refused groups: 5");
+        assert!(report.lines[3].contains("leader of each named group"));
+        assert!(report.lines.iter().any(|line| line.contains(refusal)));
+    }
+
+    #[test]
+    fn collection_scrub_group_refusal_is_a_partial_pass_exit_two() {
+        let refusal = "repair scan refused for 1 of 2 metadata group(s): group 5 refused: node 2 is not the leader of metadata group 5";
+        let body = scrub_body(4, 1, 0, 0, Some(refusal), &[refusal]);
+        let report = interpret_collection_response(CollectionCommand::Scrub, 409, &body);
+        assert_eq!(report.exit_code, 2, "{report:?}");
+        assert_eq!(
+            report.lines[1],
+            "Counters: blobs live 4, fragments deleted 1, barriers applied n/a, leases live 0, refused puts 0, pools refused 0, groups refused 1"
+        );
+        assert_eq!(report.lines[2], "Refused groups: 5");
+        assert!(report.lines[3].contains("leader of each named group"));
+    }
+
+    #[test]
+    fn collection_gc_control_snapshot_refusal_is_a_failed_pass_exit_one() {
+        let refusal = "collection refused: the control-plane snapshot a pass needs for its volume-to-pool map is unavailable (control snapshot unavailable); nothing was scanned or collected";
+        let body = gc_body(0, 0, 0, 0, Some(refusal), &[]);
+        let report = interpret_collection_response(CollectionCommand::Gc, 409, &body);
+        assert_eq!(report.exit_code, 1, "{report:?}");
+        assert_eq!(
+            report.lines[0],
+            "Pool GC: nothing was scanned or collected."
+        );
+        assert!(report.lines[1].contains("control group's quorum"));
+        assert_eq!(
+            report.lines[2],
+            "Counters: blobs live 0, fragments deleted 0, barriers applied 0, leases live 0, refused puts n/a, pools refused 0, groups refused 0"
+        );
+    }
+
+    #[test]
+    fn collection_scrub_control_snapshot_refusal_is_a_failed_pass_exit_one() {
+        let refusal = "repair scan refused: the control-plane snapshot a pass needs for its volume-to-pool map is unavailable (control snapshot unavailable); nothing was scanned or collected";
+        let body = scrub_body(0, 0, 0, 0, Some(refusal), &[]);
+        let report = interpret_collection_response(CollectionCommand::Scrub, 409, &body);
+        assert_eq!(report.exit_code, 1, "{report:?}");
+        assert_eq!(
+            report.lines[0],
+            "Pool scrub: nothing was scanned or collected."
+        );
+        assert!(report.lines[1].contains("control group's quorum"));
+        assert_eq!(
+            report.lines[2],
+            "Counters: blobs live 0, fragments deleted 0, barriers applied n/a, leases live 0, refused puts 0, pools refused 0, groups refused 0"
+        );
+    }
+
+    #[test]
+    fn collection_malformed_body_is_reported_and_never_panics() {
+        for command in [CollectionCommand::Gc, CollectionCommand::Scrub] {
+            for status in [200u16, 409] {
+                for body in [
+                    b"not json".as_slice(),
+                    b"[1, 2, 3]".as_slice(),
+                    b"{".as_slice(),
+                    b"".as_slice(),
+                ] {
+                    let report = interpret_collection_response(command, status, body);
+                    assert_eq!(report.exit_code, 1, "{command:?} {status} {report:?}");
+                    assert_eq!(report.lines.len(), 1, "{report:?}");
+                    assert!(report.lines[0].starts_with("Malformed "), "{report:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn collection_unexpected_status_is_an_error() {
+        let body = b"{\"error\":\"not an admin\"}";
+        for status in [401u16, 403, 500, 503] {
+            let report = interpret_collection_response(CollectionCommand::Gc, status, body);
+            assert_eq!(report.exit_code, 1, "{report:?}");
+            assert!(report.lines[0].contains(&format!("HTTP {status}")));
+            assert!(report.lines[0].contains("not an admin"));
+        }
     }
 }
