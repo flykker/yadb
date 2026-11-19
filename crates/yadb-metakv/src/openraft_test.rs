@@ -21,7 +21,8 @@ use openraft::{
 };
 
 use super::{YadbRaft, YadbRaftTypeConfig as C};
-use crate::openraft_runtime::persistent::PersistentGroup;
+use crate::multiraft::{GroupIdentity, ReplicaIdentity};
+use crate::openraft_runtime::persistent::{PersistentGroup, StartError};
 use crate::openraft_state_machine::DurableMetaStateMachine;
 use crate::openraft_storage::DurableOpenRaftLog;
 use crate::{KvCommand, KvResult, MetaStateMachine};
@@ -970,6 +971,7 @@ async fn registry_shutdown_cancellation_retains_slot_and_owner() {
         poll_shutdown_once(future.as_mut());
     }
     assert!(registry.get(&identity).is_some());
+    assert_eq!(registry.registered(), 1);
     assert!(matches!(
         registry.open(&identity, config.clone(), NoNetwork).await,
         Err(RegistryError::Duplicate)
@@ -984,7 +986,9 @@ async fn registry_shutdown_cancellation_retains_slot_and_owner() {
         .unwrap()
         .unwrap();
     assert!(registry.get(&identity).is_none());
+    assert_eq!(registry.registered(), 0);
     registry.open(&identity, config, NoNetwork).await.unwrap();
+    assert_eq!(registry.registered(), 1);
     assert!(stale
         .client_write(KvCommand::Put {
             key: "stale".into(),
@@ -998,6 +1002,466 @@ async fn registry_shutdown_cancellation_retains_slot_and_owner() {
         .unwrap();
     drop(registry);
     drop(stale);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+fn registry_test_root(tag: &str) -> std::path::PathBuf {
+    let root = std::env::var_os("YADB_TEST_TMPDIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join(format!(
+            "yadb-registry-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+    std::fs::create_dir(&root).unwrap();
+    root
+}
+
+fn registry_identity(
+    cluster: u8,
+    group: u64,
+    incarnation: u64,
+    node: u32,
+    voters: Vec<u32>,
+) -> ReplicaIdentity {
+    ReplicaIdentity::new(
+        GroupIdentity {
+            cluster: [cluster; 16],
+            group,
+            incarnation,
+        },
+        node,
+        voters,
+    )
+    .unwrap()
+}
+
+fn registry_root_entries(root: &std::path::Path) -> BTreeSet<std::path::PathBuf> {
+    std::fs::read_dir(root)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect()
+}
+
+#[tokio::test]
+async fn registry_bound_rejects_without_creating_a_directory() {
+    use super::registry::{GroupRegistry, RegistryError};
+
+    let root = registry_test_root("bound");
+    let mut registry = GroupRegistry::new(&root, 2).unwrap();
+    let config = Arc::new(openraft::Config::default().validate().unwrap());
+    let a = registry_identity(50, 1, 1, 1, vec![1]);
+    let b = registry_identity(50, 1, 1, 2, vec![2]);
+    let rejected = registry_identity(50, 1, 1, 3, vec![3]);
+
+    registry
+        .create(&a, config.clone(), NoNetwork)
+        .await
+        .unwrap();
+    registry
+        .create(&b, config.clone(), NoNetwork)
+        .await
+        .unwrap();
+    assert_eq!(registry.registered(), 2);
+
+    let before = registry_root_entries(&root);
+    let rejected_path = registry.path_for(&rejected);
+    assert!(
+        !rejected_path.exists(),
+        "fixture: the rejected identity must not own a directory yet"
+    );
+
+    // Both entry points must refuse before storage is touched: the bound is
+    // checked before `PersistentGroup::create`/`open` ever computes the path.
+    assert!(matches!(
+        registry.create(&rejected, config.clone(), NoNetwork).await,
+        Err(RegistryError::Full)
+    ));
+    assert!(matches!(
+        registry.open(&rejected, config.clone(), NoNetwork).await,
+        Err(RegistryError::Full)
+    ));
+
+    assert_eq!(registry.registered(), 2);
+    assert!(
+        !rejected_path.exists(),
+        "a registration rejected by the group limit created a directory"
+    );
+    assert_eq!(registry_root_entries(&root), before);
+    assert!(registry.get(&a).is_some());
+    assert!(registry.get(&b).is_some());
+
+    for identity in [&a, &b] {
+        registry.shutdown(identity).await.unwrap();
+    }
+    drop(registry);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn registry_duplicate_identity_is_rejected_without_disturbing_the_group() {
+    use super::registry::{GroupRegistry, RegistryError};
+
+    let root = registry_test_root("duplicate");
+    let mut registry = GroupRegistry::new(&root, 2).unwrap();
+    let config = Arc::new(openraft::Config::default().validate().unwrap());
+    let a = registry_identity(51, 1, 1, 1, vec![1]);
+
+    registry
+        .create(&a, config.clone(), NoNetwork)
+        .await
+        .unwrap();
+    let raft = registry.get(&a).unwrap().clone();
+    raft.initialize(BTreeMap::from([(1, BasicNode::new("node-1"))]))
+        .await
+        .unwrap();
+    raft.wait(Some(Duration::from_secs(5)))
+        .current_leader(1, "leader")
+        .await
+        .unwrap();
+    raft.client_write(KvCommand::Put {
+        key: "before".into(),
+        value: b"1".to_vec(),
+    })
+    .await
+    .unwrap();
+
+    let entries_before = registry_root_entries(&root);
+    assert!(matches!(
+        registry.create(&a, config.clone(), NoNetwork).await,
+        Err(RegistryError::Duplicate)
+    ));
+    assert!(matches!(
+        registry.open(&a, config.clone(), NoNetwork).await,
+        Err(RegistryError::Duplicate)
+    ));
+    assert_eq!(registry.registered(), 1);
+    assert_eq!(registry_root_entries(&root), entries_before);
+
+    // The rejected duplicates did not replace, shut down or detach the first
+    // group: it is still the leader and still accepts writes.
+    assert_eq!(raft.metrics().borrow().current_leader, Some(1));
+    raft.client_write(KvCommand::Put {
+        key: "after".into(),
+        value: b"2".to_vec(),
+    })
+    .await
+    .unwrap();
+    assert_eq!(raft.metrics().borrow().current_leader, Some(1));
+
+    registry.shutdown(&a).await.unwrap();
+    drop(raft);
+    drop(registry);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn registry_failed_create_leaves_no_entry_and_other_groups_start() {
+    use super::registry::{GroupRegistry, RegistryError};
+
+    let root = registry_test_root("bad-path");
+    let mut registry = GroupRegistry::new(&root, 1).unwrap();
+    let config = Arc::new(openraft::Config::default().validate().unwrap());
+    let bad = registry_identity(52, 1, 1, 1, vec![1]);
+    let good = registry_identity(52, 2, 1, 1, vec![1]);
+
+    // A regular file occupies the path the registry would reserve. `create`
+    // fails before it can own anything and must not remove or rewrite it.
+    let bad_path = registry.path_for(&bad);
+    std::fs::write(&bad_path, b"operator data").unwrap();
+
+    let error = registry
+        .create(&bad, config.clone(), NoNetwork)
+        .await
+        .unwrap_err();
+    match error {
+        RegistryError::Start(StartError::Storage(e)) => {
+            assert_eq!(e.kind(), io::ErrorKind::AlreadyExists)
+        }
+        other => panic!("expected a storage start failure, got {other}"),
+    }
+    assert_eq!(registry.registered(), 0);
+    assert!(registry.get(&bad).is_none());
+    assert_eq!(std::fs::read(&bad_path).unwrap(), b"operator data");
+
+    // The failed group does not hold a slot or a lock: a different group starts.
+    registry
+        .create(&good, config.clone(), NoNetwork)
+        .await
+        .unwrap();
+    assert_eq!(registry.registered(), 1);
+    assert!(registry.get(&good).is_some());
+    assert!(registry.get(&bad).is_none());
+
+    registry.shutdown(&good).await.unwrap();
+    drop(registry);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn registry_mismatched_identity_is_isolated_and_storage_reopens() {
+    use super::registry::{GroupRegistry, RegistryError};
+
+    let root = registry_test_root("mismatch");
+    let mut registry = GroupRegistry::new(&root, 2).unwrap();
+    let config = Arc::new(openraft::Config::default().validate().unwrap());
+    let a = registry_identity(53, 1, 1, 1, vec![1]);
+    // Same registry key (cluster/group/incarnation/node) but different voters,
+    // so it addresses the same directory with a different replica descriptor.
+    let mismatched = registry_identity(53, 1, 1, 1, vec![1, 2]);
+    let other = registry_identity(53, 1, 1, 2, vec![1, 2]);
+
+    let path = registry.path_for(&a);
+    let group = PersistentGroup::create(&path, &a, config.clone(), NoNetwork)
+        .await
+        .unwrap();
+    group.shutdown().await.unwrap();
+    drop(group);
+
+    let error = registry
+        .open(&mismatched, config.clone(), NoNetwork)
+        .await
+        .unwrap_err();
+    match error {
+        RegistryError::Start(StartError::Storage(e)) => {
+            assert_eq!(e.kind(), io::ErrorKind::InvalidData)
+        }
+        other => panic!("expected a storage start failure, got {other}"),
+    }
+    assert_eq!(registry.registered(), 0);
+    assert!(registry.get(&mismatched).is_none());
+    assert!(registry.get(&a).is_none());
+
+    // The rejected open changed nothing: the real identity opens and a second,
+    // independent group still starts.
+    registry.open(&a, config.clone(), NoNetwork).await.unwrap();
+    assert_eq!(registry.registered(), 1);
+    assert!(registry.get(&a).is_some());
+    registry
+        .create(&other, config.clone(), NoNetwork)
+        .await
+        .unwrap();
+    assert_eq!(registry.registered(), 2);
+    assert!(registry.get(&other).is_some());
+
+    for identity in [&a, &other] {
+        registry.shutdown(identity).await.unwrap();
+    }
+    drop(registry);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn registry_unwritable_root_failure_is_isolated() {
+    use super::registry::{GroupRegistry, RegistryError};
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = registry_test_root("unwritable");
+    let mut registry = GroupRegistry::new(&root, 1).unwrap();
+    let config = Arc::new(openraft::Config::default().validate().unwrap());
+    let a = registry_identity(54, 1, 1, 1, vec![1]);
+
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let probe = root.join("probe");
+    if std::fs::write(&probe, b"").is_ok() {
+        // Privileges bypass mode bits (for example a root test runner), so an
+        // unwritable directory cannot be driven here. Say so instead of
+        // pretending the case ran.
+        let _ = std::fs::remove_file(&probe);
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        drop(registry);
+        std::fs::remove_dir_all(root).unwrap();
+        eprintln!("registry_unwritable_root_failure_is_isolated: skipped, mode bits not enforced");
+        return;
+    }
+
+    let path = registry.path_for(&a);
+    let error = registry
+        .create(&a, config.clone(), NoNetwork)
+        .await
+        .unwrap_err();
+    match error {
+        RegistryError::Start(StartError::Storage(e)) => {
+            assert_eq!(e.kind(), io::ErrorKind::PermissionDenied)
+        }
+        other => panic!("expected a storage start failure, got {other}"),
+    }
+    assert_eq!(registry.registered(), 0);
+    assert!(registry.get(&a).is_none());
+    assert!(!path.exists());
+
+    // Restoring the directory is enough for the same identity to start: the
+    // failed attempt left neither an entry nor a directory behind.
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+    registry
+        .create(&a, config.clone(), NoNetwork)
+        .await
+        .unwrap();
+    assert_eq!(registry.registered(), 1);
+    registry.shutdown(&a).await.unwrap();
+    drop(registry);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// Builds an existing directory whose path length is exactly `target` bytes.
+/// Every component stays under `NAME_MAX`; only the total length is extreme.
+#[cfg(target_os = "linux")]
+fn registry_deep_root(target: usize) -> std::path::PathBuf {
+    let base = std::env::var_os("YADB_TEST_TMPDIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join(format!(
+            "yadb-registry-deep-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir(&base).unwrap();
+    let mut path = base;
+    while path.as_os_str().len() < target {
+        let remaining = target - path.as_os_str().len() - 1;
+        assert!(remaining > 0, "cannot grow {path:?} to {target} bytes");
+        let component = "d".repeat(remaining.min(200));
+        path.push(component);
+        std::fs::create_dir(&path).unwrap();
+    }
+    assert_eq!(path.as_os_str().len(), target);
+    path
+}
+
+// A directory path that fits under PATH_MAX while every file inside it does
+// not makes `PersistentGroup::create` fail after it has already reserved the
+// directory. This is a reachable failure (no fault injection), and the
+// reservation must not survive to block a later create of the same identity.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn registry_failed_create_removes_its_partial_directory() {
+    use super::registry::{GroupRegistry, RegistryError};
+
+    let root = registry_deep_root(4050);
+    let mut registry = GroupRegistry::new(&root, 1).unwrap();
+    let config = Arc::new(openraft::Config::default().validate().unwrap());
+    let identity = registry_identity(55, 1, 1, 1, vec![1]);
+    let path = registry.path_for(&identity);
+
+    assert_eq!(path.as_os_str().len(), root.as_os_str().len() + 1 + 38);
+    assert!(path.as_os_str().len() < 4096);
+    assert!(path.as_os_str().len() + 1 + "replica.json".len() > 4095);
+
+    let error = registry
+        .create(&identity, config.clone(), NoNetwork)
+        .await
+        .unwrap_err();
+    match error {
+        RegistryError::Start(StartError::Storage(e)) => assert_eq!(
+            e.raw_os_error(),
+            Some(36),
+            "expected ENAMETOOLONG from the replica descriptor, got {e}"
+        ),
+        other => panic!("expected a storage start failure, got {other}"),
+    }
+    assert_eq!(registry.registered(), 0);
+    assert!(
+        !path.exists(),
+        "a failed create left its partially initialised directory behind"
+    );
+
+    // The retry fails for the same path-length reason. Before the cleanup fix
+    // it failed earlier with AlreadyExists because the empty directory from the
+    // first attempt still occupied the reservation.
+    let retry = registry
+        .create(&identity, config.clone(), NoNetwork)
+        .await
+        .unwrap_err();
+    match retry {
+        RegistryError::Start(StartError::Storage(e)) => assert_eq!(
+            e.raw_os_error(),
+            Some(36),
+            "retry was blocked by a leftover directory instead of the path limit: {e}"
+        ),
+        other => panic!("expected a storage start failure, got {other}"),
+    }
+    assert_eq!(registry.registered(), 0);
+    assert!(!path.exists());
+
+    drop(registry);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn registry_shutdown_unknown_identity_leaves_other_groups_untouched() {
+    use super::registry::GroupRegistry;
+
+    let root = registry_test_root("shutdown-unknown");
+    let mut registry = GroupRegistry::new(&root, 2).unwrap();
+    let config = Arc::new(openraft::Config::default().validate().unwrap());
+    let a = registry_identity(56, 1, 1, 1, vec![1]);
+    let b = registry_identity(56, 1, 1, 2, vec![2]);
+    let unknown = registry_identity(56, 1, 1, 3, vec![3]);
+    // Same registry key as `a` but a different replica identity.
+    let impostor = registry_identity(56, 1, 1, 1, vec![1, 2]);
+
+    registry
+        .create(&a, config.clone(), NoNetwork)
+        .await
+        .unwrap();
+    registry
+        .create(&b, config.clone(), NoNetwork)
+        .await
+        .unwrap();
+    let raft_b = registry.get(&b).unwrap().clone();
+    raft_b
+        .initialize(BTreeMap::from([(2, BasicNode::new("node-2"))]))
+        .await
+        .unwrap();
+    raft_b
+        .wait(Some(Duration::from_secs(5)))
+        .current_leader(2, "leader")
+        .await
+        .unwrap();
+
+    let error = registry.shutdown(&unknown).await.unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    assert_eq!(registry.registered(), 2);
+    assert!(registry.get(&a).is_some());
+    assert!(registry.get(&b).is_some());
+
+    // The key alone is not authority: a different identity with the same key
+    // is not registered and must not remove the real group.
+    let error = registry.shutdown(&impostor).await.unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    assert_eq!(registry.registered(), 2);
+    assert!(registry.get(&a).is_some());
+    assert!(registry.get(&b).is_some());
+    raft_b
+        .client_write(KvCommand::Put {
+            key: "alive".into(),
+            value: b"1".to_vec(),
+        })
+        .await
+        .unwrap();
+
+    registry.shutdown(&b).await.unwrap();
+    assert_eq!(registry.registered(), 1);
+    assert!(registry.get(&b).is_none());
+    assert!(registry.get(&a).is_some());
+    assert_eq!(
+        registry.shutdown(&b).await.unwrap_err().kind(),
+        io::ErrorKind::NotFound
+    );
+
+    registry.shutdown(&a).await.unwrap();
+    assert_eq!(registry.registered(), 0);
+    drop(raft_b);
+    drop(registry);
     std::fs::remove_dir_all(root).unwrap();
 }
 

@@ -111,6 +111,11 @@ pub mod persistent {
     impl PersistentGroup {
         /// Creates a fresh replica. A failed or partial creation is never
         /// automatically retried or treated as an existing valid replica.
+        ///
+        /// Once `create_dir` succeeds the directory belongs to this call, so a
+        /// failure in any later step removes it again. Otherwise an empty or
+        /// half-written directory would survive and make a later `create` of
+        /// the same identity fail with `AlreadyExists` before it could start.
         pub async fn create<N: RaftNetworkFactory<YadbRaftTypeConfig>>(
             dir: impl AsRef<Path>,
             identity: &ReplicaIdentity,
@@ -126,6 +131,28 @@ pub mod persistent {
                 .filter(|p| !p.as_os_str().is_empty())
                 .unwrap_or_else(|| Path::new("."));
             std::fs::create_dir(dir)?;
+            match Self::initialize(dir, parent, identity, config, network).await {
+                Ok(group) => Ok(group),
+                Err(error) => {
+                    // Every handle into `dir` was dropped by `initialize`.
+                    // Remove only the directory this call reserved; a failure
+                    // in `create_dir` above never reaches this cleanup.
+                    let _ = std::fs::remove_dir_all(dir);
+                    let _ = std::fs::File::open(parent).and_then(|p| p.sync_all());
+                    Err(error)
+                }
+            }
+        }
+
+        /// Fills a directory this call has just reserved. Split out of
+        /// [`Self::create`] so any failure can remove the whole reservation.
+        async fn initialize<N: RaftNetworkFactory<YadbRaftTypeConfig>>(
+            dir: &Path,
+            parent: &Path,
+            identity: &ReplicaIdentity,
+            config: Arc<openraft::Config>,
+            network: N,
+        ) -> Result<Self, StartError> {
             std::fs::File::open(parent)?.sync_all()?;
             let owner = OsDirectoryLock::try_acquire(dir)?;
             let mut identity_file = std::fs::OpenOptions::new()
@@ -338,6 +365,20 @@ pub mod registry {
                 .get(&Self::key(identity))
                 .filter(|group| group.identity() == identity)
                 .map(PersistentGroup::raft)
+        }
+
+        /// Number of owned groups. Test-only: production callers use the bound
+        /// and `get`/`shutdown` results, never a count.
+        #[cfg(test)]
+        pub(crate) fn registered(&self) -> usize {
+            self.groups.len()
+        }
+
+        /// Directory an identity maps to. Test-only so the bound and failure
+        /// tests assert against the registry's own layout instead of a copy.
+        #[cfg(test)]
+        pub(crate) fn path_for(&self, identity: &ReplicaIdentity) -> PathBuf {
+            self.path(identity)
         }
 
         pub async fn shutdown(&mut self, identity: &ReplicaIdentity) -> Result<(), io::Error> {
