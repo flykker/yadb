@@ -1364,6 +1364,139 @@ spec: {walPool: data, dataPool: data, isolation: shared, shards: 2}
     drop(daemon);
 }
 
+/// Concurrent requests with the same key: every caller sees the committed
+/// response, and the statement is applied once.
+///
+/// The handler's fast path reads the record before planning, so two requests
+/// that arrive together can both observe "no record". The first commits the row
+/// and the record; the second then fails its INSERT on the now-existing primary
+/// key *during planning*, before the record guard or the extras builder runs.
+/// Reporting that as `400 duplicate primary key` would tell the client its
+/// write failed when it had in fact committed under this key — the exact
+/// ambiguity the key exists to remove. The keyed path therefore re-reads the
+/// record on any execution error and replays it when it exists.
+#[test]
+fn concurrent_keyed_writes_replay_instead_of_reporting_a_duplicate() {
+    let _serial = serialize_daemon_tests();
+    let base = std::env::var_os("YADB_TEST_TMPDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let root = base.join(format!(
+        "yadb-daemon-sqlrace-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir(&root).unwrap();
+    let dir = Dir(root.canonicalize().unwrap());
+    let cert_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../yadb-metakv/testdata/tls")
+        .canonicalize()
+        .unwrap();
+    let metadata = dir.0.join("metadata");
+    std::fs::create_dir(&metadata).unwrap();
+    let (manifest, public, _raft_addrs) = write_manifest(&dir.0, &cert_dir, &metadata);
+    let data = dir.0.join("data");
+    let log = dir.0.join("daemon.log");
+    let mut daemon = spawn(&data, Some(&manifest), public, &log);
+    ready(&mut daemon, public);
+
+    let yaml = r#"apiVersion: yadb.io/v1alpha1
+kind: StoragePool
+metadata: {name: data}
+spec: {erasure: {scheme: mirror, replicas: 3}, failureDomains: 3}
+---
+apiVersion: yadb.io/v1alpha1
+kind: Project
+metadata: {name: alpha}
+spec: {quotas: {maxStorageBytes: 100000000, maxIops: 1000}, members: [{subject: tester, role: readWrite}]}
+---
+apiVersion: yadb.io/v1alpha1
+kind: Database
+metadata: {name: db, project: alpha}
+spec: {walPool: data, dataPool: data, isolation: shared, shards: 2}
+"#;
+    ok(
+        public,
+        "POST",
+        "/v1/apply",
+        &serde_json::to_vec(&json!({"yaml":yaml})).unwrap(),
+        "application/json",
+    );
+    ok(
+        public,
+        "POST",
+        "/db/alpha/db/query",
+        &serde_json::to_vec(&json!({"sql":"CREATE TABLE t (id INT PRIMARY KEY, v INT)"})).unwrap(),
+        "application/json",
+    );
+
+    // Every caller sends the same statement under the same key, released
+    // together so they all pass the fast-path read before any commits.
+    const CALLERS: usize = 8;
+    let start = std::sync::Barrier::new(CALLERS);
+    let mut answers: Vec<(u16, Vec<u8>)> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..CALLERS)
+            .map(|_| {
+                let start = &start;
+                scope.spawn(move || {
+                    start.wait();
+                    let (status, _, body) = request_extra(
+                        public,
+                        "POST",
+                        "/db/alpha/db/query",
+                        &serde_json::to_vec(&json!({"sql":"INSERT INTO t VALUES (1,10)"})).unwrap(),
+                        "application/json",
+                        "Idempotency-Key: sql-race\r\n",
+                    );
+                    (status, body)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect()
+    });
+    answers.sort();
+
+    let first = answers
+        .first()
+        .cloned()
+        .expect("every caller returns an answer");
+    for (status, body) in &answers {
+        assert_eq!(
+            *status,
+            200,
+            "a caller whose key had already committed must replay, not fail: {}",
+            String::from_utf8_lossy(body)
+        );
+        assert_eq!(
+            body, &first.1,
+            "every caller must see the same recorded response"
+        );
+    }
+
+    let body = ok(
+        public,
+        "POST",
+        "/db/alpha/db/query",
+        &serde_json::to_vec(&json!({"sql":"SELECT id FROM t ORDER BY id"})).unwrap(),
+        "application/json",
+    );
+    let value: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        value["rows"],
+        json!([[1]]),
+        "the statement must be applied exactly once: {value}"
+    );
+
+    daemon.interrupt();
+    drop(daemon);
+}
+
 /// `GET /metrics` is routed on the daemon's public listener and answers with
 /// the Prometheus text format.
 ///

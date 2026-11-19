@@ -631,8 +631,10 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   then that no collector reclaimed them; both were wrong, and
   `gc::tests::openraft_tests::a_refused_block_write_is_reclaimed_by_a_multigroup_pass`
   now pins the multi-group behaviour: a refused block write stages fragments, a
-  `sweep_groups` pass deletes exactly those, and the committed bytes still read
-  back byte for byte. The real residual is timing, not scope: until a pass runs
+  `sweep_groups` pass deletes every staged logical id (the test compares
+  normalized logical ids, not each physical fragment) and leaves the committed
+  ids, and the committed bytes still read back byte for byte. The real residual
+  is timing, not scope: until a pass runs
   a refused write's fragments stay readable by id, and a pool that is not
   mounted, a group this node does not lead and a project routed to no data group
   are refused and delete nothing. The consequence is deliberate: a pool with any
@@ -1224,12 +1226,17 @@ design; the removed draft is not kept in the tree.
   one source address may hold at most `MAX_IN_FLIGHT_REQUEST_BYTES_PER_PEER`
   (half of the 64 MiB budget, which is exactly `MAX_FRAME`), accounted like the
   slot cap by canonical source IP, created on demand and removed at zero. A
-  frame over that share waits for the address's own reservations to drain and is
-  then admitted; it is never refused, because it already passed the `MAX_FRAME`
+  frame over that share waits for the address's own reservations to drain; it is
+  not refused for exceeding its share, because it already passed the `MAX_FRAME`
   and global-budget checks, and a compile-time assertion proves every admissible
-  frame fits an empty share. Waits are counted as `request_bytes_peer_waited`
-  and logged first-eight-then-powers-of-two. The global budget stays
-  `2 * MAX_FRAME` (64 MiB), so peak live frame buffers are unchanged and one
+  frame fits an empty share. The wait is not a queue: capacity release notifies
+  the waiters and they race, and a wait longer than the handler's deadline is
+  dropped, so admission is not starvation-free under sustained contention. Waits
+  are counted as `request_bytes_peer_waited`
+  and logged first-eight-then-powers-of-two. The global budget was raised in
+  this change from 32 MiB to `2 * MAX_FRAME` (64 MiB), because half of 32 MiB is
+  less than one `MAX_FRAME` and the per-address share would have been unusable;
+  peak live frame buffers therefore double, which is the accepted cost, and one
   address can leave at least one maximum frame for another. The ordinary case —
   one maximum frame from one address — is admitted without waiting. Both hazards
   were proved before the fix and pinned after it by
@@ -1402,10 +1409,11 @@ design; the removed draft is not kept in the tree.
     a missing family. Label values escape backslash, quote and newline, and
     large counters stay decimal. The handler gathers exactly what the health
     endpoint gathers and adds nothing: no lease is taken, no pass runs and no
-    counter moves, which
-    `metrics_endpoint_serves_the_health_surface_as_prometheus_text` asserts
-    against the multi-group fixture by comparing the recorded pass before and
-    after a scrape and checking the lease cache and the published records, and
+    recorded outcome changes. `metrics_endpoint_serves_the_health_surface_as_prometheus_text`
+    asserts the last two against the multi-group fixture by comparing the
+    recorded pass before and after a scrape and checking that the lease cache is
+    empty and that no lease record was published; the stronger "no counter
+    moved" wording is not something that test checks, so it is not claimed here.
     `metrics_endpoint_is_served_by_the_daemon` boots the real daemon and scrapes
     twice to prove the route is registered on the public listener (removing the
     route fails it with `404`) and that a scrape never runs a pass. It

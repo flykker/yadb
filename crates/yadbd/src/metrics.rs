@@ -737,23 +737,66 @@ mod tests {
             .unwrap_or_else(|| panic!("no line starting with {needle:?} in:\n{text}"))
     }
 
+    /// Every family the exposition declares, so the test cannot drift back to a
+    /// hand-picked sample: a new `family(...)` call must be added here too, or
+    /// the rendered `# HELP` set and this list disagree and the test fails.
+    const FAMILIES: &[&str] = &[
+        "yadb_node_info",
+        "yadb_pool_info",
+        "yadb_pool_slots",
+        "yadb_pool_handoff_slots",
+        "yadb_pool_online_slots",
+        "yadb_pool_min_read_slots",
+        "yadb_pool_min_write_slots",
+        "yadb_pool_repairs_total",
+        "yadb_pool_refused_puts_total",
+        "yadb_pool_degraded_puts_total",
+        "yadb_slot_online",
+        "yadb_slot_live_blobs",
+        "yadb_slot_live_bytes",
+        "yadb_slot_segments",
+        "yadb_slot_capacity_bytes",
+        "yadb_slot_puts_ok_total",
+        "yadb_slot_puts_err_total",
+        "yadb_slot_gets_ok_total",
+        "yadb_slot_gets_err_total",
+        "yadb_slot_repairs_ok_total",
+        "yadb_gc_last_pass_present",
+        "yadb_gc_blobs_live",
+        "yadb_gc_fragments_deleted_total",
+        "yadb_gc_bytes_reclaimed_total",
+        "yadb_gc_leases_live",
+        "yadb_gc_barriers_applied_total",
+        "yadb_gc_refused",
+        "yadb_gc_groups_refused",
+        "yadb_gc_pools_refused",
+        "yadb_gc_errors",
+        "yadb_scrub_last_pass_present",
+        "yadb_scrub_pools_checked",
+        "yadb_scrub_blobs_checked",
+        "yadb_scrub_blobs_intact",
+        "yadb_scrub_blobs_repaired",
+        "yadb_scrub_fragments_repaired",
+        "yadb_scrub_blobs_unrecoverable",
+        "yadb_scrub_refused_puts_total",
+        "yadb_scrub_degraded_puts_total",
+        "yadb_scrub_orphan_blobs_collected",
+        "yadb_scrub_repair_error",
+        "yadb_scrub_orphan_collection_error",
+        "yadb_group_observation_error",
+        "yadb_group_info",
+        "yadb_group_term",
+        "yadb_group_commit_index",
+        "yadb_group_applied_index",
+        "yadb_group_reader_leases_live",
+        "yadb_group_reader_lease_expiry_ms",
+        "yadb_group_error",
+    ];
+
     #[test]
     fn every_family_is_emitted_with_help_and_type() {
         let text = render(1, "openraft", &[pool()], None, None, &[]);
-        for name in [
-            "yadb_node_info",
-            "yadb_pool_info",
-            "yadb_pool_slots",
-            "yadb_pool_refused_puts_total",
-            "yadb_slot_online",
-            "yadb_slot_live_bytes",
-            "yadb_gc_last_pass_present",
-            "yadb_gc_refused",
-            "yadb_scrub_last_pass_present",
-            "yadb_scrub_repair_error",
-            "yadb_group_info",
-            "yadb_group_observation_error",
-        ] {
+        for name in FAMILIES {
             assert!(
                 text.contains(&format!("# HELP {name} ")),
                 "missing HELP for {name}:\n{text}"
@@ -763,6 +806,31 @@ mod tests {
                 "missing TYPE for {name}:\n{text}"
             );
         }
+        // The list above must be complete, not merely long: every declared
+        // family in the output has to appear in it.
+        let declared: Vec<&str> = text
+            .lines()
+            .filter_map(|line| line.strip_prefix("# HELP "))
+            .filter_map(|rest| rest.split_whitespace().next())
+            .collect();
+        assert_eq!(
+            declared.len(),
+            FAMILIES.len(),
+            "the exposition declares {} families but the list names {}:\n{text}",
+            declared.len(),
+            FAMILIES.len()
+        );
+        for name in &declared {
+            assert!(
+                FAMILIES.contains(name),
+                "the exposition declares {name}, which the list omits"
+            );
+        }
+        assert_eq!(
+            text.matches("# TYPE ").count(),
+            FAMILIES.len(),
+            "every family must have exactly one TYPE line"
+        );
     }
 
     #[test]

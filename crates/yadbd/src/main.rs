@@ -4722,6 +4722,23 @@ async fn keyed_db_write(
         }
     }
 
+    // A statement can fail during planning, before the record guard or the
+    // extras builder runs: two requests that both saw no record can reach the
+    // INSERT, and the loser then fails on the now-existing primary key. Its
+    // key *did* commit, so reporting the planning error would tell the client a
+    // write failed that is durable and will be replayed on retry. So on any
+    // error, read the record once more; a record under this key means this
+    // request committed, and replaying it (the fingerprint check turns a
+    // different statement into a conflict) is the only answer that cannot be
+    // mistaken for a failed write. The read is redundant when an arm above
+    // already produced the same answer, and that is accepted for the simpler
+    // rule: the check is on the error, not on which arm produced it.
+    if outcome.is_err() {
+        if let Ok(Some(record)) = read_project_record(st, &record_key).await {
+            outcome = Err(replay_record(record, &fingerprint));
+        }
+    }
+
     // End the read fence before returning. A committed mutation is not undone
     // by a lost fence; only a read's answer would be invalid.
     let verified = if let Some(lease) = reader_lease.take() {

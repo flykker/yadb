@@ -203,8 +203,9 @@ is expected under churn, while a nonzero `connections_cap_dropped` means the
 `connections_peer_cap_dropped` means one address tried to take more than its
 share — backpressure working, not a fault — and `request_bytes_peer_waited` is
 the same signal one layer down: a valid frame waited for its own address's bytes
-rather than being refused. `/metrics` exposes both alongside the pool, slot,
-collection and group rows described below. Metrics,
+rather than being refused. Both are read from `/openraft/status`; `/metrics`
+publishes the pool, slot, collection and group rows described below, not these
+transport counters. Metrics,
 authenticated operator controls and
 daemon integration validation remain incomplete. Protect the public diagnostics
 listener according to the deployment's existing access policy.

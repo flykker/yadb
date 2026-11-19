@@ -268,6 +268,24 @@ a client that wants a multi-statement write to be resolvable must send one
 statement per key, use the block or S3 path, or accept the 501 that says the
 guarantee is not there yet.
 
+Concurrency is the case that separates a key from a lock. Two requests can both
+read "no record" before either commits; the first commits the row and its
+record, and the second then fails its `INSERT` during *planning* on the
+now-existing primary key — before the record guard or the extras builder runs.
+Reporting that as `400` would tell the client its write failed when it is
+durable under the key it sent. The keyed path therefore re-reads the record on
+any error and replays it when it exists; the fingerprint check still turns a
+different statement under the same key into `409`. This is deliberately a rule
+about the error, not about which arm produced it: an earlier attempt's "no
+record" is stale by definition, so no per-attempt flag is trusted.
+`concurrent_keyed_writes_replay_instead_of_reporting_a_duplicate` releases
+eight callers at once against one key and asserts all eight see `200` with the
+same body and the table holds one row; with the final re-read disabled it fails
+with `400 duplicate primary key` on every run. The engine half of that shape is
+pinned deterministically by
+`a_keyed_attempt_on_an_existing_row_fails_before_the_builder_runs`, which also
+asserts the extras builder never ran and no record was written.
+
 That was also exercised live on the three-process deployment (binary
 `b00018a9f092da23d3cfae818bc0e4ac7008dea659abca6336924bfeb7f87ddc`, built from
 `e246483`), against a 10 GiB volume with a real 4 KiB pattern written and read
@@ -2109,7 +2127,7 @@ inside the grace and observes it collected after it.
 | Test | Proves |
 | --- | --- |
 | `gc::tests::openraft_tests::a_multigroup_pass_reclaims_each_groups_dead_fragments` | Two data groups over projects 1 and 2 each keep exactly the newest generation (16 fragments) and serve their newest bytes after the pass. |
-| `gc::tests::openraft_tests::a_refused_block_write_is_reclaimed_by_a_multigroup_pass` | A block write whose publication is refused stages fragments that no manifest names. A multi-group `sweep_groups` pass deletes exactly those staged fragments, keeps every committed one, and the committed bytes still read back byte for byte; a second pass deletes nothing and changes nothing. This is the Multi-Raft counterpart of the legacy refused-write test, and it is what makes `put_blob`'s comment about refused fragments true rather than assumed. |
+| `gc::tests::openraft_tests::a_refused_block_write_is_reclaimed_by_a_multigroup_pass` | A block write whose publication is refused stages fragments that no manifest names. A multi-group `sweep_groups` pass removes every staged logical id, keeps every committed id, and the committed bytes still read back byte for byte; a second pass deletes nothing and changes nothing. The assertions compare normalized logical ids and a deletion count, so this is "the staged ids are gone", not "each physical fragment was individually observed". This is the Multi-Raft counterpart of the legacy refused-write test, and it is what makes `put_blob`'s comment about refused fragments true rather than assumed. |
 | `gc::tests::openraft_tests::a_follower_group_refuses_and_deletes_nothing` | Group 2 is a two-node cluster whose local node is a follower. The pass refuses group 2, deletes nothing, and the group 2 leader then reclaims the same fragments — so the refusal, not the data, kept them. |
 | `gc::tests::openraft_tests::a_group_writer_lease_protects_an_unpublished_fragment` | An unexpired writer lease in group 2 keeps an appended, unpublished fragment alive and refuses group 2, while group 3 still reclaims its own garbage. Releasing the lease makes the fragment provably dead. |
 | `gc::tests::openraft_tests::a_group_leader_death_before_publication_keeps_the_fragment_leased_and_unreadable` | A fragment is appended for project 1 (group 2) with a writer lease published exactly as the block write path does, then every group is stopped and reopened from its durable directories. After the restart a quorum-confirmed read is `ObjectNotFound`, the recovered live lease refuses group 2 and deletes nothing, and after the record is deterministically expired the pass reaps it, collects the fragment and reports `fragments_deleted > 0`. |
@@ -2547,7 +2565,11 @@ sub-cap removed, one address held 64 of 64 slots; with the byte sub-cap removed,
 one address held all 67,108,864 bytes and a second address's request was starved.
 A frame over its address's byte share **waits** rather than being refused, since
 it is a valid frame that has already passed the `MAX_FRAME` and global-budget
-checks. Two colluding addresses can still fill the global budget; that is outside
+checks. There is no FIFO queue: a waiter is notified when capacity frees and
+races the other waiters, and a wait longer than the handler's deadline ends in a
+dropped request rather than admission, so "waits" is not a proof of eventual
+admission under sustained contention. Two colluding addresses can still fill the
+global budget; that is outside
 "one reachable peer" and is stated rather than implied fixed.
 
 ### A failed checkpoint fold is now reported (resolved)
@@ -2936,7 +2958,7 @@ daemon. The properties and the assertions:
 
 | Property | Test (`crates/yadbd/src/metrics.rs` unless noted) |
 | --- | --- |
-| Every family is emitted with `HELP` and `TYPE`, even with no input | `every_family_is_emitted_with_help_and_type` |
+| Every family is emitted with `HELP` and `TYPE`, even with no input | `every_family_is_emitted_with_help_and_type` (also checks the list against the exposition's own `# HELP` set, so a new family cannot be omitted silently) |
 | Pool and slot samples carry the health values, and an offline slot is a `0` gauge rather than a missing sample | `pool_and_slot_samples_carry_the_health_values` |
 | An absent pass reports `*_last_pass_present 0` and publishes no other value from that family | `an_absent_gc_or_scrub_pass_reports_zero_present_and_no_samples` |
 | A refused pass is `yadb_gc_refused 1` with its own counters | `a_refused_pass_is_visible_as_a_refusal_and_counts` |
@@ -2963,8 +2985,10 @@ pass. Removing `.route("/metrics", …)` makes it fail with `404` while every
 other test stays green, which is exactly the gap it closes.
 
 Sensitivity, run by inverting the rendering: dropping the `yadb_gc_refused`
-sample fails the refusal test, and removing the label escape fails with the
-sample split across lines. Both restored.
+sample fails the refusal test, removing the label escape fails with the
+sample split across lines, and dropping one family from the completeness list
+fails with "the exposition declares 50 families but the list names 49". All
+restored.
 
 Open: nothing consumes the endpoint. No scrape config, alert rules or dashboard
 are shipped, and the families are this node's local observations — the role in

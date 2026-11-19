@@ -3533,6 +3533,46 @@ mod tests {
         );
     }
 
+    /// A second keyed attempt at a row that already exists fails during
+    /// *planning*, before the extras builder runs.
+    ///
+    /// This is the deterministic shape of the concurrent-keyed-write race: two
+    /// requests both saw no record, the first committed the row and its record,
+    /// and the second now hits the primary key. The engine is right to refuse —
+    /// it cannot know about the caller's key — so the HTTP layer must re-read
+    /// the record and replay it instead of surfacing this as a client error.
+    /// Pinned here so the error class the handler relies on cannot drift.
+    #[test]
+    fn a_keyed_attempt_on_an_existing_row_fails_before_the_builder_runs() {
+        let (_fs, meta, engine) = publication_fixture(9412);
+        let run = |sql: &str| engine.execute_sql(1, "db", "wal", "data", 1, sql).unwrap();
+        run("CREATE TABLE t (id INT PRIMARY KEY, v INT); INSERT INTO t VALUES (1,10);");
+
+        let mut calls = 0usize;
+        let mut builder = |_result: &QueryResult| {
+            calls += 1;
+            Ok(CommitExtras::default())
+        };
+        let stmt = parse_sql_script("INSERT INTO t VALUES (1,10);")
+            .unwrap()
+            .remove(0);
+        let refused = engine
+            .execute_sql_single_keyed(1, "db", "wal", "data", 1, "yadb", stmt, &mut builder)
+            .unwrap_err();
+        assert!(
+            matches!(refused, DbError::DuplicatePrimaryKey(_)),
+            "an existing row must be refused during planning: {refused:?}"
+        );
+        assert_eq!(
+            calls, 0,
+            "the builder must not run for a statement that never reached its commit"
+        );
+        assert!(
+            meta.get_or_panic("/idempotency/1/record").is_none(),
+            "a planning failure must write no record"
+        );
+    }
+
     fn update_tx(id: i64, from: i64, to: i64) -> TxBuffer {
         let mut tx = TxBuffer::default();
         tx.record_mutation(
