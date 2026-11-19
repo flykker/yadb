@@ -376,6 +376,16 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   `open`, so neither is injectable today without changing those signatures.
 - [ ] Run separate-process crash/kill and OS/filesystem power-loss tests; document
   filesystem and hardware assumptions. In-process fault simulation is not proof.
+  `three_process_mtls_power_loss_after_ack_keeps_acknowledged_writes` SIGKILLs
+  all three replicas after acknowledged writes and reopens every log and state
+  machine from the children's own files: each acknowledged key is present, the
+  recovered log covers the applied index, and restarting the same directories
+  elects and commits again. That is crash consistency, not power-loss safety:
+  `SIGKILL` leaves the page cache intact, so the parent cannot distinguish
+  "the child synced" from "the kernel still held dirty pages", and OS panic,
+  device write-cache loss and a lost synced rename remain unproven. Those need a
+  root crash harness (`dm-flakey`/`dm-log-writes`, a forced cache flush), and the
+  filesystem and hardware assumptions are still undocumented.
 - [ ] Redundancy of acknowledged writes. `PoolStriper::put_blob` used to ack once
   `min_write_quorum()` fragments landed — `k` for Reed-Solomon 4+2, so an ack could
   leave zero parity on disk. It now requires every fragment: a short write is
@@ -910,14 +920,32 @@ design; the removed draft is not kept in the tree.
   until restart; it is not durable replay protection.
   `openraft_transport` covers impersonation, tampering, unknown senders and
   replay.
-- [ ] Complete the OpenRaft network factory and listener over TCP with
+- [x] Complete the OpenRaft network factory and listener over TCP with
   length-prefixed frames, request timeouts, connection limits and a payload
   limit. The server verifies the signature against the sender's trusted public
   key and only then dispatches the Raft RPC. Responses are signed and bound to
   a random per-request nonce. Requests bind a fresh server challenge per TCP
-  connection, including across server restart; the captured-request test checks
-  this. Protocol security still needs adversarial review and lifecycle/resource
-  validation; opt-in TLS/mTLS is implemented separately below.
+  connection, including across server restart. Wire-level tests pin each claim
+  separately: the declared-length check runs before the byte reservation (a
+  length the in-flight budget would otherwise grant is refused with the
+  semaphore untouched), an over-limit frame fails closed and leaves later
+  connections usable, the server deadline ends the connection instead of
+  reporting success, the client deadline is reported as a timeout rather than a
+  reply, a connection above `MAX_CONNECTIONS` is refused with its socket closed
+  and the cap recovers once the holders release, and the adversarial set is
+  covered: forged sender, tampered body with a valid header, replay on the same
+  and on another live connection, a captured request after server restart, a
+  request bound to another connection's challenge, and a substituted reply
+  (wrong nonce, wrong sequence, untrusted key, tampered payload). Opt-in
+  TLS/mTLS is implemented separately below.
+- [ ] Bound the plaintext listener's exposure to one reachable peer. The
+  connection cap is a global semaphore, so a single host can hold all 64 slots
+  for up to `request_timeout` before authentication runs, and there is no
+  per-peer fairness. `MAX_FRAME` equals the 32 MiB in-flight budget, so one
+  request frame can reserve the whole budget even though the verified payload
+  limit is 16 MiB. Neither is changed here: no test shows the shipped defaults
+  unsafe, and raising or lowering them without evidence would trade a proven
+  bound for a guessed one.
 - [ ] Deploy and validate mandatory TLS/mTLS for operational Raft listeners.
   `TransportConfig::with_tls` implements TLS 1.3 with CA/time/hostname validation,
   ALPN, exact leaf SHA-256 pins bound to node IDs and no plaintext fallback.
@@ -1112,11 +1140,21 @@ design; the removed draft is not kept in the tree.
   test asserts that no acknowledged key was lost, and the kill test reads every
   key back through the durable adapter after all three processes die.
 - [ ] Test delayed and duplicated messages between independent processes, and
-  run the process tests on more than one host. All three run on loopback, so a
-  delayed or duplicated RPC, a real network reordering and a multi-host
-  deployment are unproven. A killed process is also not a power cut: dirty
-  filesystem pages survive `SIGKILL`, so OS and device power loss stay with the
-  separate durability gates.
+  run the process tests on more than one host.
+  `three_process_mtls_delayed_and_duplicated_rpcs_do_not_break_agreement` puts a
+  parent-side mTLS relay on every directed link, delays each Raft RPC by 60 ms
+  and re-originates it as a second authenticated RPC, so a receiving child
+  really processes each AppendEntries twice. A write is still acknowledged only
+  after a follower already holds the index, all three replicas converge, and
+  `applied_index == last_log_index` on every replica; after the relay is removed
+  the cluster still agrees. A verbatim replayed frame is rejected before the Raft
+  handler (the rejected-envelope counter rises while the duplicate counter does
+  not move), and applying the same entry twice through the durable adapter is
+  rejected as non-consecutive. Open: this is a userspace relay on loopback with
+  in-order delay and duplication only, so real network reordering, loss, jitter,
+  congestion and a multi-host deployment remain unproven. A killed process is
+  also not a power cut: dirty filesystem pages survive `SIGKILL`, so OS and
+  device power loss stay with the separate durability gates.
 
 ## 4. Migration and release
 

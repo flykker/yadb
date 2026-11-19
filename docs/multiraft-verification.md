@@ -30,8 +30,11 @@ against real wall-clock deadlines:
 `three_nodes_three_groups_route_independent_leaders_over_mtls`,
 `three_process_mtls_network_partition`, `three_process_mtls_failover_and_quorum_loss`,
 `persistent_singleton_process_kill_reopen`,
-`openraft_persistent_three_nodes_restart_and_catch_up_follower` and
-`openraft_persistent_cluster_recovers_lagging_follower_via_snapshot`. The two process
+`openraft_persistent_three_nodes_restart_and_catch_up_follower`,
+`openraft_persistent_cluster_recovers_lagging_follower_via_snapshot`,
+`three_process_mtls_leader_kill_elects_a_replacement_and_the_dead_leader_catches_up`,
+`three_process_mtls_delayed_and_duplicated_rpcs_do_not_break_agreement` and
+`three_process_mtls_power_loss_after_ack_keeps_acknowledged_writes`. The process
 tests and the child-process kill/reopen test take the gate in the parent only.
 Children return before it. That is not what prevents a cross-process deadlock — the
 `OnceLock` is process-local, so a child re-executing the binary holds a private
@@ -2558,7 +2561,10 @@ already delivered.
 
 The counters separate the two explanations. `connections_cap_dropped` and
 `envelopes_rejected` stayed at 0 in every instrumented run, so the cap was never
-reached and no envelope was refused; what the failing runs did show was
+reached and no envelope was refused in those runs (a later unit test drives both
+deliberately — 64 held connections, a refused 65th, and a forged envelope — so a
+zero in a protocol run means that run did not reach the cap, not that the
+counter cannot move); what the failing runs did show was
 `outgoing_rpc_failures` in the thousands and `connections_failed` in the 0-50
 range — mostly dials to a node the test had deliberately killed, which OpenRaft
 retries. The counters made that visible; they were never the cause.
