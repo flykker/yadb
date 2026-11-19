@@ -1,9 +1,11 @@
 # Multi-Raft for YADB: architecture and staged migration
 
 Status: design proposal. Multi-Raft is implemented and runs the daemon, but it is
-not production-ready: collection is refused, and the open gates in the
-implementation checklist are listed in
-[multiraft-production-todo.md](multiraft-production-todo.md).
+not production-ready: the open gates in the implementation checklist are listed in
+[multiraft-production-todo.md](multiraft-production-todo.md). Collection is no
+longer blanket-refused; it runs one leased pass per data group and refuses a
+specific pass when its own preconditions (leadership, an unreadable fence, live
+leases, a held collector record) do not hold, so a refusal deletes nothing.
 This RFC specifies safety gates and
 an initial direction; open choices below require implementation-level designs and
 tests. There is no longer a legacy daemon runtime to fall back to: the removed

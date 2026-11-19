@@ -664,7 +664,8 @@ loop. A green run there does not move any of the four drills above to "proven".
 
 ## Deliberately out of scope
 
-* Reclaiming disk space already lost while collection is refused.
+* Reclaiming space a refused pass could not reclaim. A refusal deletes nothing,
+  so garbage from before it stays until a later pass succeeds.
 * Cross-group or cross-target atomicity: each target fences itself, and a pass
   that succeeds on two targets and fails on the third is a partial sweep, which
   is safe (it deletes less, never more).

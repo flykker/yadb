@@ -556,6 +556,13 @@ rejection. Accepted states survive checkpoint/reopen. After this fix, **22/22
 storage tests and the adapted suite passed**. The documented suite substitutions
 and final combined verification requirements remain unchanged.
 
+The 21 and 22 figures above are historical run records, not the current
+inventory. The durable-fault work added a per-call failure point for each of the
+five fault classes on every durable operation and 14 tests that assert the
+on-disk bytes, the poisoned handle and the reopen contract, so
+`cargo test -p yadb-metakv openraft_storage` now runs **36** and the whole crate
+**200** (orchestrator re-run on the merged tree, 44.05 s, no failures).
+
 ### Local environment observed for these runs
 
 * Rust `1.99.1 (58cf8f9c3 2026-10-13)`, host
