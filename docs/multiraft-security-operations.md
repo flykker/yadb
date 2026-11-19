@@ -35,8 +35,8 @@ seeds, and never treat a fixture's long validity period as a credential policy.
 ## Internal VDisk RPCs
 
 `PUT|GET|DELETE /internal/vdisk/<pool>/<slot>/blob/<blob_hex>`,
-`GET .../stats` and `POST .../barrier` are served on the same public listener as
-the client API. They are peer traffic: a slot whose data lives on another node is
+`GET .../stats`, `POST .../barrier`, `GET .../blobs` and `POST .../compact` are
+served on the same public listener as the client API. They are peer traffic: a slot whose data lives on another node is
 reached through them by `crates/yadb-blob/src/pool.rs`. Two of them are
 destructive by design — `DELETE` installs a permanent exact-ID tombstone, and
 `barrier` durably fences writes at or below a generation and evicts matching live
@@ -63,13 +63,14 @@ field as a deployment-wide guarantee until every target runs this version.
 
 **They were unauthenticated until this delta.** Any caller able to reach the
 listener could delete or fence a hosted slot without an admin subject and without
-project authorization, and could repeat that across the replica slots to defeat
-erasure redundancy. Pool names and slot indices are disclosed by the
+project authorization, could enumerate the slot's live fragment ids, or could
+force a segment compaction, and could repeat the destructive calls across the
+replica slots to defeat erasure redundancy. Pool names and slot indices are disclosed by the
 unauthenticated `/v1/pools/health` and `/v1/status` routes. This bypassed the
 control-plane authorization described above at the data layer; it did not alter
 control state or invalidate an idempotency record.
 
-**Fixed with the Raft peer token, not the admin subject.** All five handlers now
+**Fixed with the Raft peer token, not the admin subject.** All seven handlers now
 call `raft_token_matches` before touching the store and answer `401` otherwise,
 and the remote client sends `x-yadb-raft-token` on every call. The credential is
 deliberately the peer token: an admin check would break every remote slot call and
@@ -145,9 +146,9 @@ deployment cannot reach the unauthenticated branch.
   records a summary) and therefore requires the same signed, allowlisted admin
   subject as `/v1/apply`. There is no unauthenticated deployment to preserve: a
   daemon with an empty `--admin-subject` refuses to start, so every reachable
-  scrub is checked. (`crates/yadbd/src/main.rs:7372` enforces the allowlist; the
-  comment above the handler still describes an empty-allowlist mode that startup
-  makes unreachable.)
+  scrub is checked. (`crates/yadbd/src/main.rs:7350` enforces the allowlist; the
+  comment above the handler states that `require_admin`'s empty-allowlist branch
+  is kept for library callers and tests, not as a reachable daemon mode.)
 
 ## Current rotation procedure: coordinated offline restart only
 
