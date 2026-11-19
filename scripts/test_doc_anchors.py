@@ -44,19 +44,16 @@ CITATION_RE = re.compile(
 # A citation with no entry here must be a historical snapshot instead.
 CURRENT_CLAIMS = {
     "crates/yadbd/src/main.rs:58": ["value_parser", "openraft"],
-    "crates/yadbd/src/main.rs:7644": ["require_admin"],
+    "crates/yadbd/src/main.rs:7664": ["require_admin"],
     "crates/yadb-metakv/src/gc.rs:790": ["acquire_writer", "map(Some)"],
     "crates/yadb-db/src/lib.rs:844": ["acquire_writer_if_legacy"],
     "crates/yadb-db/src/tablet.rs:916": ["acquire_writer_if_legacy"],
     "crates/yadb-db/src/tablet.rs:982": ["acquire_writer_if_legacy"],
     "crates/yadb-block/src/lib.rs:311": ["acquire_writer_if_legacy"],
-    # `docs/multiraft-skip-closure-plan.md`: the refusal it plans to remove and
-    # the mechanisms it proposes to reuse.
-    "crates/yadbd/src/main.rs:348": ["repair scan disabled for Multi-Raft"],
-    "crates/yadbd/src/main.rs:539": ["begin_read_lease"],
-    "crates/yadbd/src/main.rs:923": ["repair_error"],
-    "crates/yadbd/src/main.rs:7661": ["CONFLICT"],
-    "crates/yadbd/src/gc.rs:431": ["sweep_groups"],
+    # `docs/multiraft-skip-closure-plan.md`: the mechanisms the record reuses.
+    # The refusal constant it removed is gone, so it is named by symbol only.
+    "crates/yadbd/src/main.rs:546": ["begin_read_lease"],
+    "crates/yadbd/src/gc.rs:611": ["sweep_groups"],
     "crates/yadbd/src/protocols/s3.rs:683": ["is_openraft"],
     "crates/yadb-blob/src/pool.rs:1136": ["read_part"],
     "crates/yadb-blob/src/pool.rs:1590": ["repair_blob"],
@@ -64,7 +61,9 @@ CURRENT_CLAIMS = {
     "crates/yadb-metakv/src/openraft_client.rs:129": ["group_id"],
     "crates/yadb-metakv/src/raft.rs:361": ["try_linearizable_group_snapshot"],
     "crates/yadb-s3/src/lib.rs:17": ["INTENT_GRACE_SECS"],
-    "crates/yadb-s3/src/lib.rs:1563": ["collect_orphans_in_group"],
+    # The `project_ids == None` guard in `collect_orphans_in_scopes_with`, which
+    # the prefix-scoped repair pass deliberately does not copy.
+    "crates/yadb-s3/src/lib.rs:1618": ["project_ids"],
 }
 
 # Citations inside explicitly dated snapshots. Only the file and range are

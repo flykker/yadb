@@ -83,6 +83,15 @@ struct Args {
     #[arg(long, default_value_t = 1024 * 1024)]
     chunk_size: usize,
 
+    /// Test-only override for how long an abandoned S3 upload intent is
+    /// protected from orphan collection. Unset in production, where the engine's
+    /// shipped default of 300 s applies; the protocol harness sets 1 so an
+    /// abandoned intent becomes collectable inside one run. Shortening it is a
+    /// test knob, not a deployment option: a shorter grace lets the collector
+    /// race a client that is still uploading.
+    #[arg(long)]
+    s3_intent_grace_secs: Option<u64>,
+
     /// MemTable auto-flush threshold per SQL shard (default 1024 rows)
     #[arg(long, default_value_t = 1024)]
     db_flush_rows: usize,
@@ -336,24 +345,19 @@ struct AppState {
     block: BlockVolumeEngine<OsFs>,
 }
 
-/// Why the repair half of a scrub refuses on Multi-Raft.
-///
-/// Repair asks "which blobs should exist" against every live manifest at once,
-/// and Multi-Raft has no single atomic view across its groups: a node's applied
-/// state can lag a committed manifest in another group, so a scan would miss a
-/// blob and leave it unrepaired. Garbage collection and orphan-blob collection
-/// do not need that view and run per group instead, through `/v1/pools/gc` and
-/// this summary's sweep and orphan fields.
-const SCRUB_MULTIRAFT_REFUSAL: &str =
-    "repair scan disabled for Multi-Raft: it needs one whole-deployment view of live manifests";
-
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct ScrubSummary {
     pub pools_checked: usize,
+    /// Live blobs the repair scan examined, over every group it was allowed to
+    /// scan. Populated on Multi-Raft as well as single-node metadata: each group
+    /// contributes the blobs its own manifests name.
     pub blobs_checked: usize,
     pub blobs_intact: usize,
     pub blobs_repaired: usize,
     pub fragments_repaired: usize,
+    /// Blobs whose payload could not be reconstructed from the surviving
+    /// fragments. Counted, never repaired and never reported intact: a pass that
+    /// cannot read a blob must not claim it healed one.
     pub blobs_unrecoverable: usize,
     /// Writes refused because the pool could not promise the redundancy it
     /// advertises, summed over pools since this process started. A refused write
@@ -367,9 +371,9 @@ struct ScrubSummary {
     pub degraded_puts: usize,
     pub orphan_blobs_collected: usize,
     pub orphan_collection_error: Option<String>,
-    /// Why the repair scan did not run. Multi-Raft refuses it because it needs
-    /// one whole-deployment view of every live manifest; `None` means the scan
-    /// ran (or was not attempted on this runtime, which the 200 already says).
+    /// Why the repair scan did not run for at least one metadata group, naming
+    /// the group. `None` means every group's live set was proved and scanned on
+    /// Multi-Raft, or that the pass ran on single-node metadata.
     pub repair_error: Option<String>,
     /// Distinct live logical blobs the sweep's final mark found.
     pub blobs_live: usize,
@@ -388,8 +392,11 @@ struct ScrubSummary {
     /// legacy metadata, which is a single namespace.
     #[serde(default)]
     pub gc_groups_refused: Vec<String>,
-    /// Barrier or compaction failures after the refusal point. Reported, never
-    /// swallowed: a failed compaction means space was not actually reclaimed.
+    /// Failures observed after the refusal point: a barrier or compaction that
+    /// did not complete, and a live blob the repair pass could not check
+    /// because its pool was not mounted. Reported, never swallowed: a failed
+    /// compaction means space was not actually reclaimed, and an unchecked blob
+    /// means its redundancy was not verified.
     pub gc_errors: Vec<String>,
     pub pools: Vec<PoolHealthSnapshot>,
 }
@@ -883,22 +890,30 @@ impl AppState {
         // bit-rotted fragment), which is a different failure and needs the manifest
         // scan to know which blobs should exist.
         if self.meta.is_openraft() {
-            // The repair scan needs one whole-deployment view of every live
-            // manifest, which Multi-Raft does not have: its groups have no
-            // shared revision, so "this fragment is unreferenced" cannot be
-            // decided from any single node's applied state. Collection does
-            // not need that view and runs below, per metadata group.
+            // Repair runs per group, because the question it asks of metadata -
+            // "which blobs should exist" - is answered completely by one
+            // group's snapshot: every data namespace routes a project id to
+            // exactly one group, and a blob id embeds its project id, so the
+            // blobs one group's manifests name are exactly that group's blobs.
+            // A group this node does not lead, or one whose quorum does not
+            // answer, is refused and named; it does not stop another group's
+            // pass. There is no fallback to locally applied state.
             let (orphan_blobs_collected, orphan_collection_error) =
                 self.collect_orphans_per_group();
+            let control = self.control.read().unwrap().clone();
+            let pools = self.pools.read().unwrap().clone();
+            let repair = gc::repair_scan_groups(&self.meta, &pools, &control);
             let sweep_outcome = if sweep {
-                let control = self.control.read().unwrap().clone();
-                let pools = self.pools.read().unwrap().clone();
                 gc::sweep(&self.meta, &pools, &control)
             } else {
                 gc::SweepOutcome::refuse(
                     "collection skipped in this repair scan: it runs every five minutes and on POST /v1/pools/gc",
                 )
             };
+            // A blob the repair pass could not check (an unmounted pool) is
+            // reported next to the sweep's failures, never folded into a count.
+            let mut gc_errors = sweep_outcome.errors;
+            gc_errors.extend(repair.errors);
             let summary = ScrubSummary {
                 refused_puts: self
                     .pools
@@ -914,13 +929,18 @@ impl AppState {
                     .values()
                     .map(|striper| striper.degraded_put_count() as usize)
                     .sum(),
-                // Orphan blob collection runs per group, because a project's
-                // manifests live in one group and that group's view can be
-                // proved. The repair scan below still refuses: it needs every
-                // group's live set at once.
+                blobs_checked: repair.blobs_checked,
+                blobs_intact: repair.blobs_intact,
+                blobs_repaired: repair.blobs_repaired,
+                fragments_repaired: repair.fragments_repaired,
+                blobs_unrecoverable: repair.blobs_unrecoverable,
+                // Orphan blob collection also runs per group, for the same
+                // reason: a project's manifests live in one group.
                 orphan_blobs_collected,
                 orphan_collection_error,
-                repair_error: Some(SCRUB_MULTIRAFT_REFUSAL.into()),
+                // `None` only when every group's live set was proved and
+                // scanned; otherwise the refused groups are named.
+                repair_error: repair.refusal,
                 blobs_live: sweep_outcome.blobs_live,
                 fragments_deleted: sweep_outcome.fragments_deleted,
                 bytes_reclaimed: sweep_outcome.bytes_reclaimed,
@@ -928,7 +948,7 @@ impl AppState {
                 gc_refusal: sweep_outcome.refusal,
                 gc_pools_refused: sweep_outcome.pools_refused,
                 gc_groups_refused: sweep_outcome.groups_refused,
-                gc_errors: sweep_outcome.errors,
+                gc_errors,
                 ..ScrubSummary::default()
             };
             *self.last_scrub.write().unwrap() = Some(summary.clone());
@@ -7653,11 +7673,13 @@ async fn handle_pools_scrub(State(st): State<AppState>, headers: HeaderMap) -> R
     let res = tokio::task::spawn_blocking(move || st_clone.scrub_all_pools(true)).await;
     match res {
         Ok(summary) => {
-            // Preserve legacy scrub responses. On Multi-Raft the repair scan
-            // cannot run, so a 200 would claim a repair that did not happen.
-            // Garbage collection and orphan-blob collection do run per group
-            // and are reported in this summary regardless.
-            let status = if st.meta.is_openraft() {
+            // Same rule as `/v1/pools/gc`: a refusal is an error, never a 200
+            // with zero counts. On Multi-Raft that means "every metadata group's
+            // live set was proved and scanned, and collection did not refuse".
+            // A node that leads only some groups answers 409 and names the
+            // groups it does not lead, while the groups it does lead are really
+            // repaired - the counters in the body say which.
+            let status = if summary.repair_error.is_some() || summary.gc_refusal.is_some() {
                 StatusCode::CONFLICT
             } else {
                 StatusCode::OK
@@ -7790,6 +7812,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let s3 = ObjectStoreEngine::new(meta.clone(), args.chunk_size);
+    // Unset in production: the engine keeps its shipped 300 s default. The
+    // protocol harness shortens it to observe orphan collection inside a run.
+    if let Some(grace) = args.s3_intent_grace_secs {
+        s3.set_intent_grace_secs(grace);
+    }
     let db = DatabaseEngine::new(meta.clone(), args.db_flush_rows);
     let block = BlockVolumeEngine::new(meta.clone(), DEFAULT_BLOCK_SIZE);
 

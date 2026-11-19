@@ -179,6 +179,186 @@ pub fn sweep(
     sweep_legacy(meta, pools, control)
 }
 
+/// Metadata prefixes whose manifests name the blobs a repair pass has to check.
+///
+/// `/s3-intent/` is deliberately absent. An intent names chunks of an upload
+/// that has not published, so the object does not exist yet; the intent
+/// collector owns them, and repairing a half-written upload would rewrite
+/// fragments nobody asked to keep.
+const REPAIR_PREFIXES: [&str; 3] = ["/db/", "/s3/", "/block/"];
+
+/// What one repair scan observed, per group and in total.
+///
+/// A repair scan verifies the fragments of every blob a live manifest names. It
+/// deletes nothing except the handoff copy of a part it has already written to
+/// the part's nominal slot, so it needs no collector lease and no cross-group
+/// decision: the only question it asks of metadata is "which blobs should
+/// exist", and that question is answered per group.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RepairOutcome {
+    pub blobs_checked: usize,
+    pub blobs_intact: usize,
+    pub blobs_repaired: usize,
+    pub fragments_repaired: usize,
+    pub blobs_unrecoverable: usize,
+    /// Metadata groups that were refused, with the reason. Empty when every
+    /// group's live set was proved and scanned.
+    pub groups_refused: Vec<String>,
+    /// Set when at least one group refused. Always names the group, never a
+    /// silent zero.
+    pub refusal: Option<String>,
+    /// Blobs that were live but could not be checked (an unmounted pool), and
+    /// any other failure observed after the refusal point.
+    pub errors: Vec<String>,
+}
+
+impl RepairOutcome {
+    pub fn refuse(reason: impl Into<String>) -> Self {
+        Self {
+            refusal: Some(reason.into()),
+            ..Self::default()
+        }
+    }
+}
+
+/// Repairs every live blob, one metadata group at a time.
+///
+/// This is the repair half of `POST /v1/pools/scrub` on Multi-Raft. It is
+/// per-group because the question it asks of metadata - "which blobs should
+/// exist" - is answered completely by one group's snapshot:
+///
+/// * every data namespace (`/db/`, `/s3/`, `/block/`) routes a project id to
+///   exactly one data group, so a project's manifests are never split;
+/// * a blob id embeds its project id, so the blobs one group's manifests name
+///   are exactly that group's blobs.
+///
+/// A quorum-confirmed snapshot of one group over those three prefixes is
+/// therefore the *complete* live set for that group's blobs, not a partial one.
+/// Nothing in the repair path crosses groups: [`repair_blob`] reads the parts of
+/// one logical id and rewrites the missing ones from the survivors.
+///
+/// What this does not prove: a blob published after a group's snapshot is not
+/// repaired by that pass (repair is idempotent, not atomic with publication),
+/// and a pool whose mount is missing from `pools` is reported in
+/// [`RepairOutcome::errors`] rather than repaired. `block_pool_lookup` inside
+/// [`mark_snapshot`] comes from the local control-plane cache, so a stale cache
+/// can make this pass *skip* a blob; it can never make it repair or delete the
+/// wrong one.
+///
+/// [`repair_blob`]: yadb_blob::PoolStriper::repair_blob
+pub fn repair_scan_groups(
+    meta: &LocalMetaKv<OsFs>,
+    pools: &BTreeMap<String, std::sync::Arc<PoolStriper<OsFs>>>,
+    control: &ControlPlaneState,
+) -> RepairOutcome {
+    let scopes = match meta.gc_group_scopes() {
+        Ok(scopes) => scopes,
+        Err(error) => {
+            return RepairOutcome::refuse(format!(
+                "repair scan refused: metadata groups cannot be enumerated: {error}"
+            ))
+        }
+    };
+    if scopes.is_empty() {
+        // No project is routed to a data group, so no manifest can be named and
+        // an empty pass would be indistinguishable from a complete one.
+        return RepairOutcome::refuse(
+            "repair scan refused: no project is routed to a data group, so no live manifest can be named",
+        );
+    }
+
+    let mut outcome = RepairOutcome::default();
+    let mut refusals = Vec::new();
+    let mut missing_pools: BTreeSet<String> = BTreeSet::new();
+    for scope in &scopes {
+        match repair_group(meta, pools, control, scope, &mut outcome, &mut missing_pools) {
+            Ok(()) => {}
+            Err(reason) => refusals.push(format!("group {} refused: {reason}", scope.group_id)),
+        }
+    }
+    for pool_name in missing_pools {
+        outcome.errors.push(format!(
+            "pool `{pool_name}` is not mounted: its live blobs were not checked"
+        ));
+    }
+    if !refusals.is_empty() {
+        outcome.refusal = Some(format!(
+            "repair scan refused for {} of {} metadata group(s): {}",
+            refusals.len(),
+            scopes.len(),
+            refusals.join("; ")
+        ));
+    }
+    outcome.groups_refused = refusals;
+    outcome
+}
+
+/// One group's repair pass: prove its live set, then repair every blob in it.
+///
+/// A group this node does not lead, or one whose quorum does not answer, is
+/// refused and repairs nothing. There is no fallback to locally applied state:
+/// a lagging view would silently omit a blob and report a complete pass.
+fn repair_group(
+    meta: &LocalMetaKv<OsFs>,
+    pools: &BTreeMap<String, std::sync::Arc<PoolStriper<OsFs>>>,
+    control: &ControlPlaneState,
+    scope: &yadb_metakv::GcGroupScope,
+    outcome: &mut RepairOutcome,
+    missing_pools: &mut BTreeSet<String>,
+) -> Result<(), String> {
+    let group = scope.group_id;
+
+    // 1. Only a leader can take the quorum-confirmed read below. Checking the
+    // role first turns a `NotLeader` into a message that names the group's
+    // leader, exactly as `sweep_group` does.
+    let (node_id, role, _, leader, _) = meta
+        .role_info_for_group(group)
+        .map_err(|error| format!("role is unreadable: {error}"))?;
+    if role != yadb_metakv::RoleState::Leader {
+        return Err(format!(
+            "node {node_id} is not the leader of metadata group {group} (leader is {leader:?}); a follower's view can lag a committed manifest, so its live set is not provable"
+        ));
+    }
+
+    // 2. Quorum-confirmed snapshot of this group over the prefixes that can name
+    // a blob. `try_scan_prefix` is deliberately not used: a lagging applied
+    // state would be mistaken for a complete live set.
+    let prefixes: Vec<String> = REPAIR_PREFIXES.iter().map(|p| (*p).to_string()).collect();
+    let snapshot = meta
+        .try_linearizable_group_snapshot(group, &[], &prefixes)
+        .map_err(|error| format!("linearizable snapshot failed: {error}"))?;
+
+    // 3. Mark from that snapshot. An unreadable manifest or extent map makes the
+    // live set unprovable, so the group is refused instead of scanned partially.
+    let mark = mark_snapshot(&snapshot, control)
+        .map_err(|reason| format!("live set is not provable: {reason}"))?;
+
+    // 4. Repair only this group's blobs. `covers` is defensive: the snapshot is
+    // already the group's own, but a fragment whose project another group owns
+    // is that group's to check and is never touched here.
+    for (pool_name, id) in mark {
+        if !scope.covers(id.project_id()) {
+            continue;
+        }
+        let Some(striper) = pools.get(&pool_name) else {
+            missing_pools.insert(pool_name);
+            continue;
+        };
+        outcome.blobs_checked += 1;
+        match striper.repair_blob(id) {
+            Ok(report) if report.repaired_parts == 0 => outcome.blobs_intact += 1,
+            Ok(report) => {
+                outcome.blobs_repaired += 1;
+                outcome.fragments_repaired += report.repaired_parts;
+            }
+            // A blob whose payload cannot be reconstructed is reported, never
+            // counted as intact: that is data loss and the caller must see it.
+            Err(_) => outcome.blobs_unrecoverable += 1,
+        }
+    }
+    Ok(())
+}
+
 /// The single-namespace pass used by legacy metadata. Its behaviour, keys and
 /// ordering are unchanged; Multi-Raft metadata takes [`sweep_groups`] instead.
 fn sweep_legacy(
@@ -2744,8 +2924,300 @@ mod tests {
             shutdown(f).await;
         }
 
+        /// Two pools, one per project, each with three local mirror slots on
+        /// this node. Group 2 owns project 1 and group 3 owns project 2, so a
+        /// pass that marks one group's snapshot can never name the other's blob.
+        ///
+        /// Each slot holds exactly one record (one part of one blob), which is
+        /// what lets `damage` name a byte without decoding the segment layout.
+        struct RepairFixture {
+            dir: PathBuf,
+            meta: LocalMetaKv<OsFs>,
+            pools: BTreeMap<String, Arc<PoolStriper<OsFs>>>,
+            control: ControlPlaneState,
+            rafts: Vec<YadbRaft>,
+        }
+
+        impl RepairFixture {
+            async fn new(tag: &str) -> Self {
+                let dir = temp_dir(tag);
+                let (control, control_state) = single_group(&dir, 1).await;
+                let (group2, group2_state) = single_group(&dir, 2).await;
+                let (group3, group3_state) = single_group(&dir, 3).await;
+                let meta = LocalMetaKv::from_openraft_groups(
+                    1,
+                    BTreeMap::from([
+                        (1, (control.clone(), control_state)),
+                        (2, (group2.clone(), group2_state)),
+                        (3, (group3.clone(), group3_state)),
+                    ]),
+                    BTreeMap::from([(1, 2), (2, 3)]),
+                    BTreeMap::new(),
+                    tokio::runtime::Handle::current(),
+                )
+                .unwrap();
+                let fs = OsFs::new(&dir).unwrap();
+                let mut pools = BTreeMap::new();
+                for pool_name in ["poolA", "poolB"] {
+                    let stores: Vec<VolumeStore<OsFs>> = (0..3)
+                        .map(|i| {
+                            VolumeStore::open(
+                                fs.clone(),
+                                format!("{pool_name}/data-{i}"),
+                                VolumeConfig::default(),
+                            )
+                            .unwrap()
+                        })
+                        .collect();
+                    pools.insert(
+                        pool_name.to_string(),
+                        Arc::new(
+                            PoolStriper::new(ErasureScheme::Mirror { replicas: 3 }, stores)
+                                .unwrap(),
+                        ),
+                    );
+                }
+                Self {
+                    dir,
+                    meta,
+                    pools,
+                    control: ControlPlaneState::new(),
+                    rafts: vec![control, group2, group3],
+                }
+            }
+
+            fn s3(&self) -> ObjectStoreEngine<OsFs> {
+                let s3 = ObjectStoreEngine::new(self.meta.clone(), 4096);
+                for (name, pool) in &self.pools {
+                    s3.register_pool(name, pool.clone());
+                }
+                s3
+            }
+
+            fn scope(&self, group: u64) -> yadb_metakv::GcGroupScope {
+                self.meta
+                    .gc_group_scopes()
+                    .unwrap()
+                    .into_iter()
+                    .find(|scope| scope.group_id == group)
+                    .expect("group scope")
+            }
+
+            /// Flips one payload byte of the only record in a slot's active
+            /// segment. The length is unchanged, so the store's append offset
+            /// stays valid and a later repair can write a fresh copy.
+            ///
+            /// Returns the part that the slot held, so a caller can assert on
+            /// that exact fragment: `get_blob` still reconstructs from the two
+            /// intact mirror copies, which is why the fragment itself is what
+            /// has to be observed.
+            fn damage(&self, pool: &str, slot: usize) -> BlobId {
+                let part = self.pools[pool].slots()[slot]
+                    .local_store()
+                    .unwrap()
+                    .live_ids()
+                    .pop()
+                    .expect("the slot must hold the part that is about to be damaged");
+                let dir = self.dir.join(pool).join(format!("data-{slot}"));
+                let file = std::fs::read_dir(&dir)
+                    .unwrap()
+                    .filter_map(|entry| entry.ok())
+                    .map(|entry| entry.path())
+                    .find(|path| path.extension().is_some_and(|ext| ext == "dat"))
+                    .expect("active segment");
+                let mut bytes = std::fs::read(&file).unwrap();
+                let last = bytes.len() - 1;
+                bytes[last] ^= 0xFF;
+                std::fs::write(&file, bytes).unwrap();
+                part
+            }
+
+            /// Reads one fragment straight from its slot, so CRC damage is
+            /// visible even though the blob itself still reconstructs.
+            fn part_ok(&self, pool: &str, slot: usize, part: BlobId) -> bool {
+                self.pools[pool].slots()[slot]
+                    .local_store()
+                    .unwrap()
+                    .get(part)
+                    .is_ok()
+            }
+        }
+
+        async fn shutdown_repair(f: RepairFixture) {
+            let RepairFixture { meta, rafts, .. } = f;
+            drop(meta);
+            for raft in rafts {
+                let _ = raft.shutdown().await;
+            }
+        }
+
+        /// A damaged fragment is rebuilt by the pass that marks its group, and a
+        /// pass over another group leaves it alone.
+        ///
+        /// Both blobs are damaged first, so the assertion on the second half is
+        /// not vacuous: group 2's pass repairs project 1's blob and leaves
+        /// project 2's blob still unreadable, and only group 3's pass repairs
+        /// that one. If the pass marked a whole-deployment view, or if it
+        /// ignored the group scope, group 2's pass would have healed both.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        async fn manual_gc_route_sweeps_and_scrub_still_refuses_repair() {
+        async fn a_repair_pass_repairs_only_the_group_it_marks() {
+            let f = RepairFixture::new("repair-scope").await;
+            let s3 = f.s3();
+            let p1 = s3
+                .put_object(1, "local", "poolA", "b", "p1", "text/plain", b"project-one-payload")
+                .unwrap();
+            let p2 = s3
+                .put_object(2, "local", "poolB", "b", "p2", "text/plain", b"project-two-payload")
+                .unwrap();
+            let id1 = p1.chunks[0].blob_id;
+            let id2 = p2.chunks[0].blob_id;
+            let part1 = f.damage("poolA", 0);
+            let part2 = f.damage("poolB", 0);
+            assert!(!f.part_ok("poolA", 0, part1), "fixture must damage the fragment");
+            assert!(!f.part_ok("poolB", 0, part2), "fixture must damage the fragment");
+            // The blob itself still reads: two of three mirror copies survive,
+            // which is why the fragment is what the assertions below observe.
+            assert_eq!(f.pools["poolA"].get_blob(id1).unwrap(), b"project-one-payload");
+
+            let mut outcome = RepairOutcome::default();
+            let mut missing_pools = BTreeSet::new();
+            repair_group(
+                &f.meta,
+                &f.pools,
+                &f.control,
+                &f.scope(2),
+                &mut outcome,
+                &mut missing_pools,
+            )
+            .unwrap();
+            assert_eq!(outcome.blobs_checked, 1, "{outcome:?}");
+            assert_eq!(outcome.blobs_repaired, 1, "{outcome:?}");
+            assert_eq!(outcome.fragments_repaired, 1, "{outcome:?}");
+            assert_eq!(
+                f.pools["poolA"].get_blob(id1).unwrap(),
+                b"project-one-payload"
+            );
+            assert!(
+                f.part_ok("poolA", 0, part1),
+                "group 2's pass must have rewritten the damaged fragment: {outcome:?}"
+            );
+            assert!(
+                !f.part_ok("poolB", 0, part2),
+                "group 2's pass must not repair a fragment group 3 owns: {outcome:?}"
+            );
+
+            // The other group's pass repairs the other blob, so the damage above
+            // was real and repairable, not an unreadable fixture.
+            let mut outcome = RepairOutcome::default();
+            repair_group(
+                &f.meta,
+                &f.pools,
+                &f.control,
+                &f.scope(3),
+                &mut outcome,
+                &mut missing_pools,
+            )
+            .unwrap();
+            assert_eq!(outcome.blobs_checked, 1, "{outcome:?}");
+            assert_eq!(outcome.fragments_repaired, 1, "{outcome:?}");
+            assert_eq!(
+                f.pools["poolB"].get_blob(id2).unwrap(),
+                b"project-two-payload"
+            );
+            assert!(missing_pools.is_empty(), "{missing_pools:?}");
+
+            drop(s3);
+            shutdown_repair(f).await;
+        }
+
+        /// A group this node does not lead is refused and repairs nothing.
+        ///
+        /// The counterpart of the test above: there, every group is a leader on
+        /// this node and the pass repairs; here group 2 has its leader on another
+        /// node, so the pass must report the group and touch no fragment.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_follower_group_refuses_and_repairs_nothing() {
+            let (f, leader_meta) = follower_multigroup("repair-follower").await;
+            let engine = BlockVolumeEngine::new(leader_meta.clone(), BLOCK_SIZE);
+            engine.register_pool(POOL, f.pool.clone());
+            write_generations(&engine, 1, 0);
+            assert!(
+                f.distinct_ids()
+                    .iter()
+                    .filter(|id| id.project_id() == 1)
+                    .count()
+                    > 16
+            );
+
+            let before = f.distinct_ids();
+            let outcome = repair_scan_groups(&f.meta, &f.pools, &f.control);
+            assert_eq!(outcome.fragments_repaired, 0, "{outcome:?}");
+            assert_eq!(outcome.blobs_checked, 0, "{outcome:?}");
+            assert_eq!(outcome.groups_refused.len(), 1, "{outcome:?}");
+            let refusal = &outcome.groups_refused[0];
+            assert!(refusal.starts_with("group 2 refused:"), "{refusal}");
+            assert!(refusal.contains("is not the leader"), "{refusal}");
+            assert!(outcome.refusal.is_some(), "{outcome:?}");
+            assert_eq!(
+                f.distinct_ids(),
+                before,
+                "a refused group's pass must touch no fragment"
+            );
+
+            drop(engine);
+            drop(leader_meta);
+            shutdown(f).await;
+        }
+
+        /// A tombstoned blob is reported unrecoverable and is never resurrected.
+        ///
+        /// Tombstoning every part makes the payload undecodable, which is the
+        /// only honest answer: the pass must not report a repair it did not make,
+        /// and the target refuses a write to a tombstoned id, so nothing comes
+        /// back. The inversion is the tombstone itself - without the delete the
+        /// same fixture repairs (see the test above).
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_tombstoned_blob_is_unrecoverable_and_never_repaired() {
+            let f = RepairFixture::new("repair-tombstone").await;
+            let s3 = f.s3();
+            let manifest = s3
+                .put_object(1, "local", "poolA", "b", "gone", "text/plain", b"doomed-payload")
+                .unwrap();
+            let id = manifest.chunks[0].blob_id;
+            for slot in f.pools["poolA"].slots() {
+                for part in 1..=3u8 {
+                    slot.delete(id.with_part(part)).unwrap();
+                }
+            }
+            assert!(f.pools["poolA"].get_blob(id).is_err(), "fixture must remove every part");
+
+            let mut outcome = RepairOutcome::default();
+            let mut missing_pools = BTreeSet::new();
+            repair_group(
+                &f.meta,
+                &f.pools,
+                &f.control,
+                &f.scope(2),
+                &mut outcome,
+                &mut missing_pools,
+            )
+            .unwrap();
+            assert_eq!(outcome.blobs_checked, 1, "{outcome:?}");
+            assert_eq!(outcome.blobs_unrecoverable, 1, "{outcome:?}");
+            assert_eq!(outcome.blobs_repaired, 0, "{outcome:?}");
+            assert_eq!(outcome.fragments_repaired, 0, "{outcome:?}");
+            assert!(
+                f.pools["poolA"].get_blob(id).is_err(),
+                "a tombstoned blob must not be resurrected by a repair pass"
+            );
+
+            drop(s3);
+            shutdown_repair(f).await;
+        }
+
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn manual_gc_route_sweeps_and_scrub_repairs_per_group() {
             let f = multigroup("refuse-routes").await;
             let engine = f.engine();
             write_generations(&engine, 1, 0);
@@ -2793,12 +3265,12 @@ mod tests {
                 "{summary}"
             );
 
-            // Scrub still answers 409: the repair half remains disabled in
-            // main.rs. Its sweep half now runs per group, so the summary is no
-            // longer the blanket refusal.
+            // Scrub answers 200 here because every group is a single-node leader
+            // on this node: the repair scan ran for all of them. Its sweep half
+            // takes the same per-group path.
             write_generations(&engine, 1, 10);
             let scrub = crate::handle_pools_scrub(axum::extract::State(st.clone()), headers).await;
-            assert_eq!(scrub.status(), axum::http::StatusCode::CONFLICT);
+            assert_eq!(scrub.status(), axum::http::StatusCode::OK);
             let body = axum::body::to_bytes(scrub.into_body(), usize::MAX)
                 .await
                 .unwrap();
@@ -2808,10 +3280,13 @@ mod tests {
                 summary["fragments_deleted"].as_u64().unwrap() > 0,
                 "{summary}"
             );
-            assert_eq!(
-                summary["repair_error"],
-                crate::SCRUB_MULTIRAFT_REFUSAL,
-                "the repair half must name the whole-deployment view it lacks"
+            assert!(
+                summary["repair_error"].is_null(),
+                "every group ran, so no group may be reported as refused: {summary}"
+            );
+            assert!(
+                summary["blobs_checked"].as_u64().unwrap() > 0,
+                "the repair half must actually scan the live blobs: {summary}"
             );
             // Orphan blob collection is per group and every group here is a
             // single-node leader on this node, so it runs and finds nothing

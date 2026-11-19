@@ -74,9 +74,8 @@ That rule was followed — SKIP 1 is closed by implementation, SKIP 2 is narrowe
 ### What the refusal said
 
 The route answered `409` for every Multi-Raft deployment, and the summary
-carried `repair_error` from `SCRUB_MULTIRAFT_REFUSAL`
-(`crates/yadbd/src/main.rs:348`, set at `crates/yadbd/src/main.rs:923`, status
-chosen at `crates/yadbd/src/main.rs:7661`). The reason given was that repair
+carried `repair_error` from a `SCRUB_MULTIRAFT_REFUSAL` constant that is now
+deleted. The reason given was that repair
 "needs one whole-deployment view of live manifests".
 
 ### Why that reason was wider than repair needs
@@ -101,7 +100,7 @@ and (1) is not a cross-group question either:
   yields the *complete* live set for that group's blobs, not a partial one.
 
 Deletion is the operation that needs a cross-group decision, and it already
-makes that decision per group (`sweep_groups` at `crates/yadbd/src/gc.rs:431`).
+makes that decision per group (`sweep_groups` at `crates/yadbd/src/gc.rs:611`).
 Repair deletes nothing except the handoff copy of a part it has already written
 to the nominal slot, and a tombstoned id refuses that write
 (`crates/yadb-blob/src/volume.rs:634`), so a pass cannot resurrect a blob a
@@ -127,7 +126,7 @@ in the repair path crosses groups.
      complete view;
    * repairs each live blob through `repair_blob`.
    * **Does not copy the `project_ids.is_some()` guard** from
-     `collect_orphans_in_scopes_with` (`crates/yadb-s3/src/lib.rs:1563`). That
+     `collect_orphans_in_scopes_with` (`crates/yadb-s3/src/lib.rs:1618`). That
      guard exists because orphan collection enumerates projects; this pass is
      prefix-scoped, so a `project_ids == None` scope is not a blocker. The
      doc comment says this, so the next reader does not copy the refusal. The
@@ -181,7 +180,7 @@ in the repair path crosses groups.
 
 ### What it said
 
-`begin_read_lease` (`crates/yadbd/src/main.rs:539`) is gated by
+`begin_read_lease` (`crates/yadbd/src/main.rs:546`) is gated by
 `!st.app.meta.is_openraft()` (`crates/yadbd/src/protocols/s3.rs:683`), so on
 Multi-Raft no metadata read lease is acquired, renewed or expired.
 
