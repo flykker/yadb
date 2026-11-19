@@ -301,6 +301,14 @@ deterministically by
 `a_keyed_attempt_on_an_existing_row_fails_before_the_builder_runs`, which also
 asserts the extras builder never ran and no record was written.
 
+The hook itself has three unit tests, because its dangerous failure mode is
+falling through: `a_waiter_is_released_when_go_appears`,
+`a_waiter_that_is_never_released_fails_instead_of_continuing` and
+`only_the_first_waiter_parks`. A wait that reaches its deadline returns an error
+the handler turns into `500` rather than continuing, so a test that dies before
+writing `go` fails on an unexpected status instead of passing for the wrong
+reason; making that branch return `Ok(())` fails two of the three.
+
 The live gate was re-run on this tree (`fa797fb`, the commit that adds the
 deterministic race test): `python3 tests/protocols.py` printed 27 PASS / 0 SKIP,
 exit 0 (2026-11-19, log `live-gate-final.log`). No scenario was added, removed

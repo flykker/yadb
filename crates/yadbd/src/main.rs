@@ -4456,14 +4456,29 @@ async fn handle_db_query(
 /// Built only under `--features test-hooks` and inert unless
 /// `YADB_TEST_KEYED_RACE_DIR` names a writable directory. The first caller
 /// creates `claimed` there and waits for `go`; later callers return at once.
-/// The wait is a plain async sleep so it cannot stall the runtime, and it is
-/// bounded so a test that dies before writing `go` fails instead of hanging.
+/// The wait is a plain async sleep so it cannot stall the runtime.
+///
+/// A wait that never ends must fail loudly rather than fall through: falling
+/// through would turn "the test never released me" into "the request ran, so
+/// maybe it passed anyway", which is exactly the silent-pass failure this hook
+/// exists to remove. The deadline therefore returns an error the caller turns
+/// into `500`, and the test fails on a status it did not expect.
 #[cfg(feature = "test-hooks")]
-async fn keyed_race_park() {
+async fn keyed_race_park() -> Result<(), &'static str> {
     let Some(dir) = std::env::var_os("YADB_TEST_KEYED_RACE_DIR") else {
-        return;
+        return Ok(());
     };
-    let dir = std::path::PathBuf::from(dir);
+    park_until_go(
+        std::path::Path::new(&dir),
+        std::time::Duration::from_secs(30),
+    )
+    .await
+}
+
+/// The wait itself, split out so the timeout branch can be tested without a
+/// daemon or an environment variable.
+#[cfg(feature = "test-hooks")]
+async fn park_until_go(dir: &std::path::Path, timeout: std::time::Duration) -> Result<(), &'static str> {
     let claimed = dir.join("claimed");
     let first = std::fs::OpenOptions::new()
         .write(true)
@@ -4471,17 +4486,17 @@ async fn keyed_race_park() {
         .open(&claimed)
         .is_ok();
     if !first {
-        return;
+        return Ok(());
     }
     let go = dir.join("go");
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    let deadline = tokio::time::Instant::now() + timeout;
     while !go.exists() {
         if tokio::time::Instant::now() >= deadline {
-            eprintln!("keyed race hook: `go` never appeared; continuing");
-            return;
+            return Err("test hook: the keyed-race test never wrote `go`");
         }
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
+    Ok(())
 }
 
 /// The HTTP mapping shared by the unkeyed and keyed SQL paths.
@@ -4651,7 +4666,9 @@ async fn keyed_db_write(
         return replay_record(record, &fingerprint);
     }
     #[cfg(feature = "test-hooks")]
-    keyed_race_park().await;
+    if let Err(message) = keyed_race_park().await {
+        return api_err(StatusCode::INTERNAL_SERVER_ERROR, message);
+    }
     // The count ceiling and a conservative byte ceiling are checked before
     // planning, so a group that is already full writes no WAL fragment. The
     // exact record size depends on `rows_affected`; it is re-checked inside the
@@ -13003,6 +13020,77 @@ mod raft_status_tests {
         for raft in rafts {
             let _ = raft.shutdown().await;
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Tests for the `test-hooks` synchronization point.
+///
+/// The hook exists to make the keyed-write race deterministic, so its own two
+/// outcomes need pinning: it must release when `go` appears, and it must fail
+/// rather than fall through when `go` never does. Falling through is the
+/// dangerous case — it would let the parked request proceed and the test pass
+/// for the wrong reason — so it is asserted to be an error, not a silent `Ok`.
+#[cfg(all(test, feature = "test-hooks"))]
+mod test_hooks {
+    use super::park_until_go;
+    use std::time::Duration;
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "yadb-test-hooks-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn a_waiter_is_released_when_go_appears() {
+        let dir = temp_dir("release");
+        let released = tokio::spawn({
+            let dir = dir.clone();
+            async move { park_until_go(&dir, Duration::from_secs(10)).await }
+        });
+        // Give the waiter time to claim before releasing it.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        std::fs::write(dir.join("go"), b"go").unwrap();
+        assert!(
+            released.await.unwrap().is_ok(),
+            "a waiter whose `go` appeared must be released"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_waiter_that_is_never_released_fails_instead_of_continuing() {
+        let dir = temp_dir("timeout");
+        let error = park_until_go(&dir, Duration::from_millis(50))
+            .await
+            .expect_err("an unreleased waiter must not fall through");
+        assert!(
+            error.contains("never wrote `go`"),
+            "the failure must name its cause: {error}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn only_the_first_waiter_parks() {
+        let dir = temp_dir("second");
+        // The first caller claims and then times out.
+        let first = park_until_go(&dir, Duration::from_millis(30));
+        let second = park_until_go(&dir, Duration::from_millis(30));
+        let (first, second) = tokio::join!(first, second);
+        assert!(first.is_err(), "the first caller parks and times out");
+        assert!(
+            second.is_ok(),
+            "a later caller must return at once rather than park"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

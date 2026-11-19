@@ -792,7 +792,8 @@ spec: {pool: data, sizeBytes: 8192}
     );
     assert_eq!(generation(), before + 1);
     // Concurrent distinct keys must each commit, while identical keys replay
-    // exactly one committed response. No HTTP hook can pause after snapshot.
+    // exactly one committed response. The `test-hooks` park is compiled out of
+    // this default build, so nothing here can pause a request mid-flight.
     let concurrent = |keys: &[&str]| {
         let barrier = std::sync::Barrier::new(keys.len());
         std::thread::scope(|scope| {
@@ -1602,7 +1603,9 @@ spec: {walPool: data, dataPool: data, isolation: shared, shards: 2}
     );
 
     // Every caller sends the same statement under the same key, released
-    // together so they all pass the fast-path read before any commits.
+    // together. This maximises the chance of the race but does not force it: a
+    // run where the requests serialize also passes. The forced ordering is in
+    // `a_parked_keyed_writer_replays_the_record_committed_underneath_it`.
     const CALLERS: usize = 8;
     let start = std::sync::Barrier::new(CALLERS);
     let mut answers: Vec<(u16, Vec<u8>)> = std::thread::scope(|scope| {
