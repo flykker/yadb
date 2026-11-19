@@ -2712,28 +2712,32 @@ not through an admin route, and the install is still initiated by an inbound
 
 ### Gates
 
-* `python3 tests/protocols.py` — the last recorded run was **26 PASS / 1 SKIP**,
-  exit 0 on 2026-11-19, *before* the reader-lease reversal. The `Multi-Raft
-  repair scan` SKIP is gone: the scenario asserts a per-group repair instead of
-  a refusal, and prints `PASS Multi-Raft repair scan repairs per group, refuses
-  only groups this node does not lead`. In that run the `reader lease` SKIP was
-  still the narrowed record. The implementation closes it: every S3 `GET` on
-  Multi-Raft publishes and renews a per-group lease, and a live run observed
-  `POST /v1/pools/gc` refusing with `leases_live: 1` after a read, then the
-  reader-lease clause leaving the refusal once the 30 s lease expires. The
-  exact PASS/SKIP total after the implementation lands is not stated here
-  because that run has not been recorded; the 26/1 above is the pre-reversal
-  observation. A live orphan-collection drill sets the intent grace to 1 s and
-  observes an abandoned intent survive a pass inside the grace and be collected
-  after it. The 26 counts the three new drills that report separately. The
-  first run of this suite failed in the orphan drill on a hex-vs-integer id
-  mismatch (`Unknown format code 'x'`), which the offline guards could not see;
-  the 26/1 result is from the run after that fix. The cross-process
-  InstallSnapshot scenario runs in this gate and prints a PASS naming the
-  installed snapshot's meta index; it is no longer a SKIP and the
-  `--install-snapshot-live` flag no longer exists.
-* The InstallSnapshot PASS from that run: node 3 was stopped at log index 571,
-  the leader purged past it under the provisioned 128-entry snapshot interval,
-  and the restarted node installed a snapshot at meta index 1802 and served its
-  own local read. The install path itself is also proven by the crate-level
-  process test `three_process_mtls_failover_and_quorum_loss`.
+* `python3 tests/protocols.py` — the last recorded run was **27 PASS / 0 SKIP**,
+  exit 0 on 2026-11-19, with the reader lease implemented. The `reader lease`
+  SKIP is gone: the scenario is now a live drill and prints `PASS Multi-Raft S3
+  GET publishes a per-group reader lease and the collector refuses until it
+  expires`. The `Multi-Raft repair scan` SKIP was already gone: that scenario
+  asserts a per-group repair instead of a refusal, and prints `PASS Multi-Raft
+  repair scan repairs per group, refuses only groups this node does not lead`.
+  The 27 is the previous 26 plus that one PASS; no scenario was removed and no
+  assertion was relaxed to reach it. A live orphan-collection drill sets the
+  intent grace to 1 s and observes an abandoned intent survive a pass inside the
+  grace and be collected after it. The three drills that report separately are
+  the three new `PASS` lines.
+* The first run of the suite after the merge failed in the *orphan* drill, not
+  in the new one: the repair drill ends with `s3_visible` GETs, those leave a
+  cached reader lease in the billing group, and the next drill's first scan
+  asserts the sweep's refused *set* exactly — so the fence named a group the
+  node leads and the set comparison failed. That is the fence working across
+  drill boundaries, not a spurious refusal, so the harness now drains from a
+  timestamp `signed()` records on every GET instead of from a timestamp each
+  drill threads by hand, and the orphan drill drains *before* it uploads its
+  part, because its first pass has to run inside the one-second grace.
+* The InstallSnapshot PASS from the 27/0 run: node 3 was stopped at log index
+  849, the leader purged past it under the provisioned 128-entry snapshot
+  interval, and the restarted node applied through index 2355 only by
+  installing a snapshot at meta index 2320, then served its own local read. The
+  cross-process InstallSnapshot scenario is part of this gate and is no longer
+  a SKIP; the `--install-snapshot-live` flag no longer exists. The install path
+  itself is also proven by the crate-level process test
+  `three_process_mtls_failover_and_quorum_loss`.

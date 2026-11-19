@@ -693,11 +693,13 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   be proved is named in `gc_groups_refused` and deletes nothing; a pool whose
   epoch advance is refused is named in `gc_pools_refused` and deletes nothing.
   Four live drills in `tests/protocols.py` cover a live reader pin, a superseded
-  collector epoch, a non-leader refusal and a clean collection. A separate live
-  run observed the reader lease: `POST /v1/pools/gc` reported `leases_live: 0`
-  before any read, then `409` with `leases_live: 1` and `fragments_deleted: 0`
-  after a `PUT` + `GET`, and the lease expired by +35 s with no intervening
-  reads. Storage-side fencing exists end to end on both runtimes. A barrier
+  collector epoch, a non-leader refusal and a clean collection. A fifth drill
+  covers the reader lease: after a `PUT` + `GET` the same route answers `409`
+  with `leases_live: 1`, `fragments_deleted: 0` and a named reader lease in the
+  billing group, and with no further read it stops refusing once the 30 s TTL
+  lapses. That drill replaced the last `SKIP` in the suite, so the gate reports
+  27 PASS and no SKIP. An earlier ad-hoc live run had already observed the same
+  shape, including `leases_live: 0` before any read and expiry by +35 s. Storage-side fencing exists end to end on both runtimes. A barrier
   carries the collector lease deadline and the target refuses an expired one
   with `409`
   (`BlobError::BarrierLeaseExpired`), and an unreadable target clock refuses

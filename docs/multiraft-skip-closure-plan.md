@@ -27,8 +27,8 @@ what was reversed, and what remains unproven. The implementation is merged into
 3. **Live repair drill and its inversion — done, observed.** The drill and the
    node-still-down inversion described below ran in the full gate on
    2026-11-19 and printed `PASS Multi-Raft repair scan repairs per group,
-   refuses only groups this node does not lead`. The gate reported 26 PASS / 1
-   SKIP.
+   refuses only groups this node does not lead`. That run reported 26 PASS / 1
+   SKIP; the run with the lease implemented reports 27 PASS / 0 SKIP.
 4. **Intent grace knob and orphan drill — done, observed.** The grace is now
    the per-engine knob `ObjectStoreEngine::set_intent_grace_secs`, default 300 s
    unchanged, provisioned only by the harness (1 s), so the orphan-collection
@@ -71,23 +71,29 @@ what was reversed, and what remains unproven. The implementation is merged into
 ### The gate run (2026-11-19)
 
 `python3 tests/protocols.py` ran against the built daemon on the documented
-fixed bases and reported **26 PASS / 1 SKIP**. That is the run *before* the
-reader-lease reversal: the single remaining `SKIP` was the narrowed `reader
-lease` one, which named the target-side pin and the drill that proves it
-instead of claiming the runtime has no fence at all. The count is kept as the
-last observation of the narrowed record, not as the current inventory. The
-three drills that report separately in that run are the three new `PASS` lines.
-
-The count after the implementation lands is not projected here. Closing the
-`reader lease` SKIP by implementation should remove the last SKIP, but the
-number is established only by the run recorded in
-`multiraft-verification.md`; no count is asserted before that run exists.
+fixed bases and reported **27 PASS / 0 SKIP**, exit 0. The single remaining
+`SKIP` — the narrowed `reader lease` one, which named the target-side pin and
+the drill that proves it instead of claiming the runtime has no fence at all —
+is replaced by a live drill that prints `PASS Multi-Raft S3 GET publishes a
+per-group reader lease and the collector refuses until it expires`. The 27 is
+the previous 26 PASS / 1 SKIP with that one scenario converted: no scenario was
+removed and no assertion was relaxed to reach it. The three drills that report
+separately in that run are the three new `PASS` lines.
 
 The run also found a defect the offline guards could not: the orphan drill
 passed the `/blobs` route's hex strings to a helper that formats an integer
 (`{blob:032x}`), so it died with `Unknown format code 'x'` before asserting
-anything. Fixed in the harness and re-run; the 26/1 result above is from the
-run after that fix.
+anything. Fixed in the harness and re-run.
+
+The first run *after* the lease was implemented failed in the orphan drill
+rather than in the new one, and that failure is the fence working: the repair
+drill ends with `s3_visible` GETs, those leave a cached reader lease in the
+billing group, and the next drill's first scan compares the sweep's refused
+*set* against the groups the node does not lead — so a live lease named a group
+the node leads. The harness now records the last S3 `GET` in `signed()` and
+drains from that timestamp, instead of each drill threading its own, and the
+orphan drill drains *before* it uploads its part, because its first pass has to
+run inside the one-second intent grace. The set comparison was not weakened.
 
 ## What this record still does not claim
 
@@ -402,17 +408,18 @@ new drill that reports separately adds one:
 | Live repair drill reported separately | 24 | 1 |
 | Orphan drill (step 4) | 25 | 1 |
 | Reader-pin drill (step 5) | 26 | 1 |
+| Reader-lease drill (step 6) | 27 | 0 |
 
 The floor of that sequence was 23 PASS / 1 SKIP: the repair scan implemented,
 the `reader lease` SKIP narrowed, and no new drill. A drill that turns out not
 to be injectable is recorded as such here and in the SKIP reason; it is never
-counted as a PASS. Every row above was reached in the gate run recorded under
-"The gate run (2026-11-19)".
+counted as a PASS. Every row above was reached in the gate runs recorded under
+"The gate run (2026-11-19)"; the last row is the 27 PASS / 0 SKIP run.
 
-The count after the implementation lands is left open. Removing the last SKIP
-should add a PASS line for the lease drill, but the number is established only
-by the run recorded in `multiraft-verification.md`; no count is asserted here
-before that run exists.
+The count after the implementation lands is no longer open: closing the last
+SKIP added one PASS line and removed the only SKIP, so the inventory is 27 PASS
+and no SKIP. The number comes from the run recorded in
+`multiraft-verification.md`, not from the arithmetic.
 
 ## What must not change
 
