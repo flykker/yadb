@@ -608,6 +608,9 @@ impl<FS: StorageFs> BlockVolumeEngine<FS> {
 }
 
 #[cfg(test)]
+mod gc_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use yadb_blob::{ErasureScheme, VolumeConfig, VolumeStore};
