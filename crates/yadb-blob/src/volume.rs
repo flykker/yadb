@@ -1149,20 +1149,7 @@ impl<FS: StorageFs> VolumeStore<FS> {
         // replay idempotently, exactly like barrier markers. Expired pins may be
         // dropped, because they block nothing. An unreadable clock keeps every
         // pin rather than guessing that it lapsed.
-        let pins_to_keep: Vec<(PinId, PinEntry)> = {
-            let pins = self.pins.read().unwrap();
-            match target_clock() {
-                Ok(now) => pins
-                    .iter()
-                    .filter(|(_, entry)| now < entry.expires_at_ms)
-                    .map(|(&pin_id, &entry)| (pin_id, entry))
-                    .collect(),
-                Err(_) => pins
-                    .iter()
-                    .map(|(&pin_id, &entry)| (pin_id, entry))
-                    .collect(),
-            }
-        };
+        let pins_to_keep = select_pins_to_keep(&self.pins.read().unwrap(), &target_clock());
         // The epoch is durable state of its own. A replacement segment must carry
         // it, or compacting away the segment that held the last epoch record
         // would lower the epoch on the next open.
@@ -1326,6 +1313,38 @@ pub(crate) fn check_barrier_deadline(
         });
     }
     Ok(())
+}
+
+/// Selects the pins a replacement segment must carry.
+///
+/// Split out of [`VolumeStore::compact_single_segment`] so the clock branch can
+/// be tested with an injected clock and an injected clock *failure*. The two
+/// directions are deliberate and opposite:
+///
+/// * a readable clock keeps every pin for which `now < expires_at_ms`, because
+///   an expired pin blocks nothing;
+/// * an unreadable clock keeps **every** pin. Dropping a live pin while
+///   rewriting a segment would let a collector advance past a reader that still
+///   holds bytes; keeping a dead one only delays collection until the next
+///   compaction, so the unreadable case takes the direction that cannot delete.
+///
+/// Keeping this a pure function is what makes the second branch a verified
+/// property rather than a claim about code no test can reach.
+pub(crate) fn select_pins_to_keep(
+    pins: &BTreeMap<PinId, PinEntry>,
+    now_ms: &Result<u64, String>,
+) -> Vec<(PinId, PinEntry)> {
+    match now_ms {
+        Ok(now) => pins
+            .iter()
+            .filter(|(_, entry)| *now < entry.expires_at_ms)
+            .map(|(&pin_id, &entry)| (pin_id, entry))
+            .collect(),
+        Err(_) => pins
+            .iter()
+            .map(|(&pin_id, &entry)| (pin_id, entry))
+            .collect(),
+    }
 }
 
 /// Liveness of a pin, as a pure decision so it can be tested with an injected
@@ -1666,4 +1685,55 @@ fn recover_segment<F: VirtualFile>(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod clock_injection_tests {
+    use super::*;
+
+    fn pin(id: u64, epoch: u64, expires_at_ms: u64) -> (PinId, PinEntry) {
+        (
+            PinId::from_wire(id),
+            PinEntry {
+                epoch,
+                expires_at_ms,
+            },
+        )
+    }
+
+    fn pins() -> BTreeMap<PinId, PinEntry> {
+        [
+            pin(1, 7, 199),
+            pin(2, 7, 200),
+            // Exactly the injected "now": `now < expires_at_ms` is strict, so
+            // this one is still live.
+            pin(3, 8, 201),
+        ]
+        .into_iter()
+        .collect()
+    }
+
+    #[test]
+    fn a_segment_replacement_copies_exactly_the_pins_live_on_its_clock() {
+        let kept = select_pins_to_keep(&pins(), &Ok(200));
+        // 199 and 200 are expired at now=200; 201 is live. Keeping a dead pin
+        // only delays collection, dropping the live one would let a collector
+        // advance past a reader that still holds bytes.
+        assert_eq!(kept.len(), 1, "kept: {kept:?}");
+        assert_eq!(kept[0].0.get(), 3);
+        assert_eq!(kept[0].1.epoch, 8);
+        assert_eq!(kept[0].1.expires_at_ms, 201);
+    }
+
+    #[test]
+    fn an_unreadable_clock_keeps_every_pin_including_expired_ones() {
+        let kept = select_pins_to_keep(&pins(), &Err("clock source unavailable".into()));
+        // This is the branch that cannot be reached through a real
+        // `target_clock()` in a test. Emptying the replacement segment here
+        // would be the one direction that loses a live pin.
+        assert_eq!(kept.len(), 3, "kept: {kept:?}");
+        let ids: Vec<u64> = kept.iter().map(|(pin_id, _)| pin_id.get()).collect();
+        assert_eq!(ids, vec![1, 2, 3]);
+        assert_eq!(kept[2].1.epoch, 8);
+    }
 }

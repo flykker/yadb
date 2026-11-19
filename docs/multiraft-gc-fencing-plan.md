@@ -195,12 +195,18 @@ What exists now:
   (`PinClockUnreadable`) instead of reading as zero - the same failure direction
   as the barrier clock. Compaction is the one exception, and deliberately the
   other way: with no readable clock it keeps every pin, because dropping a live
-  one is the worse error, and it drops only pins the clock proves expired. That
-  branch is **not covered by a test**: `target_clock()` has no injection point,
-  so the only clock a test can present is a working one, and the helper-level
-  unreadable-clock tests pass a `Result` directly rather than going through a
-  volume. Adding a seam is a separate change; until then this is a property of
-  the code as written, not a verified one.
+  one is the worse error, and it drops only pins the clock proves expired.
+  Segment replacement now selects pins through a pure helper,
+  `select_pins_to_keep(pins, &Result<u64, String>)`, so both clock outcomes are
+  tested without going through `SystemTime::now()`:
+  `a_segment_replacement_copies_exactly_the_pins_live_on_its_clock` pins the
+  strict `now < expires_at_ms` boundary and
+  `an_unreadable_clock_keeps_every_pin_including_expired_ones` pins the
+  fail-safe direction. Both were verified by inversion: `<=` at the boundary
+  and an empty result on clock failure each turn the corresponding test red.
+  The seam is the selection function, not `target_clock()` itself; the store
+  still feeds it the real clock, and no test presents a broken clock to
+  `SystemTime::now()`.
 
 What it does **not** establish, and why the invariant still does not hold:
 
