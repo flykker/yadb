@@ -1615,6 +1615,619 @@ mod reply_tests {
         assert_eq!(count.load(Ordering::SeqCst), 0);
     }
 
+    // ---- Snapshot reception bounds ----
+    //
+    // A receiver admits a snapshot only after the declared length has been
+    // checked and the assembly budget reserved, and it dispatches the handler
+    // only after the whole stream has arrived and its digest matches. The
+    // tests below pin each step against the semaphore, the `phase` marker and
+    // the dispatch record rather than against elapsed time.
+
+    struct SnapshotPeer {
+        client: ReplicaIdentity,
+        server: ReplicaIdentity,
+        client_key: Arc<NodeSigningKey>,
+        server_key: Arc<NodeSigningKey>,
+        registry: Arc<PeerKeyRegistry>,
+        config: TransportConfig,
+    }
+
+    fn snapshot_peer(tag: u8) -> SnapshotPeer {
+        let group = GroupIdentity {
+            cluster: [tag; 16],
+            group: 1,
+            incarnation: 1,
+        };
+        let client = ReplicaIdentity::new(group.clone(), 1, vec![1, 2]).unwrap();
+        let server = ReplicaIdentity::new(group, 2, vec![1, 2]).unwrap();
+        let mut seed = [0u8; 32];
+        seed[0] = 1;
+        let client_key = Arc::new(NodeSigningKey::from_seed(&seed).unwrap());
+        seed[0] = 2;
+        let server_key = Arc::new(NodeSigningKey::from_seed(&seed).unwrap());
+        let registry = Arc::new(
+            PeerKeyRegistry::new(BTreeMap::from([
+                (1, client_key.public_key()),
+                (2, server_key.public_key()),
+            ]))
+            .unwrap(),
+        );
+        let config = TransportConfig::new(
+            server.clone(),
+            server_key.clone(),
+            BTreeMap::new(),
+            registry.clone(),
+        )
+        .with_tls(Arc::new(crate::openraft_tls::test_support::config(2)));
+        SnapshotPeer {
+            client,
+            server,
+            client_key,
+            server_key,
+            registry,
+            config,
+        }
+    }
+
+    fn sha256(bytes: &[u8]) -> [u8; 32] {
+        ring::digest::digest(&ring::digest::SHA256, bytes)
+            .as_ref()
+            .try_into()
+            .unwrap()
+    }
+
+    fn signed_snapshot_frame(peer: &SnapshotPeer, sequence: u64, payload: Vec<u8>) -> Vec<u8> {
+        SignedRaftEnvelope::sign(
+            &peer.client,
+            peer.server.node(),
+            sequence,
+            payload,
+            &peer.client_key,
+        )
+        .unwrap()
+        .encode_json()
+        .unwrap()
+    }
+
+    fn manifest(
+        peer: &SnapshotPeer,
+        challenge: [u8; 32],
+        length: usize,
+        digest: [u8; 32],
+    ) -> SnapshotManifest {
+        SnapshotManifest {
+            context: SNAPSHOT_CONTEXT.into(),
+            nonce: [3; 32],
+            challenge,
+            vote: Vote::new(1, peer.client.node()),
+            meta: SnapshotMeta::default(),
+            length,
+            digest,
+        }
+    }
+
+    fn chunk(
+        challenge: [u8; 32],
+        ordinal: usize,
+        length: usize,
+        digest: [u8; 32],
+        data: Vec<u8>,
+    ) -> SnapshotChunk {
+        SnapshotChunk {
+            context: SNAPSHOT_CONTEXT.into(),
+            nonce: [3; 32],
+            challenge,
+            ordinal,
+            length,
+            digest,
+            data,
+        }
+    }
+
+    fn recording_handler(
+        received: Arc<std::sync::Mutex<Vec<usize>>>,
+    ) -> Arc<dyn Fn(WireRequest) -> BoxFuture<WireResponse> + Send + Sync> {
+        Arc::new(move |request| {
+            let WireRequest::InstallSnapshot { data, .. } = request else {
+                panic!("unexpected request kind")
+            };
+            received.lock().unwrap().push(data.len());
+            Box::pin(async {
+                WireResponse::InstallSnapshot(Box::new(SnapshotResponse {
+                    vote: Vote::new(1, 2),
+                }))
+            })
+        })
+    }
+
+    struct SnapshotWire {
+        client: tokio::io::DuplexStream,
+        task: tokio::task::JoinHandle<io::Result<()>>,
+    }
+
+    /// Serves one snapshot connection over an in-memory duplex stream.
+    fn snapshot_wire(
+        peer: &SnapshotPeer,
+        received: Arc<std::sync::Mutex<Vec<usize>>>,
+        budget: Arc<Semaphore>,
+        assembly: Arc<Semaphore>,
+        phase: Arc<AtomicU64>,
+        capacity: usize,
+    ) -> SnapshotWire {
+        let (client, server) = tokio::io::duplex(capacity);
+        let config = peer.config.clone();
+        let task = tokio::spawn(async move {
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                serve_connection(
+                    Box::new(server),
+                    None,
+                    config,
+                    recording_handler(received),
+                    budget,
+                    assembly,
+                    phase,
+                    Arc::new(AtomicU64::new(0)),
+                ),
+            )
+            .await
+            .expect("serve_connection exceeded its deadline")
+        });
+        SnapshotWire { client, task }
+    }
+
+    #[tokio::test]
+    async fn an_over_declared_snapshot_length_is_refused_before_the_assembly_reservation() {
+        // The assembly semaphore is the reservation taken immediately before
+        // `Vec::with_capacity(manifest.length)`. Holding every permit makes a
+        // legal manifest block there, so a refusal that still closes the
+        // connection proves the declared-length check ran before the
+        // reservation and therefore before the allocation. The second length
+        // truncates to 1 in `manifest.length as u32`, so it also pins the
+        // check that keeps a truncated request from reserving one permit and
+        // then allocating 4 GiB.
+        let peer = snapshot_peer(31);
+        let budget = Arc::new(Semaphore::new(MAX_IN_FLIGHT_REQUEST_BYTES));
+        let assembly = Arc::new(Semaphore::new(MAX_SNAPSHOT_BYTES));
+        let held = assembly
+            .clone()
+            .acquire_many_owned(MAX_SNAPSHOT_BYTES as u32)
+            .await
+            .unwrap();
+        for declared in [MAX_SNAPSHOT_BYTES + 1, u32::MAX as usize + 2] {
+            let received = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let wire = snapshot_wire(
+                &peer,
+                received.clone(),
+                budget.clone(),
+                assembly.clone(),
+                Arc::new(AtomicU64::new(0)),
+                4096,
+            );
+            let SnapshotWire { mut client, task } = wire;
+            let (_, challenge) = read_frame(&mut client).await.unwrap();
+            let challenge: [u8; 32] = challenge.try_into().unwrap();
+            let manifest = manifest(&peer, challenge, declared, [0; 32]);
+            write_frame(
+                &mut client,
+                SNAPSHOT_MANIFEST,
+                &signed_snapshot_frame(&peer, 1, serde_json::to_vec(&manifest).unwrap()),
+            )
+            .await
+            .unwrap();
+            let refused = tokio::time::timeout(Duration::from_secs(2), read_frame(&mut client))
+                .await
+                .expect("the declared length was not refused before the reservation");
+            assert!(
+                refused.is_err(),
+                "a manifest declaring {declared} bytes was answered"
+            );
+            assert!(
+                received.lock().unwrap().is_empty(),
+                "a manifest declaring {declared} bytes was dispatched"
+            );
+            let result = task.await.unwrap();
+            assert!(
+                result.is_err(),
+                "a manifest declaring {declared} bytes did not fail the connection"
+            );
+        }
+        drop(held);
+        assert_eq!(assembly.available_permits(), MAX_SNAPSHOT_BYTES);
+        assert_eq!(budget.available_permits(), MAX_IN_FLIGHT_REQUEST_BYTES);
+    }
+
+    #[tokio::test]
+    async fn an_exhausted_assembly_budget_blocks_the_manifest_before_allocation_or_dispatch() {
+        // `phase` becomes 1 once the manifest frame has been read and 2 only
+        // after the assembly reservation succeeds. With every permit held, a
+        // valid manifest must stop at 1: reaching 2 would mean the receiver
+        // allocated and dispatched without the reservation.
+        let peer = snapshot_peer(32);
+        let budget = Arc::new(Semaphore::new(MAX_IN_FLIGHT_REQUEST_BYTES));
+        let assembly = Arc::new(Semaphore::new(MAX_SNAPSHOT_BYTES));
+        let held = assembly
+            .clone()
+            .acquire_many_owned(MAX_SNAPSHOT_BYTES as u32)
+            .await
+            .unwrap();
+        let received = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let phase = Arc::new(AtomicU64::new(0));
+        let wire = snapshot_wire(
+            &peer,
+            received.clone(),
+            budget.clone(),
+            assembly.clone(),
+            phase.clone(),
+            4096,
+        );
+        let SnapshotWire { mut client, task } = wire;
+        let (_, challenge) = read_frame(&mut client).await.unwrap();
+        let challenge: [u8; 32] = challenge.try_into().unwrap();
+        let data = vec![1u8, 2, 3];
+        let digest = sha256(&data);
+        write_frame(
+            &mut client,
+            SNAPSHOT_MANIFEST,
+            &signed_snapshot_frame(
+                &peer,
+                1,
+                serde_json::to_vec(&manifest(&peer, challenge, data.len(), digest)).unwrap(),
+            ),
+        )
+        .await
+        .unwrap();
+        write_frame(
+            &mut client,
+            SNAPSHOT_CHUNK,
+            &signed_snapshot_frame(
+                &peer,
+                1,
+                serde_json::to_vec(&chunk(challenge, 0, data.len(), digest, data.clone())).unwrap(),
+            ),
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while phase.load(Ordering::Relaxed) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the manifest frame was never read");
+        // The chunk is already buffered, so only the reservation can hold the
+        // transfer back from here.
+        let advanced = tokio::time::timeout(Duration::from_millis(300), async {
+            while phase.load(Ordering::Relaxed) == 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(
+            advanced.is_err(),
+            "a manifest passed the assembly reservation while the budget was exhausted (phase {})",
+            phase.load(Ordering::Relaxed)
+        );
+        assert!(
+            received.lock().unwrap().is_empty(),
+            "a manifest was dispatched while the assembly budget was exhausted"
+        );
+        drop(held);
+        let (kind, _) = tokio::time::timeout(Duration::from_secs(2), read_frame(&mut client))
+            .await
+            .expect("the transfer did not resume after the budget was released")
+            .unwrap();
+        assert_eq!(kind, RESPONSE);
+        assert_eq!(*received.lock().unwrap(), vec![data.len()]);
+        assert_eq!(phase.load(Ordering::Relaxed), 4);
+        assert!(task.await.unwrap().is_ok());
+        assert_eq!(assembly.available_permits(), MAX_SNAPSHOT_BYTES);
+        assert_eq!(budget.available_permits(), MAX_IN_FLIGHT_REQUEST_BYTES);
+    }
+
+    #[tokio::test]
+    async fn a_chunk_carrying_more_bytes_than_the_manifest_declares_is_refused() {
+        // The sender signs both the declared length and the digest, so it can
+        // sign a digest over four bytes while declaring three. Only the
+        // per-chunk length check refuses the extra byte: without it the
+        // receiver would append four bytes, the digest would match, and a
+        // snapshot larger than its own declaration would be installed.
+        let peer = snapshot_peer(33);
+        let budget = Arc::new(Semaphore::new(MAX_IN_FLIGHT_REQUEST_BYTES));
+        let assembly = Arc::new(Semaphore::new(MAX_SNAPSHOT_BYTES));
+        let received = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let wire = snapshot_wire(
+            &peer,
+            received.clone(),
+            budget.clone(),
+            assembly.clone(),
+            Arc::new(AtomicU64::new(0)),
+            4096,
+        );
+        let SnapshotWire { mut client, task } = wire;
+        let (_, challenge) = read_frame(&mut client).await.unwrap();
+        let challenge: [u8; 32] = challenge.try_into().unwrap();
+        let data = vec![1u8, 2, 3, 4];
+        let digest = sha256(&data);
+        write_frame(
+            &mut client,
+            SNAPSHOT_MANIFEST,
+            &signed_snapshot_frame(
+                &peer,
+                1,
+                serde_json::to_vec(&manifest(&peer, challenge, 3, digest)).unwrap(),
+            ),
+        )
+        .await
+        .unwrap();
+        write_frame(
+            &mut client,
+            SNAPSHOT_CHUNK,
+            &signed_snapshot_frame(
+                &peer,
+                1,
+                serde_json::to_vec(&chunk(challenge, 0, 3, digest, data)).unwrap(),
+            ),
+        )
+        .await
+        .unwrap();
+        let refused = tokio::time::timeout(Duration::from_secs(2), read_frame(&mut client))
+            .await
+            .expect("an over-long chunk hung the connection");
+        assert!(refused.is_err(), "an over-long chunk was answered");
+        drop(client);
+        let result = task.await.unwrap();
+        assert!(
+            result.is_err(),
+            "an over-long chunk did not fail the connection"
+        );
+        assert!(
+            received.lock().unwrap().is_empty(),
+            "an over-long chunk was dispatched"
+        );
+        assert_eq!(assembly.available_permits(), MAX_SNAPSHOT_BYTES);
+        assert_eq!(budget.available_permits(), MAX_IN_FLIGHT_REQUEST_BYTES);
+    }
+
+    #[tokio::test]
+    async fn a_truncated_snapshot_stream_never_dispatches_its_valid_prefix() {
+        // The sender declares one byte more than it sends and signs a digest
+        // over exactly the prefix it did send. A receiver that treated the
+        // read error as the end of the stream would verify that digest and
+        // install a snapshot one byte shorter than its own manifest.
+        let peer = snapshot_peer(34);
+        let budget = Arc::new(Semaphore::new(MAX_IN_FLIGHT_REQUEST_BYTES));
+        let assembly = Arc::new(Semaphore::new(MAX_SNAPSHOT_BYTES));
+        let received = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let wire = snapshot_wire(
+            &peer,
+            received.clone(),
+            budget.clone(),
+            assembly.clone(),
+            Arc::new(AtomicU64::new(0)),
+            SNAPSHOT_CHUNK_FRAME,
+        );
+        let SnapshotWire { mut client, task } = wire;
+        let (_, challenge) = read_frame(&mut client).await.unwrap();
+        let challenge: [u8; 32] = challenge.try_into().unwrap();
+        let declared = SNAPSHOT_CHUNK_BYTES + 1;
+        let data = vec![7u8; SNAPSHOT_CHUNK_BYTES];
+        let digest = sha256(&data);
+        write_frame(
+            &mut client,
+            SNAPSHOT_MANIFEST,
+            &signed_snapshot_frame(
+                &peer,
+                1,
+                serde_json::to_vec(&manifest(&peer, challenge, declared, digest)).unwrap(),
+            ),
+        )
+        .await
+        .unwrap();
+        write_frame(
+            &mut client,
+            SNAPSHOT_CHUNK,
+            &signed_snapshot_frame(
+                &peer,
+                1,
+                serde_json::to_vec(&chunk(challenge, 0, declared, digest, data)).unwrap(),
+            ),
+        )
+        .await
+        .unwrap();
+        // Signal the end of the stream: the sender declared one byte more than
+        // it sent, so the receiver must fail rather than install the prefix.
+        client.shutdown().await.unwrap();
+        let refused = tokio::time::timeout(Duration::from_secs(2), read_frame(&mut client))
+            .await
+            .expect("a truncated snapshot hung the connection");
+        assert!(refused.is_err(), "a truncated snapshot was answered");
+        drop(client);
+        let result = task.await.unwrap();
+        assert!(
+            result.is_err(),
+            "a truncated snapshot did not fail the connection"
+        );
+        assert!(
+            received.lock().unwrap().is_empty(),
+            "a truncated snapshot dispatched its valid prefix"
+        );
+        assert_eq!(assembly.available_permits(), MAX_SNAPSHOT_BYTES);
+        assert_eq!(budget.available_permits(), MAX_IN_FLIGHT_REQUEST_BYTES);
+    }
+
+    #[tokio::test]
+    async fn concurrent_frames_share_one_in_flight_byte_budget() {
+        // The budget is one semaphore shared by every handler, not one per
+        // connection. One frame declaring the whole six-permit budget must
+        // stop a second frame from reserving anything.
+        let budget = Arc::new(Semaphore::new(6));
+        let (mut first_writer, mut first_reader) = tokio::io::duplex(64);
+        let (mut second_writer, mut second_reader) = tokio::io::duplex(64);
+        first_writer
+            .write_all(&[REQUEST, 6, 0, 0, 0])
+            .await
+            .unwrap();
+        second_writer
+            .write_all(&[REQUEST, 6, 0, 0, 0])
+            .await
+            .unwrap();
+        let first = tokio::spawn({
+            let budget = budget.clone();
+            async move {
+                let (_, body, permit) = read_request_frame(&mut first_reader, budget).await?;
+                drop(permit);
+                Ok::<Vec<u8>, io::Error>(body)
+            }
+        });
+        let second = tokio::spawn({
+            let budget = budget.clone();
+            async move {
+                let (_, body, permit) = read_request_frame(&mut second_reader, budget).await?;
+                drop(permit);
+                Ok::<Vec<u8>, io::Error>(body)
+            }
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while budget.available_permits() != 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "one 6-byte frame did not consume the shared budget: {} permits remain",
+                budget.available_permits()
+            );
+            tokio::task::yield_now().await;
+        }
+        // The first frame now holds the whole budget. The second frame may
+        // take nothing from it: a per-connection budget, or a one-permit
+        // reservation, would leave permits here. The first frame cannot
+        // complete before its body arrives, so a correct receiver stays at
+        // zero for the whole window.
+        let stolen = tokio::time::timeout(Duration::from_millis(200), async {
+            while budget.available_permits() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(
+            stolen.is_err(),
+            "a second frame reserved {} permits while the first held the whole budget",
+            6 - budget.available_permits()
+        );
+        first_writer.write_all(&[1; 6]).await.unwrap();
+        second_writer.write_all(&[2; 6]).await.unwrap();
+        let first = tokio::time::timeout(Duration::from_secs(2), first)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let second = tokio::time::timeout(Duration::from_secs(2), second)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(first, [1; 6]);
+        assert_eq!(second, [2; 6]);
+        assert_eq!(budget.available_permits(), 6);
+    }
+
+    #[tokio::test]
+    async fn a_refused_snapshot_chunk_fails_closed_and_the_next_snapshot_succeeds() {
+        // A refused chunk must not answer, must not hang, and must not cost
+        // the listener its budget: the same client sends a valid snapshot over
+        // a fresh connection immediately afterwards.
+        use openraft::network::RaftNetworkFactory;
+        let peer = snapshot_peer(35);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let received = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut config = TransportConfig::new(
+            peer.server.clone(),
+            peer.server_key.clone(),
+            BTreeMap::new(),
+            peer.registry.clone(),
+        )
+        .with_tls(Arc::new(crate::openraft_tls::test_support::config(2)));
+        config.request_timeout = Duration::from_secs(30);
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(
+            RaftPeerServer::from_listener(listener, config, recording_handler(received.clone()))
+                .serve_until(async {
+                    let _ = stopped.await;
+                }),
+        );
+
+        // Speak the wire protocol directly so the test can send a chunk the
+        // client encoder would never produce.
+        let tls = crate::openraft_tls::test_support::config(1);
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let mut raw: PeerStream =
+            Box::new(tls.client.connect(tls.name(2).unwrap(), tcp).await.unwrap());
+        let (kind, challenge) = read_frame(&mut raw).await.unwrap();
+        assert_eq!(kind, CHALLENGE);
+        let challenge: [u8; 32] = challenge.try_into().unwrap();
+        let data = vec![9u8; 3];
+        let digest = sha256(&data);
+        write_frame(
+            &mut raw,
+            SNAPSHOT_MANIFEST,
+            &signed_snapshot_frame(
+                &peer,
+                1,
+                serde_json::to_vec(&manifest(&peer, challenge, 3, digest)).unwrap(),
+            ),
+        )
+        .await
+        .unwrap();
+        // One byte short of the three the manifest declares.
+        write_frame(
+            &mut raw,
+            SNAPSHOT_CHUNK,
+            &signed_snapshot_frame(
+                &peer,
+                1,
+                serde_json::to_vec(&chunk(challenge, 0, 3, digest, data[..2].to_vec())).unwrap(),
+            ),
+        )
+        .await
+        .unwrap();
+        let refused = tokio::time::timeout(Duration::from_secs(2), read_frame(&mut raw))
+            .await
+            .expect("a refused chunk left the connection hanging");
+        assert!(refused.is_err(), "a refused chunk was answered");
+        assert!(
+            received.lock().unwrap().is_empty(),
+            "a refused chunk was dispatched"
+        );
+        drop(raw);
+
+        // The sender is still usable: a fresh connection and a valid snapshot.
+        let mut client = AuthenticatedTcpNetworkFactory::new(
+            TransportConfig::new(
+                peer.client.clone(),
+                peer.client_key.clone(),
+                BTreeMap::from([(2, addr)]),
+                peer.registry.clone(),
+            )
+            .with_tls(Arc::new(crate::openraft_tls::test_support::config(1))),
+        )
+        .new_client(2, &BasicNode::new("node-2.test"))
+        .await;
+        let result = client
+            .call_for_test(
+                WireRequest::InstallSnapshot {
+                    vote: Vote::new(1, 1),
+                    meta: SnapshotMeta::default(),
+                    data: vec![5u8; 3],
+                },
+                Duration::from_secs(10),
+            )
+            .await;
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(*received.lock().unwrap(), vec![3]);
+        stop.send(()).unwrap();
+        server.await.unwrap().unwrap();
+    }
+
     #[test]
     fn all_rpc_vote_owners_must_match_sender() {
         let vote = Vote::new(7, 1);
