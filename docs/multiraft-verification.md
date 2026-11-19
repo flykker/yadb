@@ -2672,7 +2672,9 @@ not through an admin route, and the install is still initiated by an inbound
 
 * `python3 tests/protocols.py` — 23 PASS / 2 SKIP, exit 0 on 2026-11-19. The two
   SKIPs are `Multi-Raft repair scan` (repair needs one whole-deployment view of
-  live manifests) and `reader lease` (legacy-gated). The cross-process
+  live manifests) and `reader lease` (legacy-gated). `docs/multiraft-skip-closure-plan.md`
+  records what would close each one, what it would still not prove, and the gate
+  counts it expects. The cross-process
   InstallSnapshot scenario runs in this gate and prints a PASS naming the
   installed snapshot's meta index; it is no longer a SKIP and the
   `--install-snapshot-live` flag no longer exists.
