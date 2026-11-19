@@ -79,6 +79,22 @@ struct Inner {
     repaired_tail: Option<TailRepair>,
     failed: bool,
     fault: Option<Fault>,
+    /// Test-only rendezvous at the publication boundary of [`append_durable`].
+    #[cfg(test)]
+    gate: Option<AppendGate>,
+}
+
+/// Test-only rendezvous inside [`DurableOpenRaftLog::append_durable`].
+///
+/// The writer signals `reached` after the frame has been written and synced but
+/// before the new state is published to readers, then blocks on `release`
+/// while still holding the inner lock. A test can therefore show that a
+/// concurrent reader cannot observe the log between those two points, which is
+/// the serialisation the no-torn guarantee rests on.
+#[cfg(test)]
+struct AppendGate {
+    reached: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
 }
 
 /// A torn final frame that `open` discarded.
@@ -818,6 +834,8 @@ impl DurableOpenRaftLog {
                 repaired_tail: None,
                 failed: false,
                 fault: None,
+                #[cfg(test)]
+                gate: None,
             })),
         })
     }
@@ -882,6 +900,8 @@ impl DurableOpenRaftLog {
                 repaired_tail,
                 failed: false,
                 fault: None,
+                #[cfg(test)]
+                gate: None,
             })),
         })
     }
@@ -1027,6 +1047,18 @@ impl DurableOpenRaftLog {
         }
         inner.bytes += frame.len() as u64;
         inner.frames += 1;
+        // The serialisation point for concurrent readers. The whole call runs
+        // under one `Mutex<Inner>` guard: validation, framing, the durable write
+        // and this publication. A `LogReader` therefore observes either the
+        // state before the append or the state after it, never a batch that is
+        // only partly inserted and never an entry whose frame is not yet synced.
+        // The test-only gate parks the writer exactly here so a test can show
+        // that a reader cannot pass it.
+        #[cfg(test)]
+        if let Some(gate) = inner.gate.take() {
+            let _ = gate.reached.send(());
+            let _ = gate.release.recv();
+        }
         inner.state = next;
         Ok(())
     }
@@ -1041,6 +1073,26 @@ impl DurableOpenRaftLog {
             .range(start..end)
             .map(|(_, e)| e.clone())
             .collect()
+    }
+
+    /// Test-only: stop the next durable append after its frame is synced but
+    /// before the new state is published to readers.
+    ///
+    /// Returns the signal that the boundary was reached and the sender that
+    /// releases it. The gate is consumed by that append, so a later one runs
+    /// normally. The append holds the inner lock while it waits, so this also
+    /// proves that a concurrent reader is serialised against publication.
+    #[cfg(test)]
+    pub(crate) fn gate_next_append_for_test(
+        &self,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (reached, reached_rx) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        self.inner.lock().unwrap().gate = Some(AppendGate {
+            reached,
+            release: release_rx,
+        });
+        (reached_rx, release)
     }
 }
 
@@ -1146,6 +1198,7 @@ impl RaftLogStorage<C> for DurableOpenRaftLog {
 mod tests {
     use super::*;
     use crate::KvCommand;
+    use openraft::storage::RaftLogStorageExt;
     use openraft::{CommittedLeaderId, EntryPayload};
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1377,6 +1430,59 @@ mod tests {
             vote,
             serde_json::to_vec(&entries).unwrap(),
         )
+    }
+
+    /// The indexes a `RaftLogReader` can currently return, in order.
+    async fn readable_indices(store: &mut DurableOpenRaftLog) -> Vec<u64> {
+        store
+            .try_get_log_entries(0..u64::MAX)
+            .await
+            .unwrap()
+            .iter()
+            .map(|entry| entry.log_id.index)
+            .collect()
+    }
+
+    /// The invariants `LogState` documents, checked against what the log
+    /// actually serves (`openraft-0.9.25/src/storage/mod.rs:138-149`):
+    /// `last_purged_log_id <= last_applied <= last_log_id`, and the reported
+    /// `last_log_id` is the last retained entry or the purge marker when
+    /// nothing is retained.
+    async fn assert_log_state_invariants(store: &mut DurableOpenRaftLog, what: &str) {
+        let state = store.get_log_state().await.unwrap();
+        let entries = store.try_get_log_entries(0..u64::MAX).await.unwrap();
+        let coverage = store.coverage();
+
+        if let (Some(purged), Some(last)) = (state.last_purged_log_id, state.last_log_id) {
+            assert!(
+                purged <= last,
+                "{what}: last_purged {purged:?} is greater than last_log {last:?}"
+            );
+        }
+        assert_eq!(
+            coverage.last_purged, state.last_purged_log_id,
+            "{what}: the log's own purge view disagrees with get_log_state"
+        );
+        assert_eq!(
+            state.last_log_id,
+            entries.last().map(|entry| entry.log_id).or(state.last_purged_log_id),
+            "{what}: last_log_id is neither the last retained entry nor the purge marker"
+        );
+        if let Some(purged) = state.last_purged_log_id {
+            assert!(
+                entries
+                    .iter()
+                    .all(|entry| entry.log_id.index > purged.index),
+                "{what}: an entry at or below the purge marker is still readable"
+            );
+        }
+        for pair in entries.windows(2) {
+            assert_eq!(
+                pair[0].log_id.index + 1,
+                pair[1].log_id.index,
+                "{what}: the retained log has a hole"
+            );
+        }
     }
 
     #[tokio::test]
@@ -2638,5 +2744,423 @@ mod tests {
         let store = DurableOpenRaftLog::create(&dir, &identity()).unwrap();
         drop(store);
         assert!(DurableOpenRaftLog::open(&dir, &identity()).is_ok());
+    }
+
+    /// OpenRaft 0.9.25 contract rows: `save_vote` must persist before it
+    /// returns (`storage/v2.rs:74-79`), and votes are compared with
+    /// `Vote::partial_cmp` (`vote/vote.rs:20-44`), so a later vote must never
+    /// be replaced by an earlier one.
+    ///
+    /// `rejected_limits_do_not_write_or_poison` already asserts that one
+    /// decreasing vote errors and leaves the file unchanged. This test pins the
+    /// ordering relation itself: equal, greater and committed transitions are
+    /// accepted, decreasing term and decreasing node id are refused without
+    /// changing the durable image, and the accepted vote survives a reopen.
+    #[tokio::test]
+    async fn contract_save_vote_is_monotonic_and_durable() {
+        let dir = TempDir::new();
+        let mut store = DurableOpenRaftLog::create(&dir.0, &identity()).unwrap();
+
+        store.save_vote(&Vote::new(5, 2)).await.unwrap();
+        // Re-saving the same vote is not a regression and must be accepted.
+        store.save_vote(&Vote::new(5, 2)).await.unwrap();
+        // A greater term is accepted.
+        store.save_vote(&Vote::new(6, 1)).await.unwrap();
+        // For an equal term, a greater node id is greater.
+        store.save_vote(&Vote::new(6, 2)).await.unwrap();
+        // The committed bit orders above the uncommitted vote for the same
+        // leader id (`vote/vote.rs:24`).
+        store.save_vote(&Vote::new_committed(6, 2)).await.unwrap();
+
+        let accepted = image(&mut store).await;
+        assert_eq!(accepted.2, Some(Vote::new_committed(6, 2)));
+
+        for older in [Vote::new(5, 1), Vote::new(6, 1), Vote::new(6, 2)] {
+            let error = store.save_vote(&older).await.unwrap_err();
+            assert!(
+                format!("{error}").contains("vote cannot move backwards"),
+                "saving {older:?} must be refused as a regression, got {error}"
+            );
+            assert_eq!(
+                image(&mut store).await,
+                accepted,
+                "a refused vote {older:?} changed the durable image"
+            );
+        }
+
+        // The refusal did not poison the handle: the next greater vote is
+        // accepted and survives a reopen.
+        store.save_vote(&Vote::new(7, 1)).await.unwrap();
+        drop(store);
+        let mut reopened = DurableOpenRaftLog::open(&dir.0, &identity()).unwrap();
+        assert_eq!(
+            reopened.read_vote().await.unwrap(),
+            Some(Vote::new(7, 1)),
+            "save_vote must be durable before it returns"
+        );
+    }
+
+    /// OpenRaft 0.9.25 contract rows: `truncate` removes `log_id` and
+    /// everything after it, inclusive (`storage/v2.rs:131-136`), and must not
+    /// leave a hole. Purged entries must never become readable again, so a
+    /// truncate at or below the purge marker is refused.
+    ///
+    /// Existing coverage truncates at 0 and at 11 after appending 0..=10
+    /// (`contract_truncate_and_append_after_purge_survive_reopen`). This test
+    /// covers the four boundaries the contract leaves open: at the last index,
+    /// above it, at the purge marker and below the marker.
+    #[tokio::test]
+    async fn contract_truncate_boundaries_are_inclusive_and_reject_the_purged_prefix() {
+        // At the last index: exactly that entry is removed and the predecessor
+        // becomes the last log id.
+        let dir = TempDir::new();
+        let mut store = DurableOpenRaftLog::create(&dir.0, &identity()).unwrap();
+        store
+            .append_durable(&Record::Append((0..=10).map(entry).collect()))
+            .unwrap();
+        store.truncate(entry(10).log_id).await.unwrap();
+        assert_eq!(readable_indices(&mut store).await, (0..=9).collect::<Vec<_>>());
+        assert_eq!(
+            store.get_log_state().await.unwrap().last_log_id,
+            Some(entry(9).log_id)
+        );
+        assert_log_state_invariants(&mut store, "truncate at the last index").await;
+
+        // Above the last index: nothing is removed and no hole appears.
+        store.truncate(entry(11).log_id).await.unwrap();
+        assert_eq!(readable_indices(&mut store).await, (0..=9).collect::<Vec<_>>());
+        assert_log_state_invariants(&mut store, "truncate above the last index").await;
+
+        // The next contiguous append still fits, and a reopen preserves it.
+        store
+            .append_durable(&Record::Append(vec![entry(10)]))
+            .unwrap();
+        drop(store);
+        let mut reopened = DurableOpenRaftLog::open(&dir.0, &identity()).unwrap();
+        assert_eq!(
+            readable_indices(&mut reopened).await,
+            (0..=10).collect::<Vec<_>>()
+        );
+
+        // At and below the purge marker: refused, with no durable change and no
+        // poison, because either would make a purged entry readable again.
+        let dir = TempDir::new();
+        let mut store = DurableOpenRaftLog::create(&dir.0, &identity()).unwrap();
+        store
+            .append_durable(&Record::Append((0..=10).map(entry).collect()))
+            .unwrap();
+        store.purge(entry(5).log_id).await.unwrap();
+        let durable = image(&mut store).await;
+        for boundary in [5, 3] {
+            let error = store.truncate(entry(boundary).log_id).await.unwrap_err();
+            assert!(
+                format!("{error}").contains("cannot truncate purged logs"),
+                "truncate({boundary}) must be refused, got {error}"
+            );
+            assert_eq!(
+                image(&mut store).await,
+                durable,
+                "truncate({boundary}) changed the log"
+            );
+            assert_log_state_invariants(&mut store, "rejected truncate").await;
+        }
+
+        // At the first retained index: allowed. The retained suffix is removed
+        // and the purge marker becomes the last log id, which is exactly the
+        // fallback `LogState` documents (`storage/mod.rs:146-148`).
+        store.truncate(entry(6).log_id).await.unwrap();
+        assert!(readable_indices(&mut store).await.is_empty());
+        let state = store.get_log_state().await.unwrap();
+        assert_eq!(state.last_purged_log_id, Some(entry(5).log_id));
+        assert_eq!(state.last_log_id, Some(entry(5).log_id));
+        assert_log_state_invariants(&mut store, "truncate at the first retained index").await;
+
+        drop(store);
+        let mut reopened = DurableOpenRaftLog::open(&dir.0, &identity()).unwrap();
+        assert!(readable_indices(&mut reopened).await.is_empty());
+        assert_eq!(
+            reopened.get_log_state().await.unwrap().last_purged_log_id,
+            Some(entry(5).log_id)
+        );
+    }
+
+    /// OpenRaft 0.9.25 contract rows: `RaftLogReader::try_get_log_entries`
+    /// returns `[start, stop)` and explicitly allows an entry that is not found
+    /// (`storage/mod.rs:162-171`); `limited_get_log_entries` must not return an
+    /// empty result for a non-empty range (`storage/mod.rs:173-188`).
+    ///
+    /// After a purge, a range that starts below the marker and ends above it is
+    /// the interesting case: the purged prefix must be skipped, not turned into
+    /// an error and not filled with placeholder entries.
+    #[tokio::test]
+    async fn contract_range_read_spanning_the_purge_boundary_returns_only_retained_entries() {
+        let dir = TempDir::new();
+        let mut store = DurableOpenRaftLog::create(&dir.0, &identity()).unwrap();
+        store
+            .append_durable(&Record::Append((0..=10).map(entry).collect()))
+            .unwrap();
+        store.purge(entry(5).log_id).await.unwrap();
+
+        let ids = |entries: Vec<Entry<C>>| {
+            entries
+                .into_iter()
+                .map(|entry| entry.log_id.index)
+                .collect::<Vec<_>>()
+        };
+
+        // Starts below the marker, ends above it.
+        assert_eq!(
+            ids(store.try_get_log_entries(2..9).await.unwrap()),
+            vec![6, 7, 8]
+        );
+        // A range entirely inside the purged prefix is empty, not an error.
+        assert!(store.try_get_log_entries(0..5).await.unwrap().is_empty());
+        assert!(store.try_get_log_entries(5..6).await.unwrap().is_empty());
+        // The retained suffix, including the first retained entry.
+        assert_eq!(
+            ids(store.try_get_log_entries(6..11).await.unwrap()),
+            vec![6, 7, 8, 9, 10]
+        );
+        // The default `limited_get_log_entries` path must not return empty for a
+        // non-empty range that contains retained entries.
+        assert_eq!(
+            ids(store.limited_get_log_entries(6, 9).await.unwrap()),
+            vec![6, 7, 8]
+        );
+        assert_log_state_invariants(&mut store, "spanning read").await;
+
+        drop(store);
+        let mut reopened = DurableOpenRaftLog::open(&dir.0, &identity()).unwrap();
+        assert_eq!(
+            ids(reopened.try_get_log_entries(4..8).await.unwrap()),
+            vec![6, 7]
+        );
+    }
+
+    /// OpenRaft 0.9.25 contract rows: `append` must make the entries readable
+    /// when it returns, the callback must fire only once they are persisted,
+    /// and there must be no hole (`storage/v2.rs:108-129`). All storage access
+    /// is concurrent only with the log reader (`storage/mod.rs:220-228`), and
+    /// all write IO is serialised (`storage/v2.rs:45-48`).
+    ///
+    /// The adapter publishes `inner.state` only after `write_all` and
+    /// `sync_data` succeed, all under one `Mutex<Inner>` guard. This test parks
+    /// the writer at that publication boundary and shows a concurrent reader
+    /// cannot pass it, then observes the whole batch once the writer is
+    /// released. A torn or partly inserted batch is therefore not observable.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_reader_is_serialised_against_append_publication() {
+        let dir = TempDir::new();
+        let mut store = DurableOpenRaftLog::create(&dir.0, &identity()).unwrap();
+        store
+            .append_durable(&Record::Append(vec![entry(0), entry(1)]))
+            .unwrap();
+
+        let (reached, release) = store.gate_next_append_for_test();
+        let writer = store.clone();
+        let append = tokio::spawn(async move {
+            writer
+                .append_durable(&Record::Append(vec![entry(2), entry(3)]))
+                .unwrap();
+        });
+        reached
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the append must reach its publication boundary");
+
+        // The writer has written and synced the frame but has not published the
+        // new state, and it still holds the inner lock.
+        let mut reader = store.get_log_reader().await;
+        let (started, started_rx) = std::sync::mpsc::channel();
+        let (done, done_rx) = std::sync::mpsc::channel();
+        let read = tokio::spawn(async move {
+            started.send(()).unwrap();
+            let indices: Vec<u64> = reader
+                .try_get_log_entries(0..10)
+                .await
+                .unwrap()
+                .iter()
+                .map(|entry| entry.log_id.index)
+                .collect();
+            done.send(indices).unwrap();
+        });
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the reader task must start");
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_millis(200))
+                .is_err(),
+            "a reader returned while the append was between its sync and its publication"
+        );
+
+        release.send(()).unwrap();
+        append.await.unwrap();
+        assert_eq!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("the reader must finish after the writer is released"),
+            vec![0, 1, 2, 3],
+            "the reader must observe the whole batch, never a partly inserted one"
+        );
+        read.await.unwrap();
+
+        // The same complete batch is what a fresh handle recovers.
+        drop(store);
+        let mut reopened = DurableOpenRaftLog::open(&dir.0, &identity()).unwrap();
+        assert_eq!(
+            readable_indices(&mut reopened).await,
+            vec![0, 1, 2, 3]
+        );
+    }
+
+    /// OpenRaft 0.9.25 contract rows: `get_log_state` returns the last present
+    /// entry or `last_purged_log_id` when nothing is present
+    /// (`storage/v2.rs:59-66`), and `LogState` satisfies
+    /// `last_purged_log_id <= last_applied <= last_log_id`
+    /// (`storage/mod.rs:138-149`).
+    ///
+    /// The state machine owns `last_applied`, so this store can only check the
+    /// log side; the helper also checks that the reported view agrees with what
+    /// the reader actually serves. The invariant is re-checked after every
+    /// transition, including an automatic checkpoint and a reopen.
+    #[tokio::test]
+    async fn contract_log_state_invariants_hold_across_the_whole_lifecycle() {
+        let dir = TempDir::new();
+        let mut store = DurableOpenRaftLog::create(&dir.0, &identity()).unwrap();
+        assert_log_state_invariants(&mut store, "create").await;
+
+        store.save_vote(&Vote::new(1, 1)).await.unwrap();
+        assert_log_state_invariants(&mut store, "vote").await;
+
+        store
+            .append_durable(&Record::Append((0..=10).map(entry).collect()))
+            .unwrap();
+        assert_log_state_invariants(&mut store, "append").await;
+
+        store.truncate(entry(7).log_id).await.unwrap();
+        assert_log_state_invariants(&mut store, "truncate").await;
+
+        store
+            .append_durable(&Record::Append((7..=12).map(entry).collect()))
+            .unwrap();
+        assert_log_state_invariants(&mut store, "append after truncate").await;
+
+        store.purge(entry(9).log_id).await.unwrap();
+        assert_log_state_invariants(&mut store, "purge").await;
+
+        // Saturate the frame budget so the next append rewrites the live image
+        // as a checkpoint before appending. The invariant must survive the
+        // compaction as well as the append.
+        store.inner.lock().unwrap().frames = MAX_LOG_FRAMES;
+        store
+            .append_durable(&Record::Append(vec![entry(13)]))
+            .unwrap();
+        assert_log_state_invariants(&mut store, "checkpoint").await;
+
+        let expected = image(&mut store).await;
+        drop(store);
+        let mut reopened = DurableOpenRaftLog::open(&dir.0, &identity()).unwrap();
+        assert_log_state_invariants(&mut reopened, "reopen").await;
+        assert_eq!(image(&mut reopened).await, expected);
+    }
+
+    /// OpenRaft 0.9.25 contract row: `blocking_append` returns only after the
+    /// `LogFlushed` callback fires (`storage/v2/raft_log_storage_ext.rs:21-40`),
+    /// and the callback means the entries are persisted
+    /// (`storage/callback.rs:32-46`, `storage/v2.rs:120`). The adapter fires it
+    /// after `write_all` and `sync_data`, so a successful blocking append must
+    /// be visible to a fresh handle with no recovery.
+    #[tokio::test]
+    async fn contract_append_callback_reports_only_persisted_entries() {
+        let dir = TempDir::new();
+        let mut store = DurableOpenRaftLog::create(&dir.0, &identity()).unwrap();
+        store
+            .blocking_append(vec![entry(0), entry(1)])
+            .await
+            .unwrap();
+
+        drop(store);
+        let mut reopened = DurableOpenRaftLog::open(&dir.0, &identity()).unwrap();
+        assert_eq!(readable_indices(&mut reopened).await, vec![0, 1]);
+    }
+
+    /// The adapter's limits are stricter than anything OpenRaft specifies: it
+    /// keeps at most `MAX_LIVE_ENTRIES` entries per append and a 16 MiB frame.
+    /// A stricter bound is allowed, but it must refuse the whole request
+    /// cleanly. Silently keeping the first `MAX_LIVE_ENTRIES` entries would
+    /// acknowledge a batch OpenRaft never saw whole.
+    #[tokio::test]
+    async fn contract_entry_count_bound_is_refused_without_truncation_or_poison() {
+        let dir = TempDir::new();
+        let mut store = DurableOpenRaftLog::create(&dir.0, &identity()).unwrap();
+        store
+            .append_durable(&Record::Append(vec![entry(0)]))
+            .unwrap();
+        let durable = image(&mut store).await;
+        let before = fs::read(dir.0.join("openraft.log")).unwrap();
+
+        let too_many: Vec<_> = (1..=(MAX_LIVE_ENTRIES as u64 + 1)).map(entry).collect();
+        let error = store.blocking_append(too_many).await.unwrap_err();
+        assert!(
+            format!("{error}").contains("exceeds entry limit"),
+            "the entry-count bound must be reported, got {error}"
+        );
+        assert_eq!(
+            fs::read(dir.0.join("openraft.log")).unwrap(),
+            before,
+            "a refused entry-count bound must not write a partial batch"
+        );
+        assert_eq!(image(&mut store).await, durable);
+        assert_log_state_invariants(&mut store, "rejected entry count").await;
+
+        // Not poisoned: the next valid append works and survives a reopen.
+        store
+            .append_durable(&Record::Append(vec![entry(1)]))
+            .unwrap();
+        drop(store);
+        let mut reopened = DurableOpenRaftLog::open(&dir.0, &identity()).unwrap();
+        assert_eq!(readable_indices(&mut reopened).await, vec![0, 1]);
+    }
+
+    /// The frame-payload bound is checked by `encode` before any file IO. An
+    /// entry that cannot fit must be refused whole rather than serialised in
+    /// part, and the refusal must not poison the handle.
+    #[tokio::test]
+    async fn contract_frame_payload_bound_is_refused_before_any_io() {
+        let dir = TempDir::new();
+        let mut store = DurableOpenRaftLog::create(&dir.0, &identity()).unwrap();
+        store
+            .append_durable(&Record::Append(vec![entry(0)]))
+            .unwrap();
+        let durable = image(&mut store).await;
+        let before = fs::read(dir.0.join("openraft.log")).unwrap();
+
+        let oversized = Entry {
+            log_id: LogId::new(CommittedLeaderId::new(1, 1), 1),
+            payload: EntryPayload::Normal(KvCommand::Put {
+                key: "k".repeat(MAX_FRAME_PAYLOAD),
+                value: vec![1],
+            }),
+        };
+        let error = store.blocking_append(vec![oversized]).await.unwrap_err();
+        assert!(
+            format!("{error}").contains("exceeds limit"),
+            "the frame bound must be reported, got {error}"
+        );
+        assert_eq!(
+            fs::read(dir.0.join("openraft.log")).unwrap(),
+            before,
+            "a refused frame must not leave a partial record"
+        );
+        assert_eq!(image(&mut store).await, durable);
+        assert_log_state_invariants(&mut store, "rejected frame").await;
+
+        // Not poisoned: the next valid append works and survives a reopen.
+        store
+            .append_durable(&Record::Append(vec![entry(1)]))
+            .unwrap();
+        drop(store);
+        let mut reopened = DurableOpenRaftLog::open(&dir.0, &identity()).unwrap();
+        assert_eq!(readable_indices(&mut reopened).await, vec![0, 1]);
     }
 }

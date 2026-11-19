@@ -2462,4 +2462,46 @@ mod tests {
         );
         assert_eq!(fs::read(temp).unwrap(), b"recovery evidence");
     }
+
+    /// OpenRaft 0.9.25 `RaftStateMachine::apply` docs
+    /// (`storage/v2.rs:185-191`) require storing each entry's log id as the
+    /// last applied id. The source does not state that a non-consecutive batch
+    /// must be refused, and OpenRaft only ever applies the consecutive
+    /// committed prefix (`core/raft_core.rs:734-763`). The adapter is stricter:
+    /// it refuses a gap rather than reporting a `last_applied` whose
+    /// predecessor was never applied. This pins that the stricter rule fails
+    /// closed: nothing is published, nothing is appended to the delta, and the
+    /// gap is still fillable afterwards.
+    #[tokio::test]
+    async fn apply_refuses_a_non_consecutive_batch_without_publishing_or_persisting() {
+        let dir = TempDir::new();
+        let mut sm = DurableMetaStateMachine::create(&dir.0, &identity()).unwrap();
+        sm.apply(vec![put(1, "a", b"one")]).await.unwrap();
+        let applied = sm.applied_state().await.unwrap().0;
+        let delta = fs::read(dir.0.join(DELTA_FILE)).unwrap();
+
+        let error = sm.apply(vec![put(3, "c", b"three")]).await.unwrap_err();
+        assert!(
+            format!("{error}").contains("not consecutive"),
+            "a gap must be refused, got {error}"
+        );
+        assert_eq!(sm.applied_state().await.unwrap().0, applied);
+        assert!(
+            sm.snapshot().get("c").is_none(),
+            "a refused entry must not become visible"
+        );
+        assert_eq!(
+            fs::read(dir.0.join(DELTA_FILE)).unwrap(),
+            delta,
+            "a refused entry must not be appended to the delta"
+        );
+
+        // The gap is still fillable, and a reopen sees only accepted entries.
+        sm.apply(vec![put(2, "b", b"two")]).await.unwrap();
+        drop(sm);
+        let mut reopened = DurableMetaStateMachine::open(&dir.0, &identity()).unwrap();
+        assert_eq!(reopened.applied_state().await.unwrap().0.unwrap().index, 2);
+        assert_eq!(reopened.snapshot().get("b").unwrap().value, b"two");
+        assert!(reopened.snapshot().get("c").is_none());
+    }
 }
