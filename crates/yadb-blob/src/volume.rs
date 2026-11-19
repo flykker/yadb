@@ -1737,3 +1737,127 @@ mod clock_injection_tests {
         assert_eq!(kept[2].1.epoch, 8);
     }
 }
+
+#[cfg(test)]
+mod fence_race_tests {
+    use super::*;
+    use std::sync::{Arc, Barrier, Mutex};
+    use yadb_io::SimFs;
+
+    /// The pin/advance race has one invariant: a live pin is never left on an
+    /// epoch the collector moved past.
+    ///
+    /// Both operations take the same append lock for the epoch compare and the
+    /// durable record, so each interleaving must resolve one way: either the
+    /// advance wins and a later pin is refused as "not the current epoch", or
+    /// the pin wins and every advance from that epoch is refused as
+    /// `EpochPinned`. A torn outcome - a pin granted on `E` while the epoch
+    /// moves to `E+1` - would let a collector delete bytes that pin protects.
+    /// Hammering the two calls from separate threads is what exercises the
+    /// interleaving a single-threaded test cannot.
+    #[test]
+    fn no_live_pin_survives_on_an_epoch_the_collector_moved_past() {
+        const ROUNDS: usize = 100;
+        let fs = SimFs::new(0x5eed_c0de);
+        let store = Arc::new(
+            VolumeStore::open(fs.clone(), "race", VolumeConfig::default()).unwrap(),
+        );
+        let start = Arc::new(Barrier::new(4));
+        let granted = Arc::new(Mutex::new(Vec::new()));
+
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let store = store.clone();
+            let start = start.clone();
+            let granted = granted.clone();
+            handles.push(std::thread::spawn(move || {
+                start.wait();
+                for _ in 0..ROUNDS {
+                    let requested = store.epoch();
+                    match store.pin(requested, 60_000) {
+                        Ok(grant) => {
+                            // The grant names the epoch that was current under
+                            // the same lock, and no advance can move it while
+                            // this pin is live.
+                            assert_eq!(grant.epoch, store.epoch());
+                            granted.lock().unwrap().push(grant);
+                        }
+                        Err(BlobError::PinEpochNotCurrent {
+                            requested_epoch,
+                            actual_epoch,
+                        }) => {
+                            // The collector advanced between the read and the
+                            // pin. The epoch only moves forward, and refusing a
+                            // pin for a superseded epoch is the safe answer.
+                            assert!(requested_epoch < actual_epoch);
+                        }
+                        Err(error) => panic!("unexpected pin failure: {error:?}"),
+                    }
+                }
+            }));
+        }
+        for _ in 0..2 {
+            let store = store.clone();
+            let start = start.clone();
+            handles.push(std::thread::spawn(move || {
+                start.wait();
+                for _ in 0..ROUNDS {
+                    let requested = store.epoch();
+                    match store.advance_epoch(requested) {
+                        Ok(next) => assert_eq!(next, requested + 1),
+                        Err(BlobError::EpochPinned {
+                            epoch,
+                            live_pins,
+                        }) => {
+                            assert_eq!(epoch, requested);
+                            assert!(live_pins > 0);
+                        }
+                        Err(BlobError::EpochMismatch {
+                            expected_epoch,
+                            actual_epoch,
+                        }) => {
+                            // Another observer advanced first; the epoch only
+                            // moves forward, and the stale request stops.
+                            assert!(expected_epoch < actual_epoch);
+                        }
+                        Err(error) => panic!("unexpected advance failure: {error:?}"),
+                    }
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        // TTL is 60 s, far above this test's run time, so every pin is still
+        // live. Once any pin landed, no advance could move past its epoch; if
+        // no pin landed at all, the assertion is vacuous and reported.
+        let final_epoch = store.epoch();
+        let granted = granted.lock().unwrap();
+        assert!(!granted.is_empty(), "no pin won a round");
+        for grant in granted.iter() {
+            assert_eq!(
+                grant.epoch, final_epoch,
+                "a live pin was left on epoch {} while the target moved to {final_epoch}",
+                grant.epoch
+            );
+        }
+        let live = store.live_pins().unwrap();
+        assert_eq!(live.len(), granted.len());
+        assert!(live.iter().all(|pin| pin.epoch == final_epoch));
+
+        // Release every pin, then advance once. Recovery must find the higher
+        // epoch and no resurrected pin: the race left no torn record behind.
+        for grant in granted.iter() {
+            assert!(store.unpin(grant.pin_id).unwrap());
+        }
+        drop(granted);
+        assert_eq!(store.advance_epoch(final_epoch).unwrap(), final_epoch + 1);
+        drop(store);
+
+        let reopened =
+            VolumeStore::open(fs, "race", VolumeConfig::default()).unwrap();
+        assert_eq!(reopened.epoch(), final_epoch + 1);
+        assert!(reopened.live_pins().unwrap().is_empty());
+    }
+}
