@@ -2000,8 +2000,10 @@ part back to its nominal slot. Repair deletes nothing except the handoff copy of
 a part it has already written to the nominal slot, and a tombstoned id refuses
 that write, so a pass cannot resurrect a blob a collector removed.
 
-`ScrubSummary.repair_error` is `None` when every group ran and otherwise names
-the groups that refused. `POST /v1/pools/scrub` answers `200` only when
+`ScrubSummary.repair_error` is `None` when every group ran and otherwise says
+why the scan did not run: the groups that refused, or — before any group is
+touched — that the control-plane snapshot a pass needs could not be confirmed.
+`POST /v1/pools/scrub` answers `200` only when
 `repair_error` and `gc_refusal` are both `None`, and otherwise `409` with the
 summary body — the rule `/v1/pools/gc` already uses. On a multi-node cluster a
 node leads only some data groups, so its scrub is `409` and names the groups it
@@ -2012,7 +2014,7 @@ repaired by that pass; repair is idempotent, not atomic with publication. A
 group leader dying between a fragment write and its manifest commit still has no
 drill.
 
-The volume-to-pool map is no longer one of them. `block_pool_lookup` used to be
+The volume-to-pool map is no longer a limit. `block_pool_lookup` used to be
 read from this node's local control-plane cache; a pass now takes it only from a
 control snapshot proved against the control group's quorum
 (`AppState::control_for_collection`) and refuses, deleting nothing, when that

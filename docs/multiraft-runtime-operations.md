@@ -297,7 +297,11 @@ refused by name in `repair_error`; one group's refusal does not stop another
 group's pass, so on a multi-node cluster a node leads only some data groups,
 repairs those, and answers `409` naming the ones it does not lead. That `409`
 is not a failed pass: read the counters for the groups this node leads, and run
-the same request on each named group's leader to cover the rest. `yadbctl
+the same request on each named group's leader to cover the rest. A different
+`409` shape says no group ran at all: `repair_error` (scrub) or `refusal` (gc)
+names an unavailable control-plane snapshot, which a pass needs for its
+volume-to-pool map, and the counters are all zero because nothing was touched.
+Re-run once the node can reach the control group's quorum. `yadbctl
 pool-scrub` cannot express that distinction — it prints the body and exits `1`
 on any non-`200` — so a scripted scrub must inspect `repair_error` rather than
 the exit status.
