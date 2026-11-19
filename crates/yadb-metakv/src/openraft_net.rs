@@ -12,9 +12,9 @@
 
 use std::collections::BTreeMap;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use openraft::error::{
@@ -46,9 +46,28 @@ pub const MAX_FRAME: usize = 32 * 1024 * 1024;
 /// Maximum number of concurrently served connections.
 pub const MAX_CONNECTIONS: usize = 64;
 
+/// Largest number of handler slots one source address may hold at once.
+///
+/// The global cap is shared, so without a sub-cap a single reachable address
+/// can hold every slot and deny service to every other peer before either
+/// connection has authenticated. Half of [`MAX_CONNECTIONS`] is the largest
+/// sub-cap that still leaves an equal share for a second address, and it holds
+/// even for a two-voter group where there is only one configured peer.
+pub const MAX_CONNECTIONS_PER_PEER: usize = MAX_CONNECTIONS / 2;
+
 /// Aggregate encoded request bytes reserved across active server handlers.
 /// JSON decoding and response construction require additional memory.
-pub const MAX_IN_FLIGHT_REQUEST_BYTES: usize = 32 * 1024 * 1024;
+///
+/// Two maximum-size frames must fit at once. With a budget of exactly one
+/// [`MAX_FRAME`], a single unauthenticated peer could declare the maximum
+/// frame and hold every byte permit while it trickles or stalls the body,
+/// blocking every other handler until `request_timeout`. Two frames is the
+/// smallest multiple that lets one peer's maximum frame coexist with another
+/// peer's request; a third maximum frame waits. The reserved-byte ceiling
+/// therefore rises from 32 MiB to 64 MiB (64 MiB of live frame buffers, plus
+/// the decoded JSON the comment below already excludes), rather than being
+/// lowered to a frame size that a valid payload might exceed.
+pub const MAX_IN_FLIGHT_REQUEST_BYTES: usize = 2 * MAX_FRAME;
 
 const REQUEST: u8 = 1;
 const RESPONSE: u8 = 2;
@@ -79,6 +98,9 @@ static SNAPSHOT_FAILURES: AtomicU64 = AtomicU64::new(0);
 struct TransportCounters {
     /// Accepted connections dropped because every handler slot was busy.
     cap_dropped: AtomicU64,
+    /// Accepted connections dropped because their source address already held
+    /// its share of the handler slots.
+    peer_cap_dropped: AtomicU64,
     /// Dispatched connections that ended in an I/O, TLS or frame-read error.
     failed: AtomicU64,
     /// Envelopes rejected by decoding, signature or challenge verification.
@@ -90,6 +112,7 @@ struct TransportCounters {
 
 static TRANSPORT: TransportCounters = TransportCounters {
     cap_dropped: AtomicU64::new(0),
+    peer_cap_dropped: AtomicU64::new(0),
     failed: AtomicU64::new(0),
     rejected: AtomicU64::new(0),
     rpc_failed: AtomicU64::new(0),
@@ -99,6 +122,7 @@ static TRANSPORT: TransportCounters = TransportCounters {
 pub fn transport_counters() -> serde_json::Value {
     serde_json::json!({
         "connections_cap_dropped": TRANSPORT.cap_dropped.load(Ordering::Relaxed),
+        "connections_peer_cap_dropped": TRANSPORT.peer_cap_dropped.load(Ordering::Relaxed),
         "connections_failed": TRANSPORT.failed.load(Ordering::Relaxed),
         "envelopes_rejected": TRANSPORT.rejected.load(Ordering::Relaxed),
         "outgoing_rpc_failures": TRANSPORT.rpc_failed.load(Ordering::Relaxed),
@@ -138,11 +162,14 @@ impl Drop for RpcOutcome {
     }
 }
 
-/// Count one connection dropped by the handler cap, logging the first few.
+/// Count one connection dropped by the global handler cap, logging the first
+/// few, then powers of two.
 ///
-/// The cap itself is not changed here: two backpressure variants were tried and
-/// neither was shown to help (see `docs/multiraft-verification.md`). What was
-/// missing was evidence, so this is the smallest change that supplies it.
+/// The global cap itself is unchanged. The two backpressure variants recorded
+/// in `docs/multiraft-verification.md` moved *when* the global slot was
+/// acquired and neither was shown to help; the per-address sub-cap below is a
+/// different mechanism (it partitions the same slots) rather than a third
+/// variant of that timing change.
 fn cap_dropped(node: u32, group: u64, peer: Option<u32>) {
     let n = TRANSPORT.cap_dropped.fetch_add(1, Ordering::Relaxed) + 1;
     if n <= 8 || n.is_power_of_two() {
@@ -150,6 +177,106 @@ fn cap_dropped(node: u32, group: u64, peer: Option<u32>) {
             "openraft transport node={node} group={group} peer={peer:?} connection dropped: \
              all {MAX_CONNECTIONS} handler slots busy occurrence={n}"
         );
+    }
+}
+
+/// Slots per source address for a group with `voters` voters.
+///
+/// Each of the `voters - 1` other voters gets an equal share of the global
+/// cap, rounded up, so a larger group does not let one peer hold a share it
+/// could not legitimately need. The share is capped at
+/// [`MAX_CONNECTIONS_PER_PEER`] and floored at one, so the divisor is never
+/// zero and a group larger than the cap still admits one connection per
+/// address.
+///
+/// Trade-off: an address that legitimately needs more than its share is
+/// throttled. That includes several replicas behind one NAT, and test
+/// clusters that put every node on loopback. Every RPC opens a fresh
+/// connection, so the pressure this bounds is real; per-peer connection reuse
+/// would remove the pressure rather than divide it.
+fn per_peer_connection_cap(voters: usize) -> usize {
+    let peers = voters.saturating_sub(1).max(1);
+    MAX_CONNECTIONS
+        .div_ceil(peers)
+        .clamp(1, MAX_CONNECTIONS_PER_PEER)
+}
+
+/// Count one connection dropped by the per-address sub-cap.
+///
+/// Deliberately distinct from [`cap_dropped`]: the global counter means the
+/// node is saturated, while this one means a single address is holding its
+/// share and another address may still be admitted. Log volume is bounded the
+/// same way as the other counters (first eight, then powers of two).
+fn peer_cap_dropped(node: u32, group: u64, peer: Option<u32>, address: IpAddr, cap: usize) {
+    let n = TRANSPORT.peer_cap_dropped.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 8 || n.is_power_of_two() {
+        eprintln!(
+            "openraft transport node={node} group={group} peer={peer:?} address={address} \
+             connection dropped: source address holds all {cap} of its handler slots \
+             occurrence={n}"
+        );
+    }
+}
+
+/// Per-source-address handler-slot accounting.
+///
+/// The map is bounded by the number of addresses that currently hold a slot,
+/// which the global semaphore bounds at [`MAX_CONNECTIONS`]; an entry is
+/// removed when its count reaches zero, so it cannot grow without bound from
+/// addresses that connect once and leave. It is keyed by IP rather than
+/// `SocketAddr` because every RPC opens a new TCP connection from a fresh
+/// ephemeral port, and a port-keyed cap would never bind. IPv4-mapped IPv6
+/// addresses are canonicalised so one host cannot count itself twice by
+/// connecting through both families.
+struct PeerSlots {
+    counts: Mutex<BTreeMap<IpAddr, usize>>,
+}
+
+impl PeerSlots {
+    fn new() -> Self {
+        Self {
+            counts: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    /// Reserves one handler slot for `address`, or returns `None` when that
+    /// address already holds `cap` of them.
+    fn try_acquire(self: &Arc<Self>, address: IpAddr, cap: usize) -> Option<PeerSlot> {
+        let mut counts = self
+            .counts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let held = counts.entry(address).or_insert(0);
+        if *held >= cap {
+            return None;
+        }
+        *held += 1;
+        Some(PeerSlot {
+            slots: self.clone(),
+            address,
+        })
+    }
+}
+
+/// One reserved per-address handler slot, released when the handler ends.
+struct PeerSlot {
+    slots: Arc<PeerSlots>,
+    address: IpAddr,
+}
+
+impl Drop for PeerSlot {
+    fn drop(&mut self) {
+        let mut counts = self
+            .slots
+            .counts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(held) = counts.get_mut(&self.address) {
+            *held -= 1;
+            if *held == 0 {
+                counts.remove(&self.address);
+            }
+        }
     }
 }
 
@@ -769,6 +896,8 @@ impl RaftPeerServer {
         let connections = Arc::new(Semaphore::new(MAX_CONNECTIONS));
         let request_bytes = Arc::new(Semaphore::new(MAX_IN_FLIGHT_REQUEST_BYTES));
         let snapshot_bytes = Arc::new(Semaphore::new(MAX_SNAPSHOT_BYTES));
+        let peer_slots = Arc::new(PeerSlots::new());
+        let peer_cap = per_peer_connection_cap(self.config.identity.voters().len());
         let mut tasks = JoinSet::new();
         tokio::pin!(shutdown);
         let result = loop {
@@ -808,12 +937,29 @@ impl RaftPeerServer {
                 );
                 continue;
             };
+            // Reserve this address's share after the global slot, so a refused
+            // share cannot hold a slot another address could use. The guard is
+            // moved into the handler and released when the handler ends, which
+            // also covers abort and panic.
+            let address = peer.ip().to_canonical();
+            let Some(peer_slot) = peer_slots.try_acquire(address, peer_cap) else {
+                drop(permit);
+                peer_cap_dropped(
+                    self.config.identity.node(),
+                    self.config.identity.group().group,
+                    node_id,
+                    address,
+                    peer_cap,
+                );
+                continue;
+            };
             let config = self.config.clone();
             let handler = self.handler.clone();
             let request_bytes = request_bytes.clone();
             let snapshot_bytes = snapshot_bytes.clone();
             tasks.spawn(async move {
                 let _permit = permit;
+                let _peer_slot = peer_slot;
                 let timeout = config.request_timeout;
                 let phase = Arc::new(AtomicU64::new(0));
                 let snapshot_peer = Arc::new(AtomicU64::new(0));
@@ -2489,6 +2635,16 @@ mod protocol_tests {
         body.try_into().unwrap()
     }
 
+    /// Connects to `addr` from a specific loopback source address, so a test
+    /// can present two distinct source addresses to one listener. Every RPC
+    /// opens a fresh connection from a fresh ephemeral port, which is why the
+    /// server keys fairness by address and not by `SocketAddr`.
+    async fn connect_from(source: &str, addr: SocketAddr) -> io::Result<TcpStream> {
+        let socket = tokio::net::TcpSocket::new_v4()?;
+        socket.bind(SocketAddr::new(source.parse().unwrap(), 0))?;
+        socket.connect(addr).await
+    }
+
     // ---- 1. Frames: the declared length is bounded before reservation. ----
 
     #[tokio::test]
@@ -2537,6 +2693,57 @@ mod protocol_tests {
         .expect("a huge declared length must be refused immediately")
         .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(budget.available_permits(), MAX_IN_FLIGHT_REQUEST_BYTES);
+    }
+
+    #[tokio::test]
+    async fn a_single_frame_cannot_reserve_the_whole_in_flight_budget() {
+        // `read_budgeted_frame` reserves the declared length before it
+        // allocates or reads the body, so a peer that declares the maximum
+        // frame and stalls holds the reservation for `request_timeout`. If
+        // that reservation can equal the whole budget, one unauthenticated
+        // peer blocks every other handler on the shared byte semaphore.
+        let budget = Arc::new(Semaphore::new(MAX_IN_FLIGHT_REQUEST_BYTES));
+
+        let (mut writer, mut reader) = tokio::io::duplex(64);
+        let mut header = [0u8; 5];
+        header[0] = REQUEST;
+        header[1..].copy_from_slice(&(MAX_FRAME as u32).to_le_bytes());
+        writer.write_all(&header).await.unwrap();
+        let first = tokio::spawn({
+            let budget = budget.clone();
+            async move { read_budgeted_frame(&mut reader, budget, true).await }
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while budget.available_permits() == MAX_IN_FLIGHT_REQUEST_BYTES {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the first frame never reserved its bytes");
+        assert_eq!(
+            budget.available_permits(),
+            MAX_IN_FLIGHT_REQUEST_BYTES - MAX_FRAME,
+            "one frame must leave the rest of the budget available"
+        );
+
+        // A second, small frame from another handler must still be admitted
+        // while the first is stalled mid-body.
+        let (mut writer, mut reader) = tokio::io::duplex(64);
+        writer.write_all(&[REQUEST, 4, 0, 0, 0]).await.unwrap();
+        writer.write_all(&[1, 2, 3, 4]).await.unwrap();
+        let (_, body, permit) = tokio::time::timeout(
+            Duration::from_secs(2),
+            read_budgeted_frame(&mut reader, budget.clone(), true),
+        )
+        .await
+        .expect("a second frame was starved by the first frame's reservation")
+        .unwrap();
+        assert_eq!(body, [1, 2, 3, 4]);
+        drop(permit);
+
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
         assert_eq!(budget.available_permits(), MAX_IN_FLIGHT_REQUEST_BYTES);
     }
 
@@ -2646,21 +2853,34 @@ mod protocol_tests {
         let (addr, task) =
             spawn_server(&f, counting_handler(count.clone()), Duration::from_secs(5)).await;
 
-        // Hold exactly the cap. Reading each challenge proves the handler was
-        // spawned and its connection permit is held (the handler is blocked
-        // waiting for a request frame).
+        // Hold exactly the global cap. Reading each challenge proves the
+        // handler was spawned and its connection permit is held (the handler
+        // is blocked waiting for a request frame). The per-address sub-cap
+        // deliberately stops one address from taking every slot, so fill the
+        // cap from as many source addresses as its share requires. That is
+        // the situation this test is about: the *global* cap is reached.
+        let per_peer = per_peer_connection_cap(f.server.voters().len());
+        assert!(per_peer < MAX_CONNECTIONS);
         let mut held = Vec::new();
-        for _ in 0..MAX_CONNECTIONS {
-            let mut stream = TcpStream::connect(addr).await.unwrap();
-            read_challenge(&mut stream).await;
-            held.push(stream);
+        let mut source = 2u8;
+        while held.len() < MAX_CONNECTIONS {
+            let ip = format!("127.0.0.{source}");
+            for _ in 0..per_peer.min(MAX_CONNECTIONS - held.len()) {
+                let mut stream = connect_from(&ip, addr).await.unwrap();
+                read_challenge(&mut stream).await;
+                held.push(stream);
+            }
+            source += 1;
         }
+        assert_eq!(held.len(), MAX_CONNECTIONS);
 
         // The next connection is accepted at the TCP layer and then dropped
-        // without a handler. Reading EOF proves the server closed its end: a
-        // leaked descriptor would keep the socket open and this read would
-        // time out instead of returning EOF.
-        let mut refused = TcpStream::connect(addr).await.unwrap();
+        // without a handler. It comes from an address that holds no slot, so
+        // only the global cap can be the reason. Reading EOF proves the server
+        // closed its end: a leaked descriptor would keep the socket open and
+        // this read would time out instead of returning EOF.
+        let refused_source = format!("127.0.0.{source}");
+        let mut refused = connect_from(&refused_source, addr).await.unwrap();
         match tokio::time::timeout(Duration::from_secs(3), read_frame(&mut refused)).await {
             Ok(Err(error)) => assert_eq!(
                 error.kind(),
@@ -2681,7 +2901,7 @@ mod protocol_tests {
         drop(held);
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         loop {
-            let mut stream = TcpStream::connect(addr).await.unwrap();
+            let mut stream = connect_from(&refused_source, addr).await.unwrap();
             match tokio::time::timeout(Duration::from_millis(500), read_frame(&mut stream)).await {
                 Ok(Ok((kind, _))) => {
                     assert_eq!(kind, CHALLENGE);
@@ -2693,6 +2913,66 @@ mod protocol_tests {
                 other => panic!("the cap did not recover after its holders closed: {other:?}"),
             }
         }
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn one_source_address_cannot_hold_every_handler_slot() {
+        let f = fixture(19);
+        let count = Arc::new(AtomicUsize::new(0));
+        let (addr, task) =
+            spawn_server(&f, counting_handler(count.clone()), Duration::from_secs(10)).await;
+        let cap = per_peer_connection_cap(f.server.voters().len());
+
+        // One address asks for every slot. Only its share may be served; the
+        // rest must be closed rather than held, so another address still has
+        // slots to use.
+        let mut held = Vec::new();
+        for _ in 0..MAX_CONNECTIONS {
+            let Ok(mut stream) = connect_from("127.0.0.2", addr).await else {
+                continue;
+            };
+            match tokio::time::timeout(Duration::from_secs(2), read_frame(&mut stream)).await {
+                Ok(Ok((kind, _))) => {
+                    assert_eq!(kind, CHALLENGE);
+                    held.push(stream);
+                }
+                Ok(Err(_)) => {}
+                Err(_) => panic!("a connection was neither served nor closed"),
+            }
+        }
+        assert_eq!(
+            held.len(),
+            cap,
+            "one address held more than its share of the handler slots"
+        );
+        assert!(
+            held.len() < MAX_CONNECTIONS,
+            "one source address held {} of {} handler slots",
+            held.len(),
+            MAX_CONNECTIONS
+        );
+
+        // A second address is admitted while the first holds its whole share,
+        // and a signed request on it is answered.
+        let mut other = connect_from("127.0.0.3", addr).await.unwrap();
+        let (kind, body) = tokio::time::timeout(Duration::from_secs(3), read_frame(&mut other))
+            .await
+            .expect("the second address was starved by the first")
+            .expect("the second address was refused while the first held its share");
+        assert_eq!(kind, CHALLENGE);
+        let challenge: [u8; 32] = body.try_into().unwrap();
+        let body = signed_call(&f, 1, &challenge, [4; 32], vote(1, 1));
+        write_frame(&mut other, REQUEST, &body).await.unwrap();
+        assert_eq!(read_frame(&mut other).await.unwrap().0, RESPONSE);
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "a legitimate peer was not served while another address held its share"
+        );
+
+        drop(held);
         task.abort();
         let _ = task.await;
     }
