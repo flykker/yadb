@@ -296,12 +296,14 @@ in the repair path crosses groups.
      complete view;
    * repairs each live blob through `repair_blob`.
    * **Does not copy the `project_ids.is_some()` guard** from
-     `collect_orphans_in_scopes_with` (`crates/yadb-s3/src/lib.rs:1618`). That
-     guard exists because orphan collection enumerates projects; this pass is
+     `collect_orphans_in_scopes_with` (`crates/yadb-s3/src/lib.rs:1612`). That
+     guard existed because orphan collection enumerated projects; this pass is
      prefix-scoped, so a `project_ids == None` scope is not a blocker. The
      doc comment says this, so the next reader does not copy the refusal. The
-     guard itself is still real for orphan collection; see "The two gaps the
-     SKIP 1 reason used to record".
+     guard itself was real for orphan collection at the time; it has since been
+     replaced by snapshot-derived enumeration, so a `project_ids == None` scope
+     collects from its own fenced view instead of refusing (see "The two gaps
+     the SKIP 1 reason used to record").
 2. **`crates/yadbd/src/main.rs`** — the OpenRaft branch of `scrub_all_pools`
    reports the real counters instead of `repair_error: Some(...)`.
    `repair_error` is `Some` only when a group refused, naming the group.
@@ -488,7 +490,7 @@ Removing it would silently delete them, so both were handled:
 
 1. **Orphan collection runs per group but had no live drill**, because an upload
    intent only becomes collectable after `INTENT_GRACE_SECS = 300`
-   (`crates/yadb-s3/src/lib.rs:17`) and no run waits that long. Closed by making
+   (`crates/yadb-s3/src/lib.rs:21`) and no run waits that long. Closed by making
    the grace a per-engine configuration value,
    `ObjectStoreEngine::set_intent_grace_secs`, whose default stays 300 s and
    which is provisioned only from the test harness (1 s), plus a drill. The
@@ -501,16 +503,20 @@ Removing it would silently delete them, so both were handled:
    so "the shipped default protects an intent for 300 s" rests on the knob's
    unit test (`intent_grace_is_configurable_and_protects_a_fresh_intent_until_it_expires`)
    and on the constant being unchanged, not on a live observation.
-2. **A scope with `project_ids == None` cannot be collected** — that is a
+2. **A scope with `project_ids == None` cannot be collected** — that was a
    single-group Multi-Raft deployment, where `collect_orphans_in_scopes_with`
-   refuses with `NamespaceScanUnavailable` because the group covers every
-   project and its project set cannot be enumerated. This is a real, separate
-   gap, unrelated to the repair scan, and it is now its own open item in
-   `multiraft-production-todo.md`. The repair pass does **not** inherit the
+   refused with `NamespaceScanUnavailable` because the group covered every
+   project and its project set could not be enumerated. This was a real,
+   separate gap, unrelated to the repair scan, and it became its own item in
+   `multiraft-production-todo.md`. The repair pass did **not** inherit the
    guard: it is prefix-scoped and never enumerates projects, so a
-   `project_ids == None` scope repairs normally while orphan collection over the
-   same scope still refuses. That asymmetry is deliberate and is why the gap
-   needed its own record rather than dying with the SKIP reason.
+   `project_ids == None` scope repaired normally while orphan collection over
+   the same scope refused. That asymmetry was deliberate and is why the gap
+   needed its own record rather than dying with the SKIP reason. The gap is now
+   closed: the project set is derived from the group's own quorum-confirmed
+   snapshot under the three S3 manifest prefixes, which is complete for that
+   group, and a scope with `project_ids == None` collects from it instead of
+   refusing.
 
 ## Order taken, and the projected effect on the gate
 

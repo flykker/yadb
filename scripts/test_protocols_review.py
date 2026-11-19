@@ -32,7 +32,7 @@ REQUIRED_SUBSTRINGS = {
     # The reader-lease drill waits out this TTL; the constant is load-bearing
     # for the inversion it asserts, and the drill cites it.
     "crates/yadb-metakv/src/gc.rs:74": ["DEFAULT_TTL_MS"],
-    "crates/yadb-s3/src/lib.rs:17": ["INTENT_GRACE_SECS"],
+    "crates/yadb-s3/src/lib.rs:21": ["INTENT_GRACE_SECS"],
 }
 
 # Every SKIP in tests/protocols.py, with the anchors its reason must keep.

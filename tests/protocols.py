@@ -1014,7 +1014,7 @@ def assert_orphan_collection_drill(health):
     The grace is the per-engine knob the harness provisions as one second
     (`--s3-intent-grace-secs`). Production is unchanged: with the flag unset the
     engine keeps its shipped 300 s default
-    (`crates/yadb-s3/src/lib.rs:17`), and the harness override is the only reason
+    (`crates/yadb-s3/src/lib.rs:21`), and the harness override is the only reason
     the expiry is observable inside one run. An intent carries two leases - a
     wall-clock deadline and a 32-revision one - and the collector honours both,
     so the first pass below runs inside them and the second only after both

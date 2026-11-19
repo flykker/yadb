@@ -332,9 +332,11 @@ provisioned only by the test harness, which sets 1 s so an abandoned intent is
 collectable inside a run. A live drill leaves an abandoned intent through a pass
 inside the grace and observes it collected after it. Orphan collection also runs
 per group; a group the node does not lead is named in `orphan_collection_error`
-rather than counted as collected. Orphan collection still needs an enumerable
-project set: a scope that covers every project (`project_ids == None`, as in a
-single-group deployment) is refused instead of scanned partially.
+rather than counted as collected. A scope that covers every project
+(`project_ids == None`, as in a single-group deployment) derives its project set
+from the same leader-fenced snapshot the pass takes, so it collects instead of
+refusing; a group's state machine holds only that group's keys, so the walk is
+complete for the group and there is no second unfenced scan.
 
 Multi-Raft readers publish a *metadata* read lease, renewed across reads and
 scoped to the project's metadata group, as well as pinning the fragment at the

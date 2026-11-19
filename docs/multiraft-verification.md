@@ -2058,6 +2058,8 @@ inside the grace and observes it collected after it.
 | `gc::tests::openraft_tests::a_collector_fence_lost_mid_pool_stops_deleting_and_is_never_counted` | A fence that fails between two barrier ranges stops the pool: the range applied before the loss is evicted and counted, the range after it is present and uncounted, the outcome names the stop, and a live fence afterwards reclaims exactly the refused range. This is the sweep-level shape of a collector lease lost mid-pass; the daemon still has no way to produce it through the HTTP surface. |
 | `yadb_metakv::gc::tests::group_leases_are_scoped_to_their_group` | A group 2 writer record lands in `/gc/g2/writer/`, fences group 2, does not fence group 3 and does not appear in the legacy namespace. |
 | `yadb_metakv::gc::tests::group_collectors_are_independent_and_close_admission_per_group` | Two groups hold collector records at once; admission closes per group and reopens independently. |
+| `gc::tests::openraft_tests::a_scope_covering_every_project_collects_from_its_own_snapshot` | On a real single-group deployment whose scope is asserted to be `project_ids == None`, the pass derives both projects from its own fenced snapshot: it collects project 1's aborted upload and project 2's aborted upload that has no manifest at all (so a walk over `/s3/` alone would miss it), reports exactly those two fragments, and leaves the live object readable. A group id the deployment does not own collects 0. Stopping the group's raft makes the pass refuse through the fence with a `Meta` error — not `NamespaceScanUnavailable` — and deletes nothing. |
+| `tests::a_scope_covering_every_project_enumerates_from_its_fenced_view` (`yadb-s3`) | The same enumeration over a substituted view: an empty view collects 0 even though the orphans are collectable, an `Err` view refuses and deletes nothing, and a proven view collects both projects. |
 
 ### Sensitivity
 
@@ -2089,6 +2091,13 @@ at the post-recovery pass:
 `a committed manifest must keep its fragments through a pass: SweepOutcome {
 blobs_live: 0, fragments_deleted: 15, ... }`. Both checks were restored; the
 suite is green with them.
+
+Restoring the old `project_ids == None` early return
+(`return Err(S3Error::NamespaceScanUnavailable)`) makes
+`a_scope_covering_every_project_collects_from_its_own_snapshot` fail with
+`called Result::unwrap() on an Err value: NamespaceScanUnavailable` at its
+first collection, which is the assertion that the all-projects scope now
+collects instead of refusing. Restored; green.
 
 ### Gates
 

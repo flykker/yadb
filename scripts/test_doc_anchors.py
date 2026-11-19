@@ -61,10 +61,11 @@ CURRENT_CLAIMS = {
     "crates/yadb-blob/src/volume.rs:634": ["tombstones"],
     "crates/yadb-metakv/src/openraft_client.rs:129": ["group_id"],
     "crates/yadb-metakv/src/raft.rs:361": ["try_linearizable_group_snapshot"],
-    "crates/yadb-s3/src/lib.rs:17": ["INTENT_GRACE_SECS"],
-    # The `project_ids == None` guard in `collect_orphans_in_scopes_with`, which
-    # the prefix-scoped repair pass deliberately does not copy.
-    "crates/yadb-s3/src/lib.rs:1618": ["project_ids"],
+    "crates/yadb-s3/src/lib.rs:21": ["INTENT_GRACE_SECS"],
+    # `collect_orphans_in_scopes_with`, which the prefix-scoped repair pass
+    # deliberately does not copy. It no longer refuses a `project_ids == None`
+    # scope: the project set is derived from the group's own fenced snapshot.
+    "crates/yadb-s3/src/lib.rs:1612": ["collect_orphans_in_scopes_with"],
 }
 
 # Citations inside explicitly dated snapshots. Only the file and range are

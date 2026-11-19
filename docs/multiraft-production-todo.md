@@ -799,23 +799,39 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
     the other groups keep serving, and where the death can cut a log entry
     mid-fsync rather than shut down cleanly.
 
-- [ ] Orphan blob collection refuses a scope whose `project_ids` is `None`.
-  `collect_orphans_in_scopes_with` enumerates a group's projects before it
-  collects, so a group that covers every project - a single-group Multi-Raft
-  deployment - has no enumerable project set and is refused with
-  `NamespaceScanUnavailable`. The refusal is deliberate: collecting from a
-  partial project list would leave the unlisted projects' orphans behind while
-  reporting a completed pass, so the gap is "cannot collect", not "collects
-  wrongly". The repair pass does **not** inherit the guard: `repair_scan_groups`
-  is prefix-scoped over `/db/`, `/s3/` and `/block/` and never enumerates
-  projects, so the same deployment repairs normally while orphan collection
-  over it still refuses. That asymmetry is why this is its own item rather than
-  a note on the repair scan. Closing it needs an enumeration that is complete
-  without a project list - a prefix walk that does not assume the scope is a
-  subset of a known project set - or an explicit all-projects scope in the
-  deployment manifest; until then the refusal is the honest answer. A unit test
-  pins the refusal; no live drill exercises the single-group shape and no run
-  has collected orphans from a `project_ids == None` scope.
+- [x] Orphan blob collection refuses a scope whose `project_ids` is `None`.
+  `collect_orphans_in_scopes_with` used to enumerate a group's projects before
+  it collected, so a group that covers every project - a single-group Multi-Raft
+  deployment - had no enumerable project set and was refused with
+  `NamespaceScanUnavailable`. The refusal was deliberate: collecting from a
+  partial project list would have left the unlisted projects' orphans behind
+  while reporting a completed pass, so the gap was "cannot collect", not
+  "collects wrongly". The repair pass never inherited the guard:
+  `repair_scan_groups` is prefix-scoped over `/db/`, `/s3/` and `/block/` and
+  never enumerates projects.
+  Closed by deriving the project set from the pass's own leader-fenced view.
+  `require_group_view` now returns the rows of the quorum-confirmed
+  `try_linearizable_group_snapshot` instead of discarding them, and a scope
+  with `project_ids == None` walks those rows under `/s3/`, `/s3-intent/` and
+  `/s3-retired/` with `projects_in_keys`, the same helper the legacy
+  namespace-wide pass now shares. A group's state machine holds only that
+  group's keys, so the walk is complete for the group; there is no second
+  unfenced scan, a scope with `project_ids: Some(...)` still visits exactly its
+  listed projects, and a group with no scope is still `Ok(0)`. If the snapshot
+  cannot be taken the pass still refuses and deletes nothing.
+  Proven in-process by
+  `a_scope_covering_every_project_collects_from_its_own_snapshot` in
+  `crates/yadbd/src/gc.rs`, on a real single-group OpenRaft deployment with real
+  volume directories: it collects a live project's aborted multipart upload and
+  a second project's aborted upload that has no manifest at all, reports exactly
+  those two fragments, leaves the live object's fragments intact, and then stops
+  the group's raft and asserts the pass refuses through the fence with a `Meta`
+  error (not `NamespaceScanUnavailable`) and deletes nothing. Restoring the
+  `NamespaceScanUnavailable` early return fails that test with
+  `called Result::unwrap() on an Err value: NamespaceScanUnavailable`. A
+  `yadb-s3` unit test pins the same enumeration over a substituted view. No live
+  daemon drill has collected orphans from a `project_ids == None` scope, so the
+  live shape stays unobserved even though the in-process shape is proved.
 
 Backup and restore are **out of scope by owner decision**, not an oversight: no
 command, artifact format, fence or validator exists, and none is planned. A lost
