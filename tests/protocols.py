@@ -26,10 +26,11 @@ of being turned into a pass. Reader leases are legacy-gated: Multi-Raft has no
 instead and that pin is proved by a live drill. Everything else runs: the
 repair scan repairs one metadata group at a time and refuses only the groups
 the scanning node does not lead, garbage collection is driven through four live
-drills, and a cross-process `InstallSnapshot` is part of the normal run because
-the harness provisions the snapshot knobs instead of waiting for the 5000-entry
-default trigger. A skipped scenario is still a non-zero exit if anything else
-fails.
+drills, orphan blob collection is proved live because the harness shortens the
+upload-intent grace, and a cross-process `InstallSnapshot` is part of the normal
+run because the harness provisions the snapshot knobs instead of waiting for the
+5000-entry default trigger. A skipped scenario is still a non-zero exit if
+anything else fails.
 """
 import argparse
 import datetime
@@ -829,6 +830,82 @@ def assert_reader_pin_drill(health):
                lambda seen: all(count == 0 for count in seen.values()),
                "reader pins drain after the GET", timeout=10)
     return len(observations)
+
+
+def assert_orphan_collection_drill(health):
+    """An abandoned upload intent is preserved by its grace, then collected.
+
+    The grace is the per-engine knob the harness provisions as one second
+    (`--s3-intent-grace-secs`). Production is unchanged: with the flag unset the
+    engine keeps its shipped 300 s default
+    (`crates/yadb-s3/src/lib.rs:17`), and the harness override is the only reason
+    the expiry is observable inside one run. An intent carries two leases - a
+    wall-clock deadline and a 32-revision one - and the collector honours both,
+    so the first pass below runs inside them and the second only after both
+    have lapsed. While the intent exists, the sweep's mark also treats its
+    chunks as live (`/s3-intent/` is a live prefix), so neither half collects a
+    fragment of an upload still in flight.
+    """
+    leader = wait_group_leader(BILLING_GROUP)
+    port = s3_port(leader)
+    pool = next(each for each in health["pools"] if each["pool_name"] == S3_POOL)
+    node_of = {slot["slot_index"]: slot["node_id"] for slot in pool["slots"]}
+    internal = {"x-yadb-raft-token": RAFT_TOKEN}
+
+    def slot_ids():
+        ids = {}
+        for slot in pool["slots"]:
+            path = f"/internal/vdisk/{S3_POOL}/{slot['slot_index']}/blobs"
+            status, _, body = request(http_port(slot["node_id"]), "GET", path,
+                                      headers=internal)
+            assert status == 200, (path, status, body)
+            ids[slot["slot_index"]] = set(json.loads(body)["ids"])
+        return ids
+
+    # The difference across the part upload is exactly the abandoned part's
+    # fragments, so "chunks gone from VDisk" is a statement about those ids and
+    # not about a pool-wide count that other writes also move.
+    before = slot_ids()
+    key = "/invoices-2026/orphan/abandoned"
+    status, _, body = signed(port, "POST", key + "?uploads")
+    assert status == 200, (status, body)
+    upload_id = ET.fromstring(body).find("{*}UploadId").text
+    part = b"orphan" * 683
+    status, _, body = signed(
+        port, "PUT", f"{key}?partNumber=1&uploadId={upload_id}", part)
+    assert status == 200, (status, body)
+    uploaded_at = time.monotonic()
+    after = slot_ids()
+    orphan = {index: after[index] - before[index] for index in after}
+    assert sum(len(ids) for ids in orphan.values()) >= 4, orphan
+
+    summary = assert_multiraft_repair_scan(http_port(leader), leader)
+    assert summary["orphan_blobs_collected"] == 0, summary
+    for index, ids in orphan.items():
+        for blob in ids:
+            assert vdisk_get(http_port(node_of[index]), S3_POOL, index, blob)[0] == 200, \
+                f"the immediate pass deleted chunk {blob:032x} before its grace elapsed"
+
+    # The part intent carries two leases: 32 revisions and the one-second wall
+    # clock. Burn well past 32 commits in the same project group so the revision
+    # lease cannot be what keeps it alive, and let the wall clock elapse too.
+    for index in range(40):
+        status, _, body = signed(port, "PUT", f"/invoices-2026/orphan/burn-{index}", b"b")
+        assert status == 200, (index, status, body)
+    remaining = 1.5 - (time.monotonic() - uploaded_at)
+    if remaining > 0:
+        time.sleep(remaining)
+
+    summary = assert_multiraft_repair_scan(http_port(leader), leader)
+    assert summary["orphan_blobs_collected"] >= 1, summary
+    for index, ids in orphan.items():
+        for blob in ids:
+            assert vdisk_get(http_port(node_of[index]), S3_POOL, index, blob)[0] == 404, \
+                f"the collected intent left chunk {blob:032x} on slot {index}"
+    eventually(lambda: signed(port, "GET", f"{key}?uploadId={upload_id}"),
+               lambda result: result[0] == 404,
+               "the abandoned upload record is collected")
+    return summary
 
 
 def assert_vdisk_fence_rpc(port, pool_name, slot_index):
@@ -1744,6 +1821,10 @@ def node_command(root, node):
         "--pg-listen", f"127.0.0.1:{pg_port(node)}",
         "--s3-listen", f"127.0.0.1:{s3_port(node)}",
         "--s3-target", DEV.S3_TARGET,
+        # Test-only: the daemon's shipped grace is 300 s, which no run can
+        # wait out. One second makes the abandoned-intent drill observable
+        # without changing the deployment default.
+        "--s3-intent-grace-secs", "1",
         "--iscsi-listen", f"127.0.0.1:{iscsi_port(node)}",
         "--iscsi-portals", ",".join(f"127.0.0.1:{iscsi_port(peer)}" for peer in NODES),
     ]
@@ -1884,6 +1965,9 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None):
             assert_multiraft_repair_drill(health, nodes, temp, env)
             print("PASS Multi-Raft repair scan repairs per group, refuses only "
                   "groups this node does not lead")
+            assert_orphan_collection_drill(health)
+            print("PASS Multi-Raft orphan-blob collection keeps a live upload "
+                  "intent, then collects its chunks once the grace lapses")
             assert_reader_pin_drill(health)
             print("PASS Multi-Raft S3 GET pins the fragment at the target and "
                   "the pin drains")
