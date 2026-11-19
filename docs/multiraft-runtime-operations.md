@@ -228,24 +228,24 @@ without a matching `state.json`. Use it when you
 need the PostgreSQL, S3 and iSCSI frontends as well; `scripts/yadb-local.py`
 provisions a Multi-Raft cluster without the client protocol listeners.
 
-Multi-Raft mark-and-sweep is temporarily refused, both manually and by the
-periodic task. A writer lease can be renewed while a collector pass is in
-flight, and collector RPCs can continue past lease expiry, so a reader lease
-alone is not a sufficient fence. Storage-side fencing is partial: the versioned
-delete RPC does not exist, and nothing carries an epoch or a pin over the wire.
-Three target-side pieces do exist. A barrier carries the collector
-lease deadline, and a target refuses an expired one with `409` instead of evicting
-a whole generation range for a pass that lost its fence (an unreadable target clock
+Multi-Raft mark-and-sweep runs per metadata group. Each pass is leader-only and
+marks from a quorum-confirmed snapshot of its group; a live writer lease refuses
+that group, and a pool whose epoch advance is refused (a live pin, or an
+unreadable slot) is refused by name and deletes nothing. Multi-Raft readers
+publish no lease; the target-side pin is what protects a read in flight.
+
+Storage-side fencing crosses the wire. A barrier carries the collector lease
+deadline, and a target refuses an expired one with `409` instead of evicting a
+whole generation range for a pass that lost its fence (an unreadable target clock
 refuses the same way). A volume keeps a durable epoch and stamps each fragment
-with the epoch it was written under, so a fenced delete can refuse a fragment from
-another epoch. And a volume keeps a durable pin table, so an epoch advance refuses
-while an unexpired pin exists and a collectable delete refuses a fragment that is
-not older or whose epoch is still pinned. None of the three crosses a process
-boundary yet — no RPC carries the epoch or a pin, the delete path is still
-unfenced, the pin table has no client, and no collector advances an epoch — so they
-narrow the window without making collection safe. The plan, including the invariant
-it has to establish and the drill that would prove it, is in
-`multiraft-gc-fencing-plan.md`.
+with the epoch it was written under, so `delete_fenced` refuses a fragment from
+another epoch. A volume keeps a durable pin table, so an epoch advance refuses
+while an unexpired pin exists and `delete_collectable` refuses a fragment that is
+not older or whose epoch is still pinned. A remote slot exposes all of it on the
+internal VDisk routes, and the collector advances every slot of a pool before its
+first deletion, so a pin taken concurrently either stops the advance or names the
+new epoch. The plan and the four live drills are in
+`multiraft-gc-fencing-plan.md` and `tests/protocols.py`.
 
 The metadata half of the lease is now stricter than the paragraph above
 suggests, and the difference matters when reading the plan. `ensure_live` refuses

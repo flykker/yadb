@@ -103,9 +103,10 @@ Do not read it as permission to enable collection.
 
 ## What the target epoch now establishes
 
-The first increment of item 3 is in place, and only its durable, single-target
-half, in `crates/yadb-blob` (`VolumeStore`). Nothing crosses a process boundary
-yet.
+The first increment of item 3 was its durable, single-target half, in
+`crates/yadb-blob` (`VolumeStore`); the sections that follow extend it over the
+wire and into the collector. At that increment nothing crossed a process
+boundary.
 
 What exists now:
 
@@ -141,18 +142,17 @@ What it does **not** establish, and why the invariant still does not hold:
   epoch-N fragment through this path, because nothing on the target says whether
   an epoch-N reader still holds it. That relaxation is only sound with pins, and
   it belongs to the increment that adds them.
-* Nothing carries the epoch over the wire. `PoolSlot::delete` is still the
-  unfenced delete, there is no fence header or signed token on the fragment
-  endpoint, and this increment changed nothing in `BarrierRequest`,
-  `apply_barrier` or `collect_garbage_barrier` — a barrier carries the collector
-  lease deadline, not an epoch, so it cannot express "delete only epoch N".
-  A remote collector cannot be fenced by any of this yet.
+* At this increment nothing carried the epoch over the wire: `PoolSlot::delete`
+  was the unfenced delete, there was no fence header or signed token on the
+  fragment endpoint, and a barrier carried the collector lease deadline, not an
+  epoch. The internal VDisk routes below now carry it, and `delete_collectable`
+  is the collector's delete.
 * The epoch alone cannot answer "is this epoch still readable?", and the pin
-  table that now can (see "What the pin table now establishes") has no client:
-  no reader takes a pin and no collector checks one.
-* No collector advances an epoch, and GC enablement is still refused. Until the
-  delete RPC is replaced, nothing forces the collector path to use
-  `delete_fenced` at all; the unfenced `delete` is still callable.
+  table that can (see "What the pin table now establishes") had no client at
+  this increment; the read path and the collector now use it.
+* At this increment no collector advanced an epoch and GC was still refused.
+  Both are now false: `sweep_pool` advances every slot and the collector runs on
+  Multi-Raft. The unfenced `delete` is still callable.
 
 ### On-disk format: the upgrade is one-way
 
