@@ -3,8 +3,11 @@
 //!
 //! The suite adapts `openraft::testing::Suite` with helper, assertion and input
 //! substitutions (see [`crate::openraft_suite`]); it does not close the
-//! unmodified upstream suite gate. Its cases run against [`DurableOpenRaftLog`] and
-//! [`DurableMetaStateMachine`], each in a fresh temporary directory.
+//! unmodified upstream suite gate. Its case-by-case mapping, including the
+//! upstream assertions that are observed through a different public API, is
+//! held and machine-checked by `scripts/test_openraft_suite_mapping.py`. Its
+//! cases run against [`DurableOpenRaftLog`] and [`DurableMetaStateMachine`],
+//! each in a fresh temporary directory.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};

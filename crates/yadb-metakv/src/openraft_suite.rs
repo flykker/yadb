@@ -14,8 +14,16 @@
 //! * `NodeId: From<u64>` is replaced by the local [`SuiteNodeId`] trait, whose
 //!   only purpose is to provide the node id `0` used by the upstream cases.
 //!
-//! These substitutions mean this is not unmodified upstream suite coverage;
-//! the full upstream compatibility gate remains open.
+//! These substitutions mean this is not unmodified upstream suite coverage and
+//! the unmodified upstream case bodies still cannot be run from outside the
+//! openraft crate. Equivalent coverage is recorded case by case in
+//! `scripts/test_openraft_suite_mapping.py`: that table names, for every
+//! upstream case, the adapted function, the substitutions, and every upstream
+//! assertion that is not observed verbatim (with the reason). The same script
+//! fails if the upstream case set changes, a mapped function disappears, a case
+//! is added or dropped without a mapping entry, or an unchanged case loses an
+//! assertion.
+//!
 //! The initial-state membership case is also split across fresh stores: the
 //! upstream sequence appends below the purge boundary produced by its first
 //! recovery call, conflicting with append's readable-on-return requirement.
@@ -45,6 +53,7 @@ use openraft::NodeId;
 use openraft::OptionalSend;
 use openraft::RaftSnapshotBuilder;
 use openraft::RaftTypeConfig;
+use openraft::ServerState;
 use openraft::SnapshotMeta;
 use openraft::StorageError;
 use openraft::StorageHelper;
@@ -654,10 +663,16 @@ where
             .await?;
 
         // Adapted: upstream compares the whole `RaftState` after patching a
-        // crate-private vote timestamp. The public parts carry the same
-        // meaning: an uninitialized store exposes the default vote, default
-        // membership and no snapshot.
+        // crate-private vote timestamp. Every observable public field is
+        // asserted here, plus the empty log state the private log-id cache is
+        // built from; the remaining private fields are bookkeeping.
         assert_eq!(&Vote::default(), initial.vote_ref(), "uninitialized vote");
+        assert_eq!(None, initial.committed, "uninitialized committed log id");
+        assert_eq!(
+            ServerState::default(),
+            initial.server_state,
+            "uninitialized server state"
+        );
         assert_eq!(
             &MembershipState::<C::NodeId, C::Node>::default(),
             &initial.membership_state,
@@ -699,9 +714,9 @@ where
             .get_initial_state()
             .await?;
 
-        // Adapted: `last_log_id()`/`committed()` on `RaftState` are
-        // crate-private. The same values are observable through the log store
-        // and the state machine.
+        // Adapted: `last_log_id()` on `RaftState` is crate-private; the same
+        // value is observable through the log store. `committed` is a public
+        // field, so it is asserted exactly as upstream does.
         let log_state = store.get_log_state().await?;
         assert_eq!(
             Some(log_id_0(3, 2)),
@@ -710,7 +725,7 @@ where
         );
         assert_eq!(
             Some(log_id_0(3, 1)),
-            sm.applied_state().await?.0,
+            initial.committed,
             "unexpected value for last applied log"
         );
         assert_eq!(
@@ -836,12 +851,19 @@ where
 
         apply(&mut sm, [blank_ent_0::<C>(3, 1)]).await?;
 
-        let _initial = StorageHelper::new(&mut store, &mut sm)
+        let initial = StorageHelper::new(&mut store, &mut sm)
             .get_initial_state()
             .await?;
 
         // The internal RaftState log-id cache is private; verify the public
-        // purge side effect and retained suffix separately instead.
+        // purge side effect and retained suffix separately instead. Recovery
+        // also advances the public `committed` field to the state machine's
+        // applied log, which is the value the private cache reports here.
+        assert_eq!(
+            Some(log_id_0(3, 1)),
+            initial.committed,
+            "recovery commits the applied log"
+        );
         let log_state = store.get_log_state().await?;
         assert_eq!(
             Some(log_id_0(1, 2)),
