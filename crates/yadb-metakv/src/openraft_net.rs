@@ -10,7 +10,7 @@
 //! Plaintext mode exists for isolated experiments only; there is no automatic
 //! fallback from TLS to plaintext.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -324,21 +324,25 @@ fn peer_bytes_waited(address: IpAddr) {
     }
 }
 
-/// Per-source-address in-flight frame-byte accounting.
-///
-/// Mirrors [`PeerSlots`]: keyed by canonical IP for the same reason (every RPC
-/// opens a fresh ephemeral port), an entry is created on demand and removed
-/// when its reservation returns to zero, so the map is bounded by the number
-/// of addresses currently holding bytes rather than by addresses ever seen.
-///
-/// A reservation that does not fit is *waited for*, never refused: the frame
-/// has already passed the [`MAX_FRAME`] and global-budget checks, so it is
-/// valid and only needs its address's share to drain. `Notify` wakes every
-/// waiter on release because the freed bytes may not fit the first waiter.
+/// Per-source-address byte accounting and FIFO admission, keyed by canonical IP.
+/// Entries live only while an address has reservations or queued waiters.
 struct PeerBytes {
     cap: usize,
-    reserved: Mutex<BTreeMap<IpAddr, usize>>,
-    released: Notify,
+    reserved: Mutex<BTreeMap<IpAddr, PeerByteShare>>,
+}
+
+#[derive(Default)]
+struct PeerByteShare {
+    used: usize,
+    waiters: VecDeque<Arc<Notify>>,
+}
+
+impl PeerByteShare {
+    fn wake_head(&self) {
+        if let Some(head) = self.waiters.front() {
+            head.notify_one();
+        }
+    }
 }
 
 impl PeerBytes {
@@ -346,48 +350,101 @@ impl PeerBytes {
         Self {
             cap,
             reserved: Mutex::new(BTreeMap::new()),
-            released: Notify::new(),
         }
     }
 
-    fn try_reserve(&self, address: IpAddr, bytes: usize) -> bool {
-        let mut reserved = self
-            .reserved
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let used = reserved.entry(address).or_insert(0);
-        if *used + bytes > self.cap {
-            return false;
-        }
-        *used += bytes;
-        true
-    }
-
-    /// Reserves `bytes` for `address`, waiting until its share has room.
-    ///
-    /// The compile-time assertion on [`MAX_IN_FLIGHT_REQUEST_BYTES_PER_PEER`]
-    /// proves every admissible frame fits an empty share, so this always
-    /// terminates once the address's own reservations drain.
+    /// Reserve bytes in arrival order. The compile-time assertion that
+    /// MAX_IN_FLIGHT_REQUEST_BYTES_PER_PEER >= MAX_FRAME ensures every
+    /// admissible head fits once this address's reservations drain.
     async fn reserve(self: &Arc<Self>, address: IpAddr, bytes: usize) -> PeerBytesGuard {
-        let mut waited = false;
-        loop {
-            // Register interest before checking, so a release between the
-            // check and the await cannot be lost.
-            let released = self.released.notified();
-            tokio::pin!(released);
-            released.as_mut().enable();
-            if self.try_reserve(address, bytes) {
-                if waited {
-                    peer_bytes_waited(address);
-                }
+        let notify = Arc::new(Notify::new());
+        {
+            let mut reserved = self
+                .reserved
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let share = reserved.entry(address).or_default();
+            if share.waiters.is_empty() && bytes <= self.cap - share.used {
+                share.used += bytes;
                 return PeerBytesGuard {
                     budget: self.clone(),
                     address,
                     bytes,
                 };
             }
-            waited = true;
-            released.await;
+            // Enqueue under the same lock used by release and admission. A
+            // notification sent before notified().await is retained by Notify.
+            share.waiters.push_back(notify.clone());
+        }
+        let mut queued = PeerBytesWaiter {
+            budget: self.clone(),
+            address,
+            notify,
+            queued: true,
+        };
+        loop {
+            {
+                let mut reserved = self
+                    .reserved
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let share = reserved.get_mut(&address).expect("queued share exists");
+                if Arc::ptr_eq(
+                    share.waiters.front().expect("waiter exists"),
+                    &queued.notify,
+                ) && bytes <= self.cap - share.used
+                {
+                    share.waiters.pop_front();
+                    share.used += bytes;
+                    queued.queued = false;
+                    // The next waiter may fit without waiting for a release.
+                    share.wake_head();
+                    drop(reserved);
+                    peer_bytes_waited(address);
+                    return PeerBytesGuard {
+                        budget: self.clone(),
+                        address,
+                        bytes,
+                    };
+                }
+            }
+            queued.notify.notified().await;
+        }
+    }
+}
+
+/// Removes a cancelled reservation and wakes its successor if it was the head.
+struct PeerBytesWaiter {
+    budget: Arc<PeerBytes>,
+    address: IpAddr,
+    notify: Arc<Notify>,
+    queued: bool,
+}
+
+impl Drop for PeerBytesWaiter {
+    fn drop(&mut self) {
+        if !self.queued {
+            return;
+        }
+        let mut reserved = self
+            .budget
+            .reserved
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let share = reserved
+            .get_mut(&self.address)
+            .expect("queued share exists");
+        let index = share
+            .waiters
+            .iter()
+            .position(|waiter| Arc::ptr_eq(waiter, &self.notify))
+            .expect("waiter exists");
+        share.waiters.remove(index);
+        if index == 0 {
+            share.wake_head();
+        }
+        if share.used == 0 && share.waiters.is_empty() {
+            reserved.remove(&self.address);
         }
     }
 }
@@ -401,20 +458,19 @@ struct PeerBytesGuard {
 
 impl Drop for PeerBytesGuard {
     fn drop(&mut self) {
-        {
-            let mut reserved = self
-                .budget
-                .reserved
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(used) = reserved.get_mut(&self.address) {
-                *used -= self.bytes;
-                if *used == 0 {
-                    reserved.remove(&self.address);
-                }
-            }
+        let mut reserved = self
+            .budget
+            .reserved
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let share = reserved
+            .get_mut(&self.address)
+            .expect("reserved share exists");
+        share.used -= self.bytes;
+        share.wake_head();
+        if share.used == 0 && share.waiters.is_empty() {
+            reserved.remove(&self.address);
         }
-        self.budget.released.notify_waiters();
     }
 }
 
@@ -2961,6 +3017,80 @@ mod protocol_tests {
         }
     }
 
+    async fn poll_once<F: std::future::Future>(
+        mut future: std::pin::Pin<&mut F>,
+    ) -> std::task::Poll<F::Output> {
+        std::future::poll_fn(|cx| std::task::Poll::Ready(future.as_mut().poll(cx))).await
+    }
+
+    #[tokio::test]
+    async fn fifo_admission_serves_waiters_in_arrival_order() {
+        let shares = Arc::new(PeerBytes::new(1));
+        let address = "127.0.0.2".parse().unwrap();
+        let held = shares.reserve(address, 1).await;
+        let mut first = Box::pin(shares.reserve(address, 1));
+        let mut second = Box::pin(shares.reserve(address, 1));
+        let mut third = Box::pin(shares.reserve(address, 1));
+        assert!(poll_once(first.as_mut()).await.is_pending());
+        assert!(poll_once(second.as_mut()).await.is_pending());
+        assert!(poll_once(third.as_mut()).await.is_pending());
+        drop(held);
+        assert!(
+            poll_once(third.as_mut()).await.is_pending(),
+            "third overtook the first"
+        );
+        assert!(
+            poll_once(second.as_mut()).await.is_pending(),
+            "second overtook the first"
+        );
+        let first_guard = first.await;
+        drop(first_guard);
+        assert!(
+            poll_once(third.as_mut()).await.is_pending(),
+            "third overtook the second"
+        );
+        let second_guard = second.await;
+        drop(second_guard);
+        drop(third.await);
+    }
+
+    #[tokio::test]
+    async fn large_head_is_not_overtaken_by_smaller_frames() {
+        let shares = Arc::new(PeerBytes::new(4));
+        let address = "127.0.0.2".parse().unwrap();
+        let held = shares.reserve(address, 3).await;
+        let mut large = Box::pin(shares.reserve(address, 4));
+        let mut small = Box::pin(shares.reserve(address, 1));
+        assert!(poll_once(large.as_mut()).await.is_pending());
+        assert!(
+            poll_once(small.as_mut()).await.is_pending(),
+            "small frame overtook large head"
+        );
+        drop(held);
+        let large_guard = large.await;
+        assert!(poll_once(small.as_mut()).await.is_pending());
+        drop(large_guard);
+        drop(small.await);
+    }
+
+    #[tokio::test]
+    async fn cancelled_head_does_not_block_next_waiter() {
+        let shares = Arc::new(PeerBytes::new(4));
+        let address = "127.0.0.2".parse().unwrap();
+        let held = shares.reserve(address, 3).await;
+        let mut head = Box::pin(shares.reserve(address, 4));
+        let mut next = Box::pin(shares.reserve(address, 1));
+        assert!(poll_once(head.as_mut()).await.is_pending());
+        assert!(poll_once(next.as_mut()).await.is_pending());
+        drop(head);
+        let next_guard = tokio::time::timeout(Duration::from_secs(1), next)
+            .await
+            .expect("cancelled head blocked its successor");
+        drop(next_guard);
+        drop(held);
+        assert!(shares.reserved.lock().unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn one_source_address_cannot_hold_the_whole_in_flight_byte_budget() {
         // Two maximum frames from one address: the first takes that address's
@@ -3067,12 +3197,13 @@ mod protocol_tests {
         .await
         .expect("a maximum frame from one address waited for its own share");
         assert_eq!(
-            *shares
+            shares
                 .reserved
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .get(&"127.0.0.2".parse::<IpAddr>().unwrap())
-                .expect("the frame must hold its address's share"),
+                .expect("the frame must hold its address's share")
+                .used,
             MAX_FRAME
         );
         task.abort();
