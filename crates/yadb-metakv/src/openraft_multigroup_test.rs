@@ -10,7 +10,7 @@ use crate::openraft_state_machine::DurableMetaStateMachine;
 use crate::openraft_storage::DurableOpenRaftLog;
 use crate::openraft_tls::test_support;
 use crate::openraft_transport::{NodeSigningKey, PeerKeyRegistry};
-use crate::{KvCommand, LocalMetaKv, MetaError, RoleState};
+use crate::{CasGuard, KvCommand, LocalMetaKv, MetaError, RevisionGuard, RoleState, TxnOp};
 use openraft::{BasicNode, Snapshot};
 use std::{collections::BTreeMap, io::Cursor, sync::Arc, time::Duration};
 
@@ -333,6 +333,11 @@ async fn multigroup_routing_body() {
     // Node 1 is not the leader of group 3, so its replica applies the project-2
     // record asynchronously. Wait for that replication instead of assuming it:
     // a cross-project scan must see every project's record on any node.
+    //
+    // This fan-out is a local observation, not a snapshot: each group's rows are
+    // copied from node 1's applied state at a different instant and concatenated.
+    // It carries no revision, and the same scope cannot be asked for a
+    // `MetaSnapshot` at all, which is asserted below.
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
         let seen = router.try_scan("/idempotency/").unwrap().len();
@@ -349,6 +354,14 @@ async fn multigroup_routing_body() {
     // The same fan-out must be reachable through `LocalMetaKv::scan_prefix`, which
     // is the surface the daemon uses.
     assert_eq!(routers[&1].scan_prefix_or_panic("/idempotency/").len(), 2);
+    // A merged scan returns rows, not a revision: the same scope cannot produce
+    // a `MetaSnapshot`. Both project prefixes route to different groups, so the
+    // snapshot is rejected instead of being labelled with one group's revision
+    // and passed off as a point-in-time view of both.
+    assert!(matches!(
+        router.try_snapshot(&[], &["/idempotency/1/".into(), "/idempotency/2/".into()]),
+        Err(MetaError::Routing(_))
+    ));
     // A bare project prefix must still fail closed rather than silently scan one
     // group: `/idempotency/1` has no trailing separator, so it could otherwise
     // match `/idempotency/10/...` in a different group.
@@ -600,6 +613,185 @@ async fn multigroup_routing_body() {
     assert!(matches!(
         routers[&1].try_linearizable_snapshot(&[], &["/db/1".into()]),
         Err(MetaError::Routing(_))
+    ));
+    // A transaction whose guard and op name different project groups must be
+    // rejected before any group's Raft core is handed the command. These are
+    // live three-replica groups, so an accepted write appends a log entry
+    // immediately; the leaders' log and applied indices are the proof that
+    // nothing was submitted anywhere. Wait for the writes above to stop moving
+    // them first, so in-flight replication is not mistaken for a submission.
+    let leader_progress = || {
+        [(1u64, 1u32), (2, 1), (3, 2)].map(|(group, node)| {
+            let metrics = rafts[&(group, node)].metrics().borrow().clone();
+            (
+                group,
+                metrics.last_log_index.unwrap_or(0),
+                metrics.last_applied.map_or(0, |id| id.index),
+            )
+        })
+    };
+    let mut before = leader_progress();
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        let now = leader_progress();
+        if now == before {
+            break;
+        }
+        before = now;
+    }
+    assert!(matches!(
+        routers[&1].execute(KvCommand::Txn {
+            guards: vec![CasGuard {
+                key: "/db/1/key".into(),
+                expected_version: 1,
+            }],
+            ops: vec![TxnOp::Put {
+                key: "/db/2/cross".into(),
+                value: vec![1],
+            }],
+        }),
+        Err(MetaError::Routing(_))
+    ));
+    assert!(matches!(
+        routers[&1].execute(KvCommand::RevisionTxn {
+            guards: vec![RevisionGuard {
+                key: "/db/1/key".into(),
+                expected_mod_revision: 1,
+            }],
+            ops: vec![TxnOp::Delete {
+                key: "/db/2/cross".into(),
+            }],
+        }),
+        Err(MetaError::Routing(_))
+    ));
+    // A snapshot spanning two project groups has no single revision to carry.
+    assert!(matches!(
+        routers[&1].try_snapshot(&["/db/1/key".into(), "/db/2/key".into()], &[]),
+        Err(MetaError::Routing(_))
+    ));
+    assert!(matches!(
+        routers[&1].try_snapshot(&[], &["/db/1/".into(), "/db/2/".into()]),
+        Err(MetaError::Routing(_))
+    ));
+    // No global revision is synthesized for multi-group metadata.
+    assert!(matches!(
+        routers[&1].try_revision(),
+        Err(MetaError::Routing(_))
+    ));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        leader_progress(),
+        before,
+        "a rejected cross-group transaction must not be submitted to any group: \
+         an accepted write appends a log entry even if it never applies"
+    );
+    assert!(
+        routers[&1].get_or_panic("/db/2/cross").is_none(),
+        "/db/2/cross must not exist after a rejected cross-group transaction"
+    );
+    assert_eq!(
+        routers[&1].get_or_panic("/db/1/key").unwrap().value,
+        b"/db/1/key"
+    );
+    assert_eq!(
+        routers[&2].get_or_panic("/db/2/key").unwrap().value,
+        b"/db/2/key"
+    );
+    // A GC lease for project 2 is published in group 3, the group that owns
+    // project 2's manifests, and names that group. The control group and the
+    // other data group never see it, so their passes cannot be fenced by it.
+    assert_eq!(routers[&1].gc_group_for_project(2).unwrap(), Some(3));
+    assert_eq!(routers[&1].gc_group_for_project(1).unwrap(), Some(2));
+    assert_eq!(
+        routers[&1].legacy_revision(),
+        0,
+        "OpenRaft metadata has no deployment-wide revision to stamp a lease with"
+    );
+    let lease = crate::gc::acquire_writer(
+        &routers[&2],
+        2,
+        routers[&2].legacy_revision(),
+        crate::gc::DEFAULT_TTL_MS,
+    )
+    .unwrap();
+    assert!(
+        lease.key().starts_with(&crate::gc::group_lease_prefix(3)),
+        "project 2's lease must land in group 3, not {}",
+        lease.key()
+    );
+    assert_eq!(lease.lease().group, Some(3));
+    assert_eq!(
+        lease.lease().revision,
+        0,
+        "the writer lease path must stamp legacy_revision() (0 on OpenRaft), \
+         not a computed global revision"
+    );
+    assert_eq!(crate::gc::live_leases_in(&routers[&2], 3).unwrap().len(), 1);
+    assert!(
+        crate::gc::live_leases_in(&routers[&2], 2)
+            .unwrap()
+            .is_empty(),
+        "project 2's lease must not fence group 2"
+    );
+    // The legacy single-namespace lease path is unroutable here, so a caller
+    // cannot silently read "no leases" from a namespace no group owns.
+    assert!(matches!(
+        crate::gc::live_leases(&routers[&2]),
+        Err(MetaError::Routing(_))
+    ));
+    // The legacy deployment-wide watermark fence has no namespace in
+    // multi-group metadata either, so `reader_is_safe` refuses instead of
+    // comparing a group revision against a global mark.
+    assert!(matches!(
+        crate::gc::reader_is_safe(&routers[&1]),
+        Err(MetaError::Routing(_))
+    ));
+    // A lease is only attributable to the group whose applied index it claims.
+    let applied = routers[&2].role_info_for_group(3).unwrap().4;
+    crate::gc::lease_belongs_to_group(lease.lease(), 3, applied).unwrap();
+    assert!(crate::gc::lease_belongs_to_group(lease.lease(), 2, applied).is_err());
+    lease.release().unwrap();
+    assert!(crate::gc::live_leases_in(&routers[&2], 3)
+        .unwrap()
+        .is_empty());
+    // The collector record is per group as well, and carries no synthesized
+    // global revision: the group's own applied index is the only revision it
+    // could name.
+    let collector =
+        crate::gc::acquire_collector_in(&routers[&2], 3, 0, crate::gc::DEFAULT_TTL_MS).unwrap();
+    assert_eq!(
+        collector.lease().revision,
+        0,
+        "a group collector lease must not carry a synthesized global revision"
+    );
+    assert!(crate::gc::live_collector_in(&routers[&2], 3)
+        .unwrap()
+        .is_some());
+    assert!(crate::gc::live_collector_in(&routers[&2], 2)
+        .unwrap()
+        .is_none());
+    collector.release().unwrap();
+    // A per-group pass reads its own group's role, not the control group's.
+    // Node 1 leads control and group 2 but only replicates group 3, so a pass
+    // over group 3 must refuse here even though control is led locally.
+    assert_eq!(
+        routers[&1].role_info_for_group(1).unwrap().1,
+        RoleState::Leader
+    );
+    let (node, role, _, leader, _) = routers[&1].role_info_for_group(3).unwrap();
+    assert_eq!(node, 1);
+    assert_ne!(role, RoleState::Leader);
+    assert_eq!(leader, Some(2));
+    // The second fence agrees: a quorum-confirmed read of control succeeds on
+    // this node, while the same read of group 3 is refused because node 1 is
+    // only a replica there. A pass that used the control group's leadership
+    // would take a group-3 snapshot it is not entitled to.
+    assert!(routers[&1]
+        .try_linearizable_group_snapshot(1, &[], &[])
+        .is_ok());
+    assert!(matches!(
+        routers[&1].try_linearizable_group_snapshot(3, &[], &[]),
+        Err(MetaError::NotLeader { .. })
     ));
     let control = routers[&1]
         .try_linearizable_control_snapshot(&["/sys/key".into()])
