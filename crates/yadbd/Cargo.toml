@@ -12,6 +12,10 @@ path = "src/main.rs"
 # Retained as a no-op so existing `--features openraft-storage` invocations
 # keep working; OpenRaft is the only metadata runtime and is always compiled in.
 openraft-storage = []
+# Test-only synchronization points, inert unless the matching environment
+# variable is set. Off in every shipped build; `crates/yadbd/tests` enables it
+# to force interleavings that a timing-based test cannot guarantee.
+test-hooks = []
 
 [dependencies]
 yadb-io = { path = "../yadb-io" }

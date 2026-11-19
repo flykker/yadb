@@ -1231,9 +1231,11 @@ design; the removed draft is not kept in the tree.
   and global-budget checks, and a compile-time assertion proves every admissible
   frame fits an empty share. The wait is not a queue: capacity release notifies
   the waiters and they race, and a wait longer than the handler's deadline is
-  dropped, so admission is not starvation-free under sustained contention. Waits
-  are counted as `request_bytes_peer_waited`
-  and logged first-eight-then-powers-of-two. The global budget was raised in
+  dropped, so admission is not starvation-free under sustained contention. A
+  wait that ends in admission is counted as `request_bytes_peer_waited`; a wait
+  that is abandoned at the handler deadline is not, so the counter measures
+  "admitted after waiting", not "waited at all". Waits
+  are logged first-eight-then-powers-of-two. The global budget was raised in
   this change from 32 MiB to `2 * MAX_FRAME` (64 MiB), because half of 32 MiB is
   less than one `MAX_FRAME` and the per-address share would have been unusable;
   peak live frame buffers therefore double, which is the accepted cost, and one

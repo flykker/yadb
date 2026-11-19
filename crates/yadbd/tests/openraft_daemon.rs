@@ -90,6 +90,18 @@ impl Daemon {
     }
 }
 fn spawn(data: &Path, manifest: Option<&Path>, public: SocketAddr, log: &Path) -> Daemon {
+    spawn_with_env(data, manifest, public, log, &[])
+}
+
+/// [`spawn`] plus environment variables for the child. Used by tests that need
+/// a test-only hook the daemon reads from its environment.
+fn spawn_with_env(
+    data: &Path,
+    manifest: Option<&Path>,
+    public: SocketAddr,
+    log: &Path,
+    env: &[(&str, &str)],
+) -> Daemon {
     let stderr = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -104,6 +116,9 @@ fn spawn(data: &Path, manifest: Option<&Path>, public: SocketAddr, log: &Path) -
     ])
     .env_remove("YADB_SUBJECT_SECRET")
     .env_remove("YADB_RAFT_TOKEN");
+    for (name, value) in env {
+        cmd.env(name, value);
+    }
     if let Some(manifest) = manifest {
         cmd.args([
             "--metadata-runtime",
@@ -1364,6 +1379,153 @@ spec: {walPool: data, dataPool: data, isolation: shared, shards: 2}
     drop(daemon);
 }
 
+/// Deterministic version of the concurrent-keyed-write race, built with
+/// `--features test-hooks`.
+///
+/// The timing test below cannot prove the interleaving it describes: its
+/// barrier releases the clients before they send, so a run where the requests
+/// serialize still passes. This test forces the exact order instead. The
+/// daemon's test hook parks the *first* keyed request that finds no record for
+/// its key (after the fast-path read, before planning). The test waits for that
+/// park, commits the same statement under the same key with a second request,
+/// then releases the parked one. The parked request therefore plans against a
+/// table that already holds its row and fails with `DuplicatePrimaryKey` before
+/// the record guard or the extras builder runs — the precise failure the final
+/// re-read exists for. With the re-read disabled this test fails with `400`;
+/// with it, both callers see `200` and the same recorded body, and the table
+/// holds one row.
+#[cfg(feature = "test-hooks")]
+#[test]
+fn a_parked_keyed_writer_replays_the_record_committed_underneath_it() {
+    let _serial = serialize_daemon_tests();
+    let base = std::env::var_os("YADB_TEST_TMPDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let root = base.join(format!(
+        "yadb-daemon-sqlpark-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir(&root).unwrap();
+    let dir = Dir(root.canonicalize().unwrap());
+    let cert_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../yadb-metakv/testdata/tls")
+        .canonicalize()
+        .unwrap();
+    let metadata = dir.0.join("metadata");
+    std::fs::create_dir(&metadata).unwrap();
+    let race = dir.0.join("race");
+    std::fs::create_dir(&race).unwrap();
+    let (manifest, public, _raft_addrs) = write_manifest(&dir.0, &cert_dir, &metadata);
+    let data = dir.0.join("data");
+    let log = dir.0.join("daemon.log");
+    let mut daemon = spawn_with_env(
+        &data,
+        Some(&manifest),
+        public,
+        &log,
+        &[("YADB_TEST_KEYED_RACE_DIR", race.to_str().unwrap())],
+    );
+    ready(&mut daemon, public);
+
+    let yaml = r#"apiVersion: yadb.io/v1alpha1
+kind: StoragePool
+metadata: {name: data}
+spec: {erasure: {scheme: mirror, replicas: 3}, failureDomains: 3}
+---
+apiVersion: yadb.io/v1alpha1
+kind: Project
+metadata: {name: alpha}
+spec: {quotas: {maxStorageBytes: 100000000, maxIops: 1000}, members: [{subject: tester, role: readWrite}]}
+---
+apiVersion: yadb.io/v1alpha1
+kind: Database
+metadata: {name: db, project: alpha}
+spec: {walPool: data, dataPool: data, isolation: shared, shards: 2}
+"#;
+    ok(
+        public,
+        "POST",
+        "/v1/apply",
+        &serde_json::to_vec(&json!({"yaml":yaml})).unwrap(),
+        "application/json",
+    );
+    ok(
+        public,
+        "POST",
+        "/db/alpha/db/query",
+        &serde_json::to_vec(&json!({"sql":"CREATE TABLE t (id INT PRIMARY KEY, v INT)"})).unwrap(),
+        "application/json",
+    );
+
+    const SQL: &str = "INSERT INTO t VALUES (1,10)";
+    let keyed = |key: &'static str| {
+        let body = serde_json::to_vec(&json!({ "sql": SQL })).unwrap();
+        let extra = format!("Idempotency-Key: {key}\r\n");
+        std::thread::spawn(move || {
+            let (status, _, body) =
+                request_extra(public, "POST", "/db/alpha/db/query", &body, "application/json", &extra);
+            (status, body)
+        })
+    };
+
+    // The parked request reads "no record" and stops before planning.
+    let parked = keyed("sql-park");
+    let claimed = race.join("claimed");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !claimed.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the keyed request never reached the test hook; daemon log:\n{}",
+            std::fs::read_to_string(&log).unwrap_or_default()
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    // The same key commits underneath it while it is parked.
+    let (winner_status, winner_body) = keyed("sql-park").join().unwrap();
+    assert_eq!(
+        winner_status,
+        200,
+        "the winning request must commit: {}",
+        String::from_utf8_lossy(&winner_body)
+    );
+
+    // Release the parked request: it now plans against the committed row.
+    std::fs::write(race.join("go"), b"go").unwrap();
+    let (parked_status, parked_body) = parked.join().unwrap();
+    assert_eq!(
+        parked_status,
+        200,
+        "a parked writer whose key committed underneath it must replay, not fail: {}",
+        String::from_utf8_lossy(&parked_body)
+    );
+    assert_eq!(
+        parked_body, winner_body,
+        "the replay must be the recorded response, byte for byte"
+    );
+
+    let body = ok(
+        public,
+        "POST",
+        "/db/alpha/db/query",
+        &serde_json::to_vec(&json!({"sql":"SELECT id FROM t ORDER BY id"})).unwrap(),
+        "application/json",
+    );
+    let value: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        value["rows"],
+        json!([[1]]),
+        "the statement must be applied exactly once: {value}"
+    );
+
+    daemon.interrupt();
+    drop(daemon);
+}
+
 /// Concurrent requests with the same key: every caller sees the committed
 /// response, and the statement is applied once.
 ///
@@ -1375,6 +1537,12 @@ spec: {walPool: data, dataPool: data, isolation: shared, shards: 2}
 /// write failed when it had in fact committed under this key — the exact
 /// ambiguity the key exists to remove. The keyed path therefore re-reads the
 /// record on any execution error and replays it when it exists.
+///
+/// This is the throughput-shaped check: eight callers, one key, all answered.
+/// It does not *force* the interleaving (a serialized run passes too), so the
+/// ordering is pinned deterministically by
+/// `a_parked_keyed_writer_replays_the_record_committed_underneath_it`, which
+/// needs `--features test-hooks`.
 #[test]
 fn concurrent_keyed_writes_replay_instead_of_reporting_a_duplicate() {
     let _serial = serialize_daemon_tests();

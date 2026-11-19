@@ -278,11 +278,26 @@ any error and replays it when it exists; the fingerprint check still turns a
 different statement under the same key into `409`. This is deliberately a rule
 about the error, not about which arm produced it: an earlier attempt's "no
 record" is stale by definition, so no per-attempt flag is trusted.
-`concurrent_keyed_writes_replay_instead_of_reporting_a_duplicate` releases
-eight callers at once against one key and asserts all eight see `200` with the
-same body and the table holds one row; with the final re-read disabled it fails
-with `400 duplicate primary key` on every run. The engine half of that shape is
-pinned deterministically by
+
+The ordering is pinned by
+`a_parked_keyed_writer_replays_the_record_committed_underneath_it`, which is
+built with `--features test-hooks`: the daemon's hook parks the first keyed
+request that finds no record (after the fast-path read, before planning), the
+test commits the same statement under the same key, then releases it, so the
+parked request is guaranteed to plan against the committed row. With the final
+re-read disabled it fails with `400 duplicate primary key` on every run (three
+out of three), and with it both callers return `200` with the same recorded
+body and the table holds one row. The hook is compiled out of every shipped
+build (`test-hooks` is not a default feature and the string does not appear in
+the default binary), and even a feature build does nothing unless the test sets
+its environment variable.
+
+`concurrent_keyed_writes_replay_instead_of_reporting_a_duplicate` is the
+throughput-shaped companion: eight callers released together against one key,
+all answered `200` with the same body, one row. It does **not** force the
+interleaving — a serialized run passes it too — so it is a smoke test for the
+same contract, not the proof. The engine half of the shape is pinned
+deterministically by
 `a_keyed_attempt_on_an_existing_row_fails_before_the_builder_runs`, which also
 asserts the extras builder never ran and no record was written.
 

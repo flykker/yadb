@@ -4449,6 +4449,41 @@ async fn handle_db_query(
     }
 }
 
+/// Test-only: park the first keyed request that found no record, so a test can
+/// commit the same key underneath it and force the loser into the planning
+/// failure the final re-read exists for.
+///
+/// Built only under `--features test-hooks` and inert unless
+/// `YADB_TEST_KEYED_RACE_DIR` names a writable directory. The first caller
+/// creates `claimed` there and waits for `go`; later callers return at once.
+/// The wait is a plain async sleep so it cannot stall the runtime, and it is
+/// bounded so a test that dies before writing `go` fails instead of hanging.
+#[cfg(feature = "test-hooks")]
+async fn keyed_race_park() {
+    let Some(dir) = std::env::var_os("YADB_TEST_KEYED_RACE_DIR") else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(dir);
+    let claimed = dir.join("claimed");
+    let first = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&claimed)
+        .is_ok();
+    if !first {
+        return;
+    }
+    let go = dir.join("go");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !go.exists() {
+        if tokio::time::Instant::now() >= deadline {
+            eprintln!("keyed race hook: `go` never appeared; continuing");
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
+
 /// The HTTP mapping shared by the unkeyed and keyed SQL paths.
 fn db_error_response(st: &AppState, e: DbError) -> Response {
     match e {
@@ -4615,6 +4650,8 @@ async fn keyed_db_write(
     if let Some(record) = pre.record {
         return replay_record(record, &fingerprint);
     }
+    #[cfg(feature = "test-hooks")]
+    keyed_race_park().await;
     // The count ceiling and a conservative byte ceiling are checked before
     // planning, so a group that is already full writes no WAL fragment. The
     // exact record size depends on `rows_affected`; it is re-checked inside the
