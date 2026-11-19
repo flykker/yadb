@@ -1,15 +1,13 @@
 """Offline regression checks for protocol harness refusal assertions and SKIPs.
 
-The second class parses `tests/protocols.py` with `ast` instead of importing it.
-Every `skip("scenario", "reason")` must be a literal (or an f-string registered
-below), and every `path:line` its reason cites must still resolve to the code
-the reason quotes.  A SKIP is a recorded absence of evidence, never a pass, so
-it must not be able to disappear or rot silently.
+The harness no longer records a SKIP: every scenario runs.  The SKIP guard still
+parses `tests/protocols.py` with `ast` instead of importing it, so a SKIP cannot
+be reintroduced silently.  A SKIP is a recorded absence of evidence, never a
+pass, so if one comes back it must be inventoried in `EXPECTED_SKIPS` and every
+`path:line` its reason cites must still resolve to the code the reason quotes.
 """
 import ast
-import contextlib
 import importlib.util
-import io
 from pathlib import Path
 import re
 import unittest
@@ -31,12 +29,9 @@ ANCHOR_RE = re.compile(r"([A-Za-z0-9_./-]+\.(?:rs|py)):(\d+)")
 # What the cited line must still say.  A citation without an entry here is
 # rejected: an unverifiable anchor is not allowed to pass.
 REQUIRED_SUBSTRINGS = {
-    "crates/yadbd/src/protocols/s3.rs:683": ["is_openraft"],
-    "crates/yadbd/src/main.rs:548": ["begin_read_lease"],
-    "crates/yadb-blob/src/pool.rs:1136": ["read_part"],
-    "crates/yadb-blob/src/pool.rs:750": ["live_pins"],
-    "crates/yadb-blob/src/volume.rs:588": ["live_pins"],
-    "crates/yadb-blob/src/volume.rs:858": ["live_pins"],
+    # The reader-lease drill waits out this TTL; the constant is load-bearing
+    # for the inversion it asserts, and the drill cites it.
+    "crates/yadb-metakv/src/gc.rs:74": ["DEFAULT_TTL_MS"],
     "crates/yadb-s3/src/lib.rs:17": ["INTENT_GRACE_SECS"],
 }
 
@@ -45,18 +40,12 @@ REQUIRED_SUBSTRINGS = {
 # and checked against REQUIRED_SUBSTRINGS) or a literal phrase that must still
 # appear in the reason.  Adding a SKIP means adding it here: the scenario set
 # is compared exactly, in both directions.
-EXPECTED_SKIPS = {
-    "reader lease": [
-        "crates/yadbd/src/protocols/s3.rs:683",
-        "crates/yadbd/src/main.rs:548",
-        "crates/yadb-blob/src/pool.rs:1136",
-        "crates/yadb-blob/src/volume.rs:588",
-        "crates/yadb-blob/src/volume.rs:858",
-        "crates/yadb-blob/src/pool.rs:750",
-        "Multi-Raft has no *metadata* read lease by design",
-        "fenced at the point of use",
-    ],
-}
+#
+# The last entry, `reader lease`, closed when Multi-Raft grew per-group reader
+# leases; `assert_reader_lease_drill` now proves the lease and its expiry.  The
+# mapping stays, empty, so a reintroduced SKIP is a failure until it is
+# inventoried here.
+EXPECTED_SKIPS = {}
 
 # No SKIP reason is built from an f-string today.  The set stays empty so the
 # mechanism that would allow one is still exercised by its own tests: an
@@ -254,7 +243,7 @@ class SqlNoAckTest(unittest.TestCase):
 
 
 class SkipAnchorGuardTest(unittest.TestCase):
-    """Every SKIP is inventoried, literal, and still points at its evidence."""
+    """No SKIP remains; a reintroduced one is inventoried and still verifiable."""
 
     @classmethod
     def setUpClass(cls):
@@ -269,16 +258,17 @@ class SkipAnchorGuardTest(unittest.TestCase):
             return self.dynamic_skips[scenario]
         self.fail(f"SKIP {scenario!r} disappeared from tests/protocols.py")
 
-    def skip_function(self):
-        for node in self.tree.body:
-            if isinstance(node, ast.FunctionDef) and node.name == "skip":
-                return node
-        self.fail("tests/protocols.py no longer defines skip()")
-
     def test_nonliteral_skip_reason_is_rejected(self):
         tree = ast.parse('skip("probe", reason)\n')
         with self.assertRaisesRegex(UnverifiableSkip, "not a string literal"):
             collect_skips(tree)
+
+    def test_literal_skip_collection_accepts_a_well_formed_skip(self):
+        # The harness defines no skip() any more, but the checker is still
+        # exercised on in-memory source: a reintroduced SKIP must stay
+        # collectable and inventoried.
+        tree = ast.parse('skip("probe", "a reason")\n')
+        self.assertEqual(collect_skips(tree), ({"probe": "a reason"}, {}))
 
     def test_unregistered_fstring_skip_reason_is_rejected(self):
         tree = ast.parse('skip("probe", f"value {x}")\n')
@@ -371,54 +361,48 @@ class SkipAnchorGuardTest(unittest.TestCase):
                          {"snapshot_after_logs": 128,
                           "max_in_snapshot_log_to_keep": 1})
 
-    def test_skip_function_appends_to_skips_list(self):
-        appended = [
-            node for node in ast.walk(self.skip_function())
-            if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "append"
-            and isinstance(node.func.value, ast.Name)
-            and node.func.value.id == "SKIPS"
-        ]
-        self.assertTrue(appended, "skip() no longer appends to SKIPS")
-
-    def test_skip_records_and_prints_instead_of_counting_a_pass(self):
-        buffer = io.StringIO()
-        before = list(protocols.SKIPS)
-        try:
-            with contextlib.redirect_stdout(buffer):
-                protocols.skip("guard probe", "guard probe reason")
-            recorded = list(protocols.SKIPS)
-        finally:
-            protocols.SKIPS[:] = before
-        self.assertIn(("guard probe", "guard probe reason"), recorded)
-        self.assertIn("SKIP guard probe: guard probe reason", buffer.getvalue())
-        self.assertNotIn("PASS", buffer.getvalue())
+    def test_skip_helper_presence_matches_the_inventory(self):
+        # The helper is dead code while no SKIP is registered, so it is gone.
+        # A registered SKIP must bring it back, or the harness would NameError
+        # when the scenario runs.
+        names = {node.name for node in self.tree.body
+                 if isinstance(node, ast.FunctionDef)}
+        self.assertEqual("skip" in names,
+                         bool(EXPECTED_SKIPS or DYNAMIC_SKIP_SCENARIOS))
 
     def test_anchor_checker_rejects_a_wrong_line_number(self):
-        # An in-memory copy of the reader-lease citations with the gate line
-        # moved to the top of the file; it must not be accepted.
-        reason = ("the gate is at crates/yadbd/src/protocols/s3.rs:1 and the "
-                  "lease is at crates/yadbd/src/main.rs:524")
+        # An in-memory reason that cites one line where another was expected;
+        # it must not be accepted.
+        reason = ("the TTL is at crates/yadb-metakv/src/gc.rs:75 and the "
+                  "constant is at crates/yadb-metakv/src/gc.rs:74")
         with self.assertRaisesRegex(AssertionError, "cited anchors changed"):
             check_reason_anchors(
-                ["crates/yadbd/src/protocols/s3.rs:683",
-                 "crates/yadbd/src/main.rs:524"], reason)
+                ["crates/yadb-metakv/src/gc.rs:74",
+                 "crates/yadb-metakv/src/gc.rs:76"], reason)
 
     def test_anchor_checker_rejects_a_line_that_lost_its_code(self):
         # The cited lines are right, but the quoted code is gone: the
         # required-substring table must notice even though the lines exist.
-        reason = ("crates/yadbd/src/protocols/s3.rs:683 and "
-                  "crates/yadbd/src/main.rs:524")
+        reason = ("crates/yadb-metakv/src/gc.rs:74 and "
+                  "crates/yadb-metakv/src/gc.rs:76")
         required = {
-            "crates/yadbd/src/protocols/s3.rs:683": ["definitely_gone"],
-            "crates/yadbd/src/main.rs:539": ["begin_read_lease"],
+            "crates/yadb-metakv/src/gc.rs:74": ["DEFAULT_TTL_MS"],
+            "crates/yadb-metakv/src/gc.rs:76": ["definitely_gone"],
         }
         with self.assertRaisesRegex(AssertionError, "no longer contains"):
             check_reason_anchors(
-                ["crates/yadbd/src/protocols/s3.rs:683",
-                 "crates/yadbd/src/main.rs:524"],
+                ["crates/yadb-metakv/src/gc.rs:74",
+                 "crates/yadb-metakv/src/gc.rs:76"],
                 reason, required=required)
+
+    def test_anchor_checker_accepts_a_matching_reason(self):
+        # `EXPECTED_SKIPS` is empty, so the accept path is exercised on
+        # in-memory source instead of being vacuously untested.
+        reason = "the lease TTL is at crates/yadb-metakv/src/gc.rs:74"
+        self.assertEqual(
+            check_reason_anchors(
+                ["crates/yadb-metakv/src/gc.rs:74"], reason),
+            [("crates/yadb-metakv/src/gc.rs", 74)])
 
     def test_anchor_checker_accepts_the_real_reason(self):
         for scenario, anchors in EXPECTED_SKIPS.items():
