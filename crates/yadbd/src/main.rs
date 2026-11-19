@@ -8888,7 +8888,7 @@ mod security_tests {
             pools: Arc::new(RwLock::new(BTreeMap::new())),
             local_vdisks: Arc::new(RwLock::new(BTreeMap::new())),
             last_scrub: Arc::new(RwLock::new(None)),
-            reader_lease: Arc::new(std::sync::Mutex::new(None)),
+            reader_lease: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             s3: ObjectStoreEngine::new(meta.clone(), 4096),
             db: DatabaseEngine::new(meta.clone(), 100),
             block: BlockVolumeEngine::new(meta, DEFAULT_BLOCK_SIZE),
@@ -10239,7 +10239,7 @@ mod security_tests {
             pools: Arc::new(RwLock::new(BTreeMap::new())),
             local_vdisks: Arc::new(RwLock::new(BTreeMap::new())),
             last_scrub: Arc::new(RwLock::new(None)),
-            reader_lease: Arc::new(std::sync::Mutex::new(None)),
+            reader_lease: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             s3: ObjectStoreEngine::new(meta.clone(), 4096),
             db: DatabaseEngine::new(meta.clone(), 100),
             block: BlockVolumeEngine::new(meta, DEFAULT_BLOCK_SIZE),
@@ -10731,6 +10731,175 @@ mod raft_status_tests {
         );
 
         raft.shutdown().await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// One single-node metadata group on node 1, with its own durable log and
+    /// state machine.
+    async fn singleton_group(
+        dir: &std::path::Path,
+        group: u64,
+    ) -> (YadbRaft, DurableMetaStateMachine) {
+        let identity = ReplicaIdentity::new(
+            GroupIdentity {
+                cluster: [92; 16],
+                group,
+                incarnation: 1,
+            },
+            1,
+            vec![1],
+        )
+        .unwrap();
+        let log = DurableOpenRaftLog::create(dir.join(format!("g{group}-log")), &identity).unwrap();
+        let state = DurableMetaStateMachine::create(dir.join(format!("g{group}-state")), &identity)
+            .unwrap();
+        let config = Arc::new(::openraft::Config::default().validate().unwrap());
+        let raft = YadbRaft::new(1, config, NoNetwork, log, state.clone())
+            .await
+            .unwrap();
+        raft.initialize(BTreeMap::from([(1, BasicNode::new("one"))]))
+            .await
+            .unwrap();
+        raft.wait(Some(Duration::from_secs(5)))
+            .current_leader(1, "leader")
+            .await
+            .unwrap();
+        (raft, state)
+    }
+
+    /// Control group 1 with data groups 2 and 3, and projects 1 and 2 routed to
+    /// them. Every group is a single-node cluster on node 1, so this node leads
+    /// both data groups and can publish a reader lease in either.
+    async fn multigroup_state(tag: &str) -> (AppState, std::path::PathBuf, Vec<YadbRaft>) {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("yadb-{tag}-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (control, control_state) = singleton_group(&dir, 1).await;
+        let (group2, group2_state) = singleton_group(&dir, 2).await;
+        let (group3, group3_state) = singleton_group(&dir, 3).await;
+        let meta: LocalMetaKv<OsFs> = LocalMetaKv::from_openraft_groups(
+            1,
+            BTreeMap::from([
+                (1, (control.clone(), control_state)),
+                (2, (group2.clone(), group2_state)),
+                (3, (group3.clone(), group3_state)),
+            ]),
+            BTreeMap::from([(1, 2), (2, 3)]),
+            BTreeMap::new(),
+            tokio::runtime::Handle::current(),
+        )
+        .unwrap();
+        let fs = OsFs::new(&dir).unwrap();
+        let state = AppState {
+            openraft: None,
+            listen_addr: "127.0.0.1:0".into(),
+            fs,
+            meta: meta.clone(),
+            raft_token: None,
+            subject_secret: None,
+            admin_subjects: vec![],
+            control: Arc::new(RwLock::new(ControlPlaneState::new())),
+            control_refresh: Arc::new(std::sync::Mutex::new(())),
+            control_freshness: Arc::new(std::sync::Mutex::new(ControlFreshness::default())),
+            pools: Arc::new(RwLock::new(BTreeMap::new())),
+            local_vdisks: Arc::new(RwLock::new(BTreeMap::new())),
+            last_scrub: Arc::new(RwLock::new(None)),
+            reader_lease: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
+            s3: ObjectStoreEngine::new(meta.clone(), 4096),
+            db: DatabaseEngine::new(meta.clone(), 100),
+            block: BlockVolumeEngine::new(meta.clone(), DEFAULT_BLOCK_SIZE),
+        };
+        (state, dir, vec![control, group2, group3])
+    }
+
+    /// A reader lease is published in the group that owns the project, carries
+    /// that group's applied index, and is cached per group.
+    ///
+    /// The cache is the point: a node serving projects in two groups must not
+    /// reuse one record for the other, because the collector of a group only
+    /// consults its own records. One slot for the whole node would let a read
+    /// of project 1 be fenced by a record group 2 never sees.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reader_leases_are_published_and_cached_per_metadata_group() {
+        let (st, dir, rafts) = multigroup_state("reader-lease-groups").await;
+
+        // Project 1 is routed to group 2, project 2 to group 3.
+        let applied_before = st.meta.role_info_for_group(2).unwrap().4;
+        let group2_lease = st.begin_read_lease(1).unwrap();
+        assert_eq!(
+            group2_lease.group,
+            Some(2),
+            "a lease must name the group that owns the project's manifests"
+        );
+        assert_eq!(
+            group2_lease.revision, applied_before,
+            "a group-scoped lease carries the group's applied index, not a \
+             deployment-wide revision that does not exist"
+        );
+        st.end_read_lease(&group2_lease).unwrap();
+
+        let group3_lease = st.begin_read_lease(2).unwrap();
+        assert_eq!(group3_lease.group, Some(3));
+        st.end_read_lease(&group3_lease).unwrap();
+
+        assert_eq!(
+            st.reader_lease.lock().unwrap().len(),
+            2,
+            "one cached record per group, not one for the whole node"
+        );
+
+        // A second read of project 1 renews the group-2 record instead of
+        // publishing another one, and leaves the group-3 record alone.
+        let renewed = st.begin_read_lease(1).unwrap();
+        assert_eq!(
+            renewed.id, group2_lease.id,
+            "a cached record must be renewed, not replaced"
+        );
+        assert_eq!(renewed.group, Some(2));
+        st.end_read_lease(&renewed).unwrap();
+        assert_eq!(
+            yadb_metakv::gc::live_leases_in(&st.meta, 2).unwrap().len(),
+            1
+        );
+        assert_eq!(
+            yadb_metakv::gc::live_leases_in(&st.meta, 3).unwrap().len(),
+            1
+        );
+
+        // The collector of each group consults those records: both groups
+        // refuse while their lease is live, and delete nothing.
+        let pools: BTreeMap<String, Arc<PoolStriper<OsFs>>> = BTreeMap::new();
+        let control = st.control.read().unwrap().clone();
+        let outcome = crate::gc::sweep(&st.meta, &pools, &control);
+        assert_eq!(outcome.leases_live, 2, "{outcome:?}");
+        assert_eq!(outcome.fragments_deleted, 0, "{outcome:?}");
+        let refusal = outcome.refusal.expect("a live lease must refuse the pass");
+        assert!(refusal.contains("group 2 refused"), "{refusal}");
+        assert!(refusal.contains("group 3 refused"), "{refusal}");
+        assert!(refusal.contains("live lease(s)"), "{refusal}");
+
+        // Dropping one group's record frees that group only. This is the
+        // inversion: the refusal follows the record, per group, and is not a
+        // node-wide "some read happened" flag.
+        let released = st.reader_lease.lock().unwrap().remove(&Some(2)).unwrap();
+        yadb_metakv::gc::release(&st.meta, &released).unwrap();
+        let outcome = crate::gc::sweep(&st.meta, &pools, &control);
+        assert_eq!(outcome.leases_live, 1, "{outcome:?}");
+        let refusal = outcome.refusal.expect("group 3 still holds a lease");
+        assert!(refusal.contains("group 3 refused"), "{refusal}");
+        assert!(
+            !refusal.contains("group 2 refused"),
+            "group 2 has no live record, so its pass must not refuse: {refusal}"
+        );
+
+        drop(st);
+        for raft in rafts {
+            let _ = raft.shutdown().await;
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
