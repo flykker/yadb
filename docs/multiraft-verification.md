@@ -2953,6 +2953,15 @@ recorded `SweepOutcome` is identical, the reader-lease cache is empty and no
 lease record was published — and finally that a refused pass is
 `yadb_gc_refused 1` while the exposition still parses.
 
+Route registration needs a real process, because the public router is built
+inside `main` and no other test can construct it:
+`crates/yadbd/tests/openraft_daemon.rs::metrics_endpoint_is_served_by_the_daemon`
+boots the daemon, scrapes twice and asserts `200`, the
+`text/plain; version=0.0.4` content type, the node row, the control group's row,
+and `yadb_gc_last_pass_present 0` both times — a scrape is not a collection
+pass. Removing `.route("/metrics", …)` makes it fail with `404` while every
+other test stays green, which is exactly the gap it closes.
+
 Sensitivity, run by inverting the rendering: dropping the `yadb_gc_refused`
 sample fails the refusal test, and removing the label escape fails with the
 sample split across lines. Both restored.

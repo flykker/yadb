@@ -1405,7 +1405,10 @@ design; the removed draft is not kept in the tree.
     counter moves, which
     `metrics_endpoint_serves_the_health_surface_as_prometheus_text` asserts
     against the multi-group fixture by comparing the recorded pass before and
-    after a scrape and checking the lease cache and the published records. It
+    after a scrape and checking the lease cache and the published records, and
+    `metrics_endpoint_is_served_by_the_daemon` boots the real daemon and scrapes
+    twice to prove the route is registered on the public listener (removing the
+    route fails it with `404`) and that a scrape never runs a pass. It
     is a read-only surface on the public listener, not a new control plane, and
     it publishes no subject, key or object name.
   Each group starts from strict bounded JSON configuration, explicit

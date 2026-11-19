@@ -1364,6 +1364,93 @@ spec: {walPool: data, dataPool: data, isolation: shared, shards: 2}
     drop(daemon);
 }
 
+/// `GET /metrics` is routed on the daemon's public listener and answers with
+/// the Prometheus text format.
+///
+/// The rendering itself is unit-tested in `crates/yadbd/src/metrics.rs` and the
+/// handler against a multi-group fixture in the binary's tests. What only a
+/// real process can prove is that the route is *registered* on the public
+/// router: the router is built inside `main`, so a missing `.route("/metrics",
+/// …)` would leave every other test green while a scraper received `404`.
+/// This also pins the "a scrape is not a collection pass" rule at the process
+/// level: a fresh daemon has run no pass, and two scrapes still report none.
+#[test]
+fn metrics_endpoint_is_served_by_the_daemon() {
+    let _serial = serialize_daemon_tests();
+    let base = std::env::var_os("YADB_TEST_TMPDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let root = base.join(format!(
+        "yadb-daemon-metrics-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir(&root).unwrap();
+    let dir = Dir(root.canonicalize().unwrap());
+    let cert_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../yadb-metakv/testdata/tls")
+        .canonicalize()
+        .unwrap();
+    let metadata = dir.0.join("metadata");
+    std::fs::create_dir(&metadata).unwrap();
+    let (manifest, public, _raft_addrs) = write_manifest(&dir.0, &cert_dir, &metadata);
+    let data = dir.0.join("data");
+    let log = dir.0.join("daemon.log");
+    let mut daemon = spawn(&data, Some(&manifest), public, &log);
+    ready(&mut daemon, public);
+
+    let scrape = || -> (String, String) {
+        let (status, header, body) =
+            request_extra(public, "GET", "/metrics", b"", "application/json", "");
+        assert_eq!(
+            status,
+            200,
+            "/metrics is not routed on the public listener: {}",
+            String::from_utf8_lossy(&body)
+        );
+        (header, String::from_utf8(body).expect("the exposition is UTF-8"))
+    };
+
+    let (header, first) = scrape();
+    assert!(
+        header.contains("text/plain; version=0.0.4"),
+        "the scrape must be the Prometheus text format, got: {header}"
+    );
+    // The route is the health surface, not a fresh collection: a daemon that
+    // has just started has no recorded pass and reports none.
+    assert!(
+        first.contains("yadb_gc_last_pass_present 0"),
+        "a fresh daemon must report that no pass has run:\n{first}"
+    );
+    assert!(
+        !first.contains("\nyadb_gc_refused "),
+        "no pass means no refusal sample either:\n{first}"
+    );
+    // Every configured metadata group has a row, and the control group is
+    // always group 1.
+    assert!(
+        first.contains("yadb_group_info{group=\"1\""),
+        "the control group is missing from the exposition:\n{first}"
+    );
+    assert!(
+        first.contains("yadb_node_info{"),
+        "the node row is missing:\n{first}"
+    );
+    // A second scrape reads the same recorded state: scraping does not run a
+    // pass, so the "present" gauge cannot flip to 1.
+    let (_, second) = scrape();
+    assert!(
+        second.contains("yadb_gc_last_pass_present 0"),
+        "a scrape must not run a collection pass:\n{second}"
+    );
+
+    daemon.interrupt();
+    drop(daemon);
+}
+
 #[test]
 fn three_daemons_forward_http_to_different_group_leaders() {
     let _serial = serialize_daemon_tests();
