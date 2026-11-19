@@ -52,10 +52,11 @@ CURRENT_CLAIMS = {
     "crates/yadb-block/src/lib.rs:311": ["acquire_writer_if_legacy"],
     # `docs/multiraft-skip-closure-plan.md`: the mechanisms the record reuses.
     # The refusal constant it removed is gone, so it is named by symbol only.
-    "crates/yadbd/src/main.rs:548": ["begin_read_lease"],
+    # The reader-lease gate and the `begin_read_lease` / `read_part` citations
+    # were dropped when that section was rewritten: the implementation is on
+    # `feat/reader-lease`, so a line number taken from `main` would describe the
+    # tree before the change. Those symbols are named in prose instead.
     "crates/yadbd/src/gc.rs:614": ["sweep_groups"],
-    "crates/yadbd/src/protocols/s3.rs:683": ["is_openraft"],
-    "crates/yadb-blob/src/pool.rs:1136": ["read_part"],
     "crates/yadb-blob/src/pool.rs:1590": ["repair_blob"],
     "crates/yadb-blob/src/volume.rs:634": ["tombstones"],
     "crates/yadb-metakv/src/openraft_client.rs:129": ["group_id"],

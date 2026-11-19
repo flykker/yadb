@@ -670,7 +670,14 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   heartbeat rather than keeping a per-snapshot failure state.
 - [x] Garbage collection on Multi-Raft. `sweep` routes to `sweep_groups`, one
   leader-only, quorum-confirmed pass per data group, each with its own collector
-  lease `/gc/g<group>/collector` and writer leases `/gc/g<group>/writer/<id>`.
+  lease `/gc/g<group>/collector`, writer leases `/gc/g<group>/writer/<id>` and
+  reader leases `/gc/g<group>/reader/<id>` (TTL 30 s). A reader lease is
+  published by `AppState::begin_read_lease` in the group that owns the project,
+  renewed across reads, and carries that group's applied log index as its
+  revision; `lease_belongs_to_group` checks the provenance after admission
+  closes, and a live record refuses the group. A group that has served a read
+  in the last 30 s therefore refuses collection until the lease lapses; that is
+  the cost of the reader fence, not a defect.
   `POST /v1/pools/gc` answers `200` when every group and pool completed, and
   `409` with `gc_refusal` naming any that refused; the sweep inside
   `POST /v1/pools/scrub` runs the same pass, after a per-group repair scan.
@@ -686,9 +693,13 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   be proved is named in `gc_groups_refused` and deletes nothing; a pool whose
   epoch advance is refused is named in `gc_pools_refused` and deletes nothing.
   Four live drills in `tests/protocols.py` cover a live reader pin, a superseded
-  collector epoch, a non-leader refusal and a clean collection. Storage-side
-  fencing exists end to end on both runtimes. A barrier carries the
-  collector lease deadline and the target refuses an expired one with `409`
+  collector epoch, a non-leader refusal and a clean collection. A separate live
+  run observed the reader lease: `POST /v1/pools/gc` reported `leases_live: 0`
+  before any read, then `409` with `leases_live: 1` and `fragments_deleted: 0`
+  after a `PUT` + `GET`, and the lease expired by +35 s with no intervening
+  reads. Storage-side fencing exists end to end on both runtimes. A barrier
+  carries the collector lease deadline and the target refuses an expired one
+  with `409`
   (`BlobError::BarrierLeaseExpired`), and an unreadable target clock refuses
   with `BarrierClockUnreadable` instead of defaulting to a live deadline. A
   volume keeps a durable, monotonic epoch and stamps every fragment with the
