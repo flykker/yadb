@@ -110,6 +110,16 @@ impl<FS: StorageFs> RaftWal<FS> {
         let path = wal_path(dir);
 
         let exists = fs.exists(&path);
+        if !exists && sync_writes {
+            // A missing WAL file means the directory may have just been
+            // created (a file cannot exist in a directory that did not). Make
+            // the directory's own entry durable before creating anything
+            // inside it, and report a failed sync instead of continuing with a
+            // directory that may disappear on a crash.
+            if let Some(parent) = wal_parent_dir(dir) {
+                fs.sync_dir(parent)?;
+            }
+        }
         let file = fs.open_rw(&path, true)?;
         if !exists || file.len()? == 0 {
             file.set_len(0)?;
@@ -229,6 +239,19 @@ fn wal_path(dir: &str) -> String {
     } else {
         format!("{}/raft.wal", dir.trim_end_matches('/'))
     }
+}
+
+/// Parent of a WAL directory, or `None` when the WAL lives directly in the
+/// filesystem root (which has no separate entry to sync).
+fn wal_parent_dir(dir: &str) -> Option<&str> {
+    let trimmed = dir.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(match trimmed.rfind('/') {
+        Some(index) => &trimmed[..index],
+        None => "",
+    })
 }
 
 fn read_wal_magic<F: VirtualFile>(file: &F) -> Result<FrameFormat, MetaError> {
@@ -423,7 +446,7 @@ fn truncate_torn_tail<F: VirtualFile>(file: &F, pos: u64) -> Result<(), MetaErro
 mod tests {
     use super::*;
     use crate::KvCommand;
-    use yadb_io::SimFs;
+    use yadb_io::{FaultConfig, SimFs, SyncFault};
 
     const DIR: &str = "meta";
     const PATH: &str = "meta/raft.wal";
@@ -912,5 +935,57 @@ mod tests {
         ];
         write_frames(&fs, &frames);
         assert_corrupt(RaftWal::open(&fs, DIR, true));
+    }
+
+    /// A fresh WAL in a directory that did not exist yet must make that
+    /// directory's parent entry durable before creating the file. A failed
+    /// parent sync is reported, and clearing it lets the same open succeed and
+    /// reopen unchanged.
+    #[test]
+    fn fresh_nested_directory_propagates_a_parent_sync_failure() {
+        let fs = SimFs::new(3217);
+        let nested = "a/b";
+        let nested_path = "a/b/raft.wal";
+        fs.set_faults(FaultConfig {
+            seed: 3217,
+            sync_dir_fault: SyncFault::BeforePersist,
+            ..Default::default()
+        });
+        match RaftWal::open(&fs, nested, true) {
+            Ok(_) => panic!("open succeeded despite a failed parent-directory sync"),
+            Err(MetaError::Io(error)) => assert_eq!(
+                error.to_string(),
+                "simulated sync_dir failure before persistence"
+            ),
+            Err(other) => panic!("expected the sync error to propagate, got {other:?}"),
+        }
+        assert!(
+            !fs.exists(nested_path),
+            "the WAL must not be created before its directory entry is durable"
+        );
+
+        fs.set_faults(FaultConfig {
+            seed: 3217,
+            ..Default::default()
+        });
+        let (mut wal, recovered) = RaftWal::open(&fs, nested, true).unwrap();
+        assert_eq!(recovered.term, 0);
+        assert!(recovered.log.is_empty());
+        wal.append(&hard_state(2, Some(1))).unwrap();
+        drop(wal);
+
+        let file = fs.open_rw(nested_path, false).unwrap();
+        let mut before = vec![0u8; file.len().unwrap() as usize];
+        file.read_at(0, &mut before).unwrap();
+        drop(file);
+
+        let (_, recovered) = RaftWal::open(&fs, nested, true).unwrap();
+        assert_eq!(recovered.term, 2);
+        assert_eq!(recovered.voted_for, Some(1));
+
+        let file = fs.open_rw(nested_path, false).unwrap();
+        let mut after = vec![0u8; file.len().unwrap() as usize];
+        file.read_at(0, &mut after).unwrap();
+        assert_eq!(after, before, "reopening an existing WAL must not rewrite it");
     }
 }
