@@ -4312,7 +4312,13 @@ async fn handle_block_read(
     }
 
     let blk = st.block.clone();
-    let read_consistent = q.consistent;
+    // Only Multi-Raft can take a quorum-confirmed *snapshot* of the extent map.
+    // On legacy metadata the empty transaction above is the barrier: it returns
+    // once this node has applied every entry committed before it, so the local
+    // map read observes at least that revision. Calling `read_at_consistent`
+    // there would ask for a snapshot the runtime cannot produce and fail the
+    // read, which is why the two modes read through different primitives.
+    let read_consistent = q.consistent && st.meta.is_openraft();
     let res = tokio::task::spawn_blocking(move || {
         if read_consistent {
             blk.read_at_consistent(project_id, &volume, &pool_name, size_bytes, q.offset, q.len)
