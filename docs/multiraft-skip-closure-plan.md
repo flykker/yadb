@@ -95,6 +95,48 @@ drains from that timestamp, instead of each drill threading its own, and the
 orphan drill drains *before* it uploads its part, because its first pass has to
 run inside the one-second intent grace. The set comparison was not weakened.
 
+### Second block: the shapes this record still did not claim (2026-11-19)
+
+The list below this section was the next target, and four of its items were
+closed in a second block. Three are proved at unit level rather than live,
+because the live cluster cannot produce them deterministically; the fourth was
+a real defect and is fixed in the daemon.
+
+* **A reader lease expiring mid-read** — the guard existed and nothing observed
+  it. `s3_get_refuses_bytes_when_the_read_outlives_its_reader_lease` runs the
+  real S3 `GET` over the real multi-group metadata store, writes a 4 MiB object
+  (1024 fragments at the engine's 4096-byte chunk size) into the project's
+  group, and shrinks the test-only `AppState::reader_lease_ttl_ms` to 1 ms. The
+  handler answers `503` with the `ensure_live` text and not the bytes, and the
+  same `GET` at the shipped 30 s default answers `200` with the exact bytes.
+  `reader_lease_ttl_ms` defaults to `DEFAULT_TTL_MS` at every construction site
+  and has no CLI flag and no route: it exists only so a test can shrink it.
+* **Two concurrent collectors on one group** — `a_held_group_collector_lease_refuses_the_second_pass_and_deletes_nothing`
+  holds the group's collector record and observes the second pass refuse by
+  name, delete and barrier nothing, and leave the same fragments collectable
+  once the record is released. `two_concurrent_passes_on_one_group_delete_each_fragment_at_most_once`
+  runs two real passes on separate threads and asserts the invariant: at most
+  one reports a deletion, every dead fragment is deleted exactly once in total,
+  a refusal names the collector lease, no live fragment disappears. The race
+  alone can be satisfied by running the passes back to back, so the held-record
+  test is the proof and the race test is a guard.
+* **A collector lease expiring mid-pass** — `a_collector_fence_lost_mid_pool_stops_deleting_and_is_never_counted`
+  fails the fence closure `sweep_pool` receives between two barrier ranges: the
+  range applied before the loss is evicted and counted, the range after it is
+  present and uncounted, the outcome names the stop, and a live fence
+  afterwards reclaims exactly the refused range.
+* **`block_pool_lookup` from the local cache** — this one was not a missing
+  test but a real hole, and the earlier wording understated it. The pass read
+  the `project/volume` to pool map from this node's local cache, and a stale
+  map is not merely conservative: after a volume is remapped it marks the old
+  pool live and the new pool's fragments garbage, so a pass on the cache can
+  delete data that is still referenced. `AppState::control_for_collection` now
+  hands a pass only a control snapshot proved against the control group's
+  quorum, and a pass refuses before touching any group when that proof is
+  unavailable — `409` from `POST /v1/pools/gc`, a `repair_error` from scrub.
+  `a_collection_pass_reads_the_control_map_from_a_confirmed_snapshot` proves
+  both halves.
+
 ## What this record still does not claim
 
 The following are not claimed at live-cluster level, and the text below must not

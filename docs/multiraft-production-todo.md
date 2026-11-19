@@ -699,7 +699,16 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   billing group, and with no further read it stops refusing once the 30 s TTL
   lapses. That drill replaced the last `SKIP` in the suite, so the gate reports
   27 PASS and no SKIP. An earlier ad-hoc live run had already observed the same
-  shape, including `leases_live: 0` before any read and expiry by +35 s. Storage-side fencing exists end to end on both runtimes. A barrier
+  shape, including `leases_live: 0` before any read and expiry by +35 s. Three
+  further shapes are proved at unit level rather than live, because neither a
+  race nor a mid-pass expiry is deterministic there: a second collector on one
+  group refuses on the held collector record and deletes nothing (plus a
+  two-thread invariant test), a collector fence lost between two barrier ranges
+  stops the pool and is never counted, and an S3 `GET` that outlives its reader
+  lease answers `503` with the `ensure_live` text instead of the bytes. The
+  volume-to-pool map a pass marks against is taken from a control snapshot
+  proved against the control group's quorum, not from the local cache, and a
+  pass refuses before touching any group when that proof is unavailable. Storage-side fencing exists end to end on both runtimes. A barrier
   carries the collector lease deadline and the target refuses an expired one
   with `409`
   (`BlobError::BarrierLeaseExpired`), and an unreadable target clock refuses
