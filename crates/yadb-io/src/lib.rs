@@ -22,8 +22,8 @@ pub mod sys;
 #[doc(hidden)]
 pub mod fault {
     pub use crate::sys::fault::{
-        dir_syncs, file_syncs, lock, reads, renames, writes, Armed, DirSyncFault, FileSyncFault,
-        LockFault, ReadFault, RenameFault, WriteFault,
+        dir_syncs, file_syncs, lock, reads, renames, terminate, writes, Armed, DirSyncFault,
+        FileSyncFault, LockFault, ReadFault, RenameFault, WriteFault,
     };
 }
 

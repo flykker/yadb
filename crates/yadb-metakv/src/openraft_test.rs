@@ -928,6 +928,72 @@ async fn persistent_shutdown_cancellation_retains_owner_and_stale_handle() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+/// `Raft::shutdown` joins the core and tick tasks but not the state-machine
+/// worker it spawned in `Raft::new`. The worker owns a clone of the state
+/// machine, and that clone holds the state directory's lock, so an in-process
+/// reopen races the worker by one scheduling turn and can see `WouldBlock`.
+///
+/// This pins the mechanism rather than papering over it: after `shutdown` the
+/// worker's handle must disappear within the bound, and the directory must then
+/// open. Deleting the `shutdown` call makes the wait time out, which is the
+/// inversion that proves the test is about the worker's lifetime.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn raft_shutdown_releases_the_state_machine_worker_and_the_directory_lock() {
+    let root = std::env::var_os("YADB_TEST_TMPDIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join(format!(
+            "yadb-sm-worker-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+    std::fs::create_dir_all(&root).unwrap();
+    let identity = ReplicaIdentity::new(
+        GroupIdentity {
+            cluster: [91; 16],
+            group: 1,
+            incarnation: 1,
+        },
+        1,
+        vec![1],
+    )
+    .unwrap();
+    let config = Arc::new(openraft::Config::default().validate().unwrap());
+    let log = DurableOpenRaftLog::create(root.join("log"), &identity).unwrap();
+    let state = DurableMetaStateMachine::create(root.join("state"), &identity).unwrap();
+    // Only this handle exists before the Raft is built.
+    assert_eq!(state.clone_count(), 1);
+    let raft = YadbRaft::new(1, config, NoNetwork, log, state.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        state.clone_count(),
+        2,
+        "the state-machine worker must own exactly one handle"
+    );
+
+    raft.shutdown().await.unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while state.clone_count() > 1 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the state-machine worker still holds a handle {} after shutdown",
+            state.clone_count()
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert_eq!(state.clone_count(), 1);
+    drop(state);
+
+    let reopened = DurableMetaStateMachine::open(root.join("state"), &identity).unwrap();
+    assert!(reopened.try_snapshot(&[], &[]).is_ok());
+    drop(reopened);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn registry_shutdown_cancellation_retains_slot_and_owner() {
     use super::registry::{GroupRegistry, RegistryError};

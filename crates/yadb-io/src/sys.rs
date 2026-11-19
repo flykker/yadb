@@ -59,8 +59,14 @@ pub fn read_at(file: &File, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
 
 pub fn write_all(file: &File, buf: &[u8]) -> io::Result<()> {
     #[cfg(any(test, feature = "test-faults"))]
-    if let Some(fault::WriteFault::Error(kind)) = fault::take_write() {
-        return Err(io::Error::new(kind, "injected write fault"));
+    if let Some(fault) = fault::take_write() {
+        match fault {
+            fault::WriteFault::Error(kind) => {
+                return Err(io::Error::new(kind, "injected write fault"))
+            }
+            fault::WriteFault::Kill => fault::terminate("write"),
+            fault::WriteFault::Pass => {}
+        }
     }
     // `Write` is implemented for `&File`, which is what an `OsFile` holds: the
     // append-mode delta handle is shared by `&self` callers.
@@ -70,16 +76,28 @@ pub fn write_all(file: &File, buf: &[u8]) -> io::Result<()> {
 
 pub fn write_at(file: &File, offset: u64, buf: &[u8]) -> io::Result<()> {
     #[cfg(any(test, feature = "test-faults"))]
-    if let Some(fault::WriteFault::Error(kind)) = fault::take_write() {
-        return Err(io::Error::new(kind, "injected write fault"));
+    if let Some(fault) = fault::take_write() {
+        match fault {
+            fault::WriteFault::Error(kind) => {
+                return Err(io::Error::new(kind, "injected write fault"))
+            }
+            fault::WriteFault::Kill => fault::terminate("write"),
+            fault::WriteFault::Pass => {}
+        }
     }
     file.write_all_at(buf, offset)
 }
 
 pub fn sync_data(file: &File) -> io::Result<()> {
     #[cfg(any(test, feature = "test-faults"))]
-    if let Some(fault::FileSyncFault::Error(kind)) = fault::take_file_sync() {
-        return Err(io::Error::new(kind, "injected file sync fault"));
+    if let Some(fault) = fault::take_file_sync() {
+        match fault {
+            fault::FileSyncFault::Error(kind) => {
+                return Err(io::Error::new(kind, "injected file sync fault"))
+            }
+            fault::FileSyncFault::Kill => fault::terminate("file sync"),
+            fault::FileSyncFault::Pass => {}
+        }
     }
     file.sync_data()
 }
@@ -159,11 +177,13 @@ pub mod fault {
     }
 
     /// A fault for the next write. `Pass` is the positioning slot described on
-    /// [`LockFault`].
+    /// [`LockFault`]; `Kill` terminates the process from inside the call, which
+    /// is how a separate-process crash gate dies at a chosen point.
     #[derive(Debug, Clone, Copy)]
     pub enum WriteFault {
         Error(io::ErrorKind),
         Pass,
+        Kill,
     }
 
     /// A fault for the next file-data sync.
@@ -171,6 +191,19 @@ pub mod fault {
     pub enum FileSyncFault {
         Error(io::ErrorKind),
         Pass,
+        Kill,
+    }
+
+    /// Terminate the process without unwinding, running destructors or flushing
+    /// anything beyond the syscalls already issued.
+    ///
+    /// This is the in-process stand-in for `SIGKILL` at a syscall boundary: the
+    /// durable state left behind is exactly what the writes and syncs that
+    /// already returned produced, and nothing else. The exit code is fixed so a
+    /// parent test can tell a killed child from a failed one.
+    pub fn terminate(where_: &'static str) -> ! {
+        eprintln!("crash gate: terminating at {where_}");
+        std::process::exit(97)
     }
 
     /// A fault for the next directory sync.

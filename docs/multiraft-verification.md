@@ -3102,3 +3102,103 @@ Open: no rule has fired against live traffic, the runbooks in
 gates rather than rehearsed on production-shaped infrastructure, and structured
 logging is still absent. The families remain this node's local observations —
 the role in `yadb_group_info` is not proof of quorum.
+
+## Create publication, worker lifetime, peer FIFO and the crash gate (2026-11-19)
+
+Four gaps from the same wave, each with a test that fails when its fix is
+removed. Counts are for the tree this section describes: `yadb-metakv` 253 unit
+tests plus 2 in `tests/crash_gate.rs`, `yadb-io` 13.
+
+### A create cannot publish a partial image
+
+`DurableMetaStateMachine::create` made `state.json` with `create_new`, dropped
+the handle and reopened it with `truncate` before writing, so a crash in that
+window left a 0-byte image in a root the daemon's admission check already
+counts as non-empty. `create` could not be retried (`AlreadyExists`) and `open`
+refused it, because a fresh log reports `first_index: None` and
+`LogCoverage::replays_from_start` deliberately rejects an empty log. The image
+is now written to a synced `state.json.tmp` and renamed into place, then the
+directory is synced, so it appears under its final name only when complete; any
+failure removes the temporary file and leaves the directory as it was found.
+
+Four tests: the write, file-sync and publication-rename failures each assert no
+`state.json` and no `state.json.tmp` remain and that a second `create`
+succeeds and applies, and
+`a_completed_create_opens_and_applies_and_cannot_be_repeated` pins that an
+existing image is still refused with `AlreadyExists`. Inversion: restoring the
+pre-fix sequence while routing it through the same seam (so the faults still
+fire) fails the write test at `a failed create must not leave an image behind`
+— the 0-byte brick — the rename test at `the publication rename must fail`, and
+the sync test at its no-image assertion.
+
+Still open: a partially created *replica* is not retryable through the daemon.
+`PersistentGroup::create` and `PreparedMulti`'s non-empty-root refusal reject
+the directory, and a marker-based retry cannot simply wipe it, because groups
+start sequentially: if an earlier group has already started and accepted data,
+its directory is indistinguishable from a crashed one. A marker-and-wipe draft
+was written for this wave and discarded for that reason, since it would have
+added a destructive path without delivering the retry.
+
+### `Raft::shutdown` does not join the state-machine worker
+
+`multiple_real_groups_route_and_reject_cross_group` reopened three replicas
+in-process immediately after `raft.shutdown()` and intermittently panicked with
+`Kind(WouldBlock)` from `DurableMetaStateMachine::open`. The cause is upstream:
+`Raft::new` spawns a state-machine worker (`openraft-0.9.25`
+`src/core/sm/worker.rs`) that owns a clone of the `SM`, and `Raft::shutdown`
+joins only the core and tick tasks. The worker exits one scheduling turn later
+when its command channel closes, so its clone — and the state directory's lock
+that the clone holds — outlives `shutdown()`.
+
+`raft_shutdown_releases_the_state_machine_worker_and_the_directory_lock` pins
+the mechanism with `clone_count()`: one handle before `Raft::new`, exactly two
+after (the worker's), and back to one within five seconds of `shutdown`, after
+which the directory opens. Inversion: deleting the `shutdown` call leaves the
+count at 2 and fails with `the state-machine worker still holds a handle 2
+after shutdown`. The routing test now waits for the handle to be released
+instead of treating one upstream task turn as corruption. Three consecutive
+full runs were clean, where the failure had reproduced on roughly one run in
+three before.
+
+### Per-address byte admission is FIFO
+
+`PeerBytes::reserve` used a single `Notify` and a retry loop, so a small frame
+could overtake a large one that had waited longer. Each address now has a FIFO
+queue of per-waiter notifications alongside its reserved-byte count; enqueue,
+admission and release share the mutex, only the head is woken, and a `Notify`
+permit sent before the waiter awaits is retained, so no wakeup is lost. A
+dropped waiter removes itself and wakes its successor if it was the head.
+Counters and limits are unchanged.
+
+Three tests: `fifo_admission_serves_waiters_in_arrival_order`,
+`large_head_is_not_overtaken_by_smaller_frames` and
+`cancelled_head_does_not_block_next_waiter`. Inversions, each restored: letting
+a fitting newcomer jump the queue fails with `small frame overtook large head`;
+removing the successor wakeup on cancellation fails with `cancelled head
+blocked its successor: Elapsed(())`.
+
+Still open: two colluding addresses can still fill the global 64 MiB budget,
+and the per-address cap is a policy number, not a measured one.
+
+### A separate-process crash gate
+
+`crates/yadb-metakv/tests/crash_gate.rs` spawns its own test binary as a child,
+lets it create a state machine and apply one entry, then arms a fault that
+terminates the process from inside the next syscall and applies a second entry.
+The child leaves through `std::process::exit(97)` inside the seam, so nothing
+unwinds and nothing buffered is flushed; the parent requires exit code 97 and
+reopens the directory. Death *before* the second append's write leaves only the
+acknowledged entry and no torn tail; death *after* the write but *before* its
+file sync leaves a complete, checksum-valid frame, so replay applies it and the
+applied index moves to 2. That second outcome is correct: the entry was never
+acknowledged, the Raft log holds it, and the state machine only ever replays
+what the log already has.
+
+Inversion: making `WriteFault::Kill` a no-op makes the child finish, and the
+parent fails with `the child must terminate inside the seam, not finish or fail:
+ExitStatus(...)`.
+
+What this does not show: the page cache survives a process death, so neither
+case says anything about a lost device write cache, a lost synced rename or an
+OS panic; and it covers only the state machine's delta append and checkpoint
+publish, not a live multi-node cluster under a real `kill -9`.

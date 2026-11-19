@@ -934,6 +934,39 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// Open a state directory that a just-shut-down replica still holds for one
+    /// task turn.
+    ///
+    /// `openraft::Raft::new` spawns a state-machine worker that owns the `SM`
+    /// (`openraft-0.9.25` `src/core/sm/worker.rs`), and `Raft::shutdown` joins
+    /// only the core and tick tasks. The worker exits when its command channel
+    /// closes, on a later scheduling turn, so its clone of this state machine —
+    /// and the directory lock that clone holds — outlives `shutdown()` by that
+    /// turn. An immediate in-process reopen therefore races it and can see
+    /// `WouldBlock`. This waits for the handle to be released instead of
+    /// treating one upstream task turn as corruption.
+    async fn open_state_after_worker_exit(
+        dir: &std::path::Path,
+        identity: &ReplicaIdentity,
+    ) -> DurableMetaStateMachine {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match DurableMetaStateMachine::open(dir, identity) {
+                Ok(state) => return state,
+                Err(error)
+                    if error.kind() == io::ErrorKind::WouldBlock
+                        && std::time::Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                Err(error) => panic!(
+                    "state directory {} did not become free: {error}",
+                    dir.display()
+                ),
+            }
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn multiple_real_groups_route_and_reject_cross_group() {
         let dir = std::env::temp_dir().join(format!(
@@ -1132,7 +1165,7 @@ mod tests {
             .unwrap();
             let log = DurableOpenRaftLog::open(dir.join(format!("log-{group}")), &id).unwrap();
             let state =
-                DurableMetaStateMachine::open(dir.join(format!("state-{group}")), &id).unwrap();
+                open_state_after_worker_exit(&dir.join(format!("state-{group}")), &id).await;
             let raft = YadbRaft::new(1, config.clone(), NoNetwork, log, state.clone())
                 .await
                 .unwrap();

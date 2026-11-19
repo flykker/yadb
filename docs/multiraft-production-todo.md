@@ -608,27 +608,66 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   under `--features test-faults`. What this still cannot show is a real crash:
   every fault is in-process, so the separate-process crash/kill gate below
   remains open.
-- [ ] Pair the fault matrix with a separate-process crash/kill gate. Every
-  injected fault above is in-process: it proves the code path that sees the
-  error, not what a killed process leaves on disk, and a `kill -9` between two
-  syscalls is not expressible as a return value. The gate needs a child process
-  that dies at a chosen point, a parent that reopens its directory, and a
-  check that the acknowledged prefix survives; nothing of that shape exists
-  yet, and it is the remaining half of the original item.
-- [ ] Make a crash during `DurableMetaStateMachine::create` recoverable. `create`
-  makes `state.json` with `create_new`, drops the handle, then reopens with
-  `truncate` and writes; a crash in between leaves a 0-byte image in a root the
-  admission check already counts as non-empty (`yadbd/src/openraft.rs` refuses a
-  non-empty root), so `create` cannot be retried. `open` refuses it too, because
-  a fresh log reports `first_index: None` and `LogCoverage::replays_from_start`
-  deliberately rejects an empty log — it cannot be told apart from a replica
-  whose state came from a snapshot the log no longer repeats, and rebuilding that
-  one would come up empty and serve. Pinned by
-  `zero_byte_image_on_a_fresh_root_is_refused_because_the_log_is_empty`; the same
-  0-byte image rebuilds once coverage reports `Some(0)`. This predates the
-  `yadb-io` seam and is not a decoder problem: it needs a durable
-  create-completed marker or a `LogCoverage` distinction between "never had
-  entries" and "emptied after a snapshot".
+- [x] Pair the fault matrix with a separate-process crash/kill gate.
+  `crates/yadb-metakv/tests/crash_gate.rs` spawns its own test binary as a
+  child, lets it create a state machine and apply one entry, then arms a fault
+  that terminates the process from inside the next syscall and applies a second
+  entry. The child leaves through `std::process::exit(97)` inside the seam, so
+  nothing unwinds, no destructor runs and nothing buffered is flushed; the
+  parent requires exit code 97, reopens the directory with a fresh
+  `DurableMetaStateMachine` and checks what survived. Two points are covered:
+  death *before* the second append's write (`WriteFault::Kill`), where the
+  reopened replica serves only the acknowledged entry and reports no torn tail;
+  and death *after* the write but *before* its file sync
+  (`FileSyncFault::Kill`), where the frame is complete and checksum-valid, so
+  replay applies it and the applied index moves to 2. The second outcome is
+  correct rather than a broken promise: that entry was never acknowledged, the
+  Raft log holds it, and the state machine is only ever asked to replay what
+  the log already has. Inversion: deleting the `shutdown`/`Kill` arm makes the
+  child finish instead of dying, and the parent fails on the exit code.
+  Residual, and why this does not close the next item: the page cache survives
+  a process death, so neither case says anything about a lost device write
+  cache, a lost synced rename or an OS panic. It also covers only the state
+  machine's delta append and checkpoint publish, not a live multi-node cluster
+  under a real `kill -9`.
+- [x] Make a crash during `DurableMetaStateMachine::create` leave no partial
+  image. The old sequence made `state.json` with `create_new`, dropped the
+  handle and reopened it with `truncate` before writing, so a crash in that
+  window left a 0-byte image in a root the admission check already counts as
+  non-empty (`yadbd/src/openraft.rs` refuses a non-empty root): `create` could
+  not be retried (`AlreadyExists`) and `open` refused it, because a fresh log
+  reports `first_index: None` and `LogCoverage::replays_from_start`
+  deliberately rejects an empty log. `create` now writes a synced
+  `state.json.tmp` and renames it into place, then syncs the directory, so the
+  image appears under its final name only when it is complete; a failure
+  removes the temporary file and leaves the directory as it was found. Three
+  fault tests cover the write, the file sync and the publication rename, each
+  asserting that no `state.json` and no `state.json.tmp` remain and that a
+  second `create` succeeds and applies
+  (`a_create_whose_image_write_fails_leaves_no_image_and_can_be_retried`,
+  `a_create_whose_image_sync_fails_leaves_no_image_and_can_be_retried`,
+  `a_create_whose_rename_fails_leaves_no_image_and_can_be_retried`),
+  and `a_completed_create_opens_and_applies_and_cannot_be_repeated` pins that
+  an existing image is still refused with `AlreadyExists` rather than
+  reinitialised. Inversion: restoring the pre-fix sequence, routed through the
+  same seam so the faults still fire, fails the write test at
+  `a failed create must not leave an image behind` — the 0-byte brick — the
+  rename test at `the publication rename must fail`, and the sync test at its
+  no-image assertion.
+  Residual: this closes the state-machine half only. A partially created
+  *replica* is still not retryable through the daemon: `PersistentGroup::create`
+  and `PreparedMulti`'s non-empty-root refusal reject the directory, and a
+  marker-based retry cannot simply wipe it, because groups start sequentially —
+  if an earlier group has already started and accepted data, its directory
+  looks identical to a crashed one and wiping it would be the silent
+  reinitialisation this project forbids. That needs a durable
+  create-completed marker whose removal is ordered before any Raft instance
+  starts, plus an admission rule that cannot authorize wiping a group that
+  accepted data, and a test that drives an interrupted replica through the
+  daemon path. A draft of exactly that marker-and-wipe design was written and
+  discarded for this wave: it does not handle the sequential multi-group case
+  it was meant to fix, so it would have added a destructive code path without
+  delivering the retry.
 - [ ] Run separate-process crash/kill and OS/filesystem power-loss tests; document
   filesystem and hardware assumptions. In-process fault simulation is not proof.
   `three_process_mtls_power_loss_after_ack_keeps_acknowledged_writes` SIGKILLs

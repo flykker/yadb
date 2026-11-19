@@ -585,7 +585,7 @@ fn persist_locked(inner: &mut Inner) -> Result<(), StorageError<u32>> {
     let gate = inner.gate.take();
     let mut created = false;
     let result = (|| -> io::Result<()> {
-        let mut file = OpenOptions::new()
+        let file = OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&temp)?;
@@ -816,17 +816,41 @@ impl DurableMetaStateMachine {
         fs::create_dir_all(&dir)?;
         let lock = OsDirectoryLock::try_acquire(&dir)?;
         let path = dir.join("state.json");
-        let file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)?;
-        drop(file);
+        if path.try_exists()? {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "state image already exists",
+            ));
+        }
         let image = empty_image(identity);
         let bytes = image_bytes(&image)?;
-        let mut file = OpenOptions::new().write(true).truncate(true).open(&path)?;
-        file.write_all(&bytes)?;
-        file.sync_data()?;
-        File::open(&dir)?.sync_all()?;
+        // Publish through a synced temporary file and one rename. The old
+        // sequence created `state.json` empty, dropped the handle and reopened
+        // it with `truncate`, so a crash in that window left a 0-byte image:
+        // `open` refuses it (a fresh log cannot prove replay is lossless) and
+        // `create` cannot retry it (`create_new` sees the file). With the
+        // rename, a crash leaves either no `state.json` — which `create` may
+        // retry — or the complete image.
+        let temporary = dir.join("state.json.tmp");
+        let result = (|| -> io::Result<()> {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&temporary)?;
+            yadb_io::sys::write_all(&file, &bytes)?;
+            yadb_io::sys::sync_data(&file)?;
+            drop(file);
+            yadb_io::sys::rename(&temporary, &path)?;
+            yadb_io::sys::sync_dir(&dir)?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            // The directory is left exactly as it was found, so a retry of
+            // `create` starts from the same empty state this call did.
+            let _ = fs::remove_file(&temporary);
+            return Err(error);
+        }
         Ok(Self {
             inner: Arc::new(Mutex::new(Inner {
                 dir,
@@ -2412,13 +2436,121 @@ mod tests {
         }
     }
 
-    /// The create-window brick, pinned exactly.
+    /// A create whose image write fails leaves no image, so it can be retried.
     ///
-    /// `create` makes `state.json` with `create_new`, drops the handle, then
-    /// reopens with `truncate` and writes. A crash in between leaves a 0-byte
-    /// file in a root the admission check already considers non-empty, so
-    /// `create` cannot be retried. Recovery therefore depends entirely on the
-    /// coverage that `open_or_rebuild` is given:
+    /// This is the brick itself: the pre-fix sequence created `state.json`
+    /// empty, dropped the handle and reopened it, so a failure before the bytes
+    /// landed left a 0-byte image that `create` could not retry
+    /// (`AlreadyExists`) and `open` refused.
+    #[tokio::test]
+    async fn a_create_whose_image_write_fails_leaves_no_image_and_can_be_retried() {
+        use yadb_io::fault::{writes, WriteFault};
+
+        let dir = TempDir::new();
+        let armed = writes(&[WriteFault::Error(io::ErrorKind::Other)]);
+        let error = DurableMetaStateMachine::create(&dir.0, &identity())
+            .err()
+            .expect("the image write must fail");
+        drop(armed);
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(
+            !dir.0.join("state.json").exists(),
+            "a failed create must not leave an image behind"
+        );
+        assert!(!dir.0.join("state.json.tmp").exists());
+
+        let mut machine = DurableMetaStateMachine::create(&dir.0, &identity()).unwrap();
+        machine.apply(vec![put(1, "key", b"value")]).await.unwrap();
+        drop(machine);
+        let machine = DurableMetaStateMachine::open(&dir.0, &identity()).unwrap();
+        assert_eq!(machine.snapshot().get("key").unwrap().value, b"value");
+    }
+
+    /// A create whose rename never happens leaves no image, so it can be retried.
+    ///
+    /// This is the exact window the old sequence bricked: the image existed
+    /// under its final name before its bytes were durable. Here the rename is
+    /// the publication point, so failing it leaves the directory as `create`
+    /// found it — no `state.json`, no `state.json.tmp` — and the next `create`
+    /// succeeds and applies.
+    #[tokio::test]
+    async fn a_create_whose_rename_fails_leaves_no_image_and_can_be_retried() {
+        use yadb_io::fault::{renames, RenameFault};
+
+        let dir = TempDir::new();
+        let armed = renames(&[RenameFault::Error(io::ErrorKind::Other)]);
+        let error = DurableMetaStateMachine::create(&dir.0, &identity())
+            .err()
+            .expect("the publication rename must fail");
+        drop(armed);
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(
+            !dir.0.join("state.json").exists(),
+            "an image must never be published before it is complete"
+        );
+        assert!(
+            !dir.0.join("state.json.tmp").exists(),
+            "a failed create must not leave the temporary image behind"
+        );
+
+        let mut machine = DurableMetaStateMachine::create(&dir.0, &identity()).unwrap();
+        machine.apply(vec![put(1, "key", b"value")]).await.unwrap();
+        drop(machine);
+        let machine = DurableMetaStateMachine::open(&dir.0, &identity()).unwrap();
+        assert_eq!(machine.snapshot().get("key").unwrap().value, b"value");
+    }
+
+    /// A create whose image never syncs leaves no image either.
+    ///
+    /// The sync is what makes the bytes durable before the rename publishes
+    /// them; failing it must leave the directory untouched rather than a
+    /// short or unsynced `state.json` that `open` would have to judge.
+    #[tokio::test]
+    async fn a_create_whose_image_sync_fails_leaves_no_image_and_can_be_retried() {
+        use yadb_io::fault::{file_syncs, FileSyncFault};
+
+        let dir = TempDir::new();
+        let armed = file_syncs(&[FileSyncFault::Error(io::ErrorKind::Other)]);
+        let error = DurableMetaStateMachine::create(&dir.0, &identity())
+            .err()
+            .expect("the image sync must fail");
+        drop(armed);
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(!dir.0.join("state.json").exists());
+        assert!(!dir.0.join("state.json.tmp").exists());
+
+        let mut machine = DurableMetaStateMachine::create(&dir.0, &identity()).unwrap();
+        machine.apply(vec![put(1, "key", b"value")]).await.unwrap();
+        assert_eq!(machine.snapshot().get("key").unwrap().value, b"value");
+    }
+
+    /// A completed create opens and applies, and a second create refuses.
+    #[tokio::test]
+    async fn a_completed_create_opens_and_applies_and_cannot_be_repeated() {
+        let dir = TempDir::new();
+        drop(DurableMetaStateMachine::create(&dir.0, &identity()).unwrap());
+        assert_eq!(
+            DurableMetaStateMachine::create(&dir.0, &identity())
+                .err()
+                .map(|error| error.kind()),
+            Some(io::ErrorKind::AlreadyExists),
+            "an existing image must not be reinitialised"
+        );
+        let mut machine = DurableMetaStateMachine::open(&dir.0, &identity()).unwrap();
+        machine.apply(vec![put(1, "key", b"value")]).await.unwrap();
+        drop(machine);
+        let machine = DurableMetaStateMachine::open(&dir.0, &identity()).unwrap();
+        assert_eq!(machine.snapshot().get("key").unwrap().value, b"value");
+    }
+
+    /// A 0-byte image is refused, and the refusal is the empty-log decision.
+    ///
+    /// `create` no longer produces a 0-byte image: it writes a synced
+    /// `state.json.tmp` and renames it, so a crash leaves either no image (and
+    /// `create` may retry) or the complete one. The 0-byte shape still has to
+    /// be handled, because an image written by an older build, or one damaged
+    /// outside this process, is not distinguishable from it. Recovery then
+    /// depends entirely on the coverage that `open_or_rebuild` is given:
     ///
     /// * A log holding entries from index 0 rebuilds, and nothing is lost.
     /// * An **empty** log reports `first_index: None`, and
