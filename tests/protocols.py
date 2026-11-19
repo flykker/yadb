@@ -379,16 +379,31 @@ def refused_group_names(text):
 # refused *set* must let it lapse first instead of weakening the comparison.
 READER_LEASE_TTL = 30.0
 
+# When the last S3 GET was answered. The fence belongs to the metadata group,
+# not to the code path that published it: a read one drill made still refuses
+# the next drill's pass, so the timestamp has to survive across drills.
+# `signed` is the only S3 client here, which makes it the one place that can
+# record this without every caller threading a timestamp through. Negative
+# infinity means "no read yet", so an early drain never sleeps.
+LAST_S3_READ_AT = float("-inf")
 
-def drain_reader_lease(last_read_at):
-    """Wait until the last read's cached lease has certainly lapsed.
+
+def drain_reader_lease(last_read_at=None):
+    """Wait until the last S3 read's cached lease has certainly lapsed.
+
+    With no argument this drains from the last GET this process made, which is
+    what a drill that follows another drill's reads needs. Passing a timestamp
+    is for a drill that has to drain from a read *it* made even though later
+    reads of its own moved the global.
 
     Deliberately a sleep and not a polled scrub: a scrub that finally ran would
     also repair the handoff parts, and the exact counters a drill asserts at
     this point (for instance `blobs_repaired == 0` while the receiving slots are
     down) are the thing under test. One extra second absorbs the gap between the
-    lease's publication and the timestamp the caller recorded after the read.
+    lease's publication and the moment the response arrived.
     """
+    if last_read_at is None:
+        last_read_at = LAST_S3_READ_AT
     remaining = READER_LEASE_TTL + 1.0 - (time.monotonic() - last_read_at)
     if remaining > 0:
         time.sleep(remaining)
@@ -746,8 +761,8 @@ def assert_multiraft_repair_drill(health, nodes, temp, env):
     # before each one. Only reads linger: a write's fence (the upload intent for
     # an S3 PUT, a writer lease for SQL and block writes) is removed when the
     # write completes, whereas `begin_read_lease` caches its record and the next
-    # read renews it, so the writes below do not move this timestamp.
-    last_read_at = time.monotonic()
+    # read renews it. `drain_reader_lease` therefore tracks reads only, so the
+    # writes below do not move it.
 
     nodes[down-1].kill()
     nodes[down-1].wait(timeout=10)
@@ -763,7 +778,7 @@ def assert_multiraft_repair_drill(health, nodes, temp, env):
         # The read before the outage left its lease live; let it lapse so this
         # pass refuses only the groups this node does not lead. Polling a scrub
         # instead would repair the handoff parts and break the exact counters.
-        drain_reader_lease(last_read_at)
+        drain_reader_lease()
         summary = assert_multiraft_repair_scan(
             http_port(leader), leader, live_nodes=[n for n in NODES if n != down])
         # Exact, and licensed by the baseline precondition above rather than by
@@ -781,9 +796,6 @@ def assert_multiraft_repair_drill(health, nodes, temp, env):
         assert summary["blobs_unrecoverable"] == base + 1, summary
         for key, body in during:
             s3_visible(s3_port(leader), key, body, timeout=120)
-        # These reads published (and renewed) the lease again, so the scan after
-        # the restart must wait from *this* read, not from the pre-outage one.
-        last_read_at = time.monotonic()
     finally:
         # The rest of the run needs all three nodes. Restart even when an
         # assertion above failed, then let the failure propagate.
@@ -797,7 +809,7 @@ def assert_multiraft_repair_drill(health, nodes, temp, env):
     # Same fence, second read: the during-outage GETs renewed the lease. The
     # record lives in the metadata group, not on the node that served the read,
     # so a leader change across the restart does not clear it either.
-    drain_reader_lease(last_read_at)
+    drain_reader_lease()
     summary = assert_multiraft_repair_scan(http_port(leader), leader)
     # The same four blobs, now all readable: the pre-outage one is whole again,
     # and the handoff parts of the three written during the outage were moved to
@@ -1009,12 +1021,21 @@ def assert_orphan_collection_drill(health):
     have lapsed. While the intent exists, the sweep's mark also treats its
     chunks as live (`/s3-intent/` is a live prefix), so neither half collects a
     fragment of an upload still in flight.
+
+    The first pass runs inside a one-second grace, so a reader lease left live
+    by an earlier drill's S3 GET must be drained *before* the part is uploaded:
+    draining after it would let the grace expire and the pass would collect the
+    chunks the drill asserts are still there. `sweep_group` refuses on any live
+    lease, so a stale one would also add its group to the refused set.
     """
     leader = wait_group_leader(BILLING_GROUP)
     port = s3_port(leader)
     pool = next(each for each in health["pools"] if each["pool_name"] == S3_POOL)
     node_of = {slot["slot_index"]: slot["node_id"] for slot in pool["slots"]}
     internal = {"x-yadb-raft-token": RAFT_TOKEN}
+
+    # Before the grace clock starts, not after: see the docstring.
+    drain_reader_lease()
 
     def slot_ids():
         ids = {}
@@ -1214,6 +1235,7 @@ def assert_vdisk_fence_rpc(port, pool_name, slot_index):
 
 
 def signed(port, method, path, body=b"", extra=None, secret=None, timeout=30):
+    global LAST_S3_READ_AT
     secret = SECRET if secret is None else secret
     now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     date = now[:8]
@@ -1241,7 +1263,13 @@ def signed(port, method, path, body=b"", extra=None, secret=None, timeout=30):
         key = hmac.new(key, v.encode(), hashlib.sha256).digest()
     sig = hmac.new(key, text.encode(), hashlib.sha256).hexdigest()
     headers["authorization"] = f"AWS4-HMAC-SHA256 Credential=backend/{scope}, SignedHeaders={names}, Signature={sig}"
-    return request(port, method, path, body, headers, timeout)
+    result = request(port, method, path, body, headers, timeout)
+    # Recorded after the response, not before the request: the handler publishes
+    # or renews the lease at the start of the read, so the response is the later
+    # of the two moments and a drain measured from it cannot be short.
+    if method == "GET":
+        LAST_S3_READ_AT = time.monotonic()
+    return result
 
 
 def complete_multipart_xml(parts):
