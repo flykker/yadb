@@ -1,4 +1,10 @@
-//! Independent processes on loopback. Process kill is not a power-loss test.
+//! Independent processes on loopback over mTLS.
+//!
+//! Process kill is not a power-loss test: `SIGKILL` leaves the page cache
+//! intact, so the power-loss test here proves crash consistency of what the
+//! child had already written, not device-level power-loss safety. Delayed and
+//! duplicated RPCs are injected by a userspace TLS-terminating relay in the
+//! parent, not by a real network.
 use crate::{
     multiraft::{GroupIdentity, ReplicaIdentity},
     openraft_net::{
@@ -8,23 +14,28 @@ use crate::{
     openraft_runtime::{persistent::PersistentGroup, YadbRaft},
     openraft_state_machine::{DeltaFrame, DurableMetaStateMachine},
     openraft_storage::{read_frame, DurableOpenRaftLog, Frame},
-    openraft_transport::{NodeSigningKey, PeerKeyRegistry},
+    openraft_transport::{NodeSigningKey, PeerKeyRegistry, SignedRaftEnvelope},
     KvCommand, KvResult,
 };
-use openraft::{storage::RaftLogStorage, BasicNode, EntryPayload, Snapshot};
+use openraft::{
+    network::RaftNetworkFactory,
+    storage::{RaftLogStorage, RaftStateMachine},
+    BasicNode, CommittedLeaderId, Entry, EntryPayload, LogId, Snapshot,
+};
 use serde_json::{json, Value};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     io::{Cursor, Read},
     net::SocketAddr,
     path::{Path, PathBuf},
     process::{Child, Command},
     sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+        Arc, Mutex,
     },
     time::Duration,
 };
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const CHILD_ENV: &str = "YADB_PROCESS_RAFT_CHILD";
 const TEST_NAME: &str =
@@ -45,19 +56,63 @@ fn identity(node: u32) -> ReplicaIdentity {
 fn key(node: u32) -> NodeSigningKey {
     NodeSigningKey::from_seed(&[node as u8; 32]).unwrap()
 }
+/// What the child saw at the Raft RPC boundary.
+///
+/// The transport has already decrypted and authenticated the frame before the
+/// handler runs, so these counters say nothing about TLS. `duplicate_appends`
+/// is the observable a duplicating network must move: a second delivery of the
+/// same leader/term, previous log id and entry batch. The Raft handler is then
+/// expected to stay idempotent (the durable state machine rejects a repeated
+/// log id), which is what the delayed/duplicated process test asserts.
+#[derive(Default)]
+struct RpcObservations {
+    appends: AtomicUsize,
+    duplicate_appends: AtomicUsize,
+    votes: AtomicUsize,
+    seen_appends: Mutex<BTreeSet<String>>,
+}
+
+fn note_append(
+    rpc: &openraft::raft::AppendEntriesRequest<crate::openraft_runtime::YadbRaftTypeConfig>,
+    observations: &RpcObservations,
+) {
+    observations.appends.fetch_add(1, Ordering::SeqCst);
+    // Empty appends are heartbeats: they repeat byte-for-byte by design, so
+    // counting them as duplicates would say nothing about delivery.
+    if rpc.entries.is_empty() {
+        return;
+    }
+    let signature = format!(
+        "{:?}|{:?}|{:?}|{}",
+        rpc.vote,
+        rpc.prev_log_id,
+        rpc.entries.last().map(|entry| entry.log_id),
+        rpc.entries.len()
+    );
+    if !observations.seen_appends.lock().unwrap().insert(signature) {
+        observations
+            .duplicate_appends
+            .fetch_add(1, Ordering::SeqCst);
+    }
+}
+
 fn handler(
     raft: YadbRaft,
     snapshots: Arc<AtomicUsize>,
+    observations: Arc<RpcObservations>,
 ) -> Arc<dyn Fn(WireRequest) -> BoxFuture<WireResponse> + Send + Sync> {
     Arc::new(move |req| {
         let raft = raft.clone();
         let snapshots = snapshots.clone();
+        let observations = observations.clone();
         Box::pin(async move {
             match req {
                 WireRequest::AppendEntries(rpc) => {
+                    note_append(&rpc, &observations);
                     WireResponse::AppendEntries(Box::new(raft.append_entries(*rpc).await.unwrap()))
                 }
                 WireRequest::Vote(rpc) => {
+                    observations.votes.fetch_add(1, Ordering::SeqCst);
                     WireResponse::Vote(Box::new(raft.vote(*rpc).await.unwrap()))
                 }
                 WireRequest::InstallSnapshot { vote, meta, data } => {
@@ -242,13 +297,18 @@ async fn child(config: Value) {
         Err(error) => panic!("replica startup failed: {error}"),
     };
     let snapshots = Arc::new(AtomicUsize::new(0));
+    let observations = Arc::new(RpcObservations::default());
     // The child owns this task for its entire lifetime; the parent kills and
     // reaps the process rather than requesting graceful shutdown.
     let _server = tokio::spawn(
         RaftPeerServer::from_listener(
             listener,
             transport,
-            handler(group.raft().clone(), snapshots.clone()),
+            handler(
+                group.raft().clone(),
+                snapshots.clone(),
+                observations.clone(),
+            ),
         )
         .serve(),
     );
@@ -267,7 +327,7 @@ async fn child(config: Value) {
             }
             "status" => {
                 let m = group.raft().metrics().borrow().clone();
-                json!({"leader": m.current_leader, "last_log_index": m.last_log_index, "applied_index": m.last_applied.map(|id| id.index), "snapshot_index": m.snapshot.map(|id| id.index), "purged": m.purged.map(|id| id.index), "snapshots": snapshots.load(Ordering::SeqCst), "metrics": format!("{m:?}")})
+                json!({"leader": m.current_leader, "last_log_index": m.last_log_index, "applied_index": m.last_applied.map(|id| id.index), "snapshot_index": m.snapshot.map(|id| id.index), "purged": m.purged.map(|id| id.index), "snapshots": snapshots.load(Ordering::SeqCst), "metrics": format!("{m:?}"), "rpc": {"appends": observations.appends.load(Ordering::SeqCst), "duplicate_appends": observations.duplicate_appends.load(Ordering::SeqCst), "votes": observations.votes.load(Ordering::SeqCst), "transport": crate::openraft_net::transport_counters()}})
             }
             "value" => {
                 json!({"value": image_value(&dir.join("state/state.json"), request["key"].as_str().unwrap())})
@@ -282,7 +342,17 @@ async fn child(config: Value) {
                 .await;
                 match result {
                     Ok(Ok(response)) => {
-                        json!({"ack": matches!(response.data, KvResult::PutOk { .. }), "result": format!("{:?}", response.data)})
+                        // The applied index at acknowledgement time is what the
+                        // parent compares against every replica afterwards: an
+                        // ack is only meaningful if the entry is in a log that a
+                        // majority holds, and the replicas then have to reach it.
+                        let applied = group
+                            .raft()
+                            .metrics()
+                            .borrow()
+                            .last_applied
+                            .map(|id| id.index);
+                        json!({"ack": matches!(response.data, KvResult::PutOk { .. }), "result": format!("{:?}", response.data), "applied_index": applied})
                     }
                     Ok(Err(error)) => json!({"ack": false, "error": format!("{error:?}")}),
                     Err(error) => {
@@ -472,6 +542,125 @@ async fn write(nodes: &mut BTreeMap<u32, Process>, key: &str) -> u32 {
         }
     }
 }
+/// Like [`write`], but also returns the leader's applied index at the moment the
+/// client write was acknowledged. That index is the observable used to show the
+/// acknowledgement reflects a committed (quorum) entry rather than a local
+/// append: every replica is then required to reach it.
+async fn write_and_index(nodes: &mut BTreeMap<u32, Process>, key: &str) -> (u32, u64) {
+    let mut last_attempt = None;
+    let result = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let id = leader(nodes).await;
+            let response = nodes
+                .get_mut(&id)
+                .unwrap()
+                .request(json!({"op":"write", "key":key, "value":key}))
+                .await;
+            if response["ack"] == true {
+                let applied = response["applied_index"].as_u64().unwrap_or_else(|| {
+                    panic!("node {id} acknowledged without an applied index: {response}")
+                });
+                return (id, applied);
+            }
+            last_attempt = Some((id, response));
+        }
+    })
+    .await;
+    match result {
+        Ok(value) => value,
+        Err(_) => {
+            eprintln!("no acknowledged write for key {key:?}; last attempt: {last_attempt:?}");
+            panic!("no acknowledged write for key {key:?}");
+        }
+    }
+}
+
+/// Waits until every replica's `last_applied` reaches `index`.
+///
+/// The leader reported this index when it acknowledged the client write. A
+/// follower that has not applied it yet is still catching up, so this is a
+/// poll, not a snapshot: it proves the entry reached every replica, not that it
+/// was there at the instant of the ack.
+async fn wait_applied_at_least(nodes: &mut BTreeMap<u32, Process>, index: u64) {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        for process in nodes.values_mut() {
+            loop {
+                let status = process.request(json!({"op":"status"})).await;
+                if status["applied_index"]
+                    .as_u64()
+                    .is_some_and(|applied| applied >= index)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+    })
+    .await
+    .expect("a replica never applied the acknowledged index");
+}
+
+/// Waits until each replica has applied its whole log (`applied == last_log`).
+///
+/// This is the shape a duplicated delivery must not break. If a receiver
+/// applied a repeated entry instead of ignoring it, its applied index would run
+/// past the log or the durable adapter would reject the non-consecutive apply,
+/// so equality is the observable the inversion attacks.
+async fn wait_applied_caught_up(nodes: &mut BTreeMap<u32, Process>) {
+    let result = tokio::time::timeout(Duration::from_secs(20), async {
+        for process in nodes.values_mut() {
+            loop {
+                let status = process.request(json!({"op":"status"})).await;
+                let applied = status["applied_index"].as_u64();
+                let last = status["last_log_index"].as_u64();
+                if applied.is_some() && applied == last {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+    })
+    .await;
+    if result.is_err() {
+        for (id, process) in nodes.iter_mut() {
+            let status = tokio::time::timeout(
+                Duration::from_secs(2),
+                process.request(json!({"op":"status"})),
+            )
+            .await;
+            eprintln!("node {id} status while waiting for applied == last_log: {status:?}");
+        }
+        panic!("a replica never applied its whole log");
+    }
+}
+
+/// Sum of `envelopes_rejected` across the child processes.
+///
+/// The counter lives in each child's transport, so this reads it through the
+/// control channel rather than from the parent's own process.
+async fn rejected_envelopes(nodes: &mut BTreeMap<u32, Process>) -> u64 {
+    let mut total = 0;
+    for process in nodes.values_mut() {
+        let status = process.request(json!({"op":"status"})).await;
+        total += status["rpc"]["transport"]["envelopes_rejected"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("status has no transport counter: {status}"));
+    }
+    total
+}
+
+/// Sum of non-heartbeat append deliveries that repeated an earlier batch.
+async fn duplicate_appends(nodes: &mut BTreeMap<u32, Process>) -> u64 {
+    let mut total = 0;
+    for process in nodes.values_mut() {
+        let status = process.request(json!({"op":"status"})).await;
+        total += status["rpc"]["duplicate_appends"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("status has no duplicate counter: {status}"));
+    }
+    total
+}
+
 async fn check_values(nodes: &mut BTreeMap<u32, Process>, keys: &[&str]) {
     let mut waiting = String::new();
     let result = tokio::time::timeout(Duration::from_secs(20), async {
@@ -578,6 +767,295 @@ impl Proxy {
         .await
         .expect("proxy control timed out");
     }
+}
+
+// A relay that terminates mTLS in the parent and re-originates Raft RPCs.
+//
+// The existing partition `Proxy` only copies ciphertext, so it can cut a link
+// but cannot duplicate a frame: each Raft RPC is one TLS session, and a second
+// copy of the ciphertext would be rejected by TLS before Raft saw it. To
+// duplicate a *Raft* request the relay has to decrypt it, and to deliver the
+// duplicate to the real child it has to authenticate as the original sender.
+// Test TLS material is available to the parent, so both are possible without
+// root and without a kernel network shim.
+//
+// The relay is per directed link `(source, target)`: it listens on the address
+// the source's peer map points at, presents the target's certificate to the
+// source, and opens a client connection to the real target as the source. It
+// then forwards the challenge and the request frame, optionally after a delay.
+// In `RELAY_DUPLICATE` it also re-originates the same `WireRequest` as a
+// separate authenticated RPC on its own connection: that is a duplicated RPC
+// arriving at the real receiving process, not a duplicated local channel.
+// In `RELAY_REPLAY` it instead writes the *same* signed frame on a second
+// connection, which the target must reject because the frame is bound to the
+// first connection's server challenge.
+const RELAY_DUPLICATE: u64 = 1;
+const RELAY_REPLAY: u64 = 2;
+
+#[derive(Default)]
+struct RelayStats {
+    forwarded: AtomicUsize,
+    reoriginated: AtomicUsize,
+    replayed: AtomicUsize,
+}
+
+struct FaultRelay {
+    address: SocketAddr,
+    mode: Arc<AtomicU64>,
+    delay_ms: Arc<AtomicU64>,
+    stats: Arc<RelayStats>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for FaultRelay {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+impl FaultRelay {
+    async fn new(
+        source: u32,
+        target: u32,
+        target_address: SocketAddr,
+        real_peers: BTreeMap<u32, SocketAddr>,
+    ) -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let mode = Arc::new(AtomicU64::new(RELAY_DUPLICATE));
+        let delay_ms = Arc::new(AtomicU64::new(0));
+        let stats = Arc::new(RelayStats::default());
+        let task_mode = mode.clone();
+        let task_delay = delay_ms.clone();
+        let task_stats = stats.clone();
+        let task = tokio::spawn(async move {
+            let mut tunnels = tokio::task::JoinSet::new();
+            loop {
+                tokio::select! {
+                    accepted = listener.accept() => {
+                        let Ok((stream, _)) = accepted else { break };
+                        if tunnels.len() >= 64 { continue; }
+                        let mode = task_mode.clone();
+                        let delay = task_delay.clone();
+                        let stats = task_stats.clone();
+                        let real_peers = real_peers.clone();
+                        tunnels.spawn(async move {
+                            let _ = tokio::time::timeout(
+                                Duration::from_secs(20),
+                                relay_connection(
+                                    source,
+                                    target,
+                                    target_address,
+                                    real_peers,
+                                    stream,
+                                    mode,
+                                    delay,
+                                    stats,
+                                ),
+                            )
+                            .await;
+                        });
+                    }
+                    Some(_) = tunnels.join_next(), if !tunnels.is_empty() => {}
+                }
+            }
+            tunnels.abort_all();
+            while tunnels.join_next().await.is_some() {}
+        });
+        Self {
+            address,
+            mode,
+            delay_ms,
+            stats,
+            task,
+        }
+    }
+
+    fn set_mode(&self, mode: u64) {
+        self.mode.store(mode, Ordering::SeqCst);
+    }
+
+    fn set_delay(&self, delay: Duration) {
+        self.delay_ms
+            .store(delay.as_millis() as u64, Ordering::SeqCst);
+    }
+
+    fn reoriginated(&self) -> usize {
+        self.stats.reoriginated.load(Ordering::SeqCst)
+    }
+}
+
+fn relay_client_config(source: u32, peers: BTreeMap<u32, SocketAddr>) -> TransportConfig {
+    let registry = Arc::new(
+        PeerKeyRegistry::new((1..=3).map(|n| (n, key(n).public_key())).collect()).unwrap(),
+    );
+    TransportConfig::new(identity(source), Arc::new(key(source)), peers, registry)
+        .with_tls(Arc::new(crate::openraft_tls::test_support::config(source)))
+}
+
+fn decode_request(body: &[u8]) -> Option<WireRequest> {
+    let envelope = SignedRaftEnvelope::decode_json(body).ok()?;
+    let call: Value = serde_json::from_slice(&envelope.payload).ok()?;
+    serde_json::from_value(call["request"].clone()).ok()
+}
+
+async fn relay_read_frame<S: tokio::io::AsyncRead + Unpin>(
+    stream: &mut S,
+) -> std::io::Result<(u8, Vec<u8>)> {
+    let mut header = [0u8; 5];
+    stream.read_exact(&mut header).await?;
+    let length = u32::from_le_bytes(header[1..].try_into().unwrap()) as usize;
+    if length > crate::openraft_net::MAX_FRAME {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "relay frame exceeds limit",
+        ));
+    }
+    let mut body = vec![0u8; length];
+    stream.read_exact(&mut body).await?;
+    Ok((header[0], body))
+}
+
+async fn relay_write_frame<S: tokio::io::AsyncWrite + Unpin>(
+    stream: &mut S,
+    kind: u8,
+    body: &[u8],
+) -> std::io::Result<()> {
+    let mut header = [0u8; 5];
+    header[0] = kind;
+    header[1..].copy_from_slice(&(body.len() as u32).to_le_bytes());
+    stream.write_all(&header).await?;
+    stream.write_all(body).await?;
+    stream.flush().await
+}
+
+/// Opens a second authenticated connection and writes the same signed request
+/// frame verbatim. The frame carries the challenge from the first connection,
+/// so the target must reject it before the Raft handler.
+async fn replay_frame(
+    source: u32,
+    target: u32,
+    target_address: SocketAddr,
+    body: &[u8],
+) -> std::io::Result<()> {
+    let client_tls = crate::openraft_tls::test_support::config(source);
+    let stream = tokio::net::TcpStream::connect(target_address).await?;
+    let mut stream = client_tls
+        .client
+        .connect(client_tls.name(target)?, stream)
+        .await?;
+    let peer = client_tls.peer(
+        stream.get_ref().1.peer_certificates(),
+        stream.get_ref().1.alpn_protocol(),
+    )?;
+    if peer != target {
+        return Err(std::io::Error::other("replay reached the wrong peer"));
+    }
+    let (kind, _) = relay_read_frame(&mut stream).await?;
+    if kind != 3 {
+        return Err(std::io::Error::other("replay expected a challenge"));
+    }
+    relay_write_frame(&mut stream, 1, body).await?;
+    // The target closes without a response; a read that ends here is the
+    // rejection. Anything else is unexpected but is still reported by the
+    // caller through the child's rejected-envelope counter.
+    let mut byte = [0u8; 1];
+    let _ = stream.read(&mut byte).await;
+    Ok(())
+}
+
+async fn relay_connection(
+    source: u32,
+    target: u32,
+    target_address: SocketAddr,
+    real_peers: BTreeMap<u32, SocketAddr>,
+    incoming: tokio::net::TcpStream,
+    mode: Arc<AtomicU64>,
+    delay_ms: Arc<AtomicU64>,
+    stats: Arc<RelayStats>,
+) -> std::io::Result<()> {
+    let server_tls = crate::openraft_tls::test_support::config(target);
+    let mut incoming = server_tls.server.accept(incoming).await?;
+    let peer = server_tls.peer(
+        incoming.get_ref().1.peer_certificates(),
+        incoming.get_ref().1.alpn_protocol(),
+    )?;
+    if peer != source {
+        return Err(std::io::Error::other("relay: source certificate mismatch"));
+    }
+    let client_tls = crate::openraft_tls::test_support::config(source);
+    let outgoing = tokio::net::TcpStream::connect(target_address).await?;
+    let mut outgoing = client_tls
+        .client
+        .connect(client_tls.name(target)?, outgoing)
+        .await?;
+    let peer = client_tls.peer(
+        outgoing.get_ref().1.peer_certificates(),
+        outgoing.get_ref().1.alpn_protocol(),
+    )?;
+    if peer != target {
+        return Err(std::io::Error::other("relay: target certificate mismatch"));
+    }
+    // The source reads the challenge the real target generated, so the signed
+    // request it produces is valid for the target's connection.
+    let (kind, body) = relay_read_frame(&mut outgoing).await?;
+    if kind != 3 {
+        return Err(std::io::Error::other(
+            "relay: target did not send a challenge",
+        ));
+    }
+    relay_write_frame(&mut incoming, kind, &body).await?;
+
+    let (kind, body) = relay_read_frame(&mut incoming).await?;
+    let wait = delay_ms.load(Ordering::SeqCst);
+    if wait > 0 {
+        tokio::time::sleep(Duration::from_millis(wait)).await;
+    }
+    relay_write_frame(&mut outgoing, kind, &body).await?;
+    let mode = mode.load(Ordering::SeqCst);
+
+    if kind == 1 {
+        if mode & RELAY_DUPLICATE != 0 {
+            if let Some(request) = decode_request(&body) {
+                let stats = stats.clone();
+                let config = relay_client_config(source, real_peers);
+                tokio::spawn(async move {
+                    let mut factory = AuthenticatedTcpNetworkFactory::new(config);
+                    let mut network = factory
+                        .new_client(target, &BasicNode::new(format!("relay-{source}")))
+                        .await;
+                    if network
+                        .call_for_test(request, Duration::from_secs(5))
+                        .await
+                        .is_ok()
+                    {
+                        stats.reoriginated.fetch_add(1, Ordering::SeqCst);
+                    }
+                });
+            }
+        }
+        if mode & RELAY_REPLAY != 0 {
+            let stats = stats.clone();
+            let body = body.clone();
+            tokio::spawn(async move {
+                if replay_frame(source, target, target_address, &body)
+                    .await
+                    .is_ok()
+                {
+                    stats.replayed.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+        }
+        let (kind, body) = relay_read_frame(&mut outgoing).await?;
+        relay_write_frame(&mut incoming, kind, &body).await?;
+        stats.forwarded.fetch_add(1, Ordering::SeqCst);
+        let _ = tokio::io::copy_bidirectional(&mut incoming, &mut outgoing).await;
+    } else {
+        // Snapshot manifests stream chunks in both directions; the relay does
+        // not duplicate them, it only carries them after the first frame.
+        let _ = tokio::io::copy_bidirectional(&mut incoming, &mut outgoing).await;
+    }
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1032,4 +1510,428 @@ async fn three_process_mtls_leader_kill_elects_a_replacement_and_the_dead_leader
     })
     .await
     .expect("leader-kill test exceeded total timeout");
+}
+
+fn copy_files(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_type().unwrap().is_file() {
+            std::fs::copy(entry.path(), to.join(entry.file_name())).unwrap();
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn three_process_mtls_delayed_and_duplicated_rpcs_do_not_break_agreement() {
+    // Delayed and duplicated Raft RPCs between three real child processes.
+    //
+    // What this proves: the three children exchange Raft RPCs through a
+    // TLS-terminating relay in the parent that (a) holds every request for a
+    // fixed delay before forwarding it and (b) re-originates every request as a
+    // second authenticated RPC on its own connection, so the receiving child
+    // really processes each AppendEntries/Vote twice. A client write still
+    // returns a PutOk, at least one follower already held the entry at the
+    // instant of the ack (so the ack waited for a majority), every replica
+    // applies the entry, and every replica ends with
+    // applied_index == last_log_index. It also proves the authentication
+    // boundary rejects a *verbatim* duplicate frame: the replay phase writes the
+    // same signed frame on a second connection, the target's server challenge
+    // no longer matches, and the child's rejected-envelope counter rises while
+    // its Raft handler is never entered a second time.
+    //
+    // What this does not prove: this is a userspace relay on loopback, not a
+    // network. It delays and duplicates whole frames in order; it does not
+    // reproduce a real network's loss, reordering, jitter or congestion, and
+    // both endpoints are on one host with no MTU, queue or routing behaviour.
+    // A multi-host deployment remains unproven.
+    if std::env::var_os(CHILD_ENV).is_some() {
+        panic!("delayed/duplicated parent cannot be a child");
+    }
+    let _gate = super::test_gate::exclusive().await;
+    tokio::time::timeout(Duration::from_secs(150), async {
+        let base = std::env::var_os("YADB_TEST_TMPDIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let root = base.join(format!(
+            "yadb-delayed-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let dir = TestDir(root);
+        let reservations: Vec<_> = (0..3)
+            .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+            .collect();
+        let real: BTreeMap<u32, SocketAddr> = reservations
+            .iter()
+            .enumerate()
+            .map(|(i, l)| ((i + 1) as u32, l.local_addr().unwrap()))
+            .collect();
+        drop(reservations);
+        // One relay per directed link. Each child's peer map points at the
+        // relay for that link, while the child itself binds the real address.
+        let mut relays = BTreeMap::new();
+        for source in 1..=3 {
+            for target in 1..=3 {
+                if source != target {
+                    let relay = FaultRelay::new(source, target, real[&target], real.clone()).await;
+                    relay.set_delay(Duration::from_millis(60));
+                    relays.insert((source, target), relay);
+                }
+            }
+        }
+        let mut nodes = BTreeMap::new();
+        for source in 1..=3 {
+            let peers = (1..=3)
+                .map(|target| {
+                    (
+                        target,
+                        if target == source {
+                            real[&target]
+                        } else {
+                            relays[&(source, target)].address
+                        },
+                    )
+                })
+                .collect();
+            nodes.insert(
+                source,
+                start_with_listener(&dir.0, &peers, real[&source], source, 0),
+            );
+        }
+        for node in nodes.values_mut() {
+            ready(node).await;
+        }
+        assert_eq!(
+            nodes
+                .get_mut(&1)
+                .unwrap()
+                .request(json!({"op":"initialize"}))
+                .await["ok"],
+            true
+        );
+
+        // Phase 1: 60 ms delay plus a duplicated RPC for every request.
+        let (acked_leader, acked_index) = write_and_index(&mut nodes, "delayed-dup-1").await;
+        // A log index never regresses, so a follower that already held the entry
+        // when the leader acknowledged still holds it now. At least one
+        // follower must, because OpenRaft only commits (and therefore only
+        // acknowledges) after a majority matched the entry.
+        let mut holders = Vec::new();
+        for (id, process) in nodes.iter_mut() {
+            if *id == acked_leader {
+                continue;
+            }
+            let status = process.request(json!({"op":"status"})).await;
+            if status["last_log_index"]
+                .as_u64()
+                .is_some_and(|last| last >= acked_index)
+            {
+                holders.push(*id);
+            }
+        }
+        assert!(
+            !holders.is_empty(),
+            "leader {acked_leader} acknowledged index {acked_index} without a follower holding it"
+        );
+        eprintln!(
+            "write acknowledged at index {acked_index} by node {acked_leader}; \
+             follower(s) {holders:?} already held it"
+        );
+        wait_applied_at_least(&mut nodes, acked_index).await;
+        check_values(&mut nodes, &["delayed-dup-1"]).await;
+        write(&mut nodes, "delayed-dup-2").await;
+        check_values(&mut nodes, &["delayed-dup-1", "delayed-dup-2"]).await;
+        wait_applied_caught_up(&mut nodes).await;
+
+        // The relay really re-originated RPCs, and the receiving children saw
+        // the repeated entry batches at the Raft handler.
+        let duplicates = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let duplicates = duplicate_appends(&mut nodes).await;
+                if duplicates > 0 {
+                    return duplicates;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("no duplicated append reached any child");
+        let reoriginated: usize = relays.values().map(FaultRelay::reoriginated).sum();
+        eprintln!(
+            "delay+duplicate: {duplicates} repeated append batches observed, \
+             {reoriginated} RPCs re-originated by the relays"
+        );
+        assert!(duplicates > 0);
+
+        // Phase 2 (inversion): the relay writes the *same signed frame* on a
+        // second connection. The frame is bound to the first connection's
+        // server challenge, so the target must reject it before the handler.
+        // The rejected-envelope counter is the observable that catches a
+        // protocol that accepted a replayed frame; the Raft handler counter is
+        // the observable that catches a double apply.
+        // Let a duplicate spawned just before the mode switch land before the
+        // baseline is recorded; otherwise an in-flight duplicate could be
+        // attributed to the replay phase.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let duplicates_before_replay = duplicate_appends(&mut nodes).await;
+        let rejected_before = rejected_envelopes(&mut nodes).await;
+        for relay in relays.values() {
+            relay.set_mode(RELAY_REPLAY);
+        }
+        write(&mut nodes, "delayed-replay").await;
+        let rejected_after = tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let rejected = rejected_envelopes(&mut nodes).await;
+                if rejected > rejected_before {
+                    return rejected;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("no verbatim replay was rejected by any child");
+        check_values(
+            &mut nodes,
+            &["delayed-dup-1", "delayed-dup-2", "delayed-replay"],
+        )
+        .await;
+        wait_applied_caught_up(&mut nodes).await;
+        // A verbatim replay never reaches the Raft handler, so the duplicate
+        // counter must not move during this phase.
+        assert_eq!(
+            duplicate_appends(&mut nodes).await,
+            duplicates_before_replay,
+            "a replayed frame reached the Raft handler instead of being rejected"
+        );
+        eprintln!(
+            "verbatim replays rejected before the Raft handler: {} -> {}",
+            rejected_before, rejected_after
+        );
+
+        // Phase 3: remove the delay and duplication. The cluster must still
+        // agree; this is the pass-through control, not the inversion.
+        for relay in relays.values() {
+            relay.set_mode(0);
+            relay.set_delay(Duration::ZERO);
+        }
+        write(&mut nodes, "delayed-clean").await;
+        check_values(
+            &mut nodes,
+            &[
+                "delayed-dup-1",
+                "delayed-dup-2",
+                "delayed-replay",
+                "delayed-clean",
+            ],
+        )
+        .await;
+        wait_applied_caught_up(&mut nodes).await;
+
+        drop(nodes);
+        for (_, relay) in relays {
+            relay.task.abort();
+            let mut relay = relay;
+            let _ = (&mut relay.task).await;
+        }
+
+        // Read the durable state with the adapter after every process is dead.
+        for n in 1..=3 {
+            let state =
+                DurableMetaStateMachine::open(dir.0.join(format!("node-{n}/state")), &identity(n))
+                    .unwrap();
+            for key in [
+                "delayed-dup-1",
+                "delayed-dup-2",
+                "delayed-replay",
+                "delayed-clean",
+            ] {
+                assert_eq!(state.snapshot().get(key).unwrap().value, key.as_bytes());
+            }
+        }
+
+        // Inversion, part two: a receiver that applied a duplicated entry
+        // instead of ignoring it. The durable state machine requires
+        // consecutive log ids, so applying the same entry twice fails on the
+        // second apply. That is the observable the healthy run asserts by
+        // requiring applied_index == last_log_index: a double apply cannot be
+        // silent here.
+        let copy = dir.0.join("inversion-state");
+        copy_files(&dir.0.join("node-1/state"), &copy);
+        let mut state = DurableMetaStateMachine::open(&copy, &identity(1)).unwrap();
+        let (applied, _) = state.applied_state().await.unwrap();
+        let next = applied.map(|id| id.index + 1).unwrap_or(0);
+        let entry = Entry {
+            log_id: LogId::new(CommittedLeaderId::new(1, 1), next),
+            payload: EntryPayload::Normal(KvCommand::Put {
+                key: "duplicate-apply".into(),
+                value: b"once".to_vec(),
+            }),
+        };
+        state.apply(vec![entry.clone()]).await.unwrap();
+        match state.apply(vec![entry]).await {
+            Ok(_) => panic!("the durable state machine silently applied a duplicated entry twice"),
+            Err(error) => assert!(
+                format!("{error:?}").contains("not consecutive"),
+                "duplicated apply failed for an unexpected reason: {error:?}"
+            ),
+        }
+    })
+    .await
+    .expect("delayed/duplicated test exceeded total timeout");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn three_process_mtls_power_loss_after_ack_keeps_acknowledged_writes() {
+    // Acknowledged writes survive SIGKILL, read back from the children's own
+    // files after every process is dead.
+    //
+    // What this proves: a client write is acknowledged only after the leader
+    // committed it (OpenRaft's client_write contract) and the child's apply
+    // path wrote and `sync_data`'d the delta frame before returning; after
+    // SIGKILLing all three children (asserted to be signal 9, no graceful
+    // shutdown path), the parent reopens each replica's log and state machine
+    // from disk and every acknowledged key is there. The recovered log's last
+    // index still covers the state machine's applied index, so no applied entry
+    // is missing behind a discarded tail. Restarting all three on the same
+    // directories then commits a new write, which proves the recovered log is
+    // usable rather than merely readable.
+    //
+    // What this does not prove: SIGKILL is not a power cut. The page cache
+    // survives the process, so this cannot distinguish "the child fsynced" from
+    // "the kernel still held dirty pages". It does not cover OS panic, device
+    // write-cache loss or a filesystem that loses a synced rename. Those need a
+    // root-level crash harness (`dm-flakey`/`dm-log-writes`, a forced cache
+    // flush, or a libeatmydata-style barrier) and stay with the separate
+    // durability gates; the TODO item therefore remains partially open.
+    if std::env::var_os(CHILD_ENV).is_some() {
+        panic!("power-loss parent cannot be a child");
+    }
+    let _gate = super::test_gate::exclusive().await;
+    tokio::time::timeout(Duration::from_secs(150), async {
+        let base = std::env::var_os("YADB_TEST_TMPDIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let root = base.join(format!(
+            "yadb-power-loss-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let dir = TestDir(root);
+        let reservations: Vec<_> = (0..3)
+            .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+            .collect();
+        let peers: BTreeMap<_, _> = reservations
+            .iter()
+            .enumerate()
+            .map(|(i, l)| ((i + 1) as u32, l.local_addr().unwrap()))
+            .collect();
+        drop(reservations);
+        let mut nodes: BTreeMap<_, _> = (1..=3).map(|n| (n, start(&dir.0, &peers, n, 0))).collect();
+        for node in nodes.values_mut() {
+            ready(node).await;
+        }
+        assert_eq!(
+            nodes
+                .get_mut(&1)
+                .unwrap()
+                .request(json!({"op":"initialize"}))
+                .await["ok"],
+            true
+        );
+        const KEYS: [&str; 3] = ["power-ack-1", "power-ack-2", "power-ack-3"];
+        let mut last_leader = None;
+        for key in KEYS {
+            last_leader = Some(write(&mut nodes, key).await);
+        }
+        // `check_values` reads the state image and delta file directly, so by
+        // the time it returns each replica has written the applied value to its
+        // own files. That is the child's write, not the parent's.
+        check_values(&mut nodes, &KEYS).await;
+        wait_applied_caught_up(&mut nodes).await;
+        let acking_leader = last_leader.expect("no write was acknowledged");
+
+        for (id, process) in nodes.iter_mut() {
+            process.sigkill();
+            eprintln!("SIGKILLed node {id}; no shutdown path ran");
+        }
+        drop(nodes);
+
+        // Every process is dead. Whatever is in these files now was written and
+        // synced by the child before it died; nothing in this test flushes,
+        // syncs or repairs them from the parent.
+        for n in 1..=3 {
+            let log_dir = dir.0.join(format!("node-{n}/log"));
+            let mut log = DurableOpenRaftLog::open(&log_dir, &identity(n)).unwrap();
+            if let Some(repair) = log.repaired_tail() {
+                // An unacknowledged append cut short by the kill is allowed to
+                // be discarded, but it must never be one the client saw acked.
+                eprintln!("node {n} discarded a torn unacknowledged tail: {repair:?}");
+                assert_ne!(
+                    n, acking_leader,
+                    "the node that acknowledged the last write had a torn log tail"
+                );
+            }
+            let log_state = log.get_log_state().await.unwrap();
+            let last_log = log_state.last_log_id.unwrap_or_else(|| {
+                panic!("node {n} recovered an empty log after an acknowledged write")
+            });
+            let mut state =
+                DurableMetaStateMachine::open(dir.0.join(format!("node-{n}/state")), &identity(n))
+                    .unwrap();
+            let (applied, _) = state.applied_state().await.unwrap();
+            let applied = applied.unwrap_or_else(|| panic!("node {n} recovered no applied state"));
+            assert!(
+                applied.index <= last_log.index,
+                "node {n} recovered applied index {} past its log end {}",
+                applied.index,
+                last_log.index
+            );
+            for key in KEYS {
+                assert_eq!(
+                    state.snapshot().get(key).unwrap().value,
+                    key.as_bytes(),
+                    "node {n} lost acknowledged key {key} after SIGKILL"
+                );
+            }
+        }
+
+        // The recovered log is not merely readable: the same three replicas
+        // restart on their own directories, elect, and commit a new entry.
+        let mut nodes: BTreeMap<_, _> = (1..=3).map(|n| (n, start(&dir.0, &peers, n, 1))).collect();
+        for node in nodes.values_mut() {
+            ready(node).await;
+        }
+        write(&mut nodes, "power-after-restart").await;
+        check_values(
+            &mut nodes,
+            &[
+                "power-ack-1",
+                "power-ack-2",
+                "power-ack-3",
+                "power-after-restart",
+            ],
+        )
+        .await;
+        wait_applied_caught_up(&mut nodes).await;
+        drop(nodes);
+        for n in 1..=3 {
+            let state =
+                DurableMetaStateMachine::open(dir.0.join(format!("node-{n}/state")), &identity(n))
+                    .unwrap();
+            for key in KEYS.iter().chain(std::iter::once(&"power-after-restart")) {
+                assert_eq!(state.snapshot().get(*key).unwrap().value, key.as_bytes());
+            }
+        }
+    })
+    .await
+    .expect("power-loss test exceeded total timeout");
 }
