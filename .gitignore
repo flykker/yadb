@@ -6,3 +6,7 @@
 .yadb-state.json
 __pycache__/
 *.pyc
+
+# Rebuilt daemon binaries are local test artifacts; record the hash in docs
+# instead of committing the binary (GitHub rejects objects over 100 MB).
+/cluster_data/bin/
