@@ -299,6 +299,184 @@ fn config(path: &Path, value: &Value) {
     std::fs::write(path, serde_json::to_vec(value).unwrap()).unwrap();
 }
 
+/// Every path under `root` with its type, permission bits, modification time
+/// and bytes. Comparing this before and after a refused startup proves the
+/// directory was not rewritten (mtime catches a same-length in-place write),
+/// imported, locked with a file, or added to.
+#[derive(Debug, PartialEq, Eq)]
+struct TreeEntry {
+    kind: &'static str,
+    mode: u32,
+    modified: Option<std::time::SystemTime>,
+    bytes: Vec<u8>,
+}
+
+fn tree_snapshot(root: &Path) -> std::collections::BTreeMap<PathBuf, TreeEntry> {
+    use std::os::unix::fs::PermissionsExt;
+    fn walk(root: &Path, path: &Path, out: &mut std::collections::BTreeMap<PathBuf, TreeEntry>) {
+        let metadata = std::fs::symlink_metadata(path).unwrap();
+        let kind = if metadata.is_dir() {
+            "dir"
+        } else if metadata.is_file() {
+            "file"
+        } else {
+            "other"
+        };
+        out.insert(
+            path.strip_prefix(root).unwrap().to_path_buf(),
+            TreeEntry {
+                kind,
+                mode: metadata.permissions().mode(),
+                modified: metadata.modified().ok(),
+                bytes: if metadata.is_file() {
+                    std::fs::read(path).unwrap()
+                } else {
+                    Vec::new()
+                },
+            },
+        );
+        if metadata.is_dir() {
+            let mut children = std::fs::read_dir(path)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect::<Vec<_>>();
+            children.sort();
+            for child in children {
+                walk(root, &child, out);
+            }
+        }
+    }
+    let mut out = std::collections::BTreeMap::new();
+    walk(root, root, &mut out);
+    out
+}
+
+/// A pre-OpenRaft metadata directory: a WAL, a descriptor, a state image, an
+/// empty subdirectory and a dotfile. None of it is an OpenRaft marker.
+fn write_legacy_tree(root: &Path) {
+    std::fs::create_dir_all(root.join("metakv")).unwrap();
+    std::fs::write(
+        root.join("metakv").join("state.json"),
+        br#"{"revision":7,"projects":{"alpha":1}}"#,
+    )
+    .unwrap();
+    std::fs::write(root.join("metakv").join("leases"), vec![0x7f; 64]).unwrap();
+    std::fs::create_dir(root.join("group")).unwrap();
+    std::fs::write(
+        root.join("group").join("raft.wal"),
+        b"YADBWAL1\x00\x01legacy",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("group").join("replica.identity"),
+        br#"{"node":1,"group":1,"incarnation":1}"#,
+    )
+    .unwrap();
+    std::fs::create_dir(root.join("empty-subdir")).unwrap();
+    std::fs::write(root.join(".legacy-marker"), b"legacy-runtime-v1").unwrap();
+}
+
+/// Three valid singleton group configs (each with its own listener and signing
+/// key) plus a version-2 manifest, which is what `main` requires before it looks
+/// at `--data-dir`. Returns the public HTTP listener separately from the three
+/// Raft listeners so the two never collide.
+fn write_manifest(
+    dir: &Path,
+    cert_dir: &Path,
+    metadata: &Path,
+) -> (PathBuf, SocketAddr, Vec<SocketAddr>) {
+    let reservations: Vec<_> = (0..4)
+        .map(|_| TcpListener::bind("127.0.0.1:0").unwrap())
+        .collect();
+    let addrs: Vec<SocketAddr> = reservations
+        .iter()
+        .map(|l| l.local_addr().unwrap())
+        .collect();
+    let mut paths = Vec::new();
+    for (index, addr) in addrs[1..].iter().enumerate() {
+        let group = index + 1;
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
+        let pair = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+        let key = dir.join(format!("signing-{group}.der"));
+        std::fs::write(&key, pkcs8.as_ref()).unwrap();
+        let cert = std::fs::read(cert_dir.join("node-1.test.cert.der")).unwrap();
+        let path = dir.join(format!("group-{group}.json"));
+        config(
+            &path,
+            &json!({"version":1,"root":metadata,"mode":"create","initialize":true,"cluster":vec![91;16],"group":group,"incarnation":1,"node":1,"listen":addr,"signing_key_der":key,
+            "tls":{"roots_der":[cert_dir.join("ca.der")],"chain_der":[cert_dir.join("node-1.test.cert.der")],"key_der":cert_dir.join("node-1.test.key.der")},
+            "peers":[{"id":1,"address":addr,"public_key":pair.public_key().as_ref(),"server_name":"node-1.test","cert_sha256":MutualTls::fingerprint(&cert)}]}),
+        );
+        paths.push(path);
+    }
+    let manifest = dir.join("multi.json");
+    config(
+        &manifest,
+        &json!({"version":2,"control_group":1,"project_groups":{"1":2,"2":3},"groups":paths}),
+    );
+    drop(reservations);
+    (manifest, addrs[0], addrs[1..].to_vec())
+}
+
+#[test]
+fn startup_refuses_a_legacy_data_root_and_leaves_it_byte_identical() {
+    let _serial = serialize_daemon_tests();
+    let base = std::env::var_os("YADB_TEST_TMPDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let root = base.join(format!(
+        "yadb-daemon-legacy-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir(&root).unwrap();
+    let dir = Dir(root.canonicalize().unwrap());
+    let cert_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../yadb-metakv/testdata/tls")
+        .canonicalize()
+        .unwrap();
+    // The metadata root is empty and separate; only the client data root is a
+    // pre-OpenRaft directory.
+    let metadata = dir.0.join("metadata");
+    std::fs::create_dir(&metadata).unwrap();
+    let (manifest, public, _raft_addrs) = write_manifest(&dir.0, &cert_dir, &metadata);
+    let data = dir.0.join("data");
+    write_legacy_tree(&data);
+    let before = tree_snapshot(&data);
+    let log = dir.0.join("daemon.log");
+
+    let mut daemon = spawn(&data, Some(&manifest), public, &log);
+    assert!(
+        !daemon.wait(Duration::from_secs(20)).success(),
+        "a pre-OpenRaft data root must be refused"
+    );
+    drop(daemon);
+
+    let text = std::fs::read_to_string(&log).unwrap();
+    // The refusal must be the root guard, not a port or config failure: that is
+    // what makes this evidence for admission rather than for something else.
+    assert!(
+        text.contains("new or empty data root"),
+        "unexpected refusal: {text}"
+    );
+    // No fallback: the daemon never reached the serving path, so it cannot have
+    // opened the legacy runtime on this directory.
+    assert!(
+        !text.contains("listening on http"),
+        "the daemon served despite refusing the data root: {text}"
+    );
+    assert_eq!(
+        tree_snapshot(&data),
+        before,
+        "the refused startup modified the legacy directory"
+    );
+    assert!(!data.join(".yadb-openraft-runtime.json").exists());
+    assert!(!data.join(".yadb-openraft-runtime.pending").exists());
+}
+
 #[test]
 fn daemon_multigroup_http_shutdown_reopen_and_root_guards() {
     let _serial = serialize_daemon_tests();
@@ -362,6 +540,24 @@ fn daemon_multigroup_http_shutdown_reopen_and_root_guards() {
             serde_json::from_slice(&ok(public, "GET", path, b"", "application/json")).unwrap();
         assert_eq!(v["metadata_runtime"], "openraft");
         assert_eq!(v["production_ready"], false);
+    }
+    // The removed runtime's internal endpoints are not merely unauthorized in
+    // OpenRaft mode; they are absent, so a request falls through to the S3 wire
+    // fallback and `404`s. `401`/`403` would mean the old token-protected route
+    // still exists and is refusing this caller, and `405` would mean the path is
+    // still routed with a different verb; both are what this rejects. Every old
+    // verb is checked so a re-added handler cannot pass on a method mismatch.
+    for path in ["/raft/rpc", "/raft/elect"] {
+        for method in ["GET", "POST"] {
+            let (status, _, body) =
+                request_extra(public, method, path, b"{}", "application/json", "");
+            assert_eq!(
+                status,
+                404,
+                "legacy endpoint {method} {path} is still routed: {}",
+                String::from_utf8_lossy(&body)
+            );
+        }
     }
     // The internal snapshot endpoint is token-protected and must expose the
     // control key, not an empty barrier-only snapshot.
@@ -1272,11 +1468,30 @@ spec: {pool: data, sizeBytes: 8192}
             "application/octet-stream",
         ),
     ] {
-        let (status, _, response) = request_extra(public[node], method, path, body, ty, forwarded);
-        assert!(
-            status >= 400,
+        let (status, headers, response) =
+            request_extra(public[node], method, path, body, ty, forwarded);
+        // The contract this asserts: `maybe_forward_write` treats a request that
+        // already carries `x-yadb-forwarded` as addressed to this node, and
+        // refuses it when this node is not that group's leader. It never falls
+        // through to a local mutation, so the only admissible outcomes are a
+        // refusal (`not-sent`) or a refusal with no outcome claimed at all.
+        // "unknown" would mean the request left this node, which cannot happen
+        // on this path.
+        assert_eq!(
+            status,
+            503,
             "forwarded {method} {path}: {status} {}",
             String::from_utf8_lossy(&response)
+        );
+        let headers = headers.to_ascii_lowercase();
+        assert!(
+            !headers.contains("x-yadb-write-outcome: unknown")
+                && !headers.contains("x-yadb-write-outcome: committed"),
+            "a refused forwarded write claimed an outcome: {headers}"
+        );
+        assert!(
+            !headers.contains("x-yadb-retry: do-not-retry"),
+            "a never-sent refusal asked the client not to retry: {headers}"
         );
     }
     let query = serde_json::to_vec(&json!({"sql":"SELECT v FROM t WHERE id = 99"})).unwrap();
@@ -1308,10 +1523,26 @@ spec: {pool: data, sizeBytes: 8192}
         ),
         vec![0; 4]
     );
-    let state: Value =
-        serde_json::from_slice(&ok(public[0], "GET", "/v1/status", b"", "application/json"))
-            .unwrap();
-    assert!(state["pools"]["injected"].is_null());
+    // The refused `/v1/apply` carried a StoragePool. `/v1/status` reports the
+    // control-plane state this node has *applied locally*, so checking every
+    // node proves the refusal did not commit on the follower that received it
+    // (nor anywhere else).
+    for &node in &[0usize, 1, 2] {
+        let state: Value = serde_json::from_slice(&ok(
+            public[node],
+            "GET",
+            "/v1/status",
+            b"",
+            "application/json",
+        ))
+        .unwrap();
+        assert!(
+            state["pools"]["injected"].is_null(),
+            "node {} applied the refused pool: {}",
+            node + 1,
+            state["pools"]
+        );
+    }
     for &node in &[0usize, 1] {
         // A consistent read is served from a quorum-confirmed extent map on the
         // project-group leader. It must return the same bytes as the plain read
