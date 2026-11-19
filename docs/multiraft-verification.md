@@ -3202,3 +3202,20 @@ What this does not show: the page cache survives a process death, so neither
 case says anything about a lost device write cache, a lost synced rename or an
 OS panic; and it covers only the state machine's delta append and checkpoint
 publish, not a live multi-node cluster under a real `kill -9`.
+
+### Gates on this tree
+
+`python3 tests/protocols.py` printed **27 PASS / 0 SKIP / 0 FAIL, exit 0** on
+2026-11-19 (log `/tmp/opencode/live-gate-2026-11-19b.log`), on the tree that
+contains the create-publication fix, the worker-lifetime test, the FIFO peer
+admission and the crash gate. No scenario was added, removed or relaxed for
+this run, and none of the four changes is proved by the gate: each is proved by
+the test named above and by the inversion that breaks it. The gate's role here
+is to show the merged tree still serves every protocol path.
+
+Also green on the same tree: `cargo test -p yadb-metakv` (253 lib + 2
+crash gate), `cargo test -p yadb-io` (13), `cargo test -p yadbd --bin yadbd --
+--test-threads=1` (163), `cargo build --workspace`, and the six guards
+(`test_doc_anchors.py`, `test_doc_test_names.py`, `test_protocols_review.py`,
+`test_openraft_suite_mapping.py`, `test_metrics_alert_rules.py`,
+`test_gc_refusal_protocol.py`).
