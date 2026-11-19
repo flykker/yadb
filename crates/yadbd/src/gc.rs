@@ -30,10 +30,15 @@
 //!    *after* it. A manifest that cannot be parsed, or a block extent map whose
 //!    pool cannot be resolved, makes the live set unprovable: refuse. Nothing is
 //!    deleted that this snapshot references.
-//! 6. **Delete.** Durable generation barriers on channels whose `(owner,
-//!    generation)` space is monotonic and where the dead generation range is
-//!    provably disjoint from every live generation in that `(project, owner,
-//!    channel)`; exact per-fragment tombstones everywhere else.
+//! 6. **Advance the target epoch, then delete.** Before the first deletion in a
+//!    pool, every slot of that pool (handoff slots included) is advanced to its
+//!    next durable epoch; a refusal on any slot stops the pool with nothing
+//!    deleted. Deletions then carry that new epoch, so the target itself refuses
+//!    a fragment that is not older or whose epoch a reader still pins. Durable
+//!    generation barriers are still used on channels whose `(owner, generation)`
+//!    space is monotonic and where the dead generation range is provably
+//!    disjoint from every live generation in that `(project, owner, channel)`;
+//!    exact per-fragment collectable deletes are used everywhere else.
 //! 7. **Compact.** Seal a wasteful active segment and compact sealed ones, so the
 //!    bytes the barrier/tombstone freed are actually returned to the filesystem.
 //!
@@ -52,7 +57,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use yadb_blob::{BlobId, PoolStriper};
 use yadb_control::ControlPlaneState;
 use yadb_db::TabletManifest;
-use yadb_io::OsFs;
+use yadb_io::{OsFs, StorageFs};
 use yadb_metakv::{gc, LocalMetaKv, MetaError};
 use yadb_s3::ObjectManifest;
 
@@ -686,6 +691,18 @@ fn group_by_pool(mark: &MarkSet) -> BTreeMap<String, BTreeSet<BlobId>> {
 /// failed check stops the pool immediately: no fragment after it is deleted,
 /// because from that point admission is open again.
 ///
+/// **Target-side epoch fence.** Before the first deletion the pass advances
+/// *every* slot of the pool - not only the slots that hold a dead fragment,
+/// because a handoff copy may place a part on any candidate slot - from the
+/// epoch each slot reports to the next one. A refusal on any slot (a live pin, a
+/// stale expected epoch, an unreadable clock or an I/O error) stops the pool
+/// before anything is deleted: advancing the slots that did advance and then
+/// deleting while another slot still has a pinned reader is exactly the partial
+/// fence this protocol exists to prevent. Deletions then carry the new epoch, so
+/// the target itself refuses a fragment that is not older than the pass, or whose
+/// epoch a reader still pins. The collector-lease `fence` is a second, separate
+/// guard: the epoch does not replace it.
+///
 /// An allocation that is still in flight cannot be fenced by a barrier here. A
 /// reservation writes no fragment, so it is never part of the dead set (and a
 /// fresh generation is the newest in its group, above every `up_to` this pass can
@@ -694,16 +711,23 @@ fn group_by_pool(mark: &MarkSet) -> BTreeMap<String, BTreeSet<BlobId>> {
 /// expires while the writer is stalled, its publication transaction carries the
 /// lease's own `RevisionGuard` and therefore fails instead of publishing a map
 /// that names fragments this pass reclaimed.
-fn sweep_pool(
-    striper: &PoolStriper<OsFs>,
+fn sweep_pool<FS: StorageFs>(
+    striper: &PoolStriper<FS>,
     pool_name: &str,
     dead: &BTreeSet<BlobId>,
     live: &BTreeSet<BlobId>,
     fence: &mut dyn FnMut() -> Result<u64, String>,
     outcome: &mut SweepOutcome,
 ) -> Result<(), String> {
+    // The epoch advance comes first: every slot of the pool is moved to the next
+    // epoch before the first deletion, and a refusal anywhere stops the pool
+    // with nothing deleted. The caller renewed the collector lease immediately
+    // before entering the pool, and the check below is repeated before the first
+    // actual deletion, so the advance is never the step that deletes unfenced.
+    let collector_epochs = advance_pool_epochs(striper, pool_name, outcome)?;
+
     // Nothing below may delete under an expired fence. The caller renewed before
-    // entering the pool, but the mark and the grouping above take time.
+    // entering the pool, but the advance and the grouping above take time.
     check_fence(fence, pool_name, "before the first deletion", outcome)?;
 
     let mut dead_groups: BTreeMap<(u32, u32, u8), u32> = BTreeMap::new();
@@ -782,16 +806,121 @@ fn sweep_pool(
             )?;
             deleted_since_check = 0;
         }
-        // Deleting every part is what makes the tombstone meaningful: a fragment
-        // that survives on one slot would be readable again after reconstruction.
-        match striper.delete(id) {
-            Ok(true) => outcome.fragments_deleted += striper.scheme().total_parts(),
-            Ok(false) => {}
-            Err(error) => outcome.errors.push(format!(
-                "pool `{pool_name}`: tombstone for {id} failed: {error}"
-            )),
-        }
+        // Deleting every part on every slot is what makes the tombstone
+        // meaningful: a fragment that survives on one slot (including a handoff
+        // copy) would be readable again after reconstruction. The delete carries
+        // the epoch this pool was just advanced to, so the target refuses a
+        // fragment that is not older or that a reader still pins.
+        delete_collectable_parts(striper, pool_name, id, &collector_epochs, outcome)?;
         deleted_since_check += 1;
+    }
+    Ok(())
+}
+
+/// Reads every slot's epoch and then advances every slot to the next one,
+/// returning the new epoch per slot in slot order.
+///
+/// The read is a separate pass on purpose: a slot whose epoch cannot be read
+/// makes the pool unprovable, and no slot may be advanced on a basis the pass
+/// could not establish. The advance then runs slot by slot, and the first
+/// refusal stops it - a retry would be a second attempt at a durable decision
+/// the target already made, and continuing with the remaining slots would leave
+/// part of the pool advanced while another part is still pinned.
+///
+/// The epoch is a *target-side* fence: advancing proves "no reader pins any
+/// epoch at or below this one on this slot", and the deletes that follow name
+/// the new epoch so the target can refuse anything that is not older. It does
+/// not replace the collector lease, which is checked separately.
+fn advance_pool_epochs<FS: StorageFs>(
+    striper: &PoolStriper<FS>,
+    pool_name: &str,
+    outcome: &mut SweepOutcome,
+) -> Result<Vec<u64>, String> {
+    let mut observed = Vec::with_capacity(striper.slots().len());
+    for slot in striper.slots() {
+        match slot.epoch() {
+            Ok(epoch) => observed.push(epoch),
+            Err(error) => {
+                return Err(refuse_pool(
+                    pool_name,
+                    format!("slot {} epoch is unreadable: {error}", slot.slot_index()),
+                    outcome,
+                ))
+            }
+        }
+    }
+
+    let mut advanced = Vec::with_capacity(observed.len());
+    for (slot, expected) in striper.slots().iter().zip(&observed) {
+        match slot.advance_epoch(*expected) {
+            Ok(next) => advanced.push(next),
+            Err(error) => {
+                return Err(refuse_pool(
+                    pool_name,
+                    format!(
+                        "slot {} epoch advance from {expected} refused: {error}",
+                        slot.slot_index()
+                    ),
+                    outcome,
+                ))
+            }
+        }
+    }
+    Ok(advanced)
+}
+
+/// Records a whole-pool refusal in both `pools_refused` and `errors` and returns
+/// the reason, which the caller propagates to stop the pass.
+fn refuse_pool(pool_name: &str, reason: String, outcome: &mut SweepOutcome) -> String {
+    let reason = format!("pool `{pool_name}` refused: {reason}; no fragment was deleted");
+    outcome.pools_refused.push(reason.clone());
+    outcome.errors.push(reason.clone());
+    reason
+}
+
+/// Deletes every part of `id` from every slot of the pool with a collectable
+/// delete that carries that slot's new epoch.
+///
+/// Every slot is asked, not only the nominal one: a handoff copy can put a part
+/// on any candidate slot, and leaving one behind would let a deleted fragment be
+/// read again. A slot that does not hold the part answers `Ok(false)` and
+/// tombstones the id, which is the same permanent fence the pool's unfenced
+/// delete left behind.
+///
+/// A target that says the fragment is not older than the collector's epoch
+/// (`FragmentNotOlder`), is still pinned (`FragmentPinned`) or belongs to a
+/// different epoch (`FencedByEpoch`) stops the pool immediately: retrying or
+/// falling back to an unfenced delete would bypass exactly the fence the epoch
+/// provides. Only an unreachable slot (`Io`) is recorded and stepped over, which
+/// matches how the pool treats an unavailable target elsewhere.
+fn delete_collectable_parts<FS: StorageFs>(
+    striper: &PoolStriper<FS>,
+    pool_name: &str,
+    id: BlobId,
+    collector_epochs: &[u64],
+    outcome: &mut SweepOutcome,
+) -> Result<(), String> {
+    let total_parts = striper.scheme().total_parts();
+    for part_index in 0..total_parts {
+        let part = id.with_part((part_index + 1) as u8);
+        for (slot, epoch) in striper.slots().iter().zip(collector_epochs) {
+            match slot.delete_collectable(part, *epoch) {
+                Ok(true) => outcome.fragments_deleted += 1,
+                Ok(false) => {}
+                Err(error) if error.is_unavailable() => outcome.errors.push(format!(
+                    "pool `{pool_name}` slot {}: collectable delete of {part} failed: {error}",
+                    slot.slot_index()
+                )),
+                Err(error) => {
+                    let reason = format!(
+                        "pool `{pool_name}` slot {}: collectable delete of {part} refused: {error}; no further fragment was deleted",
+                        slot.slot_index()
+                    );
+                    outcome.errors.push(reason.clone());
+                    return Err(reason);
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -912,8 +1041,10 @@ fn mark_snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use yadb_blob::{ErasureScheme, VolumeConfig, VolumeStore};
+    use yadb_io::{IoResult, SimFs, VirtualFile};
     use yadb_block::{BlockError, BlockVolumeEngine};
     use yadb_control::{BlockVolumeSpec, ProjectQuotas, ProjectSpec};
     use yadb_db::DatabaseEngine;
@@ -1407,19 +1538,19 @@ mod tests {
     const DEADLINE: u64 = u64::MAX;
 
     /// Writes `count` unreferenced fragments and returns their logical ids.
-    fn seed_exact_dead(f: &Fixture, count: u32) -> BTreeSet<BlobId> {
+    fn seed_exact_dead<FS: StorageFs>(pool: &PoolStriper<FS>, count: u32) -> BTreeSet<BlobId> {
         let mut dead = BTreeSet::new();
         for generation in 0..count {
             let id = BlobId::new(1, 1, generation, 0, EXACT_ONLY_CHANNEL, 0);
-            f.pool.put_blob(id, b"garbage").unwrap();
+            pool.put_blob(id, b"garbage").unwrap();
             dead.insert(id);
         }
         dead
     }
 
     /// Whether any slot still holds a part of `id`.
-    fn fragment_present(f: &Fixture, id: BlobId) -> bool {
-        f.pool.slots().iter().any(|slot| {
+    fn fragment_present<FS: StorageFs>(pool: &PoolStriper<FS>, id: BlobId) -> bool {
+        pool.slots().iter().any(|slot| {
             slot.local_store()
                 .unwrap()
                 .live_ids()
@@ -1428,17 +1559,25 @@ mod tests {
         })
     }
 
+    /// Every slot's durable epoch, in slot order.
+    fn slot_epochs<FS: StorageFs>(pool: &PoolStriper<FS>) -> Vec<u64> {
+        pool.slots()
+            .iter()
+            .map(|slot| slot.epoch().expect("a test slot's epoch is readable"))
+            .collect()
+    }
+
     #[test]
     fn the_fence_is_checked_before_the_first_deletion_and_every_interval() {
         let f = Fixture::new("fence-interval");
-        let dead = seed_exact_dead(&f, 2 * FENCE_CHECK_INTERVAL as u32 + 1);
+        let dead = seed_exact_dead(&f.pool, 2 * FENCE_CHECK_INTERVAL as u32 + 1);
         let calls = std::cell::Cell::new(0usize);
         let first_call_saw_everything = std::cell::Cell::new(false);
         let mut fence = || {
             if calls.get() == 0 {
                 // The closure can see the pool, so this proves the check really
                 // runs before the first tombstone rather than after a batch.
-                first_call_saw_everything.set(dead.iter().all(|id| fragment_present(&f, *id)));
+                first_call_saw_everything.set(dead.iter().all(|id| fragment_present(&f.pool, *id)));
             }
             calls.set(calls.get() + 1);
             Ok(DEADLINE)
@@ -1469,7 +1608,7 @@ mod tests {
         );
         assert!(outcome.errors.is_empty(), "{outcome:?}");
         assert!(
-            dead.iter().all(|id| !fragment_present(&f, *id)),
+            dead.iter().all(|id| !fragment_present(&f.pool, *id)),
             "a clean check must not stop the sweep: {outcome:?}"
         );
     }
@@ -1477,7 +1616,7 @@ mod tests {
     #[test]
     fn a_failed_check_mid_sweep_stops_further_deletions() {
         let f = Fixture::new("fence-fail-mid");
-        let dead = seed_exact_dead(&f, 2 * FENCE_CHECK_INTERVAL as u32 + 1);
+        let dead = seed_exact_dead(&f.pool, 2 * FENCE_CHECK_INTERVAL as u32 + 1);
         let calls = std::cell::Cell::new(0usize);
         let mut fence = || {
             calls.set(calls.get() + 1);
@@ -1520,11 +1659,11 @@ mod tests {
             .enumerate()
             .partition(|(index, _)| *index < FENCE_CHECK_INTERVAL);
         assert!(
-            deleted.iter().all(|(_, id)| !fragment_present(&f, *id)),
+            deleted.iter().all(|(_, id)| !fragment_present(&f.pool, *id)),
             "fragments before the failure were deleted: {outcome:?}"
         );
         assert!(
-            survivors.iter().all(|(_, id)| fragment_present(&f, *id)),
+            survivors.iter().all(|(_, id)| fragment_present(&f.pool, *id)),
             "fragments after the failure must still be present: {outcome:?}"
         );
     }
@@ -1532,7 +1671,7 @@ mod tests {
     #[test]
     fn a_pass_without_a_failed_check_still_deletes_every_dead_fragment() {
         let f = Fixture::new("fence-no-failure");
-        let dead = seed_exact_dead(&f, 2 * FENCE_CHECK_INTERVAL as u32 + 1);
+        let dead = seed_exact_dead(&f.pool, 2 * FENCE_CHECK_INTERVAL as u32 + 1);
 
         // The real legacy pass, so the closure is wired to the live collector
         // record rather than a test stub.
@@ -1545,7 +1684,7 @@ mod tests {
             "{outcome:?}"
         );
         assert!(
-            dead.iter().all(|id| !fragment_present(&f, *id)),
+            dead.iter().all(|id| !fragment_present(&f.pool, *id)),
             "a pass whose checks all succeed must delete every dead fragment: {outcome:?}"
         );
     }
@@ -1601,7 +1740,7 @@ mod tests {
             "{outcome:?}"
         );
         assert!(
-            dead.iter().all(|id| fragment_present(&f, *id)),
+            dead.iter().all(|id| fragment_present(&f.pool, *id)),
             "an expired barrier must evict nothing: {outcome:?}"
         );
 
@@ -1626,9 +1765,330 @@ mod tests {
             "{outcome:?}"
         );
         assert!(
-            dead.iter().all(|id| !fragment_present(&f, *id)),
+            dead.iter().all(|id| !fragment_present(&f.pool, *id)),
             "{outcome:?}"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // Target-side epoch fence in the collection pass.
+    //
+    // The pass must advance *every* slot of the pool before the first deletion
+    // (a handoff copy can place a part on any candidate slot), stop the whole
+    // pool on any refusal, and delete only with the new epoch. These tests run
+    // the real `sweep_pool` against a real `PoolStriper`.
+    // ---------------------------------------------------------------------
+
+    /// A successful pass leaves every slot one epoch higher, removes the dead
+    /// fragments and keeps the live ones. The dead fragments were written at the
+    /// old epoch, so a delete that did not carry the *new* epoch would be refused
+    /// by the target (`FragmentNotOlder`) and they would still be present: the
+    /// "gone" assertion is what proves the delete carried the new epoch.
+    #[test]
+    fn a_pass_advances_every_slot_before_deleting_and_deletes_only_with_the_new_epoch() {
+        let f = Fixture::new("advance-before-delete");
+        let dead = seed_exact_dead(&f.pool, 3);
+        let live_id = BlobId::new(1, 1, 100, 0, EXACT_ONLY_CHANNEL, 0);
+        f.pool.put_blob(live_id, b"live").unwrap();
+
+        let before = slot_epochs(&f.pool);
+        assert_eq!(before, vec![0; f.pool.slots().len()], "{before:?}");
+
+        let mut fence = || Ok(DEADLINE);
+        let mut outcome = SweepOutcome::default();
+        sweep_pool(
+            &f.pool,
+            POOL,
+            &dead,
+            &BTreeSet::from([live_id]),
+            &mut fence,
+            &mut outcome,
+        )
+        .unwrap();
+
+        assert!(outcome.errors.is_empty(), "{outcome:?}");
+        assert_eq!(
+            outcome.fragments_deleted,
+            dead.len() * f.pool.scheme().total_parts(),
+            "{outcome:?}"
+        );
+
+        // Every slot advanced by exactly one, including slots that held no dead
+        // fragment: the advance is per pool, not per fragment.
+        let after = slot_epochs(&f.pool);
+        assert_eq!(
+            after,
+            before.iter().map(|epoch| epoch + 1).collect::<Vec<_>>(),
+            "every slot must advance exactly once: before={before:?} after={after:?}"
+        );
+
+        assert!(
+            dead.iter().all(|id| !fragment_present(&f.pool, *id)),
+            "the dead fragments must be gone: {outcome:?}"
+        );
+        assert_eq!(
+            f.pool.get_blob(live_id).unwrap(),
+            b"live",
+            "a live fragment must still read"
+        );
+    }
+
+    /// A pin on one slot refuses the advance of that slot, and the pass must stop
+    /// the whole pool with nothing deleted.
+    ///
+    /// The pinned slot is slot 0, the first one the advance visits, so the other
+    /// slots were not advanced either (`after == before`). That is what
+    /// distinguishes "stop the pool" from "skip the refused slot and continue":
+    /// the latter would advance slots 1 and 2, then delete at their new epochs,
+    /// so the dead fragments on those slots would disappear and their epochs
+    /// would move. Both are asserted here.
+    #[test]
+    fn a_pinned_slot_stops_the_whole_pool_and_deletes_nothing() {
+        let f = Fixture::new("epoch-pinned-slot");
+        let dead = seed_exact_dead(&f.pool, 3);
+        let before = slot_epochs(&f.pool);
+
+        // 60 s is far longer than this test: the pin cannot expire mid-pass.
+        let grant = f.pool.slots()[0].pin(before[0], 60_000).unwrap();
+        assert_eq!(grant.epoch, before[0]);
+
+        let mut fence = || Ok(DEADLINE);
+        let mut outcome = SweepOutcome::default();
+        let error = sweep_pool(
+            &f.pool,
+            POOL,
+            &dead,
+            &BTreeSet::new(),
+            &mut fence,
+            &mut outcome,
+        )
+        .expect_err("a pinned slot must refuse the pool");
+
+        // The state assertions come first: they are the property. A pass that
+        // skipped the pinned slot and continued would still return an error (the
+        // later delete is refused too), so checking the message alone would miss
+        // the partial advance.
+        assert_eq!(outcome.fragments_deleted, 0, "{outcome:?}");
+        assert!(
+            dead.iter().all(|id| fragment_present(&f.pool, *id)),
+            "nothing may be deleted on any slot of the refused pool: {outcome:?}"
+        );
+        assert_eq!(
+            slot_epochs(&f.pool),
+            before,
+            "a refusal on the first slot must not leave the later slots advanced"
+        );
+        assert!(error.contains("epoch advance"), "{error}");
+        assert!(error.contains("unexpired pin"), "{error}");
+        assert!(
+            outcome.pools_refused.iter().any(|r| r.contains(POOL)),
+            "the refusal must be reported for the pool: {outcome:?}"
+        );
+        assert!(
+            outcome.errors.iter().any(|e| e.contains("unexpired pin")),
+            "{outcome:?}"
+        );
+
+        f.pool.slots()[0].unpin(grant.pin_id).unwrap();
+    }
+
+    /// A refused advance is not retried: the pass stops, so the fragment survives
+    /// and the epoch stays put.
+    ///
+    /// The refusal here is an injected one-shot I/O fault on the advance record,
+    /// not a pin, so a retry *would* succeed. That is what makes the assertion
+    /// meaningful: if the pass retried once, slot 0 would advance and the dead
+    /// fragments would be deleted at the new epoch. The number of advance
+    /// attempts is not directly counted (that would need a counter inside
+    /// `yadb-blob`); the proof is the observable outcome plus the final assertion
+    /// that the fault was spent and an unarmed advance does succeed.
+    #[test]
+    fn a_refused_epoch_advance_is_not_retried() {
+        let fs = OneShotWriteFaultFs::new(7);
+        let stores: Vec<VolumeStore<OneShotWriteFaultFs>> = (0..3)
+            .map(|i| {
+                VolumeStore::open(
+                    fs.clone(),
+                    format!("pool/epoch-retry-{i}"),
+                    VolumeConfig::default(),
+                )
+                .unwrap()
+            })
+            .collect();
+        let pool =
+            PoolStriper::new(ErasureScheme::Mirror { replicas: 3 }, stores).unwrap();
+        let dead = seed_exact_dead(&pool, 3);
+        let before = slot_epochs(&pool);
+
+        // The advance is the first write the pass performs, so this one fault
+        // lands on slot 0's epoch record.
+        fs.arm();
+
+        let mut fence = || Ok(DEADLINE);
+        let mut outcome = SweepOutcome::default();
+        let error = sweep_pool(&pool, POOL, &dead, &BTreeSet::new(), &mut fence, &mut outcome)
+            .expect_err("a refused advance must stop the pool");
+
+        assert!(error.contains("epoch advance"), "{error}");
+        assert!(
+            !fs.armed(),
+            "the pass must have attempted exactly one advance write, consuming the fault"
+        );
+        assert_eq!(outcome.fragments_deleted, 0, "{outcome:?}");
+        assert_eq!(
+            slot_epochs(&pool),
+            before,
+            "a refused advance must leave every epoch unchanged, with no retry"
+        );
+        assert!(
+            dead.iter().all(|id| fragment_present(&pool, *id)),
+            "nothing may be deleted after a refused advance: {outcome:?}"
+        );
+
+        // Positive control: the fault was one-shot and is now spent, so a retry
+        // in the same pass would have succeeded. Proving that here is what makes
+        // the "not retried" assertion above non-vacuous.
+        let next = pool.slots()[0].advance_epoch(before[0]).unwrap();
+        assert_eq!(
+            next,
+            before[0] + 1,
+            "an unarmed advance on the same slot must succeed"
+        );
+    }
+
+    /// A collector that names an epoch the slot has already moved past is refused
+    /// by the delete itself, and nothing is deleted.
+    ///
+    /// This is the wire-level shape of a superseded collector: it read epoch N,
+    /// another pass advanced the slot to N+1, and its `delete_collectable` still
+    /// names N. The fragment was written at N, so `fragment_epoch >=
+    /// collector_epoch` refuses it (`FragmentNotOlder`); retrying with the newer
+    /// epoch would be a delete the caller did not prove it was entitled to.
+    #[test]
+    fn a_superseded_collector_epoch_is_refused_by_the_delete() {
+        let f = Fixture::new("superseded-epoch");
+        let dead = seed_exact_dead(&f.pool, 2);
+        let superseded = slot_epochs(&f.pool);
+        assert_eq!(superseded, vec![0; f.pool.slots().len()], "{superseded:?}");
+
+        // A successful advance, as a pass that got further would have performed.
+        let advanced: Vec<u64> = f
+            .pool
+            .slots()
+            .iter()
+            .zip(&superseded)
+            .map(|(slot, epoch)| slot.advance_epoch(*epoch).unwrap())
+            .collect();
+        assert_eq!(advanced, vec![1; f.pool.slots().len()], "{advanced:?}");
+
+        let id = *dead.iter().next().unwrap();
+        let mut outcome = SweepOutcome::default();
+        let error = delete_collectable_parts(&f.pool, POOL, id, &superseded, &mut outcome)
+            .expect_err("a superseded collector epoch must be refused");
+        assert!(error.contains("not older"), "{error}");
+        assert!(error.contains("refused"), "{error}");
+        assert_eq!(outcome.fragments_deleted, 0, "{outcome:?}");
+        assert!(
+            fragment_present(&f.pool, id),
+            "a superseded delete must leave the fragment in place: {outcome:?}"
+        );
+    }
+
+    /// A `SimFs` that fails exactly one `write_at` after it is armed, and then
+    /// behaves normally.
+    ///
+    /// Used to make an epoch advance fail once in a way that a retry would
+    /// recover from, so "the pass did not retry" becomes observable. The write
+    /// failure rolls the torn tail back and leaves the volume healthy, so the
+    /// same advance succeeds afterwards.
+    #[derive(Clone)]
+    struct OneShotWriteFaultFs {
+        inner: SimFs,
+        armed: Arc<AtomicBool>,
+    }
+
+    impl OneShotWriteFaultFs {
+        fn new(seed: u64) -> Self {
+            Self {
+                inner: SimFs::new(seed),
+                armed: Arc::new(AtomicBool::new(false)),
+            }
+        }
+
+        fn arm(&self) {
+            self.armed.store(true, Ordering::SeqCst);
+        }
+
+        fn armed(&self) -> bool {
+            self.armed.load(Ordering::SeqCst)
+        }
+    }
+
+    struct OneShotWriteFaultFile {
+        inner: yadb_io::SimFile,
+        armed: Arc<AtomicBool>,
+    }
+
+    impl VirtualFile for OneShotWriteFaultFile {
+        fn write_at(&self, offset: u64, buf: &[u8]) -> IoResult<()> {
+            if self.armed.swap(false, Ordering::SeqCst) {
+                return Err(std::io::Error::other(
+                    "injected one-shot write fault on the epoch record",
+                ));
+            }
+            self.inner.write_at(offset, buf)
+        }
+
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> IoResult<usize> {
+            self.inner.read_at(offset, buf)
+        }
+
+        fn len(&self) -> IoResult<u64> {
+            self.inner.len()
+        }
+
+        fn set_len(&self, size: u64) -> IoResult<()> {
+            self.inner.set_len(size)
+        }
+
+        fn sync_data(&self) -> IoResult<()> {
+            self.inner.sync_data()
+        }
+    }
+
+    impl StorageFs for OneShotWriteFaultFs {
+        type File = OneShotWriteFaultFile;
+
+        fn create_dir_all(&self, dir: &str) -> IoResult<()> {
+            self.inner.create_dir_all(dir)
+        }
+
+        fn open_rw(&self, path: &str, create: bool) -> IoResult<Self::File> {
+            Ok(OneShotWriteFaultFile {
+                inner: self.inner.open_rw(path, create)?,
+                armed: self.armed.clone(),
+            })
+        }
+
+        fn list_files(&self, dir: &str) -> IoResult<Vec<String>> {
+            self.inner.list_files(dir)
+        }
+
+        fn remove_file(&self, path: &str) -> IoResult<()> {
+            self.inner.remove_file(path)
+        }
+
+        fn rename_atomic(&self, from: &str, to: &str) -> IoResult<()> {
+            self.inner.rename_atomic(from, to)
+        }
+
+        fn sync_dir(&self, dir: &str) -> IoResult<()> {
+            self.inner.sync_dir(dir)
+        }
+
+        fn exists(&self, path: &str) -> bool {
+            self.inner.exists(path)
+        }
     }
 
     /// Multi-Raft passes: one leader-only, quorum-confirmed sweep per data
