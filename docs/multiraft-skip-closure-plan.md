@@ -8,8 +8,8 @@ is the wrong mechanism to add — was reversed after the plan was written:
 `feat/reader-lease` (`e4555c5`) implements it, and Multi-Raft readers publish a
 per-group lease as well as pinning the fragment at the target. The sections
 below are the argument as it was made, annotated with what was implemented,
-what was reversed, and what remains unproven. The implementation is on that
-branch; it is not merged into the tree this record was written on.
+what was reversed, and what remains unproven. The implementation is merged into
+`main` (`7dd822c`, with the trial branch's test and a fix as `1254c84`).
 
 ## Status at the close of this record
 
@@ -52,7 +52,17 @@ branch; it is not merged into the tree this record was written on.
    so that check is skipped. The TTL is 30 s (`DEFAULT_TTL_MS`). A live
    three-node run observed the refusal and its expiry (see "SKIP 2" below).
    `feat/reader-lease` (`e4555c5`) implements it; the option the record
-   rejected is now the implemented one, on that branch.
+   rejected is now the implemented one, merged into `main`. Two defects were
+   found while validating it against `main` and are fixed in the merge: the WIP
+   had collapsed the legacy and Multi-Raft consistent block read into one call
+   to `read_at_consistent`, which asks for a quorum-confirmed snapshot legacy
+   metadata cannot produce, so every legacy `consistent=true` block read (what
+   the iSCSI READ path always sends) failed; and four test fixtures still built
+   the cache as `Mutex::new(None)` after it became a map. The per-group cache
+   had no test at all — the only lease test removed the `None` key and never
+   resolved a group — so one was added that runs two data groups and asserts
+   the record names its group, carries that group's applied index, is renewed
+   rather than republished, and frees only its own group when released.
 6. **Guards and docs — done.** `scripts/test_protocols_review.py` passes 21
    tests, `scripts/test_doc_anchors.py` passes 9, and the offline refusal
    contract in `tests/test_gc_refusal_protocol.py` passes 15, after the harness

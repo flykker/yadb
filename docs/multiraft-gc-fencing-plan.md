@@ -414,7 +414,7 @@ consults the group's reader records after closing admission, and refuses the
 group while one is live; the lease is therefore a collector-visible back-off
 signal, not a write that is ignored. The branch was rebased, its per-group
 keying and `lease_belongs_to_group` provenance check were kept, and the
-implementation is `e4555c5` on `feat/reader-lease` (2026-11-19).
+implementation is `e4555c5`, merged into `main` on 2026-11-19.
 
 What the reversal does not change: the pin is still the correctness mechanism,
 and the lease is still coarser. It fences the whole metadata group rather than
