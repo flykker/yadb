@@ -1,3 +1,4 @@
+pub mod fence_token;
 pub mod gc;
 pub mod kv;
 pub mod multiraft;
@@ -15,6 +16,7 @@ pub mod openraft_transport;
 pub mod raft;
 pub mod wal;
 
+pub use fence_token::{FenceOperation, FenceToken, FenceTokenError, FENCE_TOKEN_VERSION};
 pub use gc::{CollectorGuard, GcGroupScope, GcLease, GcLeaseGuard, LeaseKind};
 pub use kv::{
     CasGuard, KvCommand, KvResult, KvValue, MetaSnapshot, MetaStateMachine, RevisionGuard, TxnOp,
