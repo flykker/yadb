@@ -6,7 +6,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use yadb_blob::{BlobError, BlobId, PoolStriper};
 use yadb_io::StorageFs;
-use yadb_metakv::{KvCommand, KvResult, KvValue, LocalMetaKv, MetaError, RevisionGuard, TxnOp};
+use yadb_metakv::{
+    GcGroupScope, KvCommand, KvResult, KvValue, LocalMetaKv, MetaError, RevisionGuard, TxnOp,
+};
 
 // Keep new S3 ids separate from legacy S3/SQL (channel 2) and block (3).
 /// Blob channel of S3 object chunks. The collector needs it to know that this
@@ -1508,6 +1510,16 @@ impl<FS: StorageFs> ObjectStoreEngine<FS> {
         Ok(false)
     }
 
+    /// The namespace-wide pass needs one atomic, leader-fenced view across
+    /// every project group, which Multi-Raft cannot provide.
+    fn namespace_scan_refused(is_openraft: bool) -> Result<(), S3Error> {
+        if is_openraft {
+            Err(S3Error::NamespaceScanUnavailable)
+        } else {
+            Ok(())
+        }
+    }
+
     /// Runs the collector for every project currently represented in MetaKV.
     /// Includes projects with only failed uploads and no published objects.
     /// Malformed unrelated keys are ignored.
@@ -1515,9 +1527,7 @@ impl<FS: StorageFs> ObjectStoreEngine<FS> {
         // A Multi-Raft LocalMetaKv cannot provide one atomic, leader-fenced
         // snapshot across project groups.  Never scan/delete from a mixed
         // view: callers must disable the namespace-wide operation instead.
-        if self.meta.is_openraft() {
-            return Err(S3Error::NamespaceScanUnavailable);
-        }
+        Self::namespace_scan_refused(self.meta.is_openraft())?;
         let mut projects = std::collections::BTreeSet::new();
         for prefix in ["/s3/", "/s3-intent/", "/s3-retired/"] {
             for (key, _) in self.meta.try_scan_prefix(prefix)? {
@@ -1531,6 +1541,87 @@ impl<FS: StorageFs> ObjectStoreEngine<FS> {
         let mut removed = 0;
         for project_id in projects {
             removed += self.collect_orphans(project_id)?;
+        }
+        Ok(removed)
+    }
+
+    /// Collects orphans for exactly one metadata group.
+    ///
+    /// Only the projects the deployment routes to `group` are visited, taken
+    /// from [`LocalMetaKv::gc_group_scopes`]. A group whose scope covers every
+    /// project (`project_ids == None`) cannot be enumerated, so it refuses
+    /// instead of scanning a partial view. A group with no scope at all is not
+    /// this deployment's, so there is nothing to collect.
+    ///
+    /// Before any project is collected, a linearizable snapshot of `group` over
+    /// the S3 manifest prefixes must succeed. That proves the group's leader has
+    /// quorum and its applied state is current, so a manifest committed in that
+    /// group is visible to the scan. It does not make the scan atomic with the
+    /// deletions: each deletion goes through the existing `RevisionTxn` guards,
+    /// so a publish that commits after the scan wins the CAS and this pass does
+    /// nothing for that key rather than deleting a blob the manifest references.
+    pub fn collect_orphans_in_group(&self, group: u64) -> Result<usize, S3Error> {
+        let scopes = self.meta.gc_group_scopes()?;
+        self.collect_orphans_in_scopes(&scopes, group)
+    }
+
+    fn collect_orphans_in_scopes(
+        &self,
+        scopes: &[GcGroupScope],
+        group: u64,
+    ) -> Result<usize, S3Error> {
+        self.collect_orphans_in_scopes_with(scopes, group, || self.require_group_view(group))
+    }
+
+    /// One group's pass. `prove_view` is the leader fence: production always
+    /// passes the linearizable snapshot, and it runs before any project is
+    /// collected. The parameter exists so a single-node test can exercise
+    /// scope selection and the per-project loop, which the fixture cannot
+    /// fence because it has no OpenRaft group to ask.
+    fn collect_orphans_in_scopes_with(
+        &self,
+        scopes: &[GcGroupScope],
+        group: u64,
+        prove_view: impl FnOnce() -> Result<(), S3Error>,
+    ) -> Result<usize, S3Error> {
+        let Some(scope) = Self::group_scope(scopes, group) else {
+            // Nothing in this group is this deployment's.
+            return Ok(0);
+        };
+        let Some(project_ids) = &scope.project_ids else {
+            // The group covers every project, so its project set cannot be
+            // enumerated. Refuse rather than scan a partial view.
+            return Err(S3Error::NamespaceScanUnavailable);
+        };
+        prove_view()?;
+        self.collect_orphans_in_projects(project_ids)
+    }
+
+    fn group_scope<'a>(scopes: &'a [GcGroupScope], group: u64) -> Option<&'a GcGroupScope> {
+        scopes.iter().find(|scope| scope.group_id == group)
+    }
+
+    /// Leader-fenced, quorum-confirmed read of one group's applied state.
+    ///
+    /// There is no fallback to local state: a follower, or a group without a
+    /// quorum, returns the error and the pass deletes nothing.
+    fn require_group_view(&self, group: u64) -> Result<(), S3Error> {
+        self.meta.try_linearizable_group_snapshot(
+            group,
+            &[],
+            &[
+                "/s3/".to_string(),
+                "/s3-intent/".to_string(),
+                "/s3-retired/".to_string(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn collect_orphans_in_projects(&self, project_ids: &BTreeSet<u32>) -> Result<usize, S3Error> {
+        let mut removed = 0;
+        for project_id in project_ids {
+            removed += self.collect_orphans(*project_id)?;
         }
         Ok(removed)
     }
@@ -1691,12 +1782,19 @@ mod tests {
 
     // Stop an upload exactly after intent persistence, before metadata publication.
     fn prepared(s3: &ObjectStoreEngine<SimFs>) -> (String, UploadIntent, ObjectManifest) {
-        let allocation = s3.reserve_upload(1).unwrap();
+        prepared_for(s3, 1)
+    }
+
+    fn prepared_for(
+        s3: &ObjectStoreEngine<SimFs>,
+        project_id: u32,
+    ) -> (String, UploadIntent, ObjectManifest) {
+        let allocation = s3.reserve_upload(project_id).unwrap();
         let upload_id = format!("v2-{allocation:014x}");
-        let key = ObjectStoreEngine::<SimFs>::intent_key(1, &upload_id);
+        let key = ObjectStoreEngine::<SimFs>::intent_key(project_id, &upload_id);
         let chunks = vec![ChunkRef {
             blob_id: BlobId::new(
-                1,
+                project_id,
                 (allocation >> 24) as u32,
                 (allocation & BlobId::MAX_U24 as u64) as u32,
                 1,
@@ -1708,7 +1806,7 @@ mod tests {
         }];
         let intent = UploadIntent {
             upload_id,
-            manifest_key: "/s3/1/store/bucket/key".into(),
+            manifest_key: format!("/s3/{project_id}/store/bucket/key"),
             generation: chunks[0].blob_id.generation(),
             pool: "pool".into(),
             chunks: chunks.clone(),
@@ -1748,6 +1846,154 @@ mod tests {
                 })
                 .unwrap();
         }
+    }
+
+    #[test]
+    fn collect_orphans_in_group_refuses_without_a_group_scope() {
+        let meta_fs = SimFs::new(6320);
+        let disks = [SimFs::new(6321), SimFs::new(6322), SimFs::new(6323)];
+        let s3 = engine(&meta_fs, &disks);
+        let (key, _, manifest) = prepared(&s3);
+        let blob = manifest.chunks[0].blob_id;
+        s3.get_pool("pool")
+            .unwrap()
+            .put_blob(blob, b"payload")
+            .unwrap();
+        advance_revisions(&s3);
+
+        // Single-node metadata cannot enumerate groups at all, so the entry
+        // point refuses instead of falling back to a namespace scan.
+        assert!(matches!(
+            s3.collect_orphans_in_group(7),
+            Err(S3Error::Meta(MetaError::Routing(_)))
+        ));
+
+        // No scope for this group means nothing here is this deployment's.
+        assert_eq!(s3.collect_orphans_in_scopes(&[], 7).unwrap(), 0);
+
+        // A scope that covers every project cannot be enumerated: refuse.
+        assert!(matches!(
+            s3.collect_orphans_in_scopes(
+                &[GcGroupScope {
+                    group_id: 7,
+                    project_ids: None,
+                }],
+                7
+            ),
+            Err(S3Error::NamespaceScanUnavailable)
+        ));
+
+        // A known project set still needs a leader-fenced view. Single-node
+        // metadata cannot provide one, so the pass refuses rather than
+        // collecting from local applied state.
+        assert!(matches!(
+            s3.collect_orphans_in_scopes(
+                &[GcGroupScope {
+                    group_id: 7,
+                    project_ids: Some(BTreeSet::from([1])),
+                }],
+                7
+            ),
+            Err(S3Error::Meta(MetaError::Routing(_)))
+        ));
+
+        assert!(s3.meta.get_or_panic(&key).is_some());
+        assert_eq!(
+            s3.get_pool("pool").unwrap().get_blob(blob).unwrap(),
+            b"payload".to_vec()
+        );
+    }
+
+    #[test]
+    fn collect_orphans_in_group_collects_only_its_own_projects() {
+        let meta_fs = SimFs::new(6330);
+        let disks = [SimFs::new(6331), SimFs::new(6332), SimFs::new(6333)];
+        let s3 = engine(&meta_fs, &disks);
+        let (key1, _, manifest1) = prepared_for(&s3, 1);
+        let (key2, _, manifest2) = prepared_for(&s3, 2);
+        let blob1 = manifest1.chunks[0].blob_id;
+        let blob2 = manifest2.chunks[0].blob_id;
+        s3.get_pool("pool").unwrap().put_blob(blob1, b"one").unwrap();
+        s3.get_pool("pool").unwrap().put_blob(blob2, b"two").unwrap();
+        advance_revisions(&s3);
+
+        // Two data groups, each owning one project. A Multi-Raft deployment
+        // reports exactly this scope table; this crate's tests cannot build
+        // openraft metadata (that needs real files, an OpenRaft handle and a
+        // Tokio runtime, none of which this crate depends on), so the test
+        // drives the same scope selection and per-project loop, substituting
+        // only the fence.
+        let scopes = [
+            GcGroupScope {
+                group_id: 7,
+                project_ids: Some(BTreeSet::from([1])),
+            },
+            GcGroupScope {
+                group_id: 8,
+                project_ids: Some(BTreeSet::from([2])),
+            },
+        ];
+
+        // The real entry point cannot prove a leader-fenced view of group 7
+        // here, so it refuses and deletes nothing.
+        assert!(matches!(
+            s3.collect_orphans_in_scopes(&scopes, 7),
+            Err(S3Error::Meta(MetaError::Routing(_)))
+        ));
+        assert!(s3.meta.get_or_panic(&key1).is_some());
+
+        // With the view proven, group 7 collects its own project only.
+        assert_eq!(
+            s3.collect_orphans_in_scopes_with(&scopes, 7, || Ok(())).unwrap(),
+            1
+        );
+        assert!(s3.meta.get_or_panic(&key1).is_none());
+        assert!(s3.get_pool("pool").unwrap().get_blob(blob1).is_err());
+
+        // The other group's project is untouched.
+        assert!(s3.meta.get_or_panic(&key2).is_some());
+        assert_eq!(
+            s3.get_pool("pool").unwrap().get_blob(blob2).unwrap(),
+            b"two".to_vec()
+        );
+
+        // A group this deployment does not own has nothing to collect.
+        assert_eq!(
+            s3.collect_orphans_in_scopes_with(&scopes, 9, || Ok(())).unwrap(),
+            0
+        );
+
+        // The namespace-wide path is unchanged: it still refuses on openraft.
+        assert!(matches!(
+            ObjectStoreEngine::<SimFs>::namespace_scan_refused(true),
+            Err(S3Error::NamespaceScanUnavailable)
+        ));
+    }
+
+    #[test]
+    fn collect_orphans_all_still_refuses_on_openraft() {
+        // OpenRaft metadata cannot be constructed in this crate's tests: the
+        // Raft storage adapters need real files and a Tokio runtime, and this
+        // crate depends on neither. Drive the exact guard `collect_orphans_all`
+        // reads, with the flag it gets from `is_openraft()`.
+        assert!(matches!(
+            ObjectStoreEngine::<SimFs>::namespace_scan_refused(true),
+            Err(S3Error::NamespaceScanUnavailable)
+        ));
+        assert!(ObjectStoreEngine::<SimFs>::namespace_scan_refused(false).is_ok());
+
+        // The single-node path is unchanged: it still collects.
+        let meta_fs = SimFs::new(6340);
+        let disks = [SimFs::new(6341), SimFs::new(6342), SimFs::new(6343)];
+        let s3 = engine(&meta_fs, &disks);
+        let (key, _, manifest) = prepared(&s3);
+        s3.get_pool("pool")
+            .unwrap()
+            .put_blob(manifest.chunks[0].blob_id, b"payload")
+            .unwrap();
+        advance_revisions(&s3);
+        assert_eq!(s3.collect_orphans_all().unwrap(), 1);
+        assert!(s3.meta.get_or_panic(&key).is_none());
     }
 
     #[test]
