@@ -1257,9 +1257,11 @@ def run(native_clients=False, libiscsi_dir=None, libiscsi_probe=None,
                 assert_multiraft_gc_refusal(http_port(control_leader), path, gc_fragments)
             print("PASS Multi-Raft GC and scrub explicitly refuse without deleting fragments")
             skip("VDisk orphan collection",
-                 "scrub's repair/orphan scan is disabled on Multi-Raft")
+                 "scrub's repair/orphan scan is disabled on Multi-Raft: "
+                 "crates/yadbd/src/main.rs:7365 answers 409 instead of 200")
             skip("per-group GC collection",
-                 "mark-and-sweep is disabled for Multi-Raft")
+                 "mark-and-sweep is disabled for Multi-Raft: "
+                 "crates/yadbd/src/gc.rs:144 refuses before any pass")
             print("PASS VDisk exact DELETE, idempotent tombstone and delayed PUT fencing")
             a, b = Pg(pg_port(2)), Pg(pg_port(3))
             a.query("CREATE TABLE wire (id INT PRIMARY KEY, balance INT);")

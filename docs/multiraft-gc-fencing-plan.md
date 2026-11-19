@@ -220,6 +220,16 @@ What it does **not** establish, and why the invariant still does not hold:
   unfenced `delete` is still callable.
 * GC enablement is still refused (`409` on `/v1/pools/gc` and `/v1/pools/scrub`),
   and none of the four live drills in "What would prove it" has run.
+* `crates/yadb-blob/tests/epoch_fence_drills.rs` is the storage-side precursor
+  of those drills. It drives `VolumeStore` directly and proves four storage
+  invariants: a live pin refuses both the advance and the collectable delete of
+  the fragment it protects; a superseded collector's epoch is refused by the
+  advance and by the exact-epoch delete without changing the volume; a pass
+  that stops at its first refusal leaves the later fragments intact; and a
+  tombstone survives seal, compaction and a power-cut reopen, so a late write
+  cannot resurrect a collected fragment. It proves no wire format, no collector
+  loop, no reader path and nothing about a cluster, and it does not stand in
+  for the four cluster drills.
 
 The lock-then-read ordering the collector protocol depends on is therefore not
 established here either: it is a property of the caller holding the volume's
@@ -402,6 +412,12 @@ proved dead, so it does not need a separate epoch field.
 
 Until all four pass in `tests/protocols.py` on a three-process cluster, the
 refusal stays.
+
+`crates/yadb-blob/tests/epoch_fence_drills.rs` covers the storage half of
+drills 1, 2 and 4 and the "stop, do not retry" shape of drill 3, against a
+deterministic `SimFs`. It is a precursor, not a substitute: it never starts a
+daemon, never carries an epoch or a pin over a wire, and never runs a collector
+loop. A green run there does not move any of the four drills above to "proven".
 
 ## Deliberately out of scope
 
