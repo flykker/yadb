@@ -25,7 +25,7 @@
 //! Concurrency *inside* a test is untouched — the multigroup test still runs nine
 //! Raft groups on a four-worker runtime, and the process tests still run three
 //! processes. The scope is deliberately narrow: this mutex serializes only these
-//! seven callers within one process. Other test binaries, other Cargo invocations
+//! nine callers within one process. Other test binaries, other Cargo invocations
 //! and the live cluster still compete for CPU, so it reduces contention rather
 //! than guaranteeing a dedicated core.
 //!
