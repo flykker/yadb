@@ -140,12 +140,12 @@ a real defect and is fixed in the daemon.
 ## What this record still does not claim
 
 The following are not claimed at live-cluster level, and the text below must not
-be read as proving them there. Three were subsequently proved elsewhere: two at
+be read as proving them there. Four were subsequently proved elsewhere: three at
 sweep level against real single-node OpenRaft groups and real volume directories,
 and one in-process at the S3 handler over the real multi-group metadata store.
-One more was closed in the daemon by taking its map from a confirmed control
-snapshot. Each entry says what the proof is and what the live cluster still
-lacks.
+One more (the volume-to-pool map) was closed in the daemon by taking its map from
+a confirmed control snapshot. Each entry says what the proof is and what the live
+cluster still lacks.
 
 * a collector lease expiring in the middle of a live cluster pass — the daemon
   still has no injection point, so the live cluster cannot produce it. The
@@ -183,7 +183,31 @@ lacks.
   refusal names the collector lease, and no live fragment disappears. Both
   passes succeeding back to back satisfies the same invariant, so the race
   alone is not the proof — the held-record test is the deterministic half;
-* a group leader dying between a fragment write and its manifest commit.
+* a group leader dying between a fragment write and its manifest commit — proved
+  in-process at sweep level, not on the live cluster. Two tests in
+  `crates/yadbd/src/gc.rs` (`gc::tests::openraft_tests`) use three real
+  single-node OpenRaft groups over real volume directories, write through the
+  real engines, stop every group, and reopen the same replica identities from
+  their durable log and state-machine directories.
+  `a_group_leader_death_before_publication_keeps_the_fragment_leased_and_unreadable`
+  appends a fragment for project 1 (group 2), publishes the writer lease with
+  `yadb_metakv::gc::acquire(..., LeaseKind::Writer, ...)` exactly as
+  `acquire_writer_if_legacy` does, and dies before any manifest names it. After
+  the restart a quorum-confirmed read is `ObjectNotFound` (not a partial
+  object), the live lease still refuses group 2 and deletes nothing, and once
+  the record is expired the pass reaps it, collects the fragment and reports
+  the deletion. This is the block/SQL write shape, where the writer lease is
+  the only fence. An S3 upload in flight has its prepared intent instead;
+  `a_prepared_s3_intent_protects_its_chunks` proves that fence at the same
+  sweep level, but does not restart the group.
+  `a_group_leader_death_after_publication_keeps_the_committed_blob_readable`
+  publishes an S3 object through `put_object`, stops the groups, reopens them,
+  and reads the exact bytes with `get_object_consistent`; a pass after recovery
+  keeps every chunk the committed manifest names, and a plain read still
+  returns the same bytes. What stays unproven is the same death on a multi-node
+  cluster: the test restarts a one-node deployment (all three single-node
+  groups) with a clean shutdown, not one group leader failing over to a peer,
+  and it does not cut a log entry mid-fsync.
 
 `block_pool_lookup` used to be on this list: the pass read the
 `project/volume` to pool map from this node's local control-plane cache rather
@@ -246,7 +270,7 @@ and (1) is not a cross-group question either:
   yields the *complete* live set for that group's blobs, not a partial one.
 
 Deletion is the operation that needs a cross-group decision, and it already
-makes that decision per group (`sweep_groups` at `crates/yadbd/src/gc.rs:628`).
+makes that decision per group (`sweep_groups` at `crates/yadbd/src/gc.rs:634`).
 Repair deletes nothing except the handoff copy of a part it has already written
 to the nominal slot, and a tombstoned id refuses that write
 (`crates/yadb-blob/src/volume.rs:634`), so a pass cannot resurrect a blob a
@@ -326,8 +350,18 @@ in the repair path crosses groups.
   reach the control group's quorum refuses to collect at all.
 * A blob published after the snapshot is not repaired by that pass; the next
   pass sees it. Repair is idempotent, not atomic with publication.
-* There is still no drill for a group leader dying between a fragment write and
-  its manifest commit. That hole exists independently of this SKIP.
+* There is still no *live-cluster* drill for a group leader dying between a
+  fragment write and its manifest commit. The shape is now proved at sweep
+  level across a real restart by
+  `a_group_leader_death_before_publication_keeps_the_fragment_leased_and_unreadable`
+  and
+  `a_group_leader_death_after_publication_keeps_the_committed_blob_readable`
+  (both in `crates/yadbd/src/gc.rs`): the uncommitted half stays absent and
+  lease-protected until the lease expires and is then collected, and the
+  committed half reads back its exact bytes and keeps its fragments through a
+  pass. The live cluster still lacks the same death with peers, where one
+  group's leader fails over while the other groups keep serving. That hole
+  exists independently of this SKIP.
 
 ## SKIP 2: `reader lease`
 

@@ -308,8 +308,13 @@ the exit status.
 
 Two repair limits stay stated. A blob published after the snapshot is not
 repaired by that pass — repair is idempotent, not atomic with publication. A
-group leader dying between a fragment write and its manifest commit still has no
-drill.
+group leader dying between a fragment write and its manifest commit has no
+live-cluster drill; the shape is proved at sweep level across a real restart by
+`a_group_leader_death_before_publication_keeps_the_fragment_leased_and_unreadable`
+and
+`a_group_leader_death_after_publication_keeps_the_committed_blob_readable`,
+which restart a one-node deployment with a clean shutdown rather than failing
+one group leader over to a peer.
 
 The volume-to-pool map is no longer a limit: the pass takes it from a control
 snapshot proved against the control group's quorum
