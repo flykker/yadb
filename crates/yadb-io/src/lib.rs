@@ -5,12 +5,39 @@ use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+mod sys;
+
 pub type IoResult<T> = Result<T, io::Error>;
 
 /// Positional file handle suitable for concurrent reads and append-only volume writes.
 pub trait VirtualFile: Send + Sync {
     fn write_at(&self, offset: u64, buf: &[u8]) -> IoResult<()>;
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> IoResult<usize>;
+    /// Read exactly `buf.len()` bytes at `offset`, refusing a short file.
+    ///
+    /// A positional read may legally return fewer bytes than requested, so a
+    /// partial read is retried from where it stopped. A read of zero bytes
+    /// before `buf` is full means the file ends early: this returns
+    /// [`io::ErrorKind::UnexpectedEof`] rather than a shorter, silently valid
+    /// record. This is the validated read an open-time recovery path should
+    /// use; [`read_at`](Self::read_at) alone cannot tell a truncated record
+    /// from a complete shorter one.
+    fn read_exact_at(&self, offset: u64, buf: &mut [u8]) -> IoResult<()> {
+        let mut filled = 0;
+        while filled < buf.len() {
+            match self.read_at(offset + filled as u64, &mut buf[filled..])? {
+                0 => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "file ended before the requested bytes were read",
+                    ))
+                }
+                read => filled += read,
+            }
+        }
+        Ok(())
+    }
+
     fn len(&self) -> IoResult<u64>;
     fn is_empty(&self) -> IoResult<bool> {
         Ok(self.len()? == 0)
@@ -54,14 +81,14 @@ pub struct OsDirectoryLock {
 
 impl OsDirectoryLock {
     pub fn try_acquire(path: impl AsRef<Path>) -> IoResult<Self> {
-        let directory = File::open(path)?;
+        let directory = sys::open(path.as_ref())?;
         if !directory.metadata()?.is_dir() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "lock target is not a directory",
             ));
         }
-        directory.try_lock()?;
+        sys::try_lock(&directory)?;
         Ok(Self {
             _directory: directory,
         })
@@ -73,7 +100,7 @@ impl Drop for OsDirectoryLock {
         // On Linux the lock belongs to the open file description, which may also
         // be referenced by a descriptor inherited across fork. Closing this File
         // alone would retain the lock until every such descriptor is closed.
-        let _ = self._directory.unlock();
+        let _ = sys::unlock(&self._directory);
     }
 }
 
@@ -120,7 +147,7 @@ impl VirtualFile for OsFile {
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> IoResult<usize> {
-        self.file.read_at(buf, offset)
+        sys::read_at(&self.file, offset, buf)
     }
 
     fn len(&self) -> IoResult<u64> {
@@ -551,6 +578,200 @@ impl StorageFs for SimFs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tmp_dir(tag: &str) -> PathBuf {
+        let base = std::env::var_os("YADB_TEST_TMPDIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let dir = base.join(format!("yadb-io-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        dir
+    }
+
+    fn write_record(fs: &OsFs, path: &str, record: &[u8]) {
+        let file = fs.open_rw(path, true).unwrap();
+        file.write_at(0, record).unwrap();
+        file.sync_data().unwrap();
+    }
+
+    #[test]
+    fn lock_acquisition_failure_is_distinguishable_and_leaves_nothing_behind() {
+        let dir = tmp_dir("lock-fail");
+        fs::create_dir(&dir).unwrap();
+
+        // The next try_lock fails as if another holder won the race.
+        let armed = sys::fault::lock(&[sys::fault::LockFault::TryLock(io::ErrorKind::WouldBlock)]);
+        let error = OsDirectoryLock::try_acquire(&dir)
+            .err()
+            .expect("an injected try_lock failure must be reported");
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        // The fault is one-shot: the same thread can acquire immediately.
+        drop(OsDirectoryLock::try_acquire(&dir).unwrap());
+        drop(armed);
+
+        // A failed acquisition creates no lock file, marker or partial state.
+        assert!(fs::read_dir(&dir).unwrap().next().is_none());
+
+        // A failed open is a different, distinguishable failure and also leaves
+        // the directory usable.
+        let armed =
+            sys::fault::lock(&[sys::fault::LockFault::Open(io::ErrorKind::PermissionDenied)]);
+        let error = OsDirectoryLock::try_acquire(&dir)
+            .err()
+            .expect("an injected open failure must be reported");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        drop(armed);
+        assert!(fs::read_dir(&dir).unwrap().next().is_none());
+        drop(OsDirectoryLock::try_acquire(&dir).unwrap());
+
+        // A missing target and a non-directory target are refused with kinds
+        // that cannot be confused with a held lock.
+        let missing = dir.join("missing");
+        assert_eq!(
+            OsDirectoryLock::try_acquire(&missing)
+                .err()
+                .expect("missing target")
+                .kind(),
+            io::ErrorKind::NotFound
+        );
+        let file = dir.join("file");
+        fs::write(&file, b"not a directory").unwrap();
+        assert_eq!(
+            OsDirectoryLock::try_acquire(&file)
+                .err()
+                .expect("file target")
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+
+        // `OsFs` refuses a path that is not relative and normalized before it
+        // reaches the filesystem.
+        let fs_root = tmp_dir("lock-normalize");
+        let os_fs = OsFs::new(&fs_root).unwrap();
+        assert_eq!(
+            os_fs
+                .try_lock_directory("../escape")
+                .err()
+                .expect("unnormalized path")
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+
+        fs::remove_file(&file).unwrap();
+        fs::remove_dir(&dir).unwrap();
+        fs::remove_dir_all(&fs_root).unwrap();
+    }
+
+    #[test]
+    fn held_lock_refuses_a_second_acquirer_without_disturbing_the_holder() {
+        let dir = tmp_dir("lock-held");
+        fs::create_dir(&dir).unwrap();
+        let holder = OsDirectoryLock::try_acquire(&dir).unwrap();
+        for _ in 0..2 {
+            let error = OsDirectoryLock::try_acquire(&dir)
+                .err()
+                .expect("a held lock must refuse a second acquirer");
+            assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+            // The refusal neither released nor invalidated the holder.
+            assert!(holder._directory.metadata().unwrap().is_dir());
+            assert!(dir.is_dir());
+        }
+        drop(holder);
+        let reacquired = OsDirectoryLock::try_acquire(&dir).unwrap();
+        drop(reacquired);
+        fs::remove_dir(&dir).unwrap();
+    }
+
+    #[test]
+    fn truncated_recovery_read_is_refused_not_accepted_as_a_shorter_file() {
+        let root = tmp_dir("truncated-read");
+        let os_fs = OsFs::new(&root).unwrap();
+        let record = b"0123456789abcdef";
+        write_record(&os_fs, "state", record);
+
+        // Control: the complete record reads back through the validated read.
+        let file = os_fs.open_rw("state", false).unwrap();
+        let mut buf = [0u8; 16];
+        file.read_exact_at(0, &mut buf).unwrap();
+        assert_eq!(&buf, record);
+        drop(file);
+
+        // A read that stops after 8 bytes is what a truncated file looks like.
+        // The raw read exposes the hazard: it happily returns 8 bytes.
+        let file = os_fs.open_rw("state", false).unwrap();
+        let armed = sys::fault::reads(&[sys::fault::ReadFault::Truncate(8)]);
+        let mut raw = [0u8; 16];
+        assert_eq!(file.read_at(0, &mut raw).unwrap(), 8);
+        // The validated read refuses it instead of accepting 8 valid bytes as
+        // the whole record.
+        let mut buf = [0u8; 16];
+        let error = file
+            .read_exact_at(0, &mut buf)
+            .err()
+            .expect("a truncated read must be refused");
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        drop(armed);
+        drop(file);
+
+        // The injection did not touch the file: a later open sees every byte.
+        let file = os_fs.open_rw("state", false).unwrap();
+        assert_eq!(file.len().unwrap(), record.len() as u64);
+        let mut buf = [0u8; 16];
+        file.read_exact_at(0, &mut buf).unwrap();
+        assert_eq!(&buf, record);
+        drop(file);
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn simfs_short_file_is_refused_by_the_validated_read() {
+        let sim = SimFs::new(7);
+        let file = sim.open_rw("state", true).unwrap();
+        file.write_at(0, b"0123456789abcdef").unwrap();
+        file.set_len(8).unwrap();
+        let mut buf = [0u8; 16];
+        let error = file
+            .read_exact_at(0, &mut buf)
+            .err()
+            .expect("a short file must be refused");
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn mid_read_failure_is_refused_and_a_later_open_is_deterministic() {
+        let root = tmp_dir("mid-read");
+        let os_fs = OsFs::new(&root).unwrap();
+        let record: Vec<u8> = (0..64).collect();
+        write_record(&os_fs, "state", &record);
+
+        // A partial read followed by an error is a failure in the middle of a
+        // record, not a short record.
+        let file = os_fs.open_rw("state", false).unwrap();
+        let armed = sys::fault::reads(&[
+            sys::fault::ReadFault::Partial(16),
+            sys::fault::ReadFault::Error(io::ErrorKind::Other),
+        ]);
+        let mut buf = vec![0u8; record.len()];
+        let error = file
+            .read_exact_at(0, &mut buf)
+            .err()
+            .expect("a failed read must be refused");
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        drop(armed);
+        drop(file);
+
+        // The failure changed nothing, and repeated opens agree byte for byte.
+        for _ in 0..2 {
+            let file = os_fs.open_rw("state", false).unwrap();
+            assert_eq!(file.len().unwrap(), record.len() as u64);
+            let mut buf = vec![0u8; record.len()];
+            file.read_exact_at(0, &mut buf).unwrap();
+            assert_eq!(buf, record);
+        }
+
+        fs::remove_dir_all(&root).unwrap();
+    }
 
     #[test]
     fn directory_lock_child() {
