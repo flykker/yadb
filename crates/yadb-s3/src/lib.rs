@@ -212,7 +212,8 @@ pub struct ObjectSummary {
 /// This is the S3 counterpart of `yadb_block::MapPublication`: the engine owns
 /// the manifest/intent guards and ops, the caller appends its own (an
 /// idempotency record and its admission counter, in practice), and all of them
-/// are checked and applied by one Raft apply under one cluster revision. A
+/// are checked and applied by one Raft apply under one revision — the owning
+/// group's revision, because a metadata transaction may not span groups. A
 /// failing caller guard therefore aborts the manifest write too — there is no
 /// state in which the object advanced without the record, or the record exists
 /// without the object.
@@ -235,6 +236,12 @@ struct UploadIntent {
     state: UploadState,
     created_revision: u64,
     /// Revision grace supplements (but does not replace) wall-clock grace.
+    ///
+    /// This is a revision of the group that owns the project's `/s3-intent/`
+    /// keys, taken with `LocalMetaKv::revision_for_key`. Multi-group metadata
+    /// has no deployment-wide revision, and the collector compares this value
+    /// against the same project's group revision, so a group-local number is
+    /// never mistaken for a global one.
     lease_until_revision: u64,
     /// Both the wall-clock and revision grace must elapse before aborting.
     #[serde(default)]
@@ -2977,9 +2984,10 @@ mod tests {
             Err(S3Error::Blob(BlobError::NotFound(_)))
         ));
     }
-    // The manifest and the caller record carry one cluster revision, which only
-    // a single transaction can produce, and `prepare` saw the manifest that
-    // committed (so a recorded response cannot describe a different object).
+    // The manifest and the caller record carry one revision (the owning
+    // group's), which only a single transaction can produce, and `prepare` saw
+    // the manifest that committed (so a recorded response cannot describe a
+    // different object).
     #[test]
     fn keyed_put_commits_manifest_and_record_in_one_transaction() {
         let meta_fs = SimFs::new(6104);

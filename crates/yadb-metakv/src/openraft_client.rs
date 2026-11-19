@@ -315,6 +315,12 @@ impl GroupRouter {
         let group = self.group_id_for_project(Some(project))?;
         self.group_idempotency_namespace(group)
     }
+    /// The single group that owns every key in `keys`.
+    ///
+    /// Every key is routed before any group is returned, so a scope that spans
+    /// groups fails here with [`MetaError::Routing`] and the command is never
+    /// handed to a Raft core. That is the "before submission" half of the
+    /// cross-group rule: no group appends a log entry for a rejected command.
     fn group_for<'a, 'k>(
         &'a self,
         keys: impl IntoIterator<Item = &'k str>,
@@ -511,6 +517,12 @@ impl GroupRouter {
             .expect("invalid watch scope")
             .watch_prefix(prefix)
     }
+    /// The deployment-wide revision, available only in singleton mode.
+    ///
+    /// Multi-group metadata has one revision per group and no global one, so
+    /// this refuses instead of combining or synthesizing the group revisions.
+    /// Use `revision_for_key` for a key's owning group and
+    /// `role_info_for_group(..).4` for a group's applied index.
     pub(crate) fn try_revision(&self) -> Result<u64, MetaError> {
         if !self.singleton {
             return Err(MetaError::Routing(
@@ -522,6 +534,15 @@ impl GroupRouter {
             .try_snapshot(&[], &[])?
             .revision())
     }
+    /// Merged scan across every group that can hold keys under `prefix`.
+    ///
+    /// This is an administrative **local observation, not a snapshot**. Each
+    /// group's rows are copied from this node's applied state at a different
+    /// instant and then concatenated, so a write that commits in one group
+    /// between another group's read can appear for one and not the other. The
+    /// result carries no revision and is not a point-in-time view. A caller
+    /// that needs one instant must read a single group with `try_snapshot` /
+    /// `linearizable_snapshot`, which reject a scope spanning groups.
     pub(crate) fn try_scan(
         &self,
         prefix: &str,
@@ -623,7 +644,7 @@ mod tests {
     use crate::multiraft::{GroupIdentity, ReplicaIdentity};
     use crate::openraft_runtime::YadbRaftTypeConfig as C;
     use crate::openraft_storage::DurableOpenRaftLog;
-    use crate::{LocalMetaKv, RevisionGuard, TxnOp};
+    use crate::{CasGuard, LocalMetaKv, RevisionGuard, TxnOp};
     use openraft::error::{
         Fatal, RPCError, RaftError, ReplicationClosed, StreamingError, Unreachable,
     };
@@ -969,6 +990,24 @@ mod tests {
             })
             .unwrap();
         }
+        // A rejected cross-group command must not reach any group's Raft core:
+        // an accepted write appends a log entry even if it never applies, so the
+        // leaders' log and applied indices are the observable proof. All three
+        // groups are single-node leaders here, so a submission would apply
+        // immediately and this snapshot would move.
+        let progress = |rafts: &[YadbRaft]| -> Vec<(u64, u64)> {
+            rafts
+                .iter()
+                .map(|raft| {
+                    let metrics = raft.metrics().borrow().clone();
+                    (
+                        metrics.last_log_index.unwrap_or(0),
+                        metrics.last_applied.map_or(0, |id| id.index),
+                    )
+                })
+                .collect()
+        };
+        let before = progress(&rafts);
         let rev1 = meta.revision_for_key("/db/1/a").unwrap();
         let rev2 = meta.revision_for_key("/db/2/a").unwrap();
         assert!(matches!(
@@ -997,10 +1036,68 @@ mod tests {
             }),
             Err(MetaError::Routing(_))
         ));
+        // A plain `Txn` is rejected on the same rule: the guard names project 1's
+        // group and the op names project 2's. So is a `Txn` whose ops alone span
+        // both groups.
+        assert!(matches!(
+            meta.execute(KvCommand::Txn {
+                guards: vec![CasGuard {
+                    key: "/db/1/a".into(),
+                    expected_version: 1
+                }],
+                ops: vec![TxnOp::Put {
+                    key: "/db/2/b".into(),
+                    value: vec![1]
+                }]
+            }),
+            Err(MetaError::Routing(_))
+        ));
+        assert!(matches!(
+            meta.execute(KvCommand::Txn {
+                guards: vec![],
+                ops: vec![
+                    TxnOp::Put {
+                        key: "/db/1/x".into(),
+                        value: vec![1]
+                    },
+                    TxnOp::Put {
+                        key: "/db/2/y".into(),
+                        value: vec![1]
+                    }
+                ]
+            }),
+            Err(MetaError::Routing(_))
+        ));
         assert!(matches!(
             meta.try_snapshot(&["/db/1/a".into(), "/db/2/a".into()], &[]),
             Err(MetaError::Routing(_))
         ));
+        // Two prefixes that route to different groups have no single revision
+        // to carry, so no snapshot is produced for them either.
+        assert!(matches!(
+            meta.try_snapshot(&[], &["/db/1/".into(), "/db/2/".into()]),
+            Err(MetaError::Routing(_))
+        ));
+        // Multi-group metadata has no global revision to synthesize.
+        assert!(matches!(meta.try_revision(), Err(MetaError::Routing(_))));
+        // The GC lease path stamps its revision through `legacy_revision`,
+        // which is `0` on OpenRaft rather than a computed global value.
+        assert_eq!(meta.legacy_revision(), 0);
+        // Nothing above may have been submitted anywhere. A write that was
+        // accepted would append to one group's log before the call returned.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_eq!(
+            progress(&rafts),
+            before,
+            "a rejected cross-group command must not be submitted to any group: \
+             an accepted write appends a log entry even if it never applies"
+        );
+        for key in ["/db/2/b", "/db/1/x", "/db/2/y"] {
+            assert!(
+                meta.get_or_panic(key).is_none(),
+                "{key} must not exist after a rejected cross-group transaction"
+            );
+        }
         assert!(matches!(
             meta.try_snapshot(&[], &["/db/1".into()]),
             Err(MetaError::Routing(_))
