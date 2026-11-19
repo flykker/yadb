@@ -286,6 +286,12 @@ pinned deterministically by
 `a_keyed_attempt_on_an_existing_row_fails_before_the_builder_runs`, which also
 asserts the extras builder never ran and no record was written.
 
+The live gate was re-run after this fix, against the binary built from
+`7f8c1e9`: `python3 tests/protocols.py` printed 27 PASS / 0 SKIP, exit 0
+(2026-11-19, log `live-gate-20261119-b.log`). No scenario was added, removed or
+relaxed for it, and the fix itself is proved by the two tests above, not by the
+gate.
+
 That was also exercised live on the three-process deployment (binary
 `b00018a9f092da23d3cfae818bc0e4ac7008dea659abca6336924bfeb7f87ddc`, built from
 `e246483`), against a 10 GiB volume with a real 4 KiB pattern written and read
