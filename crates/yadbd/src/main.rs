@@ -15,8 +15,8 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 use yadb_blob::{
-    BarrierRequest, BarrierResponse, BlobError, BlobId, PoolHealthSnapshot, PoolSlot, PoolStriper,
-    VolumeConfig, VolumeStore,
+    BarrierRequest, BarrierResponse, BlobError, BlobId, PinId, PoolHealthSnapshot, PoolSlot,
+    PoolStriper, VolumeConfig, VolumeStore,
 };
 use yadb_block::{BlockError, BlockVolumeEngine, VolumeExtentMap, DEFAULT_BLOCK_SIZE};
 use yadb_control::{parse_manifests, ControlError, ControlPlaneState, DiffOp, Role};
@@ -7179,9 +7179,89 @@ async fn handle_vdisk_stats(
     }
 }
 
-async fn handle_vdisk_delete(
+// Storage-fence RPC. These endpoints expose the durable epoch and pin table of
+// one VDisk slot. They are transport only: the collector that drives them is a
+// later change, so nothing here takes a pin or advances an epoch on its own.
+#[derive(Deserialize)]
+struct VdiskPinBody {
+    epoch: u64,
+    ttl_ms: u64,
+}
+
+#[derive(Deserialize)]
+struct VdiskUnpinBody {
+    pin_id: u64,
+}
+
+#[derive(Deserialize)]
+struct VdiskAdvanceBody {
+    expected_epoch: u64,
+}
+
+#[derive(Deserialize, Default)]
+struct VdiskDeleteQuery {
+    #[serde(default)]
+    fence_epoch: Option<u64>,
+    #[serde(default)]
+    collector_epoch: Option<u64>,
+}
+
+#[derive(Clone, Copy)]
+enum VdiskDeleteFence {
+    Exact(u64),
+    Collectable(u64),
+}
+
+/// Error envelope of the fence endpoints: a stable machine code plus a human
+/// message. Kept separate from `api_err`, whose body is a single `error` string
+/// shared with the legacy endpoints.
+fn fence_api_err(status: StatusCode, code: &'static str, message: impl Into<String>) -> Response {
+    (
+        status,
+        Json(serde_json::json!({
+            "error": code,
+            "message": message.into(),
+        })),
+    )
+        .into_response()
+}
+
+fn fence_slot_not_found() -> Response {
+    fence_api_err(
+        StatusCode::NOT_FOUND,
+        "slot_not_found",
+        "local VDisk slot not hosted on this node",
+    )
+}
+
+/// The status/code each [`BlobError`] means on a fence endpoint. A refusal is a
+/// durable-state answer the caller stops on, so every pin/fence variant has a
+/// stable `409` (or `503` for an unreadable clock/storage) rather than becoming
+/// a generic server error.
+fn fence_blob_error(error: BlobError) -> Response {
+    let (status, code) = match &error {
+        BlobError::PinTtlZero => (StatusCode::BAD_REQUEST, "pin_ttl_zero"),
+        BlobError::PinTtlTooLong { .. } => (StatusCode::BAD_REQUEST, "pin_ttl_too_long"),
+        BlobError::EpochMismatch { .. } => (StatusCode::CONFLICT, "epoch_mismatch"),
+        BlobError::EpochPinned { .. } => (StatusCode::CONFLICT, "epoch_pinned"),
+        BlobError::EpochExhausted => (StatusCode::CONFLICT, "epoch_exhausted"),
+        BlobError::PinEpochNotCurrent { .. } => (StatusCode::CONFLICT, "pin_epoch_not_current"),
+        BlobError::PinIdsExhausted => (StatusCode::CONFLICT, "pin_ids_exhausted"),
+        BlobError::FencedByEpoch { .. } => (StatusCode::CONFLICT, "fenced_by_epoch"),
+        BlobError::FragmentNotOlder { .. } => (StatusCode::CONFLICT, "fragment_not_older"),
+        BlobError::FragmentPinned { .. } => (StatusCode::CONFLICT, "fragment_pinned"),
+        BlobError::PinClockUnreadable { .. } => {
+            (StatusCode::SERVICE_UNAVAILABLE, "pin_clock_unreadable")
+        }
+        BlobError::StorageUnavailable => (StatusCode::SERVICE_UNAVAILABLE, "storage_unavailable"),
+        _ => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
+    };
+    fence_api_err(status, code, error.to_string())
+}
+
+async fn handle_vdisk_epoch(
     State(st): State<AppState>,
-    Path((pool, slot, blob_hex)): Path<(String, usize, String)>,
+    Path((pool, slot)): Path<(String, usize)>,
     headers: axum::http::HeaderMap,
 ) -> Response {
     if !raft_token_matches(&headers, st.raft_token.as_deref()) {
@@ -7190,19 +7270,182 @@ async fn handle_vdisk_delete(
             "invalid or missing internal Raft token",
         );
     }
+    let Some(store) = st.local_vdisks.read().unwrap().get(&(pool, slot)).cloned() else {
+        return fence_slot_not_found();
+    };
+    match tokio::task::spawn_blocking(move || store.epoch()).await {
+        Ok(epoch) => Json(serde_json::json!({ "epoch": epoch })).into_response(),
+        Err(e) => fence_api_err(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()),
+    }
+}
+
+async fn handle_vdisk_pins(
+    State(st): State<AppState>,
+    Path((pool, slot)): Path<(String, usize)>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    if !raft_token_matches(&headers, st.raft_token.as_deref()) {
+        return api_err(
+            StatusCode::UNAUTHORIZED,
+            "invalid or missing internal Raft token",
+        );
+    }
+    let Some(store) = st.local_vdisks.read().unwrap().get(&(pool, slot)).cloned() else {
+        return fence_slot_not_found();
+    };
+    match tokio::task::spawn_blocking(move || store.live_pins()).await {
+        Ok(Ok(pins)) => {
+            let pins: Vec<_> = pins
+                .into_iter()
+                .map(|pin| {
+                    serde_json::json!({
+                        "pin_id": pin.pin_id.get(),
+                        "epoch": pin.epoch,
+                        "expires_at_ms": pin.expires_at_ms,
+                    })
+                })
+                .collect();
+            Json(serde_json::json!({ "pins": pins })).into_response()
+        }
+        Ok(Err(error)) => fence_blob_error(error),
+        Err(e) => fence_api_err(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()),
+    }
+}
+
+async fn handle_vdisk_pin(
+    State(st): State<AppState>,
+    Path((pool, slot)): Path<(String, usize)>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<VdiskPinBody>,
+) -> Response {
+    if !raft_token_matches(&headers, st.raft_token.as_deref()) {
+        return api_err(
+            StatusCode::UNAUTHORIZED,
+            "invalid or missing internal Raft token",
+        );
+    }
+    let Some(store) = st.local_vdisks.read().unwrap().get(&(pool, slot)).cloned() else {
+        return fence_slot_not_found();
+    };
+    match tokio::task::spawn_blocking(move || store.pin(body.epoch, body.ttl_ms)).await {
+        Ok(Ok(grant)) => Json(serde_json::json!({
+            "pin_id": grant.pin_id.get(),
+            "epoch": grant.epoch,
+            "expires_at_ms": grant.expires_at_ms,
+        }))
+        .into_response(),
+        Ok(Err(error)) => fence_blob_error(error),
+        Err(e) => fence_api_err(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()),
+    }
+}
+
+async fn handle_vdisk_unpin(
+    State(st): State<AppState>,
+    Path((pool, slot)): Path<(String, usize)>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<VdiskUnpinBody>,
+) -> Response {
+    if !raft_token_matches(&headers, st.raft_token.as_deref()) {
+        return api_err(
+            StatusCode::UNAUTHORIZED,
+            "invalid or missing internal Raft token",
+        );
+    }
+    let Some(store) = st.local_vdisks.read().unwrap().get(&(pool, slot)).cloned() else {
+        return fence_slot_not_found();
+    };
+    let pin_id = PinId::from_wire(body.pin_id);
+    match tokio::task::spawn_blocking(move || store.unpin(pin_id)).await {
+        Ok(Ok(released)) => Json(serde_json::json!({ "released": released })).into_response(),
+        Ok(Err(error)) => fence_blob_error(error),
+        Err(e) => fence_api_err(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()),
+    }
+}
+
+async fn handle_vdisk_advance(
+    State(st): State<AppState>,
+    Path((pool, slot)): Path<(String, usize)>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<VdiskAdvanceBody>,
+) -> Response {
+    if !raft_token_matches(&headers, st.raft_token.as_deref()) {
+        return api_err(
+            StatusCode::UNAUTHORIZED,
+            "invalid or missing internal Raft token",
+        );
+    }
+    let Some(store) = st.local_vdisks.read().unwrap().get(&(pool, slot)).cloned() else {
+        return fence_slot_not_found();
+    };
+    match tokio::task::spawn_blocking(move || store.advance_epoch(body.expected_epoch)).await {
+        Ok(Ok(epoch)) => Json(serde_json::json!({ "epoch": epoch })).into_response(),
+        Ok(Err(error)) => fence_blob_error(error),
+        Err(e) => fence_api_err(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()),
+    }
+}
+
+async fn handle_vdisk_delete(
+    State(st): State<AppState>,
+    Path((pool, slot, blob_hex)): Path<(String, usize, String)>,
+    Query(query): Query<VdiskDeleteQuery>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    if !raft_token_matches(&headers, st.raft_token.as_deref()) {
+        return api_err(
+            StatusCode::UNAUTHORIZED,
+            "invalid or missing internal Raft token",
+        );
+    }
+    let fence = match (query.fence_epoch, query.collector_epoch) {
+        (Some(_), Some(_)) => {
+            return fence_api_err(
+                StatusCode::BAD_REQUEST,
+                "bad_fence_params",
+                "fence_epoch and collector_epoch are mutually exclusive",
+            );
+        }
+        (Some(expected), None) => Some(VdiskDeleteFence::Exact(expected)),
+        (None, Some(collector)) => Some(VdiskDeleteFence::Collectable(collector)),
+        (None, None) => None,
+    };
     let Some(blob_id) = BlobId::from_hex(&blob_hex) else {
-        return api_err(StatusCode::BAD_REQUEST, "invalid 32-char hex BlobId");
+        return match fence {
+            Some(_) => fence_api_err(
+                StatusCode::BAD_REQUEST,
+                "bad_blob_id",
+                "invalid 32-char hex BlobId",
+            ),
+            None => api_err(StatusCode::BAD_REQUEST, "invalid 32-char hex BlobId"),
+        };
     };
     let Some(store) = st.local_vdisks.read().unwrap().get(&(pool, slot)).cloned() else {
-        return api_err(
-            StatusCode::NOT_FOUND,
-            "local VDisk slot not hosted on this node",
-        );
+        return match fence {
+            Some(_) => fence_slot_not_found(),
+            None => api_err(
+                StatusCode::NOT_FOUND,
+                "local VDisk slot not hosted on this node",
+            ),
+        };
     };
-    match tokio::task::spawn_blocking(move || store.delete(blob_id)).await {
+    let fenced = fence.is_some();
+    let res = match fence {
+        None => tokio::task::spawn_blocking(move || store.delete(blob_id)).await,
+        Some(VdiskDeleteFence::Exact(expected_epoch)) => {
+            tokio::task::spawn_blocking(move || store.delete_fenced(blob_id, expected_epoch)).await
+        }
+        Some(VdiskDeleteFence::Collectable(collector_epoch)) => {
+            tokio::task::spawn_blocking(move || store.delete_collectable(blob_id, collector_epoch))
+                .await
+        }
+    };
+    match res {
         Ok(Ok(true)) => (StatusCode::OK, "deleted").into_response(),
         Ok(Ok(false)) => (StatusCode::OK, "absent").into_response(),
+        Ok(Err(error)) if fenced => fence_blob_error(error),
         Ok(Err(e)) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        Err(e) if fenced => {
+            fence_api_err(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string())
+        }
         Err(e) => api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }
@@ -7657,6 +7900,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route(
             "/internal/vdisk/{pool}/{slot}/compact",
             post(handle_vdisk_compact),
+        )
+        .route(
+            "/internal/vdisk/{pool}/{slot}/epoch",
+            get(handle_vdisk_epoch),
+        )
+        .route(
+            "/internal/vdisk/{pool}/{slot}/pins",
+            get(handle_vdisk_pins),
+        )
+        .route(
+            "/internal/vdisk/{pool}/{slot}/pin",
+            post(handle_vdisk_pin),
+        )
+        .route(
+            "/internal/vdisk/{pool}/{slot}/unpin",
+            post(handle_vdisk_unpin),
+        )
+        .route(
+            "/internal/vdisk/{pool}/{slot}/advance",
+            post(handle_vdisk_advance),
         )
         .route("/db/{project}/{database}/query", post(handle_db_query))
         .route("/block/{project}/{volume}/unmap", post(handle_block_unmap))
@@ -8426,7 +8689,13 @@ mod security_tests {
             assert_eq!(get.status(), expected);
             let stats = handle_vdisk_stats(State(st.clone()), slot_path(), headers.clone()).await;
             assert_eq!(stats.status(), expected);
-            let delete = handle_vdisk_delete(State(st.clone()), blob_path(), headers.clone()).await;
+            let delete = handle_vdisk_delete(
+                State(st.clone()),
+                blob_path(),
+                Query(VdiskDeleteQuery::default()),
+                headers.clone(),
+            )
+            .await;
             assert_eq!(delete.status(), expected);
             let barrier = handle_vdisk_barrier(
                 State(st.clone()),
@@ -8480,9 +8749,14 @@ mod security_tests {
             StatusCode::OK
         );
         assert_eq!(
-            handle_vdisk_delete(State(st.clone()), path(), headers.clone())
-                .await
-                .status(),
+            handle_vdisk_delete(
+                State(st.clone()),
+                path(),
+                Query(VdiskDeleteQuery::default()),
+                headers.clone()
+            )
+            .await
+            .status(),
             StatusCode::OK
         );
         assert_eq!(
@@ -9861,6 +10135,373 @@ mod security_tests {
 
         // No conditional headers at all.
         assert!(passed(&[]));
+    }
+
+    fn vdisk_fence_test_state(label: &str) -> (std::path::PathBuf, AppState) {
+        let dir = std::env::temp_dir().join(format!(
+            "yadb-vdisk-fence-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let fs = OsFs::new(&dir).unwrap();
+        let meta = LocalMetaKv::open_single_node(&fs, "meta", 1).unwrap();
+        let st = AppState {
+            openraft: None,
+            listen_addr: "127.0.0.1:0".into(),
+            fs,
+            meta: meta.clone(),
+            raft_token: None,
+            subject_secret: None,
+            admin_subjects: vec![],
+            control: Arc::new(RwLock::new(ControlPlaneState::new())),
+            control_refresh: Arc::new(std::sync::Mutex::new(())),
+            control_freshness: Arc::new(std::sync::Mutex::new(ControlFreshness::default())),
+            pools: Arc::new(RwLock::new(BTreeMap::new())),
+            local_vdisks: Arc::new(RwLock::new(BTreeMap::new())),
+            last_scrub: Arc::new(RwLock::new(None)),
+            reader_lease: Arc::new(std::sync::Mutex::new(None)),
+            s3: ObjectStoreEngine::new(meta.clone(), 4096),
+            db: DatabaseEngine::new(meta.clone(), 100),
+            block: BlockVolumeEngine::new(meta, DEFAULT_BLOCK_SIZE),
+        };
+        st.open_or_get_local_vdisk("pool", 0).unwrap();
+        (dir, st)
+    }
+
+    async fn response_json(response: Response) -> (StatusCode, serde_json::Value) {
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value = serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+        (status, value)
+    }
+
+    async fn response_text(response: Response) -> (StatusCode, String) {
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    #[tokio::test]
+    async fn vdisk_fence_rpc_drives_the_durable_epoch_and_pin_table() {
+        let (dir, st) = vdisk_fence_test_state("rpc");
+        let slot_path = || Path(("pool".to_string(), 0));
+        let headers = || HeaderMap::new();
+        let blob_path = |id: BlobId| Path(("pool".to_string(), 0, id.to_hex()));
+        let delete_query = |fence_epoch, collector_epoch| {
+            Query(VdiskDeleteQuery {
+                fence_epoch,
+                collector_epoch,
+            })
+        };
+
+        // A fresh slot starts at epoch 0 and reports it over the wire.
+        let (status, body) =
+            response_json(handle_vdisk_epoch(State(st.clone()), slot_path(), headers()).await)
+                .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["epoch"], 0);
+
+        // A pin must name the target's current epoch.
+        let (status, body) = response_json(
+            handle_vdisk_pin(
+                State(st.clone()),
+                slot_path(),
+                headers(),
+                Json(VdiskPinBody {
+                    epoch: 1,
+                    ttl_ms: 1_000,
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"], "pin_epoch_not_current");
+
+        let (status, body) = response_json(
+            handle_vdisk_pin(
+                State(st.clone()),
+                slot_path(),
+                headers(),
+                Json(VdiskPinBody {
+                    epoch: 0,
+                    ttl_ms: 0,
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "pin_ttl_zero");
+
+        let (status, body) = response_json(
+            handle_vdisk_pin(
+                State(st.clone()),
+                slot_path(),
+                headers(),
+                Json(VdiskPinBody {
+                    epoch: 0,
+                    ttl_ms: yadb_blob::MAX_PIN_TTL_MS + 1,
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "pin_ttl_too_long");
+
+        // A valid pin is durable enough to refuse an epoch advance, and
+        // `GET /pins` reports exactly that pin.
+        let (status, body) = response_json(
+            handle_vdisk_pin(
+                State(st.clone()),
+                slot_path(),
+                headers(),
+                Json(VdiskPinBody {
+                    epoch: 0,
+                    ttl_ms: 60_000,
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["epoch"], 0);
+        let pin_id = body["pin_id"].as_u64().expect("pin id");
+        let expires_at_ms = body["expires_at_ms"].as_u64().expect("pin deadline");
+
+        // Written while the slot is still at epoch 0, so it is the fragment the
+        // collectable path may reclaim after the advance.
+        let old_id = BlobId::new(11, 12, 13, 0, 14, 0);
+        let store = st
+            .local_vdisks
+            .read()
+            .unwrap()
+            .get(&("pool".to_string(), 0))
+            .unwrap()
+            .clone();
+        store.put(old_id, b"epoch-zero fragment").unwrap();
+
+        let (status, body) = response_json(
+            handle_vdisk_advance(
+                State(st.clone()),
+                slot_path(),
+                headers(),
+                Json(VdiskAdvanceBody { expected_epoch: 0 }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"], "epoch_pinned");
+
+        let (status, body) =
+            response_json(handle_vdisk_pins(State(st.clone()), slot_path(), headers()).await).await;
+        assert_eq!(status, StatusCode::OK);
+        let pins = body["pins"].as_array().expect("pins array");
+        assert_eq!(pins.len(), 1);
+        assert_eq!(pins[0]["pin_id"], pin_id);
+        assert_eq!(pins[0]["epoch"], 0);
+        assert_eq!(pins[0]["expires_at_ms"], expires_at_ms);
+
+        // Releasing the pin unblocks the advance.
+        let (status, body) = response_json(
+            handle_vdisk_unpin(
+                State(st.clone()),
+                slot_path(),
+                headers(),
+                Json(VdiskUnpinBody { pin_id }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["released"], true);
+
+        let (status, body) = response_json(
+            handle_vdisk_advance(
+                State(st.clone()),
+                slot_path(),
+                headers(),
+                Json(VdiskAdvanceBody { expected_epoch: 0 }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["epoch"], 1);
+
+        // The epoch-0 fragment is older than the collector's epoch 1.
+        let (status, text) = response_text(
+            handle_vdisk_delete(
+                State(st.clone()),
+                blob_path(old_id),
+                delete_query(None, Some(1)),
+                headers(),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(text, "deleted");
+
+        // A fragment written at epoch 1 is not deletable under the old fence,
+        // but its own epoch deletes it.
+        let new_id = BlobId::new(11, 12, 13, 1, 14, 0);
+        store.put(new_id, b"epoch-one fragment").unwrap();
+
+        let (status, body) = response_json(
+            handle_vdisk_delete(
+                State(st.clone()),
+                blob_path(new_id),
+                delete_query(Some(0), None),
+                headers(),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"], "fenced_by_epoch");
+
+        let (status, text) = response_text(
+            handle_vdisk_delete(
+                State(st.clone()),
+                blob_path(new_id),
+                delete_query(Some(1), None),
+                headers(),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(text, "deleted");
+
+        // The two fences are different rules and may not be combined.
+        let (status, body) = response_json(
+            handle_vdisk_delete(
+                State(st.clone()),
+                blob_path(new_id),
+                delete_query(Some(1), Some(1)),
+                headers(),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "bad_fence_params");
+
+        // Fenced endpoints answer 404 with the JSON envelope.
+        let (status, body) = response_json(
+            handle_vdisk_epoch(State(st.clone()), Path(("pool".to_string(), 1)), headers()).await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"], "slot_not_found");
+
+        // A fenced delete names a fragment, so bad hex is a request error.
+        let (status, body) = response_json(
+            handle_vdisk_delete(
+                State(st.clone()),
+                Path(("pool".to_string(), 0, "not-hex".to_string())),
+                delete_query(Some(1), None),
+                headers(),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "bad_blob_id");
+
+        drop(st);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn vdisk_fence_rpc_requires_peer_token() {
+        let (dir, mut st) = vdisk_fence_test_state("auth");
+        st.raft_token = Some("secret".into());
+        let slot_path = || Path(("pool".to_string(), 0));
+        let blob_path = || {
+            Path((
+                "pool".to_string(),
+                0,
+                BlobId::new(21, 22, 23, 1, 24, 0).to_hex(),
+            ))
+        };
+
+        for headers in [
+            HeaderMap::new(),
+            headers_with(&[("x-yadb-raft-token", "wrong")]),
+        ] {
+            let responses = vec![
+                handle_vdisk_epoch(State(st.clone()), slot_path(), headers.clone()).await,
+                handle_vdisk_pins(State(st.clone()), slot_path(), headers.clone()).await,
+                handle_vdisk_pin(
+                    State(st.clone()),
+                    slot_path(),
+                    headers.clone(),
+                    Json(VdiskPinBody {
+                        epoch: 0,
+                        ttl_ms: 1_000,
+                    }),
+                )
+                .await,
+                handle_vdisk_unpin(
+                    State(st.clone()),
+                    slot_path(),
+                    headers.clone(),
+                    Json(VdiskUnpinBody { pin_id: 1 }),
+                )
+                .await,
+                handle_vdisk_advance(
+                    State(st.clone()),
+                    slot_path(),
+                    headers.clone(),
+                    Json(VdiskAdvanceBody { expected_epoch: 0 }),
+                )
+                .await,
+                handle_vdisk_delete(
+                    State(st.clone()),
+                    blob_path(),
+                    Query(VdiskDeleteQuery {
+                        fence_epoch: Some(1),
+                        collector_epoch: None,
+                    }),
+                    headers.clone(),
+                )
+                .await,
+                // The legacy unfenced delete keeps the same peer check.
+                handle_vdisk_delete(
+                    State(st.clone()),
+                    blob_path(),
+                    Query(VdiskDeleteQuery::default()),
+                    headers.clone(),
+                )
+                .await,
+            ];
+            for response in responses {
+                assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            }
+        }
+
+        // The configured token still reaches the store.
+        let response = handle_vdisk_epoch(
+            State(st.clone()),
+            slot_path(),
+            headers_with(&[("x-yadb-raft-token", "secret")]),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        drop(st);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
 

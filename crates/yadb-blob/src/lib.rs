@@ -174,6 +174,13 @@ pub enum BlobError {
         written: usize,
         required: usize,
     },
+
+    #[error("remote VDisk fence request refused with HTTP {status} ({code}): {detail}")]
+    RemoteFenceRefused {
+        status: u16,
+        code: String,
+        detail: String,
+    },
 }
 
 impl BlobError {

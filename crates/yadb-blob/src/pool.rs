@@ -5,10 +5,13 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use yadb_io::StorageFs;
 
-use crate::{BlobError, BlobId, ErasureCodec, ErasureScheme, VolumeStats, VolumeStore};
+use crate::{
+    BlobError, BlobId, ErasureCodec, ErasureScheme, PinGrant, PinId, PinView, VolumeStats,
+    VolumeStore,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepairReport {
@@ -118,6 +121,93 @@ pub struct BlobIdList {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CompactResponse {
     pub reclaimed_bytes: u64,
+}
+
+// Wire bodies of the storage-fence RPC. They are private to the transport: the
+// public surface is `PoolSlot`'s methods, and the daemon speaks the same JSON
+// through its own request types.
+#[derive(Debug, Serialize, Deserialize)]
+struct EpochWire {
+    epoch: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PinRefWire {
+    pin_id: u64,
+    epoch: u64,
+    expires_at_ms: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PinsWire {
+    pins: Vec<PinRefWire>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PinCallWire {
+    epoch: u64,
+    ttl_ms: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct UnpinCallWire {
+    pin_id: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ReleasedWire {
+    released: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct AdvanceCallWire {
+    expected_epoch: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct FenceErrorWire {
+    error: String,
+    #[serde(default)]
+    message: Option<String>,
+}
+
+/// Maps a non-200 answer from a fenced endpoint to a durable-state error.
+///
+/// A fence refusal is an answer, not a transport failure: turning it into
+/// `BlobError::Io` would mark the slot offline and let the caller hand the work
+/// to another slot, silently defeating the fence. Only a status-less transport
+/// error is `Io`, and that is decided by the caller that owns the socket.
+fn fence_refusal(status: u16, body: &[u8]) -> BlobError {
+    let Ok(wire) = serde_json::from_slice::<FenceErrorWire>(body) else {
+        return BlobError::RemoteFenceRefused {
+            status,
+            code: "unparsed".to_string(),
+            detail: String::from_utf8_lossy(body).into_owned(),
+        };
+    };
+    if wire.error == "storage_unavailable" {
+        return BlobError::StorageUnavailable;
+    }
+    BlobError::RemoteFenceRefused {
+        status,
+        code: wire.error,
+        detail: wire.message.unwrap_or_default(),
+    }
+}
+
+/// Parses the answer of a fenced endpoint. A non-200 answer is mapped through
+/// [`fence_refusal`] first, so its stable wire code is preserved; a 200 body
+/// that does not match the contract is still an answer from the slot, so it
+/// must not become `Io` either.
+fn fence_json<T: DeserializeOwned>(status: u16, body: &[u8]) -> Result<T, BlobError> {
+    if status != 200 {
+        return Err(fence_refusal(status, body));
+    }
+    serde_json::from_slice(body).map_err(|error| BlobError::RemoteFenceRefused {
+        status,
+        code: "unparsed".to_string(),
+        detail: format!("{error}: {}", String::from_utf8_lossy(body)),
+    })
 }
 
 enum SlotBackend<FS: StorageFs> {
@@ -569,6 +659,175 @@ impl<FS: StorageFs> PoolSlot<FS> {
                     }
                 }
             }
+        }
+    }
+
+    /// Sends one storage-fence RPC to a remote slot.
+    ///
+    /// An HTTP response marks the slot online even when it refuses the request:
+    /// a refusal is durable state the caller must stop on. Only a transport
+    /// error is `Io` and marks the slot offline, because only then is "this slot
+    /// did not answer" true.
+    fn fence_request(
+        &self,
+        method: &str,
+        suffix: &str,
+        content_type: &str,
+        body: &[u8],
+    ) -> Result<(u16, Vec<u8>), BlobError> {
+        let SlotBackend::Remote {
+            pool_name,
+            slot_index,
+            peer_addr,
+            token,
+        } = &self.backend
+        else {
+            unreachable!("fence_request is only called for a remote slot");
+        };
+        let path = format!("/internal/vdisk/{pool_name}/{slot_index}/{suffix}");
+        match http_raw_request(
+            peer_addr,
+            method,
+            &path,
+            content_type,
+            body,
+            token.as_deref(),
+        ) {
+            Ok((status, body)) => {
+                self.metrics.online.store(true, Ordering::Relaxed);
+                Ok((status, body))
+            }
+            Err(error) => {
+                self.metrics.online.store(false, Ordering::Relaxed);
+                Err(BlobError::Io(error))
+            }
+        }
+    }
+
+    /// The durable target epoch of the slot's volume.
+    pub fn epoch(&self) -> Result<u64, BlobError> {
+        match &self.backend {
+            SlotBackend::Local(store) => {
+                self.metrics.online.store(true, Ordering::Relaxed);
+                Ok(store.epoch())
+            }
+            SlotBackend::Remote { .. } => {
+                let (status, body) = self.fence_request("GET", "epoch", "application/json", &[])?;
+                let wire: EpochWire = fence_json(status, &body)?;
+                Ok(wire.epoch)
+            }
+        }
+    }
+
+    /// Every unexpired reader pin on the slot's volume.
+    pub fn live_pins(&self) -> Result<Vec<PinView>, BlobError> {
+        match &self.backend {
+            SlotBackend::Local(store) => store.live_pins(),
+            SlotBackend::Remote { .. } => {
+                let (status, body) = self.fence_request("GET", "pins", "application/json", &[])?;
+                let wire: PinsWire = fence_json(status, &body)?;
+                Ok(wire
+                    .pins
+                    .into_iter()
+                    .map(|pin| PinView {
+                        pin_id: PinId::from_wire(pin.pin_id),
+                        epoch: pin.epoch,
+                        expires_at_ms: pin.expires_at_ms,
+                    })
+                    .collect())
+            }
+        }
+    }
+
+    /// Takes a reader pin on `epoch` for `ttl_ms`.
+    pub fn pin(&self, epoch: u64, ttl_ms: u64) -> Result<PinGrant, BlobError> {
+        match &self.backend {
+            SlotBackend::Local(store) => store.pin(epoch, ttl_ms),
+            SlotBackend::Remote { .. } => {
+                let body = serde_json::to_vec(&PinCallWire { epoch, ttl_ms })
+                    .map_err(|e| BlobError::Io(std::io::Error::other(e)))?;
+                let (status, body) =
+                    self.fence_request("POST", "pin", "application/json", &body)?;
+                let wire: PinRefWire = fence_json(status, &body)?;
+                Ok(PinGrant {
+                    pin_id: PinId::from_wire(wire.pin_id),
+                    epoch: wire.epoch,
+                    expires_at_ms: wire.expires_at_ms,
+                })
+            }
+        }
+    }
+
+    /// Releases `pin_id`. Idempotent: `false` means it was already gone.
+    pub fn unpin(&self, pin_id: PinId) -> Result<bool, BlobError> {
+        match &self.backend {
+            SlotBackend::Local(store) => store.unpin(pin_id),
+            SlotBackend::Remote { .. } => {
+                let body = serde_json::to_vec(&UnpinCallWire {
+                    pin_id: pin_id.get(),
+                })
+                .map_err(|e| BlobError::Io(std::io::Error::other(e)))?;
+                let (status, body) =
+                    self.fence_request("POST", "unpin", "application/json", &body)?;
+                let wire: ReleasedWire = fence_json(status, &body)?;
+                Ok(wire.released)
+            }
+        }
+    }
+
+    /// Raises the slot's epoch from exactly `expected_epoch` and returns the new
+    /// value.
+    pub fn advance_epoch(&self, expected_epoch: u64) -> Result<u64, BlobError> {
+        match &self.backend {
+            SlotBackend::Local(store) => store.advance_epoch(expected_epoch),
+            SlotBackend::Remote { .. } => {
+                let body = serde_json::to_vec(&AdvanceCallWire { expected_epoch })
+                    .map_err(|e| BlobError::Io(std::io::Error::other(e)))?;
+                let (status, body) =
+                    self.fence_request("POST", "advance", "application/json", &body)?;
+                let wire: EpochWire = fence_json(status, &body)?;
+                Ok(wire.epoch)
+            }
+        }
+    }
+
+    /// Deletes `id` only if the slot holds it under exactly `expected_epoch`.
+    pub fn delete_fenced(&self, id: BlobId, expected_epoch: u64) -> Result<bool, BlobError> {
+        match &self.backend {
+            SlotBackend::Local(store) => store.delete_fenced(id, expected_epoch),
+            SlotBackend::Remote { .. } => {
+                let suffix = format!("blob/{}?fence_epoch={expected_epoch}", id.to_hex());
+                self.delete_fenced_response(&suffix)
+            }
+        }
+    }
+
+    /// Deletes `id` only if its epoch is older than `collector_epoch` and no
+    /// unexpired pin names it.
+    pub fn delete_collectable(&self, id: BlobId, collector_epoch: u64) -> Result<bool, BlobError> {
+        match &self.backend {
+            SlotBackend::Local(store) => store.delete_collectable(id, collector_epoch),
+            SlotBackend::Remote { .. } => {
+                let suffix = format!("blob/{}?collector_epoch={collector_epoch}", id.to_hex());
+                self.delete_fenced_response(&suffix)
+            }
+        }
+    }
+
+    fn delete_fenced_response(&self, suffix: &str) -> Result<bool, BlobError> {
+        let (status, body) =
+            self.fence_request("DELETE", suffix, "application/octet-stream", &[])?;
+        if status != 200 {
+            return Err(fence_refusal(status, &body));
+        }
+        match body.as_slice() {
+            b"deleted" => Ok(true),
+            b"absent" => Ok(false),
+            other => Err(BlobError::RemoteFenceRefused {
+                status,
+                code: "unexpected_body".to_string(),
+                detail: String::from_utf8_lossy(other).into_owned(),
+            }),
         }
     }
 
@@ -1507,4 +1766,188 @@ fn decode_chunked(mut input: &[u8]) -> Result<Vec<u8>, std::io::Error> {
         input = &input[chunk_len + 2..];
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod fence_transport_tests {
+    use super::*;
+    use std::net::TcpListener;
+    use std::thread;
+
+    #[test]
+    fn conflict_is_a_refusal_not_unavailability() {
+        let error = fence_refusal(
+            409,
+            br#"{"error":"fragment_pinned","message":"a reader still pins epoch 3"}"#,
+        );
+        match &error {
+            BlobError::RemoteFenceRefused {
+                status,
+                code,
+                detail,
+            } => {
+                assert_eq!(*status, 409);
+                assert_eq!(code, "fragment_pinned");
+                assert_eq!(detail, "a reader still pins epoch 3");
+            }
+            other => panic!("expected RemoteFenceRefused, got {other:?}"),
+        }
+        assert!(!error.is_unavailable());
+    }
+
+    #[test]
+    fn storage_unavailable_keeps_its_own_variant() {
+        let error = fence_refusal(
+            503,
+            br#"{"error":"storage_unavailable","message":"restart and recover"}"#,
+        );
+        assert!(matches!(error, BlobError::StorageUnavailable));
+        assert!(!error.is_unavailable());
+    }
+
+    #[test]
+    fn non_json_error_body_is_an_unparsed_refusal() {
+        let error = fence_refusal(409, b"plain text refusal, not JSON");
+        match &error {
+            BlobError::RemoteFenceRefused {
+                status,
+                code,
+                detail,
+            } => {
+                assert_eq!(*status, 409);
+                assert_eq!(code, "unparsed");
+                assert_eq!(detail, "plain text refusal, not JSON");
+            }
+            other => panic!("expected RemoteFenceRefused, got {other:?}"),
+        }
+        assert!(!error.is_unavailable());
+    }
+
+    #[test]
+    fn unauthorized_is_a_refusal_not_io() {
+        let error = fence_refusal(401, br#"{"error":"unauthorized","message":"bad token"}"#);
+        match &error {
+            BlobError::RemoteFenceRefused { status, code, .. } => {
+                assert_eq!(*status, 401);
+                assert_eq!(code, "unauthorized");
+            }
+            other => panic!("expected RemoteFenceRefused, got {other:?}"),
+        }
+        assert!(!error.is_unavailable());
+    }
+
+    #[test]
+    fn json_endpoint_preserves_the_wire_code_on_non_200() {
+        let error = fence_json::<EpochWire>(
+            409,
+            br#"{"error":"epoch_mismatch","message":"caller is stale"}"#,
+        );
+        match error {
+            Err(BlobError::RemoteFenceRefused {
+                status,
+                code,
+                detail,
+            }) => {
+                assert_eq!(status, 409);
+                assert_eq!(code, "epoch_mismatch");
+                assert_eq!(detail, "caller is stale");
+            }
+            other => panic!("expected a mapped RemoteFenceRefused, got {other:?}"),
+        }
+    }
+
+    /// Reads one HTTP/1.1 request, headers plus `Content-Length` bytes.
+    fn read_http_request(stream: &mut TcpStream) -> String {
+        let mut raw = Vec::new();
+        let mut chunk = [0u8; 1024];
+        loop {
+            let read = stream.read(&mut chunk).expect("read request");
+            if read == 0 {
+                break;
+            }
+            raw.extend_from_slice(&chunk[..read]);
+            let Some(header_end) = raw.windows(4).position(|w| w == b"\r\n\r\n") else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&raw[..header_end]);
+            let body_len = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    if name.eq_ignore_ascii_case("content-length") {
+                        value.trim().parse::<usize>().ok()
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(0);
+            if raw.len() >= header_end + 4 + body_len {
+                break;
+            }
+        }
+        String::from_utf8_lossy(&raw).into_owned()
+    }
+
+    #[test]
+    fn remote_slot_round_trips_epoch_pin_unpin_and_advance_over_tcp() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let address = listener.local_addr().expect("listener address");
+        let server = thread::spawn(move || {
+            let mut requests = Vec::new();
+            for _ in 0..4 {
+                let (mut stream, _) = listener.accept().expect("accept request");
+                let request = read_http_request(&mut stream);
+                let request_line = request.lines().next().unwrap_or("").to_string();
+                let target = request_line.split_whitespace().nth(1).unwrap_or("");
+                let endpoint = target.split('?').next().unwrap_or("").rsplit('/').next();
+                let body = match endpoint {
+                    Some("epoch") => r#"{"epoch":7}"#,
+                    Some("pin") => r#"{"pin_id":41,"epoch":7,"expires_at_ms":900}"#,
+                    Some("unpin") => r#"{"released":true}"#,
+                    Some("advance") => r#"{"epoch":8}"#,
+                    other => panic!("unexpected endpoint {other:?}"),
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write response");
+                requests.push(request);
+            }
+            requests
+        });
+
+        let slot: PoolSlot<yadb_io::OsFs> = PoolSlot::remote(
+            "pool",
+            0,
+            "domain",
+            2,
+            address.to_string().as_str(),
+            Some("secret".to_string()),
+        );
+        assert_eq!(slot.epoch().expect("epoch"), 7);
+        let grant = slot.pin(7, 60_000).expect("pin");
+        assert_eq!(grant.pin_id, PinId::from_wire(41));
+        assert_eq!(grant.epoch, 7);
+        assert_eq!(grant.expires_at_ms, 900);
+        assert!(slot.unpin(grant.pin_id).expect("unpin"));
+        assert_eq!(slot.advance_epoch(7).expect("advance"), 8);
+
+        let requests = server.join().expect("test server");
+        assert_eq!(requests.len(), 4);
+        for (request, method) in requests.iter().zip(["GET", "POST", "POST", "POST"]) {
+            assert!(
+                request.starts_with(&format!("{method} /internal/vdisk/pool/0/")),
+                "unexpected request line: {request}"
+            );
+            assert!(
+                request
+                    .to_ascii_lowercase()
+                    .contains("x-yadb-raft-token: secret"),
+                "token header missing: {request}"
+            );
+        }
+    }
 }
