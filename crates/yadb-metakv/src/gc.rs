@@ -988,10 +988,16 @@ pub fn live_leases_in<FS: StorageFs>(
 /// Reaping matters for admission as well as for collection: reader and writer
 /// leases are only published while this key is absent, so an expired record left
 /// in place would refuse every read and write until somebody removed it.
-pub fn live_collector<FS: StorageFs>(meta: &LocalMetaKv<FS>) -> Option<GcLease> {
+///
+/// Fallible, like [`live_collector_in`]: `Ok(None)` means "this namespace
+/// answered, and no pass holds the record", while `Err` means the record could
+/// not be read at all. Flattening the error into `None` would report an
+/// unreadable fence as an idle one, which is the direction that admits a second
+/// pass on a namespace whose state is unknown.
+pub fn live_collector<FS: StorageFs>(
+    meta: &LocalMetaKv<FS>,
+) -> Result<Option<GcLease>, MetaError> {
     live_collector_in_scope(meta, LeaseScope::Legacy)
-        .ok()
-        .flatten()
 }
 
 /// The collector lease of one metadata group, if one is live.
@@ -1500,7 +1506,7 @@ mod tests {
             "the successor's record must survive the superseded pass"
         );
         // `release` consumed the guard only on success, so Drop runs too.
-        assert!(live_collector(&meta).is_some());
+        assert!(live_collector(&meta).unwrap().is_some());
     }
 
     #[test]
@@ -1540,12 +1546,12 @@ mod tests {
     #[test]
     fn collector_lease_is_exclusive_and_reaped_when_expired() {
         let meta = meta();
-        assert!(live_collector(&meta).is_none());
+        assert!(live_collector(&meta).unwrap().is_none());
         let first = acquire_collector(&meta, 0, DEFAULT_TTL_MS).unwrap();
-        assert!(live_collector(&meta).is_some());
+        assert!(live_collector(&meta).unwrap().is_some());
         assert!(acquire_collector(&meta, 0, DEFAULT_TTL_MS).is_err());
         first.release().unwrap();
-        assert!(live_collector(&meta).is_none());
+        assert!(live_collector(&meta).unwrap().is_none());
 
         let second = acquire_collector(&meta, 0, 1).unwrap();
         let mut lease = second.lease().clone();
@@ -1556,7 +1562,7 @@ mod tests {
             value: serde_json::to_vec(&lease).unwrap(),
         })
         .unwrap();
-        assert!(live_collector(&meta).is_none());
+        assert!(live_collector(&meta).unwrap().is_none());
         // The expired record is reaped, not merely ignored: leaving it in place
         // would refuse every reader and writer, which are only admitted while
         // this key is absent. A fresh pass therefore takes it from the absent
@@ -1643,7 +1649,7 @@ mod tests {
         let group3 = acquire_collector_in(&meta, 3, 0, DEFAULT_TTL_MS).unwrap();
         assert!(live_collector_in(&meta, 2).unwrap().is_some());
         assert!(live_collector_in(&meta, 3).unwrap().is_some());
-        assert!(live_collector(&meta).is_none());
+        assert!(live_collector(&meta).unwrap().is_none());
 
         // Admission in group 2 is closed while its own collector record is held.
         let refused = put_lease_in(

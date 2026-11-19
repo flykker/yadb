@@ -855,6 +855,18 @@ mod tests {
             meta.try_snapshot(&["present".into()], &[]),
             Err(MetaError::StorageUnavailable)
         ));
+        // The GC fence readers must make the same distinction. `live_collector`
+        // used to flatten its error into `None`, which reads as "no pass holds
+        // the record" - the direction that admits a second collector on a
+        // namespace whose state is unknown.
+        assert!(
+            matches!(crate::gc::live_collector(&meta), Err(MetaError::StorageUnavailable)),
+            "an unreadable collector record must refuse, not report an idle pass"
+        );
+        assert!(
+            matches!(crate::gc::live_leases(&meta), Err(MetaError::StorageUnavailable)),
+            "an unreadable lease namespace must refuse, not report no live leases"
+        );
 
         drop(meta);
         raft.shutdown().await.unwrap();

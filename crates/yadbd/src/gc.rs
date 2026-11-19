@@ -190,13 +190,20 @@ fn sweep_legacy(
         // A live collector lease means another pass is between its fence check
         // and its deletions. Its CAS below would still succeed (the record only
         // changes when it is released), so this must be refused explicitly.
-        Some(lease) => {
+        Ok(Some(lease)) => {
             return SweepOutcome::refuse(format!(
                 "garbage collection refused: another pass holds the collector lease until {}",
                 lease.expires_at_ms
             ))
         }
-        None => match meta.try_get(gc::COLLECTOR_KEY) {
+        // "Cannot be read" is not "no pass is running": the pass must refuse
+        // rather than acquire a record whose current holder it could not see.
+        Err(error) => {
+            return SweepOutcome::refuse(format!(
+                "garbage collection refused: collector lease record cannot be read: {error}"
+            ))
+        }
+        Ok(None) => match meta.try_get(gc::COLLECTOR_KEY) {
             Ok(current) => current.map_or(0, |kv| kv.mod_revision),
             Err(error) => {
                 return SweepOutcome::refuse(format!(
