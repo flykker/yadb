@@ -97,30 +97,52 @@ run inside the one-second intent grace. The set comparison was not weakened.
 
 ## What this record still does not claim
 
-These stay unproven, and the text below must not be read as proving them:
+The following are not claimed at live-cluster level, and the text below must not
+be read as proving them there. Two were subsequently proved at sweep level
+against real single-node OpenRaft groups and real volume directories, and one
+was closed in the daemon by taking its map from a confirmed control snapshot;
+each entry says what the proof is and what the live cluster still lacks.
 
-* a collector lease expiring in the middle of a pass — the daemon has no
-  injection point, so only the storage-level drill covers the shape;
+* a collector lease expiring in the middle of a live cluster pass — the daemon
+  still has no injection point, so the live cluster cannot produce it. The
+  shape is proved at sweep level with a real single-node OpenRaft group and
+  real volume directories: `a_collector_fence_lost_mid_pool_stops_deleting_and_is_never_counted`
+  fails the fence closure `sweep_pool` receives between two barrier ranges and
+  observes that the earlier range is evicted and counted, the later range is
+  untouched and uncounted, and the outcome names the stop. What stays unproven
+  is the same failure through `POST /v1/pools/gc` on a cluster;
 * a reader lease expiring in the middle of a read — the live run observed the
   record block a pass and then expire with no read in flight, not a read that
   outlived its lease;
-* two concurrent collectors on one group;
+* two concurrent collectors on one group on a live cluster — a concurrent
+  `POST /v1/pools/gc` pair is inherently racy, so there is no deterministic
+  drill. The shape is proved at sweep level against a real single-node
+  OpenRaft group: `a_held_group_collector_lease_refuses_the_second_pass_and_deletes_nothing`
+  holds the group's collector record and observes the second pass refuse by
+  name, delete nothing and leave the same fragments collectable once the record
+  is released; `two_concurrent_passes_on_one_group_delete_each_fragment_at_most_once`
+  runs two real passes on separate threads and asserts that at most one
+  reports a deletion, every dead fragment is deleted exactly once in total, a
+  refusal names the collector lease, and no live fragment disappears. Both
+  passes succeeding back to back satisfies the same invariant, so the race
+  alone is not the proof — the held-record test is the deterministic half;
 * a group leader dying between a fragment write and its manifest commit.
 
 `block_pool_lookup` used to be on this list: the pass read the
 `project/volume` to pool map from this node's local control-plane cache rather
 than from a snapshot of the control group, so a stale map could name the wrong
 pool for a volume. A pass now takes that map only from a control snapshot this
-node has proved against the control group's quorum (`AppState::control_for_collection`),
-and refuses before touching any group when that proof is unavailable — `409`
-from `POST /v1/pools/gc`, a `repair_error` from scrub — instead of sweeping on
-an unproven map. `a_collection_pass_reads_the_control_map_from_a_confirmed_snapshot`
-proves both halves: a pass is handed the control group's newer map while the
-cache still holds the old one, and both routes refuse and delete nothing when no
-snapshot can be confirmed. The remaining limit is narrower: the map is the
-control group's confirmed applied state, so a volume created after that
-snapshot is not seen by that pass, and a node that cannot reach the control
-group's quorum now refuses to collect even the groups it leads.
+node has proved against the control group's quorum
+(`AppState::control_for_collection`), and refuses before touching any group when
+that proof is unavailable — `409` from `POST /v1/pools/gc`, a `repair_error`
+from scrub — instead of sweeping on an unproven map.
+`a_collection_pass_reads_the_control_map_from_a_confirmed_snapshot` proves both
+halves: a pass is handed the control group's newer map while the cache still
+holds the old one, and both routes refuse and delete nothing when no snapshot can
+be confirmed. The remaining limit is narrower: the map is the control group's
+confirmed applied state, so a volume created after that snapshot is not seen by
+that pass, and a node that cannot reach the control group's quorum refuses to
+collect even the groups it leads.
 
 The two SKIPs were the only remaining record of a capability the runtime does
 not have. They are not removed by deletion: either the capability is
@@ -167,7 +189,7 @@ and (1) is not a cross-group question either:
   yields the *complete* live set for that group's blobs, not a partial one.
 
 Deletion is the operation that needs a cross-group decision, and it already
-makes that decision per group (`sweep_groups` at `crates/yadbd/src/gc.rs:614`).
+makes that decision per group (`sweep_groups` at `crates/yadbd/src/gc.rs:628`).
 Repair deletes nothing except the handoff copy of a part it has already written
 to the nominal slot, and a tombstoned id refuses that write
 (`crates/yadb-blob/src/volume.rs:634`), so a pass cannot resurrect a blob a

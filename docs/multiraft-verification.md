@@ -1982,8 +1982,8 @@ listed at the end of the section.
 | Leadership | The pass runs only on the leader of group G, read through `role_info_for_group`. A follower refuses with the leader it knows. |
 | Snapshot | `try_linearizable_group_snapshot(G)` names the group directly and returns a quorum-confirmed snapshot. Followers and unavailable quorums are errors, never a fallback to local applied state. |
 | Repair | `gc::repair_scan_groups` takes a quorum-confirmed snapshot of each group over `/db/`, `/s3/` and `/block/`, builds the live set from those rows only (never `try_scan_prefix`), and runs `repair_blob` on each live blob of that group. A follower or a quorum-less group is refused by name; one group's refusal does not stop another group's pass. |
-| Collector lease | `/gc/g<group>/collector`, one key per group, held for `COLLECTOR_LEASE_MS` (120 s) and renewed before each pool. Two passes over different groups do not block each other. |
-| Lease fence | The collector checks `/gc/g<group>/writer/<id>` (TTL 300 s) and `/gc/g<group>/reader/<id>` (TTL 30 s); a live record in G refuses G only. Multi-Raft readers publish a group lease: `AppState::begin_read_lease` resolves the owning group with `gc_group_for_project`, caches one record per group, and carries the group's applied log index as its revision; `lease_belongs_to_group` checks that provenance after admission closes. The target-side pin still fences each fragment; the lease is the coarser, collector-visible fence. The fence is checked before and after collector admission closes. |
+| Collector lease | `/gc/g<group>/collector`, one key per group, held for `COLLECTOR_LEASE_MS` (120 s) and renewed before each pool. Two passes over different groups do not block each other; a second pass over the same group refuses by name while the record is live (`a_held_group_collector_lease_refuses_the_second_pass_and_deletes_nothing`). |
+| Lease fence | The collector checks `/gc/g<group>/writer/<id>` (TTL 300 s) and `/gc/g<group>/reader/<id>` (TTL 30 s); a live record in G refuses G only. Multi-Raft readers publish a group lease: `AppState::begin_read_lease` resolves the owning group with `gc_group_for_project`, caches one record per group, and carries the group's applied log index as its revision; `lease_belongs_to_group` checks that provenance after admission closes. The target-side pin still fences each fragment; the lease is the coarser, collector-visible fence. The fence is checked before and after collector admission closes, and `CollectorGuard::renew` proves the record again before each pool, before every barrier range and every `FENCE_CHECK_INTERVAL` exact deletes, so a record lost mid-pass stops the pool (`a_collector_fence_lost_mid_pool_stops_deleting_and_is_never_counted`). |
 | S3 intent | An unexpired `Prepared` intent is part of the mark, so chunks appended before publication are kept. |
 | Deletion | Only ids whose `project_id` the group's scope covers, and only when the pool enumerated successfully. A refused pool is left untouched for every group. |
 | Refusal | Not leader, unreadable fence, collector lease held, snapshot failure or an unprovable live set refuses the group with the reason in `gc_groups_refused`; `/v1/pools/gc` answers `409` with that reason. Other groups are unaffected. |
@@ -2039,6 +2039,9 @@ inside the grace and observes it collected after it.
 | `gc::tests::openraft_tests::a_follower_group_refuses_and_deletes_nothing` | Group 2 is a two-node cluster whose local node is a follower. The pass refuses group 2, deletes nothing, and the group 2 leader then reclaims the same fragments — so the refusal, not the data, kept them. |
 | `gc::tests::openraft_tests::a_group_writer_lease_protects_an_unpublished_fragment` | An unexpired writer lease in group 2 keeps an appended, unpublished fragment alive and refuses group 2, while group 3 still reclaims its own garbage. Releasing the lease makes the fragment provably dead. |
 | `gc::tests::openraft_tests::a_prepared_s3_intent_protects_its_chunks` | A `Prepared` intent keeps its chunks through a pass with `fragments_deleted: 0`; deleting the intent makes the same chunks dead. |
+| `gc::tests::openraft_tests::a_held_group_collector_lease_refuses_the_second_pass_and_deletes_nothing` | A second pass over group 2 while its collector record is held refuses with "another pass holds the collector lease of group 2", deletes and barriers nothing, and leaves the same fragments collectable once the record is released. This is the deterministic half of "two concurrent collectors on one group". |
+| `gc::tests::openraft_tests::two_concurrent_passes_on_one_group_delete_each_fragment_at_most_once` | Two real passes over group 2 on separate threads: at most one reports a deletion, the dead fragments are deleted exactly once in total, a refusal names the collector lease, and no live fragment disappears. Back-to-back success satisfies the same invariant, so this is a race check, not the proof of exclusion. |
+| `gc::tests::openraft_tests::a_collector_fence_lost_mid_pool_stops_deleting_and_is_never_counted` | A fence that fails between two barrier ranges stops the pool: the range applied before the loss is evicted and counted, the range after it is present and uncounted, the outcome names the stop, and a live fence afterwards reclaims exactly the refused range. This is the sweep-level shape of a collector lease lost mid-pass; the daemon still has no way to produce it through the HTTP surface. |
 | `yadb_metakv::gc::tests::group_leases_are_scoped_to_their_group` | A group 2 writer record lands in `/gc/g2/writer/`, fences group 2, does not fence group 3 and does not appear in the legacy namespace. |
 | `yadb_metakv::gc::tests::group_collectors_are_independent_and_close_admission_per_group` | Two groups hold collector records at once; admission closes per group and reopens independently. |
 
@@ -2050,6 +2053,15 @@ Disabling the post-admission fence re-check (`if !live.is_empty()` →
 `groups_refused` is empty and the pass deletes 483 fragments while a writer
 lease is live (`left: 0, right: 1`). The check was restored; the suite is green
 with it.
+
+Disabling the pre-admission collector-record check (treating a live
+`live_collector_in` result as absent in `sweep_group` step 3) makes
+`a_held_group_collector_lease_refuses_the_second_pass_and_deletes_nothing`
+fail: the pass acquires the record it should have refused and reports
+`fragments_deleted: 240` instead of `0`, with an empty `groups_refused`. The
+check was restored; the suite is green with it. This is the inversion that
+shows the exclusivity test is testing the collector record and not an
+incidental live-set refusal.
 
 ### Gates
 
@@ -2067,7 +2079,13 @@ passes when run alone (pre-existing timing sensitivity, not touched here).
 * The four live cluster drills cover a live pin, a superseded epoch, a
   non-leader refusal and a clean collection. None kills a group leader between a
   fragment write and its manifest commit, and none runs two collectors
-  concurrently on one group.
+  concurrently on one group. The latter is proved at sweep level instead, with
+  real single-node OpenRaft groups and real volume directories: a held group
+  collector record makes the second pass refuse by name and delete nothing, and
+  two real passes on separate threads delete each dead fragment at most once
+  while no live fragment disappears. A live `POST /v1/pools/gc` pair is not
+  drilled because it is inherently racy, so the deterministic proof is the
+  held-record test and the concurrent test only guards the invariant.
 * Readers on Multi-Raft now publish a per-group metadata lease as well as
   pinning the fragment at the target. The lease blocks `POST /v1/pools/gc` and
   scrub's collection half for up to its 30 s TTL after the last read in the
@@ -2078,8 +2096,13 @@ passes when run alone (pre-existing timing sensitivity, not touched here).
   then `409` with `leases_live: 1` and `fragments_deleted: 0` after a `PUT` +
   `GET`; the lease was live at +15 s and had expired by +35 s with no
   intervening reads, after which the reader-lease clause left the refusal.
-  What this does not cover: a pass that starts before the lease and continues
-  after it expires, and two concurrent collectors on one group.
+  What this does not cover: a live pass that starts before the lease and
+  continues after it expires. The mid-pass shape is proved at sweep level by
+  `a_collector_fence_lost_mid_pool_stops_deleting_and_is_never_counted`, which
+  fails the fence closure between two barrier ranges and observes that nothing
+  after the loss is deleted or counted; the daemon has no way to produce that
+  expiry through the HTTP surface. Two concurrent collectors on one group are
+  likewise proved at sweep level, not by a live drill.
 * A pass over a group whose project set is empty still takes and releases its
   collector record; the cost is one round trip, not a correctness issue.
 

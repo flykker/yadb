@@ -48,9 +48,15 @@
 //! quorum-confirmed snapshot, advances every slot's epoch before the first
 //! deletion, and deletes only through the target's collectable delete. Four
 //! live cluster drills in `tests/protocols.py` cover a live pin, a superseded
-//! epoch, a non-leader refusal and a clean collection. Still unproven at cluster
-//! level: two concurrent collectors on one group, and a collector lease expiring
-//! mid-pass (the daemon has no injection point for the latter).
+//! epoch, a non-leader refusal and a clean collection. Two shapes are proved at
+//! sweep level with real single-node OpenRaft groups and real volume
+//! directories (`gc::tests::openraft_tests`) instead of on the live cluster: a
+//! second collector on one group refuses on the held collector record and
+//! deletes nothing (both deterministically and under a real race), and a fence
+//! lost between two barrier ranges stops the pass, leaving the later range
+//! untouched and uncounted and naming the stop. The live cluster still proves
+//! neither: a concurrent `POST /v1/pools/gc` pair is inherently racy, and the
+//! daemon has no injection point for expiring a collector record mid-pass.
 //!
 //! Crash safety comes from the order, not from atomicity: the fence and the
 //! barrier/tombstone records are durable before any byte is freed, and every step
@@ -166,8 +172,11 @@ pub const MULTIRAFT_GC_REFUSAL: &str = "garbage collection refused: mark-and-swe
 ///
 /// The four live cluster drills are in `tests/protocols.py` (see
 /// `docs/multiraft-gc-fencing-plan.md`, "What would prove it"). They run on a
-/// three-process cluster; two concurrent collectors on one group and a
-/// mid-pass lease expiry are still unproven there.
+/// three-process cluster. Two concurrent collectors on one group and a
+/// mid-pass lease loss are proved at sweep level instead, against real
+/// single-node OpenRaft groups (`gc::tests::openraft_tests`), because neither
+/// is deterministic on the live cluster: the first is a race and the second has
+/// no injection point.
 pub fn sweep(
     meta: &LocalMetaKv<OsFs>,
     pools: &BTreeMap<String, std::sync::Arc<PoolStriper<OsFs>>>,
@@ -608,9 +617,14 @@ fn sweep_legacy(
 /// The four live cluster drills are in `tests/protocols.py`
 /// (`assert_multiraft_gc_drills`): a live reader pin, a superseded collector
 /// epoch, a non-leader refusal and a clean collection. They run on the
-/// three-process cluster. Still unproven here: two concurrent collectors on one
-/// group, and a collector lease expiring mid-pass - the daemon has no injection
-/// point for the latter, and the storage-level drills cover it instead.
+/// three-process cluster. Two concurrent collectors on one group and a
+/// collector lease lost mid-pass are proved at sweep level instead, with real
+/// single-node OpenRaft groups and real volume directories
+/// (`gc::tests::openraft_tests`): the deterministic held-record refusal, the
+/// concurrent race invariant, and a fence that fails between two barrier
+/// ranges. Neither has a live-cluster drill: a concurrent `POST /v1/pools/gc`
+/// pair is inherently racy and the daemon has no injection point for expiring a
+/// collector record mid-pass.
 fn sweep_groups(
     meta: &LocalMetaKv<OsFs>,
     pools: &BTreeMap<String, std::sync::Arc<PoolStriper<OsFs>>>,
@@ -3555,6 +3569,320 @@ mod tests {
             })
             .await
             .expect("s3-intent test timed out");
+        }
+
+        // -----------------------------------------------------------------
+        // Two collectors on one group.
+        //
+        // The collector record is the only thing that serialises a pass over a
+        // group: it is taken before the mark and released after the deletions,
+        // and a pass that cannot take it must refuse instead of interleaving
+        // its mark and sweep with the holder's. These tests prove the two
+        // shapes separately - a held record (deterministic) and a real race
+        // (invariant-based) - because a race alone can pass by running the
+        // passes one after the other.
+        // -----------------------------------------------------------------
+
+        /// A second pass over a group whose collector record is held refuses
+        /// before it marks or deletes anything.
+        ///
+        /// The record is held directly, so this is the deterministic half of
+        /// "two concurrent collectors on one group": there is no window in
+        /// which the second pass could win, and the assertion is about the
+        /// refusal path rather than about scheduling.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_held_group_collector_lease_refuses_the_second_pass_and_deletes_nothing() {
+            let f = multigroup("collector-exclusive").await;
+            let engine = f.engine();
+            write_generations(&engine, 1, 10);
+            let before = f.distinct_ids();
+            assert!(
+                before.iter().filter(|id| id.project_id() == 1).count() > 16,
+                "the fixture must leave superseded fragments: {before:?}"
+            );
+
+            // The record a concurrent pass would hold. Group 2 owns project 1;
+            // expected revision 0 means no collector record exists yet.
+            let held = yadb_metakv::gc::acquire_collector_in(&f.meta, 2, 0, 60_000).unwrap();
+
+            let outcome = f.sweep();
+            assert_eq!(outcome.fragments_deleted, 0, "{outcome:?}");
+            assert_eq!(outcome.barriers_applied, 0, "{outcome:?}");
+            assert_eq!(outcome.groups_refused.len(), 1, "{outcome:?}");
+            let refusal = &outcome.groups_refused[0];
+            assert!(refusal.starts_with("group 2 refused:"), "{refusal}");
+            assert!(
+                refusal.contains("another pass holds the collector lease of group 2"),
+                "{refusal}"
+            );
+            assert_eq!(
+                f.distinct_ids(),
+                before,
+                "the loser of the collector record must delete nothing: {outcome:?}"
+            );
+
+            // The same fragments are provably collectable: with the record
+            // released the next pass reclaims them, so the refusal above was
+            // the record and not an unprovable live set.
+            held.release().unwrap();
+            let after_release = f.sweep();
+            assert!(after_release.refusal.is_none(), "{after_release:?}");
+            assert!(after_release.fragments_deleted > 0, "{after_release:?}");
+            assert_eq!(
+                f.distinct_ids()
+                    .iter()
+                    .filter(|id| id.project_id() == 1)
+                    .count(),
+                16
+            );
+
+            drop(engine);
+            shutdown(f).await;
+        }
+
+        /// Two real passes over one group at the same time.
+        ///
+        /// The assertion is an invariant, not an order: at most one pass may
+        /// report a deletion, a refusal must name the collector lease, the dead
+        /// fragments are deleted exactly once in total, and no live fragment
+        /// disappears. Both passes may also run back to back and both succeed
+        /// with only one deleting, which satisfies the same invariant.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn two_concurrent_passes_on_one_group_delete_each_fragment_at_most_once() {
+            let f = multigroup("collector-concurrent").await;
+            let engine = f.engine();
+            write_generations(&engine, 1, 10);
+
+            // The group's own quorum-confirmed snapshot, exactly as
+            // `sweep_group` takes it: the merged `mark` helper rejects a bare
+            // namespace prefix on a routed deployment.
+            let prefixes: Vec<String> = LIVE_PREFIXES.iter().map(|p| (*p).to_string()).collect();
+            let snapshot = f
+                .meta
+                .try_linearizable_group_snapshot(2, &[], &prefixes)
+                .expect("the group's live set is readable");
+            let live_mark = mark_snapshot(&snapshot, &f.control).expect("the live set is provable");
+            let live_ids: BTreeSet<BlobId> = live_mark
+                .iter()
+                .filter(|(_, id)| id.project_id() == 1)
+                .map(|(_, id)| *id)
+                .collect();
+            assert_eq!(live_ids.len(), 16, "{live_mark:?}");
+            let before = f.distinct_ids();
+            let dead = before
+                .iter()
+                .filter(|id| id.project_id() == 1 && !live_ids.contains(id))
+                .count();
+            assert!(
+                dead > 0,
+                "the fixture must leave superseded fragments: {before:?}"
+            );
+
+            // The passes run on plain threads so `sweep` sees no Tokio context
+            // and waits on the bridge directly instead of blocking a runtime
+            // worker. The raft tasks still run on this test's runtime.
+            let meta = f.meta.clone();
+            let pools = f.pools.clone();
+            let control = f.control.clone();
+            let (first, second) = std::thread::scope(|scope| {
+                let spawn = |meta: LocalMetaKv<OsFs>,
+                             pools: BTreeMap<String, Arc<PoolStriper<OsFs>>>,
+                             control: ControlPlaneState| {
+                    scope.spawn(move || sweep(&meta, &pools, &control))
+                };
+                let a = spawn(meta.clone(), pools.clone(), control.clone());
+                let b = spawn(meta, pools, control);
+                (a.join().unwrap(), b.join().unwrap())
+            });
+
+            let passes = [&first, &second];
+            let deleting = passes.iter().filter(|o| o.fragments_deleted > 0).count();
+            assert!(
+                deleting <= 1,
+                "both passes reported deletions: {first:?} / {second:?}"
+            );
+            assert_eq!(
+                first.fragments_deleted + second.fragments_deleted,
+                dead * f.pool.scheme().total_parts(),
+                "every dead fragment must be deleted exactly once: {first:?} / {second:?}"
+            );
+            for outcome in passes {
+                for refusal in &outcome.groups_refused {
+                    assert!(refusal.starts_with("group 2 refused:"), "{refusal}");
+                    assert!(
+                        refusal.contains("collector lease"),
+                        "a refusal must name the record it lost: {refusal}"
+                    );
+                }
+            }
+
+            let after = f.distinct_ids();
+            for id in &live_ids {
+                assert!(
+                    after.contains(id),
+                    "a live fragment disappeared: {id:?} in {first:?} / {second:?}"
+                );
+            }
+            assert_eq!(
+                after.iter().filter(|id| id.project_id() == 1).count(),
+                16,
+                "only the newest generation may survive: {first:?} / {second:?}"
+            );
+
+            drop(engine);
+            shutdown(f).await;
+        }
+
+        // -----------------------------------------------------------------
+        // A collector lease lost in the middle of a pass.
+        //
+        // `sweep_group` proves its record through `CollectorGuard::renew` in
+        // the fence closure it hands to `sweep_pool`: before the first
+        // deletion, before every barrier range and every `FENCE_CHECK_INTERVAL`
+        // exact tombstones. A failure there must stop the pool, and the
+        // fragments after it must be neither deleted nor counted. The daemon
+        // has no way to expire the record mid-pass, so this test supplies the
+        // same closure directly and fails it at a chosen call. It is a test
+        // fence, not a production injection point.
+        // -----------------------------------------------------------------
+
+        /// A fence lost between two barrier ranges stops the pass: the range
+        /// applied before the loss is deleted and counted, the range after it
+        /// is untouched and not counted, and the outcome names the stop.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_collector_fence_lost_mid_pool_stops_deleting_and_is_never_counted() {
+            let f = multigroup("collector-midpass").await;
+            let engine = f.engine();
+            // Block writes give one barrier range, S3 writes a second one, both
+            // over project 1 and both owned by group 2. The two channels differ,
+            // so the pool has two `(project, owner, channel)` ranges and the
+            // fence can fail between them.
+            write_generations(&engine, 1, 10);
+            let s3 = f.s3();
+            for i in 0..4u8 {
+                s3.put_object(
+                    1,
+                    "local",
+                    POOL,
+                    "bucket",
+                    "midpass",
+                    "text/plain",
+                    &vec![i; 16 * 1024],
+                )
+                .unwrap();
+            }
+
+            let mut outcome = SweepOutcome::default();
+            let present = enumerate_present(&f.pools, &mut outcome);
+            assert!(outcome.pools_refused.is_empty(), "{outcome:?}");
+            let live_mark = mark_snapshot(
+                &f.meta
+                    .try_linearizable_group_snapshot(
+                        2,
+                        &[],
+                        &LIVE_PREFIXES
+                            .iter()
+                            .map(|p| (*p).to_string())
+                            .collect::<Vec<_>>(),
+                    )
+                    .expect("the group's live set is readable"),
+                &f.control,
+            )
+            .expect("the live set is provable");
+            let live_by_pool = group_by_pool(&live_mark);
+            let pool_present = &present[POOL];
+            let live = &live_by_pool[POOL];
+            let dead: BTreeSet<BlobId> = pool_present
+                .iter()
+                .filter(|id| !live.contains(*id))
+                .copied()
+                .collect();
+            let block_dead: BTreeSet<BlobId> = dead
+                .iter()
+                .filter(|id| id.channel() == yadb_block::BLOCK_CHANNEL)
+                .copied()
+                .collect();
+            let s3_dead: BTreeSet<BlobId> = dead
+                .iter()
+                .filter(|id| id.channel() == yadb_s3::S3_CHANNEL)
+                .copied()
+                .collect();
+            assert!(!block_dead.is_empty(), "{dead:?}");
+            assert!(!s3_dead.is_empty(), "{dead:?}");
+
+            let calls = std::cell::Cell::new(0usize);
+            let mut fence = || {
+                calls.set(calls.get() + 1);
+                // Call 1 is before the first deletion, call 2 before the first
+                // barrier range and call 3 before the second. The record lapses
+                // at the second range, after one range has already been evicted.
+                if calls.get() == 3 {
+                    Err("collector lease expired mid-pass".to_string())
+                } else {
+                    Ok(u64::MAX)
+                }
+            };
+
+            let error = sweep_pool(&f.pool, POOL, &dead, live, &mut fence, &mut outcome)
+                .expect_err("a lost fence must stop the pool");
+            assert!(error.contains("collector fence lost"), "{error}");
+            assert!(error.contains("collector lease expired mid-pass"), "{error}");
+            assert_eq!(calls.get(), 3, "no check may run after the loss");
+            assert_eq!(outcome.barriers_applied, 1, "{outcome:?}");
+            assert_eq!(outcome.errors.len(), 1, "{outcome:?}");
+            assert!(
+                outcome.errors[0].contains("collector fence lost")
+                    && outcome.errors[0].contains("no further fragment was deleted"),
+                "{outcome:?}"
+            );
+
+            // Exactly one of the two ranges was applied. The order is not part
+            // of the contract, so the assertion is symmetric: one range is
+            // gone and counted, the other is present and uncounted.
+            let block_gone = block_dead.iter().all(|id| !fragment_present(&f.pool, *id));
+            let s3_gone = s3_dead.iter().all(|id| !fragment_present(&f.pool, *id));
+            assert_ne!(
+                block_gone, s3_gone,
+                "exactly one barrier range may be applied before the loss: {outcome:?}"
+            );
+            let (applied, refused) = if block_gone {
+                (&block_dead, &s3_dead)
+            } else {
+                (&s3_dead, &block_dead)
+            };
+            assert_eq!(
+                outcome.fragments_deleted,
+                applied.len() * f.pool.scheme().total_parts(),
+                "only the range applied before the loss may be counted: {outcome:?}"
+            );
+            assert!(
+                refused.iter().all(|id| fragment_present(&f.pool, *id)),
+                "no fragment after the lost fence may be deleted: {outcome:?}"
+            );
+            assert!(
+                live.iter().all(|id| fragment_present(&f.pool, *id)),
+                "a live fragment must never be deleted: {outcome:?}"
+            );
+
+            // Positive control: with a fence that keeps proving the record, the
+            // same pass finishes and only the refused range is reclaimed.
+            let mut live_fence = || Ok(u64::MAX);
+            let mut finished = SweepOutcome::default();
+            sweep_pool(&f.pool, POOL, &dead, live, &mut live_fence, &mut finished)
+                .expect("a live fence must finish the pool");
+            assert_eq!(
+                finished.fragments_deleted,
+                refused.len() * f.pool.scheme().total_parts(),
+                "{finished:?}"
+            );
+            assert!(
+                dead.iter().all(|id| !fragment_present(&f.pool, *id)),
+                "the survivors of the lost fence are provably collectable: {finished:?}"
+            );
+
+            drop(s3);
+            drop(engine);
+            shutdown(f).await;
         }
     }
 }
