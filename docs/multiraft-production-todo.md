@@ -417,7 +417,30 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   in-process contract coverage, not power loss or cross-host qualification, and
   it does not add the separate-process crash/kill gate.
 - [ ] Bound memory, disk growth, startup replay and snapshot reception; introduce
-  compaction and resource limits without losing acknowledged state.
+  compaction and resource limits without losing acknowledged state. **Partial:
+  snapshot reception and the in-flight transport budget are bounded and pinned
+  at the wire.** The declared snapshot length is checked against
+  `MAX_SNAPSHOT_BYTES` before the assembly reservation and therefore before
+  `Vec::with_capacity`, and a length that would truncate in `length as u32` is
+  refused the same way
+  (`an_over_declared_snapshot_length_is_refused_before_the_assembly_reservation`);
+  a chunk carrying more bytes than the manifest declares is refused
+  (`a_chunk_carrying_more_bytes_than_the_manifest_declares_is_refused`); one
+  shared 32 MiB semaphore bounds the sum of live frame bodies across every
+  handler rather than per connection
+  (`concurrent_frames_share_one_in_flight_byte_budget`); an exhausted assembly
+  budget blocks the manifest before allocation and dispatch
+  (`an_exhausted_assembly_budget_blocks_the_manifest_before_allocation_or_dispatch`);
+  a truncated stream never dispatches its valid prefix
+  (`a_truncated_snapshot_stream_never_dispatches_its_valid_prefix`); and a
+  refused chunk fails the connection closed while the same sender's next
+  snapshot succeeds
+  (`a_refused_snapshot_chunk_fails_closed_and_the_next_snapshot_succeeds`).
+  Still open: disk growth, startup replay, general memory and CPU admission
+  across groups, the receiver's on-disk staging area, and end-to-end snapshot
+  capacity under the default deadlines. The encoded-frame reservation does not
+  bound the transient decoded JSON, and `MAX_PAYLOAD` is verified only after a
+  `REQUEST` body of up to `MAX_FRAME` has been buffered.
   The checkpoint implementation is under validation: 32 MiB active-log limit,
   1024 replay frames, 4096 retained live entries and an 8 MiB serialized live
   checkpoint. Replacements sync a new file, rename, sync the directory, then
