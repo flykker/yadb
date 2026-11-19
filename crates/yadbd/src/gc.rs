@@ -42,9 +42,13 @@
 //! 7. **Compact.** Seal a wasteful active segment and compact sealed ones, so the
 //!    bytes the barrier/tombstone freed are actually returned to the filesystem.
 //!
-//! **Multi-Raft.** Collection is disabled: a writer can renew an expired lease
-//! during a pass, and a collector RPC can continue after the collector lease
-//! expires. Per-group snapshots and lease checks do not close those races.
+//! **Multi-Raft.** Collection runs per data group through `sweep_groups`, one
+//! pass per group. Each pass is bounded by that group's leadership, refuses on
+//! any live lease, verifies every observed lease's provenance, marks from a
+//! quorum-confirmed snapshot, advances every slot's epoch before the first
+//! deletion, and deletes only through the target's collectable delete. This is
+//! code-only evidence: the four live cluster drills that belong in
+//! `tests/protocols.py` have not run.
 //!
 //! Crash safety comes from the order, not from atomicity: the fence and the
 //! barrier/tombstone records are durable before any byte is freed, and every step
@@ -138,21 +142,43 @@ impl SweepOutcome {
 /// A mark set plus the pool each reference names.
 type MarkSet = BTreeSet<(String, BlobId)>;
 
+/// The blanket refusal that used to guard every Multi-Raft pass. [`sweep`] no
+/// longer returns it; kept because the verification docs and the protocol
+/// review script still cite it. Tests here assert it is never returned.
+#[allow(dead_code)]
 pub const MULTIRAFT_GC_REFUSAL: &str = "garbage collection refused: mark-and-sweep disabled for Multi-Raft; writer leases can renew after expiry and collector RPCs can outlive their lease";
 
+/// Collects garbage.
+///
+/// On legacy metadata this is the single-namespace pass described above. On
+/// Multi-Raft metadata it routes to [`sweep_groups`], one pass per data group,
+/// instead of returning the old blanket refusal.
+///
+/// The per-group path is bounded, for each group, by: this node being that
+/// group's leader; any live reader/writer lease refusing the group; every
+/// observed lease proving it belongs to the group at the applied index
+/// (`lease_belongs_to_group`); a mark taken from a quorum-confirmed snapshot;
+/// every slot's epoch being advanced before the first deletion; and deletion
+/// going through the target's collectable delete. A group that refuses deletes
+/// nothing and does not stop another group's pass.
+///
+/// The four live cluster drills that belong in `tests/protocols.py` (see
+/// `docs/multiraft-gc-fencing-plan.md`, "What would prove it") are the
+/// outstanding evidence for this path. Until they pass on a three-process
+/// cluster, this code half must not be treated as proof.
 pub fn sweep(
     meta: &LocalMetaKv<OsFs>,
     pools: &BTreeMap<String, std::sync::Arc<PoolStriper<OsFs>>>,
     control: &ControlPlaneState,
 ) -> SweepOutcome {
     if meta.is_openraft() {
-        return SweepOutcome::refuse(MULTIRAFT_GC_REFUSAL);
+        return sweep_groups(meta, pools, control);
     }
     sweep_legacy(meta, pools, control)
 }
 
 /// The single-namespace pass used by legacy metadata. Its behaviour, keys and
-/// ordering are unchanged; Multi-Raft collection is temporarily disabled.
+/// ordering are unchanged; Multi-Raft metadata takes [`sweep_groups`] instead.
 fn sweep_legacy(
     meta: &LocalMetaKv<OsFs>,
     pools: &BTreeMap<String, std::sync::Arc<PoolStriper<OsFs>>>,
@@ -375,11 +401,29 @@ fn sweep_legacy(
 
 /// The Multi-Raft pass: one leader-only, quorum-confirmed sweep per data group.
 ///
+/// This is the path [`sweep`] takes whenever `meta.is_openraft()`.
+///
 /// Enumeration is physical and therefore shared: every slot is asked once which
 /// fragments it holds, and a pool that cannot answer is refused for every group.
 /// The mark and the deletion are per group, and each group's fragments are the
 /// ones whose project id that group owns.
-#[allow(dead_code)] // Retained temporarily, unreachable while Multi-Raft GC is disabled.
+///
+/// What still bounds each group's pass, in order: this node must be that
+/// group's leader; any live reader/writer lease refuses the group; after
+/// admission closes, every observed lease must prove it belongs to the group at
+/// the applied index (`lease_belongs_to_group`); the mark is taken from a
+/// quorum-confirmed snapshot of that group; every slot's epoch is advanced
+/// before the first deletion; and deletions use the target's collectable
+/// delete. A group refusal is recorded in `groups_refused`, deletes nothing,
+/// and does not stop another group's pass.
+///
+/// If no project is routed to a data group there is nothing to mark, so the
+/// pass refuses instead of reporting a successful sweep of nothing.
+///
+/// The four live cluster drills that belong in `tests/protocols.py` (see
+/// `docs/multiraft-gc-fencing-plan.md`, "What would prove it") have not run.
+/// They are the outstanding evidence for this path; a green unit suite is not a
+/// substitute.
 fn sweep_groups(
     meta: &LocalMetaKv<OsFs>,
     pools: &BTreeMap<String, std::sync::Arc<PoolStriper<OsFs>>>,
@@ -394,8 +438,11 @@ fn sweep_groups(
         }
     };
     if scopes.is_empty() {
+        // Empty scopes means no project is routed to a data group (a non-singleton
+        // deployment with no project mapping, or no groups at all). There is
+        // nothing to mark, so this is a refusal, never a successful empty sweep.
         return SweepOutcome::refuse(
-            "garbage collection refused: no data group is configured, so no manifest can be marked",
+            "garbage collection refused: no project is routed to a data group, so no manifest can be marked",
         );
     }
 
@@ -2533,56 +2580,171 @@ mod tests {
             }
         }
 
-        fn assert_refused_without_mutation(f: &GroupFixture) {
-            let before = f.distinct_ids();
-            let outcome = f.sweep();
-            assert_eq!(outcome.refusal.as_deref(), Some(MULTIRAFT_GC_REFUSAL));
-            assert_eq!(outcome.fragments_deleted, 0);
-            assert_eq!(outcome.barriers_applied, 0);
-            assert_eq!(outcome.bytes_reclaimed, 0);
-            assert_eq!(f.distinct_ids(), before);
-        }
-
+        /// The routing decision at the `sweep` boundary: OpenRaft metadata must
+        /// reach the per-group pass, never the old blanket refusal. The fixture
+        /// is the existing in-process multigroup deployment (three single-node
+        /// groups), so a real per-group sweep is observable rather than faked.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        async fn multigroup_leader_refuses_before_collection() {
-            let f = multigroup("refuse-leader").await;
+        async fn an_openraft_sweep_reaches_the_group_path_instead_of_refusing() {
+            let f = multigroup("route-groups").await;
             let engine = f.engine();
             write_generations(&engine, 1, 10);
             write_generations(&engine, 2, 20);
             assert!(f.distinct_ids().len() > 32);
-            assert_refused_without_mutation(&f);
+
+            let outcome = f.sweep();
+            assert_ne!(
+                outcome.refusal.as_deref(),
+                Some(MULTIRAFT_GC_REFUSAL),
+                "sweep must not return the blanket Multi-Raft refusal: {outcome:?}"
+            );
+            // Every group is a single-node leader here, so the routing decision
+            // must produce a real per-group pass, not a refusal with a per-group
+            // reason. This is the stronger branch of "sweeps or refuses per
+            // group".
+            assert!(outcome.refusal.is_none(), "{outcome:?}");
+            assert!(outcome.groups_refused.is_empty(), "{outcome:?}");
+            assert!(outcome.fragments_deleted > 0, "{outcome:?}");
+            assert!(outcome.errors.is_empty(), "{outcome:?}");
+
+            // Exactly the newest generation of each project survives, which is
+            // only possible if both groups' passes actually ran.
+            let after = f.distinct_ids();
+            assert_eq!(
+                after.iter().filter(|id| id.project_id() == 1).count(),
+                16,
+                "{outcome:?}"
+            );
+            assert_eq!(
+                after.iter().filter(|id| id.project_id() == 2).count(),
+                16,
+                "{outcome:?}"
+            );
+
+            drop(engine);
+            shutdown(f).await;
+        }
+
+        /// A group that refuses must delete nothing, even while another group's
+        /// pass succeeds. A live writer lease in group 2 is the refusal; group 3
+        /// owns project 2, which has no fragments, so the whole pass is a no-op
+        /// for deletion.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_group_refusal_deletes_nothing() {
+            let f = multigroup("group-refusal").await;
+            let engine = f.engine();
+            write_generations(&engine, 1, 10);
+            let before = f.distinct_ids();
+            assert!(
+                before.iter().filter(|id| id.project_id() == 1).count() > 16,
+                "the fixture must leave superseded fragments: {before:?}"
+            );
+
             let writer = yadb_metakv::gc::acquire_writer(&f.meta, 1, 0, 60_000).unwrap();
-            assert_refused_without_mutation(&f);
+            let outcome = f.sweep();
+            assert_ne!(
+                outcome.refusal.as_deref(),
+                Some(MULTIRAFT_GC_REFUSAL),
+                "a live lease must refuse its group, not the whole deployment: {outcome:?}"
+            );
+            assert_eq!(outcome.fragments_deleted, 0, "{outcome:?}");
+            assert_eq!(outcome.barriers_applied, 0, "{outcome:?}");
+            assert_eq!(outcome.groups_refused.len(), 1, "{outcome:?}");
+            let refusal = &outcome.groups_refused[0];
+            assert!(refusal.starts_with("group 2 refused:"), "{refusal}");
+            assert!(refusal.contains("live lease"), "{refusal}");
+            assert_eq!(
+                f.distinct_ids(),
+                before,
+                "a refused group must delete nothing: {outcome:?}"
+            );
+
             writer.release().unwrap();
             drop(engine);
             shutdown(f).await;
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        async fn multigroup_follower_and_leader_refuse_before_collection() {
+        async fn multigroup_leader_sweeps_and_a_live_lease_refuses_one_group() {
+            let f = multigroup("refuse-leader").await;
+            let engine = f.engine();
+            write_generations(&engine, 1, 10);
+            write_generations(&engine, 2, 20);
+            assert!(f.distinct_ids().len() > 32);
+
+            // Every group is a single-node leader on this node, so the pass
+            // reaches the per-group path and reclaims both projects' superseded
+            // generations.
+            let outcome = f.sweep();
+            assert_ne!(
+                outcome.refusal.as_deref(),
+                Some(MULTIRAFT_GC_REFUSAL),
+                "{outcome:?}"
+            );
+            assert!(outcome.refusal.is_none(), "{outcome:?}");
+            assert!(outcome.groups_refused.is_empty(), "{outcome:?}");
+            assert!(outcome.fragments_deleted > 0, "{outcome:?}");
+            let after = f.distinct_ids();
+            assert_eq!(after.iter().filter(|id| id.project_id() == 1).count(), 16);
+            assert_eq!(after.iter().filter(|id| id.project_id() == 2).count(), 16);
+
+            // A live writer lease in group 2 (project 1) refuses only that
+            // group; group 3 has no dead fragments left to delete.
+            let before = f.distinct_ids();
+            let writer = yadb_metakv::gc::acquire_writer(&f.meta, 1, 0, 60_000).unwrap();
+            let outcome = f.sweep();
+            assert_eq!(outcome.groups_refused.len(), 1, "{outcome:?}");
+            let refusal = &outcome.groups_refused[0];
+            assert!(refusal.starts_with("group 2 refused:"), "{refusal}");
+            assert!(refusal.contains("live lease"), "{refusal}");
+            assert_eq!(outcome.fragments_deleted, 0, "{outcome:?}");
+            assert_eq!(f.distinct_ids(), before);
+            writer.release().unwrap();
+
+            drop(engine);
+            shutdown(f).await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn multigroup_follower_refuses_its_group_and_deletes_nothing() {
             let (f, leader_meta) = follower_multigroup("refuse-follower").await;
             let engine = BlockVolumeEngine::new(leader_meta.clone(), BLOCK_SIZE);
             engine.register_pool(POOL, f.pool.clone());
             write_generations(&engine, 1, 0);
-            assert_refused_without_mutation(&f);
+
             let before = f.distinct_ids();
-            let outcome = sweep(&leader_meta, &f.pools, &f.control);
-            assert_eq!(outcome.refusal.as_deref(), Some(MULTIRAFT_GC_REFUSAL));
-            assert_eq!(outcome.fragments_deleted, 0);
-            assert_eq!(outcome.barriers_applied, 0);
-            assert_eq!(outcome.bytes_reclaimed, 0);
-            assert_eq!(f.distinct_ids(), before);
+            assert!(before.iter().filter(|id| id.project_id() == 1).count() > 16);
+
+            // Node 1 is not the leader of group 2, which owns project 1. That
+            // group is refused and deletes nothing; group 3 owns project 2,
+            // which has no fragments in this fixture.
+            let outcome = f.sweep();
+            assert_ne!(
+                outcome.refusal.as_deref(),
+                Some(MULTIRAFT_GC_REFUSAL),
+                "{outcome:?}"
+            );
+            assert_eq!(outcome.fragments_deleted, 0, "{outcome:?}");
+            assert_eq!(outcome.groups_refused.len(), 1, "{outcome:?}");
+            let refusal = &outcome.groups_refused[0];
+            assert!(refusal.starts_with("group 2 refused:"), "{refusal}");
+            assert!(refusal.contains("is not the leader"), "{refusal}");
+            assert_eq!(
+                f.distinct_ids(),
+                before,
+                "a follower's pass must delete nothing"
+            );
+
             drop(engine);
             drop(leader_meta);
             shutdown(f).await;
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        async fn manual_routes_and_periodic_scrub_refuse_without_collection() {
+        async fn manual_gc_route_sweeps_and_scrub_still_refuses_repair() {
             let f = multigroup("refuse-routes").await;
             let engine = f.engine();
             write_generations(&engine, 1, 0);
-            let before = f.live_ids();
             let meta = f.meta.clone();
             let st = crate::AppState {
                 openraft: None,
@@ -2611,20 +2773,57 @@ mod tests {
                     .parse()
                     .unwrap(),
             );
-            for response in [
-                crate::handle_pools_gc(axum::extract::State(st.clone()), headers.clone()).await,
-                crate::handle_pools_scrub(axum::extract::State(st.clone()), headers).await,
-            ] {
-                assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
-                let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-                    .await
-                    .unwrap();
-                assert!(String::from_utf8_lossy(&body).contains(MULTIRAFT_GC_REFUSAL));
-            }
+
+            // POST /v1/pools/gc now reaches the per-group path: it returns 200
+            // and deletes dead fragments instead of the blanket refusal.
+            let gc =
+                crate::handle_pools_gc(axum::extract::State(st.clone()), headers.clone()).await;
+            assert_eq!(gc.status(), axum::http::StatusCode::OK);
+            let body = axum::body::to_bytes(gc.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let summary: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert!(summary["gc_refusal"].is_null(), "{summary}");
+            assert!(
+                summary["fragments_deleted"].as_u64().unwrap() > 0,
+                "{summary}"
+            );
+
+            // Scrub still answers 409: the repair half remains disabled in
+            // main.rs. Its sweep half now runs per group, so the summary is no
+            // longer the blanket refusal.
+            write_generations(&engine, 1, 10);
+            let scrub = crate::handle_pools_scrub(axum::extract::State(st.clone()), headers).await;
+            assert_eq!(scrub.status(), axum::http::StatusCode::CONFLICT);
+            let body = axum::body::to_bytes(scrub.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let summary: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert!(summary["gc_refusal"].is_null(), "{summary}");
+            assert!(
+                summary["fragments_deleted"].as_u64().unwrap() > 0,
+                "{summary}"
+            );
+            assert_eq!(
+                summary["orphan_collection_error"],
+                "scrub disabled for Multi-Raft"
+            );
+
+            // The periodic scan's sweep half takes the same per-group path.
+            write_generations(&engine, 1, 20);
             let summary = st.scrub_all_pools(true);
-            assert_eq!(summary.gc_refusal.as_deref(), Some(MULTIRAFT_GC_REFUSAL));
-            assert_eq!(summary.fragments_deleted, 0);
-            assert_eq!(f.live_ids(), before);
+            assert!(summary.gc_refusal.is_none(), "{summary:?}");
+            assert!(summary.gc_groups_refused.is_empty(), "{summary:?}");
+            assert!(summary.fragments_deleted > 0, "{summary:?}");
+            assert_eq!(
+                f.distinct_ids()
+                    .iter()
+                    .filter(|id| id.project_id() == 1)
+                    .count(),
+                16,
+                "{summary:?}"
+            );
+
             drop(st);
             drop(engine);
             shutdown(f).await;
