@@ -325,11 +325,18 @@ def listener_hash(root, base):
     return hashlib.sha256(canonical).hexdigest()
 
 
-def node_command(root, base, node):
-    """Daemon argv for one node; secrets arrive through the environment."""
+def node_command(root, base, node, s3_intent_grace_secs=None):
+    """Daemon argv for one node; secrets arrive through the environment.
+
+    `s3_intent_grace_secs` is a test-only knob: it shortens how long an
+    abandoned S3 upload intent is protected from orphan collection, so a
+    harness can observe that collection inside one run. It is forwarded only
+    when set, so an ordinary `start` leaves the daemon's shipped 300 s default
+    untouched.
+    """
     peers = ','.join(f'{n}=127.0.0.1:{http_port(base, n)}' for n in NODES)
     portals = ','.join(f'127.0.0.1:{iscsi_port(base, n)}' for n in NODES)
-    return [
+    command = [
         str(DAEMON),
         '--listen', f'127.0.0.1:{http_port(base, node)}',
         '--node-id', str(node),
@@ -345,6 +352,9 @@ def node_command(root, base, node):
         '--iscsi-listen', f'127.0.0.1:{iscsi_port(base, node)}',
         '--iscsi-portals', portals,
     ]
+    if s3_intent_grace_secs is not None:
+        command += ['--s3-intent-grace-secs', str(s3_intent_grace_secs)]
+    return command
 
 
 def daemon_env(root):
@@ -735,7 +745,8 @@ def cmd_start(args):
                 log = log_path.open('ab', buffering=0)
                 try:
                     child = subprocess.Popen(
-                        node_command(root, args.port_base, node), env=env,
+                        node_command(root, args.port_base, node,
+                                     args.s3_intent_grace_secs), env=env,
                         stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
                 finally:
                     log.close()
@@ -869,12 +880,12 @@ def cmd_stop(args):
         return 0
 
 
-def launch_node(root, base, node, env):
+def launch_node(root, base, node, env, s3_intent_grace_secs=None):
     """Spawn one daemon, appending to its log, in its own session."""
     log_path = root / 'logs' / f'node-{node}.log'
     with log_path.open('ab', buffering=0) as log:
         return subprocess.Popen(
-            node_command(root, base, node), env=env,
+            node_command(root, base, node, s3_intent_grace_secs), env=env,
             stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
 
 
@@ -925,7 +936,7 @@ def _signal_one(root, state, node, sig):
     return pid
 
 
-def _bring_up(root, state, node):
+def _bring_up(root, state, node, s3_intent_grace_secs=None):
     """Start one recorded-down node and wait for its health endpoint."""
     base = state['port_base']
     pids = list(state['pids'])
@@ -934,7 +945,7 @@ def _bring_up(root, state, node):
     if port_open(http_port(base, node)):
         raise RuntimeError(f'HTTP port {http_port(base, node)} for node {node} '
                            f'is already bound by another process')
-    child = launch_node(root, base, node, daemon_env(root))
+    child = launch_node(root, base, node, daemon_env(root), s3_intent_grace_secs)
     pids[node - 1] = child.pid
     state.update(pids=pids, down=[n for n, pid in zip(NODES, pids) if not pid])
     write_json(root / 'state.json', state)
@@ -973,7 +984,7 @@ def cmd_start_node(args):
         # node restarted after that first start is refused with "replica path
         # conflicts with explicit create/open mode".
         sync_replica_modes(root)
-        _bring_up(root, state, args.node)
+        _bring_up(root, state, args.node, args.s3_intent_grace_secs)
     return 0
 
 
@@ -990,7 +1001,7 @@ def cmd_restart_node(args):
         state.update(pids=pids, down=[n for n, pid in zip(NODES, pids) if not pid])
         write_json(root / 'state.json', state)
         sync_replica_modes(root)
-        _bring_up(root, state, args.node)
+        _bring_up(root, state, args.node, args.s3_intent_grace_secs)
     return 0
 
 
@@ -1139,6 +1150,9 @@ def main():
     start.add_argument('--port-base', type=int, default=DEFAULT_PORT_BASE)
     start.add_argument('--force', action='store_true',
                        help='proceed past a stale or failed state; never wipes data or re-applies manifests')
+    start.add_argument('--s3-intent-grace-secs', type=int, default=None,
+                       help='test-only: shorten the abandoned-upload-intent grace handed to every '
+                            'daemon (unset keeps the daemon default of 300 s)')
 
     stop = sub.add_parser('stop', help='SIGTERM the three recorded daemons and wait')
     stop.add_argument('--root', type=Path, default=DEFAULT_ROOT)
@@ -1167,6 +1181,10 @@ def main():
         if name != 'start-node':
             node_parser.add_argument('--signal', choices=('TERM', 'KILL'), default='TERM',
                                      help='signal used to stop the node (default TERM)')
+        if name != 'stop-node':
+            node_parser.add_argument('--s3-intent-grace-secs', type=int, default=None,
+                                     help='test-only: shorten the abandoned-upload-intent grace '
+                                          '(unset keeps the daemon default of 300 s)')
 
     args = parser.parse_args()
     if getattr(args, 'lines', 1) < 1:
