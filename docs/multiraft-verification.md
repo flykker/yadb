@@ -309,11 +309,11 @@ the handler turns into `500` rather than continuing, so a test that dies before
 writing `go` fails on an unexpected status instead of passing for the wrong
 reason; making that branch return `Ok(())` fails two of the three.
 
-The live gate was re-run on this tree (`fa797fb`, the commit that adds the
-deterministic race test): `python3 tests/protocols.py` printed 27 PASS / 0 SKIP,
-exit 0 (2026-11-19, log `live-gate-final.log`). No scenario was added, removed
-or relaxed for it, and the fix itself is proved by the tests above, not by the
-gate. `cargo test -j 2 --workspace` was green on the same tree.
+The live gate was re-run on this tree (`e9f45f3`, which hardens the hook): 
+`python3 tests/protocols.py` printed 27 PASS / 0 SKIP, exit 0 (2026-11-19,
+log `live-gate-final2.log`). No scenario was added, removed or relaxed for it,
+and the fix itself is proved by the tests above, not by the gate.
+`cargo test -j 2 --workspace` was green on the same tree.
 
 That was also exercised live on the three-process deployment (binary
 `b00018a9f092da23d3cfae818bc0e4ac7008dea659abca6336924bfeb7f87ddc`, built from
