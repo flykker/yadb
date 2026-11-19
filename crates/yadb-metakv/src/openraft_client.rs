@@ -1156,6 +1156,107 @@ mod tests {
         drop(rafts);
         std::fs::remove_dir_all(dir).unwrap();
     }
+
+    /// A linearizable read must not leave a clone of the durable state machine
+    /// in a task it spawned.
+    ///
+    /// The clone owns the group's directory lock, so a task that outlives the
+    /// call keeps the lock and an in-process reopen fails with `WouldBlock`.
+    /// That is the flake this test removes: the barrier task used to own the
+    /// clone and the caller returned as soon as the reply was sent, before the
+    /// executor had dropped the finished task.
+    ///
+    /// The runtime has one worker and a parked task occupies it, so the barrier
+    /// task is never polled. The read times out and aborts it, and the clone
+    /// count observed afterwards is therefore deterministic: a clone parked in
+    /// the aborted task cannot have been dropped yet.
+    #[test]
+    fn a_timed_out_linearizable_read_does_not_retain_the_durable_lock() {
+        let dir = std::env::temp_dir().join(format!(
+            "yadb-linearizable-lock-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let id = ReplicaIdentity::new(
+            GroupIdentity {
+                cluster: [46; 16],
+                group: 1,
+                incarnation: 1,
+            },
+            1,
+            vec![1],
+        )
+        .unwrap();
+        let (state, meta, raft) = rt.block_on(async {
+            let log = DurableOpenRaftLog::create(dir.join("log"), &id).unwrap();
+            let state = DurableMetaStateMachine::create(dir.join("state"), &id).unwrap();
+            let config = Arc::new(openraft::Config::default().validate().unwrap());
+            let raft = YadbRaft::new(1, config, NoNetwork, log, state.clone())
+                .await
+                .unwrap();
+            raft.initialize(BTreeMap::from([(1, BasicNode::new("one"))]))
+                .await
+                .unwrap();
+            raft.wait(Some(Duration::from_secs(5)))
+                .current_leader(1, "leader")
+                .await
+                .unwrap();
+            let meta: LocalMetaKv<SimFs> = LocalMetaKv::from_openraft(
+                raft.clone(),
+                state.clone(),
+                BTreeMap::new(),
+                rt.handle().clone(),
+            );
+            (state, meta, raft)
+        });
+
+        // Occupy the only worker so the barrier task cannot be polled at all.
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let blocker = rt.spawn(async move {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the worker must be parked before the read starts");
+
+        let before = state.clone_count();
+        let keys = vec!["/sys/probe".to_string()];
+        let error = meta
+            .try_linearizable_snapshot(&keys, &[])
+            .expect_err("a barrier that cannot be polled must time out");
+        assert!(
+            matches!(error, MetaError::ControlFreshnessUnavailable(_)),
+            "{error:?}"
+        );
+        assert_eq!(
+            state.clone_count(),
+            before,
+            "the read must not leave a state-machine clone in the aborted task: \
+             that clone keeps the group's directory lock"
+        );
+
+        release_tx.send(()).unwrap();
+        rt.block_on(blocker).unwrap();
+        drop(meta);
+        rt.block_on(raft.shutdown()).unwrap();
+        drop(raft);
+        drop(state);
+
+        // With no clone left behind, the same directory can be reopened.
+        drop(DurableMetaStateMachine::open(dir.join("state"), &id).unwrap());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }
 
 impl OpenRaftClient {
@@ -1260,14 +1361,21 @@ impl OpenRaftClient {
         {
             return Err(MetaError::OpenRaftAsyncContext);
         }
-        let (tx, rx) = mpsc::sync_channel(1);
-        let raft = self.raft.clone();
+        // The durable state machine owns the group's directory lock, and a clone
+        // of it keeps that lock for as long as the clone lives. The clone
+        // therefore stays on this stack: if the barrier task owned one, it would
+        // outlive this call by however long the executor takes to drop a finished
+        // (or aborted) task, and an in-process reopen of the group in that window
+        // would fail with `WouldBlock`. Only the `Raft` handle, which does not
+        // own the state machine, enters the task.
         let state = self.state.clone();
+        let raft = self.raft.clone();
         let keys = keys.to_vec();
         let prefixes = prefixes.to_vec();
+        let (tx, rx) = mpsc::sync_channel(1);
         let task = self.handle.spawn(async move {
-            let result = match raft.ensure_linearizable().await {
-                Ok(_) => state.try_snapshot(&keys, &prefixes),
+            let barrier = match raft.ensure_linearizable().await {
+                Ok(_) => Ok(()),
                 Err(RaftError::APIError(CheckIsLeaderError::ForwardToLeader(f))) => {
                     Err(MetaError::NotLeader {
                         leader: f.leader_id,
@@ -1277,7 +1385,7 @@ impl OpenRaftClient {
                     "linearizable control read failed: {error}"
                 ))),
             };
-            let _ = tx.send(result);
+            let _ = tx.send(barrier);
         });
         let wait = || {
             rx.recv_timeout(Duration::from_millis(1000))
@@ -1288,11 +1396,13 @@ impl OpenRaftClient {
                     ))
                 })
         };
-        if runtime.is_some() {
+        let barrier = if runtime.is_some() {
             tokio::task::block_in_place(wait)
         } else {
             wait()
-        }
+        };
+        barrier?;
+        state.try_snapshot(&keys, &prefixes)
     }
 
     pub(crate) fn watch_prefix(&self, prefix: String) -> mpsc::Receiver<WatchEvent> {

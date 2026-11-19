@@ -2208,6 +2208,20 @@ at the post-recovery pass:
 blobs_live: 0, fragments_deleted: 15, ... }`. Both checks were restored; the
 suite is green with them.
 
+The leader-death pair reopens each group from its durable directories, so it
+only passes while nothing still holds the group's directory lock. A linearizable
+read used to move a clone of the durable state machine into the task it spawned
+for the quorum barrier; the caller returned as soon as the reply was sent, and
+the clone (which owns the lock) lived until the executor dropped the finished
+task. Under load the reopen could therefore land inside that window and fail
+with `Kind(WouldBlock)` from `DurableMetaStateMachine::open`. The clone now
+stays on the caller's stack and only the `Raft` handle enters the task, so a
+returned read cannot retain the lock. `a_timed_out_linearizable_read_does_not_retain_the_durable_lock`
+pins it deterministically: one runtime worker is parked so the barrier task can
+never be polled, the read times out and aborts it, and the machine's clone count
+must be unchanged. Moving a clone back into the task makes that assertion fail
+`left: 4, right: 3`.
+
 Restoring the old `project_ids == None` early return
 (`return Err(S3Error::NamespaceScanUnavailable)`) makes
 `a_scope_covering_every_project_collects_from_its_own_snapshot` fail with

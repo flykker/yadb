@@ -753,6 +753,18 @@ fn load_image(
 }
 
 impl DurableMetaStateMachine {
+    /// Number of live clones of this machine.
+    ///
+    /// Every clone shares the same `Arc<Mutex<Inner>>`, and `Inner` owns the
+    /// group's directory lock, so a clone that outlives its owner keeps the
+    /// lock held. Tests use this to prove that a read path does not park a
+    /// clone inside a spawned task, which would make an in-process reopen of
+    /// the group fail with `WouldBlock` for as long as the task is alive.
+    #[cfg(test)]
+    pub(crate) fn clone_count(&self) -> usize {
+        Arc::strong_count(&self.inner)
+    }
+
     /// Copy selected locally applied keys and prefix ranges at one revision.
     /// This does not perform a quorum or linearizable read barrier.
     pub fn try_snapshot(
