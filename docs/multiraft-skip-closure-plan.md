@@ -262,7 +262,7 @@ It never consults a manifest. The whole-deployment view is needed only for (1),
 and (1) is not a cross-group question either:
 
 * every data namespace (`/db/`, `/s3/`, `/block/`) routes by project id to
-  exactly one data group (`crates/yadb-metakv/src/openraft_client.rs:157`), so
+  exactly one data group (`crates/yadb-metakv/src/openraft_client.rs:199`), so
   a project's manifests are never split across groups;
 * a blob id embeds the project id, so the blobs of one group's projects are
   exactly the blobs whose manifests that group holds;
@@ -270,7 +270,7 @@ and (1) is not a cross-group question either:
   yields the *complete* live set for that group's blobs, not a partial one.
 
 Deletion is the operation that needs a cross-group decision, and it already
-makes that decision per group (`sweep_groups` at `crates/yadbd/src/gc.rs:634`).
+makes that decision per group (`sweep_groups` at `crates/yadbd/src/gc.rs:753`).
 Repair deletes nothing except the handoff copy of a part it has already written
 to the nominal slot, and a tombstoned id refuses that write
 (`crates/yadb-blob/src/volume.rs:634`), so a pass cannot resurrect a blob a
@@ -287,7 +287,7 @@ in the repair path crosses groups.
    refusals and the counters `ScrubSummary` already has. For each
    `GcGroupScope` it:
    * takes `try_linearizable_group_snapshot(group, &[], ["/db/", "/s3/",
-     "/block/"])` (`crates/yadb-metakv/src/raft.rs:378`). A follower or a group
+     "/block/"])` (`crates/yadb-metakv/src/raft.rs:379`). A follower or a group
      without a quorum is a refusal for that group; there is no fallback to local
      applied state, and one group's refusal does not stop another group's pass,
      exactly as `sweep_groups` behaves;

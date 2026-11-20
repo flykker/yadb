@@ -186,20 +186,40 @@ class DocTestNameTest(unittest.TestCase):
             self.fail("\n".join(problems))
 
     def test_allowlisted_names_are_still_absent(self) -> None:
-        """A name that exists again must leave the allowlist."""
+        """A name that exists again must leave the allowlist.
+
+        "Exists" means the name occurs on its own. A name that survives only as
+        part of a longer identifier has not come back: `execute_with` is listed
+        as removed, and `execute_with_ack` is a different function added later
+        that happens to contain those bytes. Treating the substring as a
+        resurrection would force the document to stop formatting the name of the
+        function it is narrating, which loses information without gaining a
+        check.
+        """
         stale: list[str] = []
         for name, reason in {
             **EXTERNAL,
             **HISTORICAL,
             **NOT_IDENTIFIERS,
         }.items():
-            if name in self.corpus:
+            standalone = re.compile(
+                rf"(?<![A-Za-z0-9_]){re.escape(name)}(?![A-Za-z0-9_])"
+            )
+            if standalone.search(self.corpus):
                 stale.append(f"{name}: {reason}")
         if stale:
             self.fail(
                 "these allowlist entries now exist in the tree, so the reason "
                 "is wrong and the entry must be removed:\n" + "\n".join(stale)
             )
+
+    def test_a_name_inside_a_longer_identifier_is_not_a_resurrection(self) -> None:
+        # The distinction the check above relies on, pinned so a later change
+        # cannot quietly turn it back into a substring search.
+        name = "execute_with"
+        standalone = re.compile(rf"(?<![A-Za-z0-9_]){re.escape(name)}(?![A-Za-z0-9_])")
+        self.assertIsNone(standalone.search("fn execute_with_ack(&self) {}"))
+        self.assertIsNotNone(standalone.search("LocalMetaKv::execute_with(cmd)"))
 
     def test_guard_detects_a_missing_identifier(self) -> None:
         fake = "A test named `this_test_does_not_exist_anywhere` proves it."

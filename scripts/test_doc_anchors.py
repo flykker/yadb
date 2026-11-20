@@ -44,7 +44,7 @@ CITATION_RE = re.compile(
 # A citation with no entry here must be a historical snapshot instead.
 CURRENT_CLAIMS = {
     "crates/yadbd/src/main.rs:80": ["value_parser", "openraft"],
-    "crates/yadbd/src/main.rs:8426": ["require_admin"],
+    "crates/yadbd/src/main.rs:8545": ["require_admin"],
     "crates/yadb-metakv/src/gc.rs:790": ["acquire_writer", "map(Some)"],
     "crates/yadb-db/src/lib.rs:940": ["acquire_writer_if_legacy"],
     "crates/yadb-db/src/tablet.rs:916": ["acquire_writer_if_legacy"],
@@ -56,11 +56,11 @@ CURRENT_CLAIMS = {
     # were dropped when that section was rewritten: the implementation is on
     # `feat/reader-lease`, so a line number taken from `main` would describe the
     # tree before the change. Those symbols are named in prose instead.
-    "crates/yadbd/src/gc.rs:634": ["sweep_groups"],
+    "crates/yadbd/src/gc.rs:753": ["sweep_groups"],
     "crates/yadb-blob/src/pool.rs:1600": ["repair_blob"],
     "crates/yadb-blob/src/volume.rs:634": ["tombstones"],
-    "crates/yadb-metakv/src/openraft_client.rs:157": ["group_id"],
-    "crates/yadb-metakv/src/raft.rs:378": ["try_linearizable_group_snapshot"],
+    "crates/yadb-metakv/src/openraft_client.rs:199": ["group_id"],
+    "crates/yadb-metakv/src/raft.rs:379": ["try_linearizable_group_snapshot"],
     "crates/yadb-s3/src/lib.rs:21": ["INTENT_GRACE_SECS"],
     # `collect_orphans_in_scopes_with`, which the prefix-scoped repair pass
     # deliberately does not copy. It no longer refuses a `project_ids == None`
