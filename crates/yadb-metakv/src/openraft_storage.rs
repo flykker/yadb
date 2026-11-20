@@ -28,10 +28,10 @@ const MAGIC: &[u8; 8] = b"YORLOG05";
 const IDENTITY_LEN: usize = 44;
 const FRAME_MAGIC: &[u8; 4] = b"YORF";
 /// `magic`, `len`, `payload_crc` and `header_crc` over the first three.
-const FRAME_HEADER_LEN: usize = 16;
+pub(crate) const FRAME_HEADER_LEN: usize = 16;
 /// Bytes of the header covered by its own checksum.
 const FRAME_HEADER_CHECKED_LEN: usize = 12;
-const MAX_FRAME_PAYLOAD: usize = 16 * 1024 * 1024;
+pub(crate) const MAX_FRAME_PAYLOAD: usize = 16 * 1024 * 1024;
 // A checkpoint must fit a single frame. Physical log and replay are bounded
 // independently; temporary replacement can briefly double disk usage.
 const MAX_CHECKPOINT_PAYLOAD: usize = 8 * 1024 * 1024;

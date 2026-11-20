@@ -25,7 +25,9 @@ use yadb_io::{OsDirectoryLock, OsFile, OsFs, StorageFs, VirtualFile};
 use crate::kv::{MetaSnapshot, MetaStateMachine};
 use crate::multiraft::{GroupIdentity, ReplicaIdentity};
 use crate::openraft_runtime::YadbRaftTypeConfig as C;
-use crate::openraft_storage::{frame_payload, read_frame, Frame, LogCoverage, TailRepair};
+use crate::openraft_storage::{
+    frame_payload, read_frame, Frame, LogCoverage, TailRepair, FRAME_HEADER_LEN, MAX_FRAME_PAYLOAD,
+};
 use crate::{KvResult, MetaError, WatchEvent};
 
 const MAGIC: &[u8; 8] = b"YORSM001";
@@ -55,6 +57,45 @@ const COMPACT_AFTER_ENTRIES: u64 = 4096;
 /// one apply batch: folding costs one full-image publish, and that cost is only
 /// amortised if it happens far less often than the applies it replaces.
 const COMPACT_AFTER_BYTES: u64 = 8 * 1024 * 1024;
+// A successful append may cross the compaction threshold by one whole frame.
+// Refuse larger histories rather than deleting acknowledged state. An operator
+// must inspect and recover such a store; it is not automatically rebuilt.
+const MAX_DELTA_REPLAY_BYTES: u64 =
+    COMPACT_AFTER_BYTES + (MAX_FRAME_PAYLOAD + FRAME_HEADER_LEN) as u64;
+const MAX_DELTA_REPLAY_FRAMES: u64 = COMPACT_AFTER_ENTRIES;
+
+fn replay_limit() -> io::Error {
+    invalid("startup delta replay limit exceeded; operator recovery required")
+}
+
+/// Check before loading or rebuilding the image, which can itself mutate disk.
+/// A final torn frame is not counted: normal replay will repair it afterwards.
+fn preflight_delta(dir: &Path) -> io::Result<()> {
+    let mut file = match File::open(dir.join(DELTA_FILE)) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let len = file.metadata()?.len();
+    // Even allowing one maximum-sized torn frame, this cannot fit.
+    if len > MAX_DELTA_REPLAY_BYTES + (MAX_FRAME_PAYLOAD + FRAME_HEADER_LEN) as u64 {
+        return Err(replay_limit());
+    }
+    let mut frames = 0;
+    loop {
+        match read_frame(&mut file)? {
+            Frame::End | Frame::Torn => return Ok(()),
+            Frame::Complete { .. } => {
+                frames += 1;
+                if frames > MAX_DELTA_REPLAY_FRAMES
+                    || file.stream_position()? > MAX_DELTA_REPLAY_BYTES
+                {
+                    return Err(replay_limit());
+                }
+            }
+        }
+    }
+}
 
 /// One delta frame: the entries of one `apply` call, in log order.
 ///
@@ -920,6 +961,7 @@ impl DurableMetaStateMachine {
     ) -> io::Result<Self> {
         let dir = dir.to_path_buf();
         let lock = OsDirectoryLock::try_acquire(&dir)?;
+        preflight_delta(&dir)?;
         let (file, image, rebuilt) = load_image(&dir, identity, rebuild_allowed)?;
         validate_image(&image, identity)?;
         if let Some(snapshot) = &image.current_snapshot {
@@ -1351,6 +1393,76 @@ mod tests {
                 value: value.to_vec(),
             }),
         }
+    }
+
+    #[test]
+    fn startup_delta_replay_frame_limit_preserves_all_files() {
+        let dir = TempDir::new();
+        drop(DurableMetaStateMachine::create(&dir.0, &identity()).unwrap());
+        let entries = [put(1, "key", b"value")];
+        let payload = serde_json::to_vec(&DeltaFrameRef { version: VERSION, entries: &entries }).unwrap();
+        let frame = frame_payload(payload).unwrap();
+        let mut bytes = frame.repeat(MAX_DELTA_REPLAY_FRAMES as usize);
+        fs::write(dir.0.join(DELTA_FILE), &bytes).unwrap();
+        drop(DurableMetaStateMachine::open(&dir.0, &identity()).unwrap());
+        bytes.extend_from_slice(&frame);
+        fs::write(dir.0.join(DELTA_FILE), &bytes).unwrap();
+        fs::write(dir.0.join("state.json.tmp"), b"preserve temporary evidence").unwrap();
+        let before: std::collections::BTreeMap<_, _> = fs::read_dir(&dir.0).unwrap()
+            .map(|item| { let item = item.unwrap(); (item.file_name(), fs::read(item.path()).unwrap()) })
+            .collect();
+        let error = match DurableMetaStateMachine::open(&dir.0, &identity()) {
+            Ok(_) => panic!("over-bound delta opened"),
+            Err(error) => error,
+        };
+        assert_eq!(error.to_string(), "startup delta replay limit exceeded; operator recovery required");
+        let after: std::collections::BTreeMap<_, _> = fs::read_dir(&dir.0).unwrap()
+            .map(|item| { let item = item.unwrap(); (item.file_name(), fs::read(item.path()).unwrap()) })
+            .collect();
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn startup_delta_replay_byte_limit_preserves_all_files() {
+        let dir = TempDir::new();
+        drop(DurableMetaStateMachine::create(&dir.0, &identity()).unwrap());
+        let empty = br#"{"version":1,"entries":[]}"#;
+        let make_frame = |size: usize| {
+            let mut payload = empty.to_vec();
+            payload.resize(size - FRAME_HEADER_LEN, b' ');
+            frame_payload(payload).unwrap()
+        };
+        let first = make_frame(MAX_FRAME_PAYLOAD + FRAME_HEADER_LEN);
+        let second = make_frame(MAX_DELTA_REPLAY_BYTES as usize - first.len());
+        let mut bytes = [first, second].concat();
+        fs::write(dir.0.join(DELTA_FILE), &bytes).unwrap();
+        drop(DurableMetaStateMachine::open(&dir.0, &identity()).unwrap());
+        bytes.extend(frame_payload(empty.to_vec()).unwrap());
+        fs::write(dir.0.join(DELTA_FILE), &bytes).unwrap();
+        fs::write(dir.0.join("state.json.tmp"), b"do not remove").unwrap();
+        let before: std::collections::BTreeMap<_, _> = fs::read_dir(&dir.0).unwrap()
+            .map(|item| { let item = item.unwrap(); (item.file_name(), fs::read(item.path()).unwrap()) })
+            .collect();
+        let error = match DurableMetaStateMachine::open(&dir.0, &identity()) {
+            Ok(_) => panic!("over-bound delta opened"),
+            Err(error) => error,
+        };
+        assert_eq!(error.to_string(), "startup delta replay limit exceeded; operator recovery required");
+        let after: std::collections::BTreeMap<_, _> = fs::read_dir(&dir.0).unwrap()
+            .map(|item| { let item = item.unwrap(); (item.file_name(), fs::read(item.path()).unwrap()) })
+            .collect();
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn startup_delta_replay_exact_frame_limit_opens() {
+        let dir = TempDir::new();
+        drop(DurableMetaStateMachine::create(&dir.0, &identity()).unwrap());
+        let entries = [put(1, "key", b"value")];
+        let payload = serde_json::to_vec(&DeltaFrameRef { version: VERSION, entries: &entries }).unwrap();
+        let frame = frame_payload(payload).unwrap();
+        fs::write(dir.0.join(DELTA_FILE), frame.repeat(MAX_DELTA_REPLAY_FRAMES as usize)).unwrap();
+        DurableMetaStateMachine::open(&dir.0, &identity()).unwrap();
     }
 
     #[tokio::test]
