@@ -709,9 +709,13 @@ pub fn prepare(path: &Path) -> io::Result<Prepared> {
         "{cluster}-{}-{}-{}",
         config.group, config.incarnation, config.node
     ));
-    if (config.mode == Mode::Create && path.exists())
-        || (config.mode == Mode::Open && !path.is_dir())
-    {
+    if config.mode == Mode::Create && path.exists() {
+        return Err(invalid(format!(
+            "replica {} already exists; create cannot safely retry: a replica may have started. Preserve the data; use open mode only if all replicas are complete, or restore the entire cluster from a consistent backup",
+            path.display()
+        )));
+    }
+    if config.mode == Mode::Open && !path.is_dir() {
         return Err(invalid(
             "replica path conflicts with explicit create/open mode",
         ));
@@ -1503,6 +1507,24 @@ mod tests {
         }
         std::fs::write(&path, vec![b' '; MAX_CONFIG as usize + 1]).unwrap();
         assert!(prepare(&path).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn create_refusal_explains_existing_replica_recovery_without_changing_it() {
+        let (dir, config, _) = fixture();
+        let replica = dir.join(format!("{}-1-1-1", "01".repeat(16)));
+        std::fs::create_dir(&replica).unwrap();
+        std::fs::write(replica.join("replica.json"), b"existing replica").unwrap();
+        let before = tree_snapshot(&replica);
+        let error = match prepare(&config) {
+            Ok(_) => panic!("create accepted an existing replica"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("Preserve the data"), "{error}");
+        assert!(error.contains("open mode"), "{error}");
+        assert!(error.contains("consistent backup"), "{error}");
+        assert_eq!(tree_snapshot(&replica), before);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
