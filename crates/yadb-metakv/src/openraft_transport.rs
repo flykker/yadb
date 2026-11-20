@@ -12,8 +12,8 @@
 //! encryption still requires TLS. Reordering and duplication of *distinct*
 //! Raft messages remain OpenRaft's responsibility.
 
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, RwLock};
 
 use ring::signature::{Ed25519KeyPair, KeyPair, UnparsedPublicKey, ED25519};
 use serde::{Deserialize, Serialize};
@@ -86,6 +86,15 @@ pub(crate) fn verify_signature(public_key: &[u8], message: &[u8], signature: &[u
 #[derive(Debug, Clone, Default)]
 pub struct PeerKeyRegistry {
     keys: BTreeMap<u32, Vec<u8>>,
+    pins: Arc<RwLock<CertificatePinRegistry>>,
+}
+
+#[derive(Debug, Default)]
+struct CertificatePinRegistry {
+    active: BTreeMap<u32, BTreeSet<[u8; 32]>>,
+    owners: BTreeMap<[u8; 32], u32>,
+    revoked: BTreeSet<[u8; 32]>,
+    initial: Option<BTreeMap<u32, [u8; 32]>>,
 }
 
 impl PeerKeyRegistry {
@@ -93,7 +102,10 @@ impl PeerKeyRegistry {
         if keys.is_empty() || keys.values().any(|key| key.len() != PUBLIC_KEY_LEN) {
             return Err(TransportError::InvalidInput("invalid peer public key"));
         }
-        Ok(Self { keys })
+        Ok(Self {
+            keys,
+            pins: Arc::new(RwLock::new(CertificatePinRegistry::default())),
+        })
     }
 
     pub fn with_peer(mut self, node_id: u32, public_key: Vec<u8>) -> Result<Self, TransportError> {
@@ -106,6 +118,137 @@ impl PeerKeyRegistry {
 
     pub fn public_key(&self, node_id: u32) -> Option<&[u8]> {
         self.keys.get(&node_id).map(Vec::as_slice)
+    }
+
+    /// Installs a certificate pin while retaining all currently active pins.
+    /// Install the replacement before retiring the old pin: this ordering is
+    /// the overlap rule. Retire refuses to leave zero pins; the operator must
+    /// also confirm that the replacement credential works before retirement,
+    /// which a local registry cannot establish. A pin is bound to its first
+    /// node for this registry's lifetime and a revoked pin cannot be reinstalled.
+    pub fn install_pin(&self, node_id: u32, pin: [u8; 32]) -> Result<(), TransportError> {
+        let mut pins = self
+            .pins
+            .write()
+            .map_err(|_| TransportError::InvalidInput("certificate pin registry poisoned"))?;
+        if !self.keys.contains_key(&node_id)
+            || pins.revoked.contains(&pin)
+            || pins.owners.get(&pin).is_some_and(|owner| *owner != node_id)
+        {
+            return Err(TransportError::InvalidInput(
+                "certificate pin belongs to another, revoked or unknown node",
+            ));
+        }
+        pins.owners.insert(pin, node_id);
+        pins.active.entry(node_id).or_default().insert(pin);
+        Ok(())
+    }
+
+    /// Retires one pin, but never the last active pin for a node. Callers must
+    /// first install the replacement and deploy it to every peer.
+    pub fn retire_pin(&self, node_id: u32, pin: [u8; 32]) -> Result<(), TransportError> {
+        let mut pins = self
+            .pins
+            .write()
+            .map_err(|_| TransportError::InvalidInput("certificate pin registry poisoned"))?;
+        let active = pins
+            .active
+            .get_mut(&node_id)
+            .ok_or(TransportError::UnknownSender)?;
+        if active.len() <= 1 || !active.remove(&pin) {
+            return Err(TransportError::InvalidInput(
+                "certificate pin absent or last active pin",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Revocation is deliberately allowed to remove the last pin. It is an
+    /// emergency operation and takes effect on the next frame check.
+    pub fn revoke_pin(&self, node_id: u32, pin: [u8; 32]) -> Result<(), TransportError> {
+        let mut pins = self
+            .pins
+            .write()
+            .map_err(|_| TransportError::InvalidInput("certificate pin registry poisoned"))?;
+        if !pins
+            .active
+            .get_mut(&node_id)
+            .is_some_and(|active| active.remove(&pin))
+        {
+            return Err(TransportError::InvalidInput("certificate pin not active"));
+        }
+        pins.revoked.insert(pin);
+        Ok(())
+    }
+
+    pub(crate) fn register_initial_pins(
+        &self,
+        initial: &BTreeMap<u32, [u8; 32]>,
+    ) -> Result<(), TransportError> {
+        let mut pins = self
+            .pins
+            .write()
+            .map_err(|_| TransportError::InvalidInput("certificate pin registry poisoned"))?;
+        if let Some(existing) = &pins.initial {
+            return if existing == initial {
+                Ok(())
+            } else {
+                Err(TransportError::InvalidInput(
+                    "conflicting initial certificate pins",
+                ))
+            };
+        }
+        if !pins.active.is_empty() {
+            return Err(TransportError::InvalidInput(
+                "invalid initial certificate pins",
+            ));
+        }
+        for (&node, &pin) in initial {
+            pins.active.insert(node, BTreeSet::from([pin]));
+            pins.owners.insert(pin, node);
+        }
+        pins.initial = Some(initial.clone());
+        Ok(())
+    }
+
+    pub(crate) fn pin_owner(&self, pin: [u8; 32]) -> Result<u32, TransportError> {
+        let pins = self
+            .pins
+            .read()
+            .map_err(|_| TransportError::InvalidInput("certificate pin registry poisoned"))?;
+        let node = *pins
+            .owners
+            .get(&pin)
+            .ok_or(TransportError::AuthenticationFailed)?;
+        if pins
+            .active
+            .get(&node)
+            .is_some_and(|active| active.contains(&pin))
+        {
+            Ok(node)
+        } else {
+            Err(TransportError::AuthenticationFailed)
+        }
+    }
+
+    /// Per-frame cost is one uncontended RwLock read (atomic acquire/release,
+    /// no allocation or syscall), plus ordered-map lookups. It can contend
+    /// with lifecycle writers under heavy fan-in; the lock is never held over
+    /// I/O or an await.
+    pub(crate) fn check_pin(&self, node_id: u32, pin: [u8; 32]) -> Result<(), TransportError> {
+        let pins = self
+            .pins
+            .read()
+            .map_err(|_| TransportError::InvalidInput("certificate pin registry poisoned"))?;
+        if pins
+            .active
+            .get(&node_id)
+            .is_some_and(|active| active.contains(&pin))
+        {
+            Ok(())
+        } else {
+            Err(TransportError::AuthenticationFailed)
+        }
     }
 }
 
@@ -332,6 +475,57 @@ mod tests {
             (2, two.public_key()),
         ]))
         .unwrap()
+    }
+
+    #[test]
+    fn rotation_requires_overlap_before_retiring_a_working_pin() {
+        let (one, two) = keys();
+        let registry = registry(&one, &two);
+        let old = [11; 32];
+        let new = [12; 32];
+        registry.install_pin(1, old).unwrap();
+        assert!(
+            registry.retire_pin(1, old).is_err(),
+            "last pin was retired before replacement"
+        );
+        registry.check_pin(1, old).unwrap();
+        registry.install_pin(1, new).unwrap();
+        registry.check_pin(1, old).unwrap();
+        registry.check_pin(1, new).unwrap();
+        registry.retire_pin(1, old).unwrap();
+        assert_eq!(
+            registry.check_pin(1, old),
+            Err(TransportError::AuthenticationFailed)
+        );
+        registry.check_pin(1, new).unwrap();
+    }
+
+    #[test]
+    fn rotated_pins_cannot_be_rebound_to_a_different_node() {
+        let (one, two) = keys();
+        let registry = registry(&one, &two);
+        let old = [11; 32];
+        let new = [12; 32];
+        let node_two = [22; 32];
+        registry.install_pin(1, old).unwrap();
+        registry.install_pin(2, node_two).unwrap();
+        registry.install_pin(1, new).unwrap();
+        assert!(
+            registry.install_pin(1, node_two).is_err(),
+            "node 2 pin was rebound to node 1"
+        );
+        assert_eq!(
+            registry.check_pin(1, node_two),
+            Err(TransportError::AuthenticationFailed)
+        );
+        assert_eq!(registry.pin_owner(new).unwrap(), 1);
+        assert_eq!(registry.pin_owner(node_two).unwrap(), 2);
+        let (one_id, two_id) = identities();
+        let forged = SignedRaftEnvelope::sign(&two_id, 1, 1, b"forged".to_vec(), &two).unwrap();
+        assert_eq!(
+            forged.verify(&one_id, Some(1), &registry),
+            Err(TransportError::SenderMismatch)
+        );
     }
 
     #[test]

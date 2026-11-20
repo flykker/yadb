@@ -62,6 +62,15 @@ pub(crate) mod test_support {
         )
         .unwrap()
     }
+
+    // Use the spare CA-signed test certificate as node 1's replacement client
+    // credential in the two-node rotation test (it is not node 3 there).
+    pub fn two_node_config(cert: u32) -> MutualTls {
+        let mut tls = config(cert);
+        tls.names.remove(&3);
+        tls.pins.remove(&3);
+        tls
+    }
 }
 
 #[cfg(test)]
@@ -225,6 +234,26 @@ impl MutualTls {
         self.names.get(&node).cloned().ok_or_else(|| {
             io::Error::new(io::ErrorKind::PermissionDenied, "TLS peer not provisioned")
         })
+    }
+
+    pub(crate) fn initial_pins(&self) -> &BTreeMap<u32, [u8; 32]> {
+        &self.pins
+    }
+
+    pub(crate) fn peer_pin(
+        certs: Option<&[CertificateDer<'_>]>,
+        alpn: Option<&[u8]>,
+    ) -> io::Result<[u8; 32]> {
+        if alpn != Some(ALPN) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "TLS ALPN mismatch",
+            ));
+        }
+        let cert = certs.and_then(|chain| chain.first()).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::PermissionDenied, "TLS certificate missing")
+        })?;
+        Ok(Self::fingerprint(cert.as_ref()))
     }
 
     pub(crate) fn peer(

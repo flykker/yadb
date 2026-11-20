@@ -692,6 +692,7 @@ pub struct TransportConfig {
     /// rely on.
     pub rpc_ttl_floor: Option<Duration>,
     pub tls: Option<Arc<MutualTls>>,
+    tls_pins_bound: bool,
 }
 
 impl TransportConfig {
@@ -711,6 +712,7 @@ impl TransportConfig {
             request_timeout: Duration::from_secs(5),
             rpc_ttl_floor: None,
             tls: None,
+            tls_pins_bound: false,
         }
     }
 
@@ -720,6 +722,12 @@ impl TransportConfig {
     }
 
     pub fn with_tls(mut self, tls: Arc<MutualTls>) -> Self {
+        // The first binding seeds pins; later bindings must not resurrect a
+        // retired or revoked credential. A bad binding fails closed on use.
+        self.tls_pins_bound = self
+            .registry
+            .register_initial_pins(tls.initial_pins())
+            .is_ok();
         self.tls = Some(tls);
         self
     }
@@ -800,6 +808,9 @@ impl AuthenticatedTcpNetwork {
                     .map_err(|_| TransportError::InvalidInput("connect failed"))?;
             stream.set_nodelay(true).ok();
             let mut stream: PeerStream = if let Some(tls) = &self.config.tls {
+                if !self.config.tls_pins_bound {
+                    return Err(TransportError::AuthenticationFailed);
+                }
                 let name = tls.name(self.target).map_err(transport_io)?;
                 let stream = tls
                     .client
@@ -807,9 +818,9 @@ impl AuthenticatedTcpNetwork {
                     .await
                     .map_err(transport_io)?;
                 let session = stream.get_ref().1;
-                let peer = tls
-                    .peer(session.peer_certificates(), session.alpn_protocol())
+                let pin = MutualTls::peer_pin(session.peer_certificates(), session.alpn_protocol())
                     .map_err(transport_io)?;
+                let peer = self.config.registry.pin_owner(pin)?;
                 if peer != self.target {
                     return Err(TransportError::AuthenticationFailed);
                 }
@@ -1306,23 +1317,37 @@ async fn serve_peer(
     snapshot_peer: Arc<AtomicU64>,
 ) -> io::Result<()> {
     stream.set_nodelay(true).ok();
-    let (stream, node_id): (PeerStream, Option<u32>) = if let Some(tls) = &config.tls {
-        let stream = tls.server.accept(stream).await?;
-        let session = stream.get_ref().1;
-        let peer = tls.peer(session.peer_certificates(), session.alpn_protocol())?;
-        if node_id.is_some_and(|node| node != peer) {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "TLS node/address mismatch",
-            ));
-        }
-        (Box::new(stream), Some(peer))
-    } else {
-        (Box::new(stream), node_id)
-    };
+    let (stream, node_id, pin): (PeerStream, Option<u32>, Option<[u8; 32]>) =
+        if let Some(tls) = &config.tls {
+            if !config.tls_pins_bound {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "TLS certificate pin configuration mismatch",
+                ));
+            }
+            let stream = tls.server.accept(stream).await?;
+            let session = stream.get_ref().1;
+            let pin = MutualTls::peer_pin(session.peer_certificates(), session.alpn_protocol())?;
+            let peer = config.registry.pin_owner(pin).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "TLS certificate pin mismatch",
+                )
+            })?;
+            if node_id.is_some_and(|node| node != peer) {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "TLS node/address mismatch",
+                ));
+            }
+            (Box::new(stream), Some(peer), Some(pin))
+        } else {
+            (Box::new(stream), node_id, None)
+        };
     serve_connection(
         stream,
         node_id,
+        pin,
         config,
         handler,
         request_bytes,
@@ -1337,6 +1362,7 @@ async fn serve_peer(
 async fn serve_connection(
     mut stream: PeerStream,
     node_id: Option<u32>,
+    pin: Option<[u8; 32]>,
     config: TransportConfig,
     handler: Arc<dyn Fn(WireRequest) -> BoxFuture<WireResponse> + Send + Sync>,
     request_bytes: Arc<Semaphore>,
@@ -1371,6 +1397,20 @@ async fn serve_connection(
             return Ok(());
         }
     };
+    if config.tls.is_some() {
+        let (Some(node), Some(pin)) = (node_id, pin) else {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "TLS peer credential missing",
+            ));
+        };
+        config.registry.check_pin(node, pin).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "TLS certificate pin revoked",
+            )
+        })?;
+    }
     if kind == SNAPSHOT_MANIFEST {
         phase.store(1, Ordering::Relaxed);
     }
@@ -1471,6 +1511,16 @@ async fn serve_connection(
                 false,
             )
             .await?;
+            // The initial frame has already established both values above.
+            config
+                .registry
+                .check_pin(node_id.unwrap(), pin.unwrap())
+                .map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "TLS certificate pin revoked",
+                    )
+                })?;
             let chunk_envelope = SignedRaftEnvelope::decode_json(&frame)
                 .map_err(|_| io::Error::other("invalid chunk envelope"))?;
             if chunk_envelope.sender != sender || chunk_envelope.sequence != sequence {
@@ -1663,6 +1713,208 @@ mod reply_tests {
                 .contains("unknown variant `InstallSnapshot`"),
             "inline snapshot must be rejected before its data is parsed: {error}"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rotation_overlap_keeps_raft_replicating_then_rejects_retired_pin() {
+        use crate::openraft_tls::test_support;
+        use crate::{
+            openraft_runtime::YadbRaft, openraft_state_machine::DurableMetaStateMachine,
+            openraft_storage::DurableOpenRaftLog, KvCommand,
+        };
+        use openraft::Snapshot;
+        let dir = std::path::PathBuf::from(
+            std::env::var("YADB_TEST_TMPDIR").unwrap_or_else(|_| "/tmp".into()),
+        )
+        .join(format!(
+            "yadb-tls-rotation-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let group = GroupIdentity {
+            cluster: [55; 16],
+            group: 1,
+            incarnation: 1,
+        };
+        let ids: BTreeMap<_, _> = (1..=2)
+            .map(|n| {
+                (
+                    n,
+                    ReplicaIdentity::new(group.clone(), n, vec![1, 2]).unwrap(),
+                )
+            })
+            .collect();
+        let keys: BTreeMap<_, _> = (1..=2)
+            .map(|n| {
+                (
+                    n,
+                    Arc::new(NodeSigningKey::from_seed(&[n as u8; 32]).unwrap()),
+                )
+            })
+            .collect();
+        let registry = Arc::new(
+            PeerKeyRegistry::new(keys.iter().map(|(n, k)| (*n, k.public_key())).collect()).unwrap(),
+        );
+        let mut listeners = BTreeMap::new();
+        let mut addresses = BTreeMap::new();
+        for n in 1..=2 {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            addresses.insert(n, listener.local_addr().unwrap());
+            listeners.insert(n, listener);
+        }
+        let old = MutualTls::fingerprint(test_support::cert(1));
+        let new = MutualTls::fingerprint(test_support::cert(3));
+        let first = TransportConfig::new(
+            ids[&1].clone(),
+            keys[&1].clone(),
+            addresses.clone(),
+            registry.clone(),
+        )
+        .with_tls(Arc::new(test_support::two_node_config(1)));
+        assert!(
+            registry.retire_pin(1, old).is_err(),
+            "retired before installing replacement"
+        );
+        registry.install_pin(1, new).unwrap();
+        let mut rafts = BTreeMap::new();
+        let mut states = BTreeMap::new();
+        let mut servers = Vec::new();
+        for n in 1..=2 {
+            let config = if n == 1 {
+                first.clone()
+            } else {
+                TransportConfig::new(
+                    ids[&n].clone(),
+                    keys[&n].clone(),
+                    addresses.clone(),
+                    registry.clone(),
+                )
+                .with_tls(Arc::new(test_support::two_node_config(n)))
+            };
+            let outgoing = if n == 1 {
+                TransportConfig::new(
+                    ids[&n].clone(),
+                    keys[&n].clone(),
+                    addresses.clone(),
+                    registry.clone(),
+                )
+                .with_tls(Arc::new(test_support::two_node_config(3)))
+            } else {
+                config.clone()
+            };
+            let log = DurableOpenRaftLog::create(dir.join(format!("{n}/log")), &ids[&n]).unwrap();
+            let state =
+                DurableMetaStateMachine::create(dir.join(format!("{n}/state")), &ids[&n]).unwrap();
+            let raft = YadbRaft::new(
+                n,
+                Arc::new(openraft::Config::default().validate().unwrap()),
+                AuthenticatedTcpNetworkFactory::new(outgoing),
+                log,
+                state.clone(),
+            )
+            .await
+            .unwrap();
+            let handler_raft = raft.clone();
+            let handler = Arc::new(move |request| -> BoxFuture<WireResponse> {
+                let raft = handler_raft.clone();
+                Box::pin(async move {
+                    match request {
+                        WireRequest::Vote(rpc) => {
+                            WireResponse::Vote(Box::new(raft.vote(*rpc).await.unwrap()))
+                        }
+                        WireRequest::AppendEntries(rpc) => WireResponse::AppendEntries(Box::new(
+                            raft.append_entries(*rpc).await.unwrap(),
+                        )),
+                        WireRequest::InstallSnapshot { vote, meta, data } => {
+                            WireResponse::InstallSnapshot(Box::new(
+                                raft.install_full_snapshot(
+                                    vote,
+                                    Snapshot {
+                                        meta,
+                                        snapshot: Box::new(std::io::Cursor::new(data)),
+                                    },
+                                )
+                                .await
+                                .unwrap(),
+                            ))
+                        }
+                    }
+                })
+            });
+            servers.push(tokio::spawn(
+                RaftPeerServer::from_listener(listeners.remove(&n).unwrap(), config, handler)
+                    .serve(),
+            ));
+            rafts.insert(n, raft);
+            states.insert(n, state);
+        }
+        rafts[&1]
+            .initialize(
+                (1..=2)
+                    .map(|n| (n, BasicNode::new(format!("node-{n}"))))
+                    .collect::<BTreeMap<_, _>>(),
+            )
+            .await
+            .unwrap();
+        rafts[&1]
+            .wait(Some(Duration::from_secs(15)))
+            .current_leader(1, "leader")
+            .await
+            .unwrap();
+        rafts[&1]
+            .client_write(KvCommand::Put {
+                key: "rotation".into(),
+                value: b"overlap".to_vec(),
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                if states[&2]
+                    .snapshot()
+                    .get("rotation")
+                    .is_some_and(|v| v.value == b"overlap")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("replacement credential did not replicate");
+        // Old certificate is still accepted by the listener during overlap.
+        let old_tls = test_support::two_node_config(1);
+        let tcp = TcpStream::connect(addresses[&2]).await.unwrap();
+        let mut old_stream = old_tls
+            .client
+            .connect(old_tls.name(2).unwrap(), tcp)
+            .await
+            .unwrap();
+        assert_eq!(read_frame(&mut old_stream).await.unwrap().0, CHALLENGE);
+        drop(old_stream);
+        registry.retire_pin(1, old).unwrap();
+        let tcp = TcpStream::connect(addresses[&2]).await.unwrap();
+        let mut old_stream = old_tls
+            .client
+            .connect(old_tls.name(2).unwrap(), tcp)
+            .await
+            .unwrap();
+        assert!(
+            read_frame(&mut old_stream).await.is_err(),
+            "retired certificate was accepted"
+        );
+        for raft in rafts.values() {
+            raft.shutdown().await.unwrap();
+        }
+        for server in servers {
+            server.abort();
+            let _ = server.await;
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]
@@ -1981,7 +2233,10 @@ mod reply_tests {
                 },
                 serve_connection(
                     Box::new(server),
-                    None,
+                    Some(1),
+                    Some(MutualTls::fingerprint(
+                        crate::openraft_tls::test_support::cert(1),
+                    )),
                     config.clone(),
                     handler,
                     budget.clone(),
@@ -2208,7 +2463,10 @@ mod reply_tests {
                 Duration::from_secs(10),
                 serve_connection(
                     Box::new(server),
-                    None,
+                    Some(1),
+                    Some(MutualTls::fingerprint(
+                        crate::openraft_tls::test_support::cert(1),
+                    )),
                     config,
                     recording_handler(received),
                     budget,
@@ -2577,6 +2835,151 @@ mod reply_tests {
         assert_eq!(first, [1; 6]);
         assert_eq!(second, [2; 6]);
         assert_eq!(budget.available_permits(), 6);
+    }
+
+    #[tokio::test]
+    async fn revoked_peer_next_snapshot_frame_on_authenticated_connection_is_refused() {
+        let peer = snapshot_peer(45);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let received = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let phase = Arc::new(AtomicU64::new(0));
+        let (accepted, accept) = tokio::sync::oneshot::channel();
+        let config = peer.config.clone();
+        let task_phase = phase.clone();
+        let task_received = received.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _ = accepted.send(());
+            serve_peer(
+                stream,
+                None,
+                config,
+                recording_handler(task_received),
+                Arc::new(Semaphore::new(MAX_IN_FLIGHT_REQUEST_BYTES)),
+                Arc::new(Semaphore::new(MAX_SNAPSHOT_BYTES)),
+                None,
+                task_phase,
+                Arc::new(AtomicU64::new(0)),
+            )
+            .await
+        });
+        let tls = crate::openraft_tls::test_support::config(1);
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        accept.await.unwrap();
+        let mut stream = tls.client.connect(tls.name(2).unwrap(), tcp).await.unwrap();
+        let (_, challenge) = read_frame(&mut stream).await.unwrap();
+        let challenge: [u8; 32] = challenge.try_into().unwrap();
+        let data = vec![9; 3];
+        let digest = sha256(&data);
+        write_frame(
+            &mut stream,
+            SNAPSHOT_MANIFEST,
+            &signed_snapshot_frame(
+                &peer,
+                1,
+                serde_json::to_vec(&manifest(&peer, challenge, 3, digest)).unwrap(),
+            ),
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while phase.load(Ordering::Relaxed) != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        peer.registry
+            .revoke_pin(
+                1,
+                MutualTls::fingerprint(crate::openraft_tls::test_support::cert(1)),
+            )
+            .unwrap();
+        write_frame(
+            &mut stream,
+            SNAPSHOT_CHUNK,
+            &signed_snapshot_frame(
+                &peer,
+                1,
+                serde_json::to_vec(&chunk(challenge, 0, 3, digest, data)).unwrap(),
+            ),
+        )
+        .await
+        .unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "TLS certificate pin revoked",
+            "revoked connection accepted its next frame"
+        );
+        assert!(received.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn revocation_after_handshake_refuses_first_request_frame() {
+        let peer = snapshot_peer(46);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let received = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let config = peer.config.clone();
+        let task_received = received.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            serve_peer(
+                stream,
+                None,
+                config,
+                recording_handler(task_received),
+                Arc::new(Semaphore::new(MAX_IN_FLIGHT_REQUEST_BYTES)),
+                Arc::new(Semaphore::new(MAX_SNAPSHOT_BYTES)),
+                None,
+                Arc::new(AtomicU64::new(0)),
+                Arc::new(AtomicU64::new(0)),
+            )
+            .await
+        });
+        let tls = crate::openraft_tls::test_support::config(1);
+        let mut stream = tls
+            .client
+            .connect(
+                tls.name(2).unwrap(),
+                TcpStream::connect(addr).await.unwrap(),
+            )
+            .await
+            .unwrap();
+        let (_, challenge) = read_frame(&mut stream).await.unwrap();
+        let challenge: [u8; 32] = challenge.try_into().unwrap();
+        peer.registry
+            .revoke_pin(
+                1,
+                MutualTls::fingerprint(crate::openraft_tls::test_support::cert(1)),
+            )
+            .unwrap();
+        let data = vec![9; 3];
+        write_frame(
+            &mut stream,
+            SNAPSHOT_MANIFEST,
+            &signed_snapshot_frame(
+                &peer,
+                1,
+                serde_json::to_vec(&manifest(&peer, challenge, 3, sha256(&data))).unwrap(),
+            ),
+        )
+        .await
+        .unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "TLS certificate pin revoked"
+        );
+        assert!(received.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
