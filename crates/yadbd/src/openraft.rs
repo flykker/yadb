@@ -754,6 +754,11 @@ pub fn prepare(path: &Path) -> io::Result<Prepared> {
         .map_err(|e| invalid(format!("local client certificate invalid: {e}")))?;
     let tls_key = PrivateKeyDer::try_from(read_bounded(&config.tls.key_der, MAX_DER)?)
         .map_err(|_| invalid("invalid TLS private key DER"))?;
+    let initial_pins: BTreeMap<u32, [u8; 32]> = config
+        .peers
+        .iter()
+        .map(|p| (p.id, p.cert_sha256))
+        .collect();
     let tls = MutualTls::new(
         roots,
         chain,
@@ -763,28 +768,8 @@ pub fn prepare(path: &Path) -> io::Result<Prepared> {
             .iter()
             .map(|p| (p.id, p.server_name.clone()))
             .collect(),
-        config.peers.iter().map(|p| (p.id, p.cert_sha256)).collect(),
+        initial_pins.clone(),
     )?;
-    let registry = PeerKeyRegistry::new(
-        config
-            .peers
-            .iter()
-            .map(|p| (p.id, p.public_key.to_vec()))
-            .collect(),
-    )
-    .map_err(|e| invalid(e.to_string()))?;
-    let members = config
-        .peers
-        .iter()
-        .map(|p| (p.id, openraft::BasicNode::new(p.address.to_string())))
-        .collect();
-    let transport = TransportConfig::new(
-        identity.clone(),
-        key,
-        config.peers.iter().map(|p| (p.id, p.address)).collect(),
-        Arc::new(registry),
-    )
-    .with_tls(Arc::new(tls));
     let cluster = config
         .cluster
         .iter()
@@ -805,6 +790,32 @@ pub fn prepare(path: &Path) -> io::Result<Prepared> {
             "replica path conflicts with explicit create/open mode",
         ));
     }
+    // The config's pins are the initial set; the replica's durable pin state is
+    // merged over them here, before the transport can bind any pin. A state
+    // file that cannot be read or merged refuses startup rather than letting
+    // the config resurrect a credential the operator retired or revoked.
+    let registry = PeerKeyRegistry::open_for_replica(
+        config
+            .peers
+            .iter()
+            .map(|p| (p.id, p.public_key.to_vec()))
+            .collect(),
+        &initial_pins,
+        &path,
+    )
+    .map_err(|error| invalid(error.to_string()))?;
+    let members = config
+        .peers
+        .iter()
+        .map(|p| (p.id, openraft::BasicNode::new(p.address.to_string())))
+        .collect();
+    let transport = TransportConfig::new(
+        identity.clone(),
+        key,
+        config.peers.iter().map(|p| (p.id, p.address)).collect(),
+        Arc::new(registry),
+    )
+    .with_tls(Arc::new(tls));
     if config
         .preferred_leader
         .is_some_and(|id| !identity.voters().contains(&id))
@@ -1310,6 +1321,88 @@ mod tests {
             ),
         };
         assert!(refused.to_string().contains("multi-group daemon"));
+    }
+
+    /// The replica directory `prepare` computes for a config, so a test can
+    /// place the durable pin state where startup will look for it.
+    fn replica_dir(config: &Value) -> PathBuf {
+        let root = Path::new(config["root"].as_str().unwrap())
+            .canonicalize()
+            .unwrap();
+        let cluster = config["cluster"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|byte| format!("{:02x}", byte.as_u64().unwrap()))
+            .collect::<String>();
+        root.join(format!(
+            "{cluster}-{}-{}-{}",
+            config["group"].as_u64().unwrap(),
+            config["incarnation"].as_u64().unwrap(),
+            config["node"].as_u64().unwrap()
+        ))
+    }
+
+    /// A `[u8; 32]` as the config serialises it.
+    fn fixed_bytes(value: &Value) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        for (slot, byte) in out.iter_mut().zip(value.as_array().unwrap()) {
+            *slot = byte.as_u64().unwrap() as u8;
+        }
+        out
+    }
+
+    /// Startup merges the replica's stored pin state over the config, so a pin
+    /// installed before the restart is still accepted after it.
+    #[test]
+    fn an_installed_pin_survives_a_daemon_restart() {
+        let (dir, path, mut config) = fixture();
+        let replica = replica_dir(&config);
+        std::fs::create_dir(&replica).unwrap();
+        let peer = &config["peers"][0];
+        let keys = BTreeMap::from([(1u32, fixed_bytes(&peer["public_key"]).to_vec())]);
+        let initial = BTreeMap::from([(1u32, fixed_bytes(&peer["cert_sha256"]))]);
+        let registry = PeerKeyRegistry::open_for_replica(keys, &initial, &replica).unwrap();
+        let replacement = [0x5a; 32];
+        registry.install_pin(1, replacement).unwrap();
+        drop(registry);
+
+        config["mode"] = json!("open");
+        config["initialize"] = json!(false);
+        std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+        let prepared = prepare(&path).unwrap();
+        // Retiring the installed pin is accepted here; a registry rebuilt from
+        // the config alone would refuse it as absent.
+        prepared
+            .pin_registry()
+            .check_pin_change(&PinChange::Retire {
+                node: 1,
+                pin: replacement,
+            })
+            .expect("the installed pin must still be active after the restart");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A damaged state file must refuse startup, not silently revert to the
+    /// config's pins.
+    #[test]
+    fn a_corrupt_certificate_pin_state_refuses_startup() {
+        let (dir, path, mut config) = fixture();
+        let replica = replica_dir(&config);
+        std::fs::create_dir(&replica).unwrap();
+        std::fs::write(replica.join("certificate-pins.json"), b"{\"version\":1,").unwrap();
+
+        config["mode"] = json!("open");
+        config["initialize"] = json!(false);
+        std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+        let error = prepare(&path)
+            .err()
+            .expect("a corrupt certificate pin state must refuse startup");
+        let text = error.to_string();
+        assert!(text.contains("certificate pin state"), "{text}");
+        assert!(text.contains("is corrupt"), "{text}");
+        assert!(text.contains("certificate-pins.json"), "{text}");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     fn fixture() -> (PathBuf, PathBuf, Value) {
