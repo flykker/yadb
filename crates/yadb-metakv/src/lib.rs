@@ -63,6 +63,13 @@ pub enum MetaError {
     #[error("OpenRaft write outcome unknown: {0}")]
     OpenRaftWriteUnknown(String),
 
+    /// The write provably never reached Raft: the bridge queue was full or
+    /// already closed, so `try_send` refused it. Unlike an unknown outcome this
+    /// is safe to retry, and telling a client otherwise would suppress a
+    /// mutation that definitively did not happen.
+    #[error("OpenRaft write was not sent: {0}")]
+    OpenRaftWriteNotSent(String),
+
     /// A control-group linearizable read could not be established. Callers must
     /// fail closed rather than use the locally applied snapshot.
     #[error("control-plane freshness unavailable: {0}")]

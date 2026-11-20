@@ -605,6 +605,33 @@ impl GroupRouter {
 
 type Request = (KvCommand, mpsc::SyncSender<Result<KvResult, MetaError>>);
 
+/// Enqueue a command for the bridge worker.
+///
+/// `try_send` fails in exactly two ways — `Full` and `Disconnected` — and
+/// neither can have enqueued the command, so the write provably never reached
+/// Raft. Reporting that as `not-sent` lets the caller retry; `unknown` would
+/// forbid a retry for a mutation that definitively did not happen.
+fn enqueue(sender: &mpsc::SyncSender<Request>, request: Request) -> Result<(), MetaError> {
+    sender.try_send(request).map_err(|_| {
+        MetaError::OpenRaftWriteNotSent("metadata bridge unavailable or full".into())
+    })
+}
+
+/// Wait for the bridge worker's reply to an already-enqueued command.
+///
+/// A dropped or silent worker is genuinely ambiguous: the command was enqueued,
+/// so it may have been submitted to Raft before the reply path disappeared.
+fn await_reply(receiver: mpsc::Receiver<Result<KvResult, MetaError>>) -> Result<KvResult, MetaError> {
+    receiver
+        .recv_timeout(Duration::from_secs(6))
+        .map_err(|_| {
+            MetaError::OpenRaftWriteUnknown(
+                "metadata bridge response timed out or stopped".into(),
+            )
+        })
+        .and_then(|inner| inner)
+}
+
 #[derive(Clone)]
 pub(crate) struct OpenRaftClient {
     raft: YadbRaft,
@@ -655,6 +682,56 @@ mod tests {
     use openraft::{BasicNode, RaftNetwork, RaftNetworkFactory, Snapshot, Vote};
     use std::{collections::BTreeMap, io, sync::Arc};
     use yadb_io::SimFs;
+
+    fn delete_command() -> KvCommand {
+        KvCommand::Delete { key: "k".into() }
+    }
+
+    #[test]
+    fn a_full_bridge_reports_not_sent_not_unknown() {
+        // Capacity zero makes every `try_send` find the queue full. The command
+        // is provably not enqueued, so the outcome must be retryable.
+        let (sender, _receiver) = mpsc::sync_channel(0);
+        let (reply, _reply_rx) = mpsc::sync_channel(1);
+        let error = enqueue(&sender, (delete_command(), reply)).unwrap_err();
+        assert!(
+            matches!(error, MetaError::OpenRaftWriteNotSent(_)),
+            "a full bridge must be not-sent, got {error:?}"
+        );
+        assert_eq!(
+            error.to_string(),
+            "OpenRaft write was not sent: metadata bridge unavailable or full"
+        );
+    }
+
+    #[test]
+    fn a_disconnected_bridge_reports_not_sent_not_unknown() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        drop(receiver);
+        let (reply, _reply_rx) = mpsc::sync_channel(1);
+        let error = enqueue(&sender, (delete_command(), reply)).unwrap_err();
+        assert!(
+            matches!(error, MetaError::OpenRaftWriteNotSent(_)),
+            "a closed bridge must be not-sent, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn a_lost_reply_after_a_successful_send_stays_unknown() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let (reply, reply_rx) = mpsc::sync_channel(1);
+        enqueue(&sender, (delete_command(), reply)).unwrap();
+        // Take the accepted request out and drop it: the reply sender dies, as
+        // it would if the worker exited after accepting the command. The write
+        // was enqueued, so this outcome is ambiguous and must not be retryable.
+        let accepted = receiver.recv().unwrap();
+        drop(accepted);
+        let error = await_reply(reply_rx).unwrap_err();
+        assert!(
+            matches!(error, MetaError::OpenRaftWriteUnknown(_)),
+            "a lost reply must stay unknown, got {error:?}"
+        );
+    }
 
     struct NoNetwork;
     impl RaftNetworkFactory<C> for NoNetwork {
@@ -1353,25 +1430,13 @@ impl OpenRaftClient {
             return Err(MetaError::OpenRaftAsyncContext);
         }
         let (tx, rx) = mpsc::sync_channel(1);
-        self.bridge
-            .sender
-            .as_ref()
-            .expect("bridge sender exists")
-            .try_send((cmd, tx))
-            .map_err(|_| {
-                MetaError::OpenRaftWriteUnknown("metadata bridge unavailable or full".into())
-            })?;
+        enqueue(
+            self.bridge.sender.as_ref().expect("bridge sender exists"),
+            (cmd, tx),
+        )?;
         // A caller timeout never causes a retry. The queued request may still
         // execute; response loss is an unknown outcome.
-        let wait = || {
-            rx.recv_timeout(Duration::from_secs(6))
-                .map_err(|_| {
-                    MetaError::OpenRaftWriteUnknown(
-                        "metadata bridge response timed out or stopped".into(),
-                    )
-                })
-                .and_then(|inner| inner)
-        };
+        let wait = || await_reply(rx);
         if runtime.is_some() {
             tokio::task::block_in_place(wait)
         } else {

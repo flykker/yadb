@@ -1459,6 +1459,12 @@ fn meta_err_response(err: MetaError, peer_addr: impl FnOnce(u32) -> Option<Strin
     ) {
         return forward_error_response(err.to_string(), Some("unknown"));
     }
+    // The bridge refused the command before enqueuing it, so it never reached
+    // Raft. Answer `not-sent` (no `do-not-retry`), not `unknown`: forbidding a
+    // retry here would suppress a mutation that definitively did not happen.
+    if matches!(err, MetaError::OpenRaftWriteNotSent(_)) {
+        return forward_error_response(err.to_string(), Some("not-sent"));
+    }
     match err {
         // The node has stopped accepting metadata work until it is restarted;
         // another replica may still be able to serve the request. A read of the
@@ -2955,14 +2961,16 @@ struct ApplySnapshot {
 async fn read_apply_snapshot(st: &AppState) -> Result<ApplySnapshot, Response> {
     let meta = st.meta.clone();
     let read = tokio::task::spawn_blocking(move || -> Result<ApplySnapshot, String> {
+        // Quorum read, not the locally applied state: the keyed path is
+        // OpenRaft-only (see `apply_dispatch`), and planning an admission
+        // against a follower's stale revision would let two writers both pass
+        // the ceiling and then both commit. A leader that cannot confirm
+        // quorum must fail the request rather than serve local state.
         let snapshot = meta
-            .try_snapshot(
-                &[
-                    CONTROL_STATE_KEY.to_string(),
-                    IDEMPOTENCY_USAGE_KEY.to_string(),
-                ],
-                &[],
-            )
+            .try_linearizable_control_snapshot(&[
+                CONTROL_STATE_KEY.to_string(),
+                IDEMPOTENCY_USAGE_KEY.to_string(),
+            ])
             .map_err(|e| e.to_string())?;
         let (control, revision) = match snapshot.get(CONTROL_STATE_KEY) {
             Some(kv) => (
@@ -9095,6 +9103,18 @@ mod security_tests {
         assert_eq!(mapped.headers()["x-yadb-retry"], "do-not-retry");
     }
 
+    // A bridge that refused the command never enqueued it, so the mutation
+    // provably did not run. Mapping that to `unknown` would tell the client
+    // never to retry a write that definitively did not happen.
+    #[test]
+    fn openraft_not_sent_meta_error_is_retryable_503() {
+        let mapped =
+            meta_err_response(MetaError::OpenRaftWriteNotSent("queue full".into()), |_| None);
+        assert_eq!(mapped.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(mapped.headers()["x-yadb-write-outcome"], "not-sent");
+        assert!(!mapped.headers().contains_key("x-yadb-retry"));
+    }
+
     // S7: the legacy path has the same ambiguity as the OpenRaft bridge, but its
     // error was mapped to a plain 500, so a client could not tell "unknown" from
     // "rejected" and would retry a mutation that may already have committed.
@@ -12031,6 +12051,41 @@ mod raft_status_tests {
         for raft in rafts.into_iter().skip(1) {
             raft.shutdown().await.unwrap();
         }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The apply snapshot must be a quorum read, not the locally applied copy.
+    ///
+    /// A follower's local state can lag the leader, so planning admission
+    /// against it would let two writers both pass the ceiling. Once the control
+    /// group is stopped a local read still succeeds, while a quorum read
+    /// cannot: that difference is the assertion.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gate3_apply_snapshot_requires_a_quorum_read() {
+        let (st, dir, rafts) = gate3_state("gate3-quorum").await;
+        let original = gate3_parts(
+            apply_dispatch(
+                State(st.clone()),
+                gate3_request(gate3_apply_body(), Some("quorum")),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(original.0, StatusCode::OK);
+        assert!(
+            st.meta
+                .try_snapshot(&[CONTROL_STATE_KEY.into()], &[])
+                .is_ok(),
+            "the local state must stay readable, otherwise this test proves nothing"
+        );
+        for raft in rafts {
+            raft.shutdown().await.unwrap();
+        }
+        let response = match read_apply_snapshot(&st).await {
+            Ok(_) => panic!("apply snapshot was served without a quorum read"),
+            Err(response) => response,
+        };
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         let _ = std::fs::remove_dir_all(dir);
     }
 
