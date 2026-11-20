@@ -1793,16 +1793,40 @@ mod tests {
         }
     }
 
-    /// A reported index is present on a follower after it converges.
-    ///
-    /// This is the library-level half of "acknowledged only once a follower
-    /// holds the index": the acknowledgement names an entry, and a replica that
-    /// did not serve the write ends up holding that entry at that index and
-    /// term. It does not show the follower held it at acknowledgement time.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_reported_index_reaches_a_follower() {
+    /// An in-process three-node group whose per-node handles stay accessible, so
+    /// a test can read a replica's log and stop one replica.
+    struct ThreeNodeGroup {
+        dir: std::path::PathBuf,
+        peers: Arc<std::sync::Mutex<BTreeMap<u32, YadbRaft>>>,
+        rafts: BTreeMap<u32, YadbRaft>,
+        states: BTreeMap<u32, DurableMetaStateMachine>,
+        logs: BTreeMap<u32, DurableOpenRaftLog>,
+    }
+
+    impl ThreeNodeGroup {
+        /// Stop one replica the way the multi-node tests do: shut the core down,
+        /// drop the handle and stop routing to it. The remaining majority then
+        /// has to elect a replacement.
+        async fn stop_node(&mut self, node: u32) {
+            let raft = self.rafts.remove(&node).unwrap();
+            raft.shutdown().await.unwrap();
+            drop(raft);
+            self.peers.lock().unwrap().remove(&node);
+        }
+
+        async fn shutdown(mut self) {
+            for raft in std::mem::take(&mut self.rafts).into_values() {
+                raft.shutdown().await.unwrap();
+            }
+            drop(self.states);
+            drop(self.logs);
+            std::fs::remove_dir_all(&self.dir).unwrap();
+        }
+    }
+
+    async fn three_node_group(cluster: u8) -> ThreeNodeGroup {
         let dir = std::env::temp_dir().join(format!(
-            "yadb-write-ack-followers-{}-{}",
+            "yadb-write-ack-group-{cluster}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1818,7 +1842,7 @@ mod tests {
         for node in 1..=3u32 {
             let id = ReplicaIdentity::new(
                 GroupIdentity {
-                    cluster: [54; 16],
+                    cluster: [cluster; 16],
                     group: 1,
                     incarnation: 1,
                 },
@@ -1853,29 +1877,59 @@ mod tests {
             ]))
             .await
             .unwrap();
+        ThreeNodeGroup {
+            dir,
+            peers,
+            rafts,
+            states,
+            logs,
+        }
+    }
 
+    /// Wait until every replica in `rafts` reports the same leader, that leader
+    /// is one of them and reports itself as `Leader`.
+    ///
+    /// `exclude` names a replica that must not be selected. A stopped old leader
+    /// can linger in a survivor's `current_leader` for a heartbeat, so a test
+    /// that changed leadership has to name it rather than accept the first
+    /// agreed value.
+    async fn agreed_leader(rafts: &BTreeMap<u32, YadbRaft>, exclude: Option<u32>) -> u32 {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-        let leader = loop {
+        loop {
             let seen: Vec<Option<u32>> = rafts
                 .values()
                 .map(|raft| raft.metrics().borrow().current_leader)
                 .collect();
             if let Some(id) = seen[0].filter(|id| {
-                seen.iter().all(|leader| *leader == Some(*id))
+                Some(*id) != exclude
+                    && rafts.contains_key(id)
+                    && seen.iter().all(|leader| *leader == Some(*id))
                     && rafts[id].metrics().borrow().state == openraft::ServerState::Leader
             }) {
-                break id;
+                return id;
             }
             assert!(
                 tokio::time::Instant::now() < deadline,
                 "the group did not settle on one leader: {seen:?}"
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
-        };
+        }
+    }
+
+    /// A reported index is present on a follower after it converges.
+    ///
+    /// This is the library-level half of "acknowledged only once a follower
+    /// holds the index": the acknowledgement names an entry, and a replica that
+    /// did not serve the write ends up holding that entry at that index and
+    /// term. It does not show the follower held it at acknowledgement time.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_reported_index_reaches_a_follower() {
+        let group = three_node_group(54).await;
+        let leader = agreed_leader(&group.rafts, None).await;
 
         let client = OpenRaftClient::new(
-            rafts[&leader].clone(),
-            states[&leader].clone(),
+            group.rafts[&leader].clone(),
+            group.states[&leader].clone(),
             tokio::runtime::Handle::current(),
         );
         let command = put("ack/follower", b"replicated");
@@ -1885,7 +1939,7 @@ mod tests {
         let follower = (1..=3).find(|node| *node != leader).unwrap();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
         loop {
-            let applied = rafts[&follower]
+            let applied = group.rafts[&follower]
                 .metrics()
                 .borrow()
                 .last_applied
@@ -1901,7 +1955,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
 
-        let entry = log_entry(&logs[&follower], ack.index()).await;
+        let entry = log_entry(&group.logs[&follower], ack.index()).await;
         assert_eq!(entry.log_id.index, ack.index());
         assert_eq!(
             entry.log_id.leader_id.term,
@@ -1913,7 +1967,7 @@ mod tests {
             other => panic!("the follower's index holds a non-command payload: {other:?}"),
         }
         assert_eq!(
-            states[&follower]
+            group.states[&follower]
                 .try_snapshot(&["ack/follower".into()], &[])
                 .unwrap()
                 .get("ack/follower")
@@ -1923,11 +1977,148 @@ mod tests {
         );
 
         drop(client);
-        for raft in rafts.values() {
-            raft.shutdown().await.unwrap();
+        group.shutdown().await;
+    }
+
+    /// An acknowledgement stays true across a leader change: the replacement
+    /// leader's log holds the acknowledged index at the acknowledged term with
+    /// the acknowledged payload.
+    ///
+    /// Leadership-change mechanism: the one the multi-node tests already use.
+    /// The leader's core is stopped, its handle is dropped and the peer map stops
+    /// routing to it, leaving the two survivors to elect a replacement. The
+    /// group stays in process; no replica is restarted from disk.
+    ///
+    /// Inversion: check the acknowledged entry's term against the replacement
+    /// leader's *current* term instead of the entry's term and the term
+    /// assertion fails, because the election that replaced the leader
+    /// incremented the term. Report `last_applied` instead of the entry index
+    /// and this test still passes (one writer, so the applied index happens to
+    /// be the acknowledged one); the index tests catch that mutation:
+    /// `a_committed_write_reports_the_index_it_occupies`,
+    /// `overlapping_writes_each_report_their_own_entry` and
+    /// `the_library_layer_does_not_deduplicate_a_resubmitted_command`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_committed_ack_survives_a_leader_change() {
+        let mut group = three_node_group(56).await;
+        let old_leader = agreed_leader(&group.rafts, None).await;
+        let client = OpenRaftClient::new(
+            group.rafts[&old_leader].clone(),
+            group.states[&old_leader].clone(),
+            tokio::runtime::Handle::current(),
+        );
+        let command = put("ack/survives-leader-change", b"committed");
+        let ack = client.execute_with_ack(command.clone()).unwrap();
+        assert!(matches!(ack.result, KvResult::PutOk { .. }));
+        assert!(ack.index() > 0);
+        // Close the bridge before the node it writes through goes away.
+        drop(client);
+
+        group.stop_node(old_leader).await;
+        let new_leader = agreed_leader(&group.rafts, Some(old_leader)).await;
+        assert_ne!(new_leader, old_leader, "leadership must have changed");
+        let new_term = group.rafts[&new_leader].metrics().borrow().current_term;
+        assert!(
+            new_term > ack.term(),
+            "the replacement leader's term ({new_term}) must be later than the \
+             acknowledged entry's term ({})",
+            ack.term()
+        );
+
+        let entry = log_entry(&group.logs[&new_leader], ack.index()).await;
+        assert_eq!(entry.log_id.index, ack.index());
+        assert_eq!(
+            entry.log_id.leader_id.term,
+            ack.term(),
+            "the replacement leader's entry at the acknowledged index must still \
+             be at the acknowledged term"
+        );
+        match &entry.payload {
+            EntryPayload::Normal(committed) => assert_eq!(
+                committed, &command,
+                "the replacement leader's acknowledged index must still hold the \
+                 acknowledged payload"
+            ),
+            other => panic!(
+                "the replacement leader's acknowledged index holds a non-command \
+                 payload: {other:?}"
+            ),
         }
-        drop(rafts);
-        std::fs::remove_dir_all(dir).unwrap();
+
+        group.shutdown().await;
+    }
+
+    /// The library layer does not deduplicate a resubmitted command.
+    ///
+    /// `KvCommand` carries no request id and `OpenRaftClient` keeps no table of
+    /// submitted commands: each `client_write` appends a new entry, so the same
+    /// `KvCommand` submitted twice occupies two indices with two results. The
+    /// idempotency namespace helpers in this file (`/sys/idempotency/`,
+    /// `/idempotency/`, `/idempotency/g<group>/`) only *name* where a record
+    /// would live; nothing here reads a record and skips the append.
+    ///
+    /// Deduplication lives one layer up, in `yadbd`'s `POST /v1/apply` record
+    /// path (`record_key` / `read_record` / `replay_record` in
+    /// `crates/yadbd/src/main.rs`), which looks a request up by
+    /// `Idempotency-Key` and re-serves the stored response. That layer stores a
+    /// response, not this `WriteAck`, and this test does not exercise it.
+    ///
+    /// The second half pins the only replay this layer supports: re-serving a
+    /// stored `WriteAck` reports the original index, because the pair is carried
+    /// with the result and is never recomputed from the log's current position.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_library_layer_does_not_deduplicate_a_resubmitted_command() {
+        let node = single_node_group(57).await;
+        let client = OpenRaftClient::new(
+            node.raft.clone(),
+            node.state.clone(),
+            tokio::runtime::Handle::current(),
+        );
+        let command = put("ack/not-deduplicated", b"twice");
+
+        let first = client.execute_with_ack(command.clone()).unwrap();
+        let stored = first.clone();
+        let second = client.execute_with_ack(command.clone()).unwrap();
+
+        assert!(
+            second.index() > first.index(),
+            "a resubmitted command must occupy a new entry: {} then {}",
+            first.index(),
+            second.index()
+        );
+        // Both indices really hold the command, so the second append is not the
+        // first entry being re-served.
+        for ack in [&first, &second] {
+            let entry = log_entry(&node.log, ack.index()).await;
+            assert_eq!(entry.log_id.index, ack.index());
+            assert_eq!(entry.log_id.leader_id.term, ack.term());
+            match &entry.payload {
+                EntryPayload::Normal(committed) => assert_eq!(
+                    committed,
+                    &command,
+                    "index {} must hold the resubmitted command",
+                    ack.index()
+                ),
+                other => panic!(
+                    "index {} holds a non-command payload: {other:?}",
+                    ack.index()
+                ),
+            }
+        }
+
+        // Re-serving the stored acknowledgement names the original entry.
+        assert_eq!(stored.index(), first.index());
+        assert_eq!(stored.result, first.result);
+        let entry = log_entry(&node.log, stored.index()).await;
+        match &entry.payload {
+            EntryPayload::Normal(committed) => assert_eq!(committed, &command),
+            other => panic!("the stored index holds a non-command payload: {other:?}"),
+        }
+
+        drop(client);
+        node.raft.shutdown().await.unwrap();
+        drop(node.raft);
+        std::fs::remove_dir_all(node.dir).unwrap();
     }
 
     /// A bridge whose worker submits the command and then loses the reply, the
