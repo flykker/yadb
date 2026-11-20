@@ -102,7 +102,10 @@ const SNAPSHOT_CHUNK_BYTES: usize = 256 * 1024;
 const SNAPSHOT_MANIFEST_PAYLOAD: usize = 64 * 1024;
 // JSON encodes bytes twice (payload and envelope), at most 16 bytes per byte.
 const SNAPSHOT_MANIFEST_FRAME: usize = SNAPSHOT_MANIFEST_PAYLOAD * 4 + 4096;
-const SNAPSHOT_CHUNK_FRAME: usize = SNAPSHOT_CHUNK_BYTES * 16 + 16384;
+// A chunk payload carries its bytes base64-encoded (4 characters per 3 bytes)
+// and the signed envelope then writes that payload as a JSON array of decimal
+// numbers, at most 4 bytes per payload byte (three digits and a comma).
+const SNAPSHOT_CHUNK_FRAME: usize = SNAPSHOT_CHUNK_BYTES.div_ceil(3) * 4 * 4 + 8192;
 
 // Bound repeated diagnostic volume while retaining evidence of persistent faults.
 static SNAPSHOT_FAILURES: AtomicU64 = AtomicU64::new(0);
@@ -649,6 +652,128 @@ struct SnapshotManifest {
     digest: [u8; 32],
 }
 
+/// RFC 4648 standard base64, padded. Snapshot chunks used to carry `data` as a
+/// JSON array of decimal numbers, which costs roughly 3.6 bytes per byte in the
+/// chunk payload and is expanded again by the signed envelope. Base64 costs
+/// 4/3 bytes per byte and decodes in one pass, so a chunk payload shrinks from
+/// ~3.56x to ~1.34x and the frame that carries it shrinks with it.
+const BASE64_ALPHABET: &[u8; 64] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+fn encode_base64(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for group in bytes.chunks(3) {
+        let b0 = group[0] as u32;
+        let b1 = *group.get(1).unwrap_or(&0) as u32;
+        let b2 = *group.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(BASE64_ALPHABET[(n >> 18) as usize & 0x3f] as char);
+        out.push(BASE64_ALPHABET[(n >> 12) as usize & 0x3f] as char);
+        out.push(if group.len() > 1 {
+            BASE64_ALPHABET[(n >> 6) as usize & 0x3f] as char
+        } else {
+            '='
+        });
+        out.push(if group.len() > 2 {
+            BASE64_ALPHABET[n as usize & 0x3f] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// Strict base64 decode: the input must be padded, four characters per group,
+/// with `=` only in the last two positions and no non-zero unused bits. A
+/// malformed chunk is refused rather than decoded to different bytes.
+fn decode_base64(text: &str) -> Option<Vec<u8>> {
+    let bytes = text.as_bytes();
+    if bytes.len() % 4 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
+    for (group_index, group) in bytes.chunks(4).enumerate() {
+        let mut n = 0u32;
+        let mut padding = 0usize;
+        for (index, &byte) in group.iter().enumerate() {
+            let value = if byte == b'=' {
+                if index < 2 {
+                    return None;
+                }
+                padding += 1;
+                0
+            } else {
+                if padding != 0 {
+                    return None;
+                }
+                base64_value(byte)?
+            };
+            n = (n << 6) | value as u32;
+        }
+        // Padding is only legal in the final group.
+        if padding != 0 && group_index + 1 != bytes.len() / 4 {
+            return None;
+        }
+        match padding {
+            0 => out.extend_from_slice(&[(n >> 16) as u8, (n >> 8) as u8, n as u8]),
+            1 if n & 0xff == 0 => out.extend_from_slice(&[(n >> 16) as u8, (n >> 8) as u8]),
+            2 if n & 0xffff == 0 => out.push((n >> 16) as u8),
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+fn base64_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'A'..=b'Z' => Some(byte - b'A'),
+        b'a'..=b'z' => Some(byte - b'a' + 26),
+        b'0'..=b'9' => Some(byte - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
+    }
+}
+
+fn serialize_chunk_data<S: serde::Serializer>(
+    data: &[u8],
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(&encode_base64(data))
+}
+
+/// Accepts both the current base64 string and the legacy array of numbers, so a
+/// peer that still runs the old encoder is understood instead of misread.
+fn deserialize_chunk_data<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<u8>, D::Error> {
+    use serde::de::{Error, SeqAccess, Visitor};
+
+    struct ChunkData;
+
+    impl<'de> Visitor<'de> for ChunkData {
+        type Value = Vec<u8>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a base64 string or an array of byte values")
+        }
+
+        fn visit_str<E: Error>(self, value: &str) -> Result<Vec<u8>, E> {
+            decode_base64(value).ok_or_else(|| E::custom("invalid base64 snapshot chunk data"))
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(self, mut sequence: A) -> Result<Vec<u8>, A::Error> {
+            let mut out = Vec::with_capacity(sequence.size_hint().unwrap_or(0));
+            while let Some(byte) = sequence.next_element::<u8>()? {
+                out.push(byte);
+            }
+            Ok(out)
+        }
+    }
+
+    deserializer.deserialize_any(ChunkData)
+}
+
 #[derive(Serialize, Deserialize)]
 struct SnapshotChunk {
     context: String,
@@ -657,6 +782,10 @@ struct SnapshotChunk {
     ordinal: usize,
     length: usize,
     digest: [u8; 32],
+    #[serde(
+        serialize_with = "serialize_chunk_data",
+        deserialize_with = "deserialize_chunk_data"
+    )]
     data: Vec<u8>,
 }
 
@@ -3217,6 +3346,220 @@ mod reply_tests {
         );
         assert_eq!(count.load(Ordering::SeqCst), 1);
         task.abort();
+    }
+
+    #[test]
+    fn base64_round_trips_every_byte_value_and_length() {
+        for length in 0..=64usize {
+            let data: Vec<u8> = (0..length).map(|i| (i * 37 + 11) as u8).collect();
+            let encoded = encode_base64(&data);
+            assert_eq!(encoded.len(), data.len().div_ceil(3) * 4);
+            assert_eq!(decode_base64(&encoded), Some(data));
+        }
+        let all: Vec<u8> = (0..=255).collect();
+        assert_eq!(decode_base64(&encode_base64(&all)), Some(all));
+        // The standard alphabet's two non-alphanumeric characters survive a
+        // JSON string unescaped, which is what keeps the payload at 4/3.
+        let high = [0xffu8, 0xff, 0xff];
+        assert_eq!(encode_base64(&high), "////");
+        assert_eq!(decode_base64("////"), Some(high.to_vec()));
+    }
+
+    #[test]
+    fn a_maximum_chunk_round_trips_byte_exactly_and_fits_the_frame() {
+        let group = GroupIdentity {
+            cluster: [11; 16],
+            group: 1,
+            incarnation: 1,
+        };
+        let client = ReplicaIdentity::new(group, 1, vec![1, 2]).unwrap();
+        let key = NodeSigningKey::from_seed(&[1; 32]).unwrap();
+        // Worst case for the wire form: every base64 sextet is 36 ('k') or the
+        // trailing 32 ('g'), both three-digit decimals once the signed
+        // envelope writes the payload as a JSON array of numbers.
+        let data: Vec<u8> = (0..SNAPSHOT_CHUNK_BYTES)
+            .map(|i| [0x92u8, 0x49, 0x24][i % 3])
+            .collect();
+        let encoded = encode_base64(&data);
+        assert_eq!(encoded.len(), SNAPSHOT_CHUNK_BYTES.div_ceil(3) * 4);
+        assert!(encoded
+            .bytes()
+            .take_while(|b| *b != b'=')
+            .all(|b| b == b'k' || b == b'g'));
+        let digest = sha256(&data);
+        let chunk = SnapshotChunk {
+            context: SNAPSHOT_CONTEXT.into(),
+            nonce: [3; 32],
+            challenge: [4; 32],
+            ordinal: 0,
+            length: data.len(),
+            digest,
+            data: data.clone(),
+        };
+        let payload = serde_json::to_vec(&chunk).unwrap();
+        let frame = SignedRaftEnvelope::sign(&client, 2, 1, payload, &key)
+            .unwrap()
+            .encode_json()
+            .unwrap();
+        assert!(
+            frame.len() <= SNAPSHOT_CHUNK_FRAME,
+            "a maximum chunk frame is {} bytes, above the {SNAPSHOT_CHUNK_FRAME}-byte bound",
+            frame.len()
+        );
+        let envelope = SignedRaftEnvelope::decode_json(&frame).unwrap();
+        let decoded: SnapshotChunk = serde_json::from_slice(&envelope.payload).unwrap();
+        assert_eq!(decoded.data, data);
+        assert_eq!(sha256(&decoded.data), decoded.digest);
+        assert_eq!(decoded.data.len(), SNAPSHOT_CHUNK_BYTES);
+    }
+
+    #[test]
+    fn a_legacy_array_of_numbers_chunk_still_decodes_to_the_same_bytes() {
+        // The previous encoder wrote `data` as a JSON array of decimal numbers.
+        // A decoder that only accepted the new string form would misread a
+        // peer still running that encoder, so both shapes must be accepted.
+        #[derive(Serialize)]
+        struct LegacyChunk {
+            context: String,
+            nonce: [u8; 32],
+            challenge: [u8; 32],
+            ordinal: usize,
+            length: usize,
+            digest: [u8; 32],
+            data: Vec<u8>,
+        }
+        let data: Vec<u8> = (0..=255u8).cycle().take(1024).collect();
+        let legacy = LegacyChunk {
+            context: SNAPSHOT_CONTEXT.into(),
+            nonce: [3; 32],
+            challenge: [4; 32],
+            ordinal: 2,
+            length: data.len(),
+            digest: sha256(&data),
+            data: data.clone(),
+        };
+        let json = serde_json::to_vec(&legacy).unwrap();
+        assert!(
+            json.windows(8).any(|window| window == b"\"data\":["),
+            "the legacy fixture must actually use the array-of-numbers shape"
+        );
+        let decoded: SnapshotChunk = serde_json::from_slice(&json).unwrap();
+        assert_eq!(decoded.data, data);
+        assert_eq!(decoded.ordinal, 2);
+    }
+
+    #[test]
+    fn malformed_chunk_data_is_refused() {
+        let chunk = SnapshotChunk {
+            context: SNAPSHOT_CONTEXT.into(),
+            nonce: [3; 32],
+            challenge: [4; 32],
+            ordinal: 0,
+            length: 3,
+            digest: [5; 32],
+            data: vec![1, 2, 3],
+        };
+        let valid = serde_json::to_value(&chunk).unwrap();
+        for bad in [
+            "!!!!",  // character outside the alphabet
+            "AAA",   // length not a multiple of four
+            "A===",  // padding in the first position
+            "AA=A",  // padding followed by data
+            "AB==",  // non-zero unused bits
+            "AAAB=", // trailing padding in a complete group
+        ] {
+            let mut value = valid.clone();
+            value["data"] = serde_json::Value::String(bad.into());
+            assert!(
+                serde_json::from_value::<SnapshotChunk>(value).is_err(),
+                "malformed base64 {bad:?} was accepted"
+            );
+        }
+        // The legacy shape is still validated as bytes, not as arbitrary JSON.
+        let mut value = valid.clone();
+        value["data"] = serde_json::json!([1, 2, 256]);
+        assert!(
+            serde_json::from_value::<SnapshotChunk>(value).is_err(),
+            "an out-of-range legacy byte was accepted"
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_chunks_are_refused_without_a_reply_or_a_dispatch() {
+        // Four independent refusals, each with the same observable class as
+        // before the encoding change: the connection fails, nothing is
+        // answered and nothing reaches the handler.
+        let peer = snapshot_peer(36);
+        let budget = Arc::new(Semaphore::new(MAX_IN_FLIGHT_REQUEST_BYTES));
+        let assembly = Arc::new(Semaphore::new(MAX_SNAPSHOT_BYTES));
+        let data = vec![9u8; 3];
+        let digest = sha256(&data);
+        for case in [
+            "bad_base64",
+            "wrong_length",
+            "wrong_digest",
+            "corrupt_payload",
+        ] {
+            let received = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let wire = snapshot_wire(
+                &peer,
+                received.clone(),
+                budget.clone(),
+                assembly.clone(),
+                Arc::new(AtomicU64::new(0)),
+                65536,
+            );
+            let SnapshotWire { mut client, task } = wire;
+            let (_, challenge) = read_frame(&mut client).await.unwrap();
+            let challenge: [u8; 32] = challenge.try_into().unwrap();
+            write_frame(
+                &mut client,
+                SNAPSHOT_MANIFEST,
+                &signed_snapshot_frame(
+                    &peer,
+                    1,
+                    serde_json::to_vec(&manifest(&peer, challenge, 3, digest)).unwrap(),
+                ),
+            )
+            .await
+            .unwrap();
+            let mut value =
+                serde_json::to_value(chunk(challenge, 0, 3, digest, data.clone())).unwrap();
+            match case {
+                "bad_base64" => value["data"] = serde_json::Value::String("!!!!".into()),
+                "wrong_length" => value["data"] = serde_json::Value::String(encode_base64(&[1, 2])),
+                "wrong_digest" => {
+                    value["digest"] = serde_json::Value::Array(vec![serde_json::json!(7); 32])
+                }
+                _ => {
+                    // Valid base64 of the declared length, one byte different:
+                    // only the whole-snapshot digest can refuse this chunk.
+                    let mut encoded = encode_base64(&data).into_bytes();
+                    encoded[0] = if encoded[0] == b'A' { b'B' } else { b'A' };
+                    value["data"] = serde_json::Value::String(String::from_utf8(encoded).unwrap());
+                }
+            }
+            write_frame(
+                &mut client,
+                SNAPSHOT_CHUNK,
+                &signed_snapshot_frame(&peer, 1, serde_json::to_vec(&value).unwrap()),
+            )
+            .await
+            .unwrap();
+            let refused = tokio::time::timeout(Duration::from_secs(2), read_frame(&mut client))
+                .await
+                .expect("a malformed chunk left the connection hanging");
+            assert!(refused.is_err(), "{case}: a malformed chunk was answered");
+            drop(client);
+            let result = task.await.unwrap();
+            assert!(result.is_err(), "{case}: the connection did not fail");
+            assert!(
+                received.lock().unwrap().is_empty(),
+                "{case}: a malformed chunk was dispatched"
+            );
+            assert_eq!(assembly.available_permits(), MAX_SNAPSHOT_BYTES);
+            assert_eq!(budget.available_permits(), MAX_IN_FLIGHT_REQUEST_BYTES);
+        }
     }
 }
 
