@@ -1580,6 +1580,10 @@ struct ProxyResponse {
     etag: Option<String>,
     write_outcome: Option<String>,
     retry: Option<String>,
+    /// The committed log position a leader reported for a mutation, carried
+    /// across the hop so a client of a follower sees the same evidence a client
+    /// of the leader does. Both are absent together or present together.
+    log_position: Option<(String, String)>,
     headers: Vec<(String, String)>,
     /// Declared body length. A `HEAD` answer reports the size of the
     /// representation while carrying no bytes, so the length must survive the
@@ -1863,6 +1867,8 @@ fn parse_proxy_response_for(raw: &[u8], head: bool) -> Result<ProxyResponse, std
     let mut content_length = None;
     let mut write_outcome = None;
     let mut retry = None;
+    let mut log_index = None;
+    let mut log_term = None;
     let mut headers = Vec::new();
     for line in hdr_str.split("\r\n").skip(1) {
         if let Some((k, v)) = line.split_once(':') {
@@ -1893,6 +1899,21 @@ fn parse_proxy_response_for(raw: &[u8], head: bool) -> Result<ProxyResponse, std
                 }
             } else if kl == "x-yadb-retry" {
                 if retry.replace(vt.to_string()).is_some() {
+                    return Err(invalid());
+                }
+            } else if kl == "x-yadb-log-index" || kl == "x-yadb-log-term" {
+                // A log position is a decimal log id, never free text. Refusing
+                // anything else keeps a malformed leader from putting an
+                // arbitrary value into a header the client is meant to trust.
+                if vt.is_empty() || !vt.bytes().all(|b| b.is_ascii_digit()) {
+                    return Err(invalid());
+                }
+                let slot = if kl == "x-yadb-log-index" {
+                    &mut log_index
+                } else {
+                    &mut log_term
+                };
+                if slot.replace(vt.to_string()).is_some() {
                     return Err(invalid());
                 }
             } else if matches!(
@@ -1928,6 +1949,12 @@ fn parse_proxy_response_for(raw: &[u8], head: bool) -> Result<ProxyResponse, std
             etag: resp_etag,
             write_outcome,
             retry,
+            log_position: match (log_index, log_term) {
+                (Some(index), Some(term)) => Some((index, term)),
+                // A leader that reports only one half is not reporting a
+                // position; treat the pair as absent rather than inventing it.
+                _ => None,
+            },
             headers,
             content_length: None,
             body: Vec::new(),
@@ -1946,6 +1973,12 @@ fn parse_proxy_response_for(raw: &[u8], head: bool) -> Result<ProxyResponse, std
             etag: resp_etag,
             write_outcome,
             retry,
+            log_position: match (log_index, log_term) {
+                (Some(index), Some(term)) => Some((index, term)),
+                // A leader that reports only one half is not reporting a
+                // position; treat the pair as absent rather than inventing it.
+                _ => None,
+            },
             headers,
             content_length,
             body: Vec::new(),
@@ -1976,6 +2009,10 @@ fn parse_proxy_response_for(raw: &[u8], head: bool) -> Result<ProxyResponse, std
         etag: resp_etag,
         write_outcome,
         retry,
+        log_position: match (log_index, log_term) {
+            (Some(index), Some(term)) => Some((index, term)),
+            _ => None,
+        },
         headers,
         content_length,
         body: decoded,
@@ -2375,6 +2412,14 @@ async fn maybe_forward_write(
             }
             if let Some(value) = response.retry {
                 builder = builder.header("x-yadb-retry", value);
+            }
+            // The leader's log position for this mutation survives the hop, so a
+            // client that wrote through a follower holds the same evidence as
+            // one that wrote through the leader.
+            if let Some((index, term)) = response.log_position {
+                builder = builder
+                    .header("x-yadb-log-index", index)
+                    .header("x-yadb-log-term", term);
             }
             // A HEAD answer keeps the leader's declared representation length;
             // axum would otherwise report the empty body's length (zero).
@@ -3686,7 +3731,7 @@ async fn commit_keyed_apply(
         let meta = st.meta.clone();
         let record_key = key.to_owned();
         let result = tokio::task::spawn_blocking(move || {
-            meta.execute(KvCommand::RevisionTxn {
+            meta.execute_with_ack(KvCommand::RevisionTxn {
                 guards: vec![
                     yadb_metakv::RevisionGuard {
                         key: CONTROL_STATE_KEY.into(),
@@ -3722,21 +3767,23 @@ async fn commit_keyed_apply(
         })
         .await;
         match result {
-            Ok(Ok(yadb_metakv::KvResult::TxnOk { .. })) => {
+            Ok(Ok(ack)) if matches!(ack.result, yadb_metakv::KvResult::TxnOk { .. }) => {
                 st.refresh_openraft_control_async().await;
-                return replay_record(record, fingerprint);
+                return with_write_log_id(replay_record(record, fingerprint), &ack);
             }
-            Ok(Ok(yadb_metakv::KvResult::CasConflict { .. })) => match read_record(st, key).await {
-                Ok(Some(record)) => return replay_record(record, fingerprint),
-                Ok(None) if attempt < MAX_ATTEMPTS => continue,
-                Ok(None) => {
-                    return api_err(
-                        StatusCode::CONFLICT,
-                        "control state changed; replan and retry",
-                    )
+            Ok(Ok(ack)) if matches!(ack.result, yadb_metakv::KvResult::CasConflict { .. }) => {
+                match read_record(st, key).await {
+                    Ok(Some(record)) => return replay_record(record, fingerprint),
+                    Ok(None) if attempt < MAX_ATTEMPTS => continue,
+                    Ok(None) => {
+                        return api_err(
+                            StatusCode::CONFLICT,
+                            "control state changed; replan and retry",
+                        )
+                    }
+                    Err(e) => return api_err(StatusCode::SERVICE_UNAVAILABLE, e),
                 }
-                Err(e) => return api_err(StatusCode::SERVICE_UNAVAILABLE, e),
-            },
+            }
             Ok(Ok(_)) => {
                 return api_err(
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -3748,6 +3795,29 @@ async fn commit_keyed_apply(
         }
     }
     unreachable!("at least one attempt is made")
+}
+
+/// Adds the committed log position to a successful mutation response.
+///
+/// A client that is told "committed" should be able to say *where*. The two
+/// headers name the log entry the write occupies, so a reader can check the
+/// claim against any replica's log instead of trusting the word. They are added
+/// only when the write is known to have committed: an unknown outcome carries
+/// no position, because inventing one would turn a guess into evidence.
+///
+/// The index is the entry's own index, not a status sample: another writer may
+/// have appended after it, so a sampled `last_log_index` would name a different
+/// entry. It is deliberately not part of the response body — the body is a
+/// client contract that existing callers parse, and a header is additive.
+fn with_write_log_id(mut response: Response, ack: &yadb_metakv::WriteAck) -> Response {
+    let headers = response.headers_mut();
+    if let Ok(value) = axum::http::HeaderValue::from_str(&ack.index().to_string()) {
+        headers.insert("x-yadb-log-index", value);
+    }
+    if let Ok(value) = axum::http::HeaderValue::from_str(&ack.term().to_string()) {
+        headers.insert("x-yadb-log-term", value);
+    }
+    response
 }
 
 fn resolve_unknown(reason: &str) -> Response {
@@ -4181,6 +4251,7 @@ async fn handle_apply(
         Err(e) => return api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
     let meta = st.meta.clone();
+    let openraft = st.meta.is_openraft();
     let put_res = tokio::task::spawn_blocking(move || {
         let command = if meta.is_openraft() {
             KvCommand::RevisionTxn {
@@ -4199,27 +4270,38 @@ async fn handle_apply(
                 value: serialized,
             }
         };
-        meta.execute(command)
+        // The log position exists only where there is a log. A legacy store
+        // answers with the result alone, so the response simply carries no
+        // position rather than a fabricated one.
+        if openraft {
+            meta.execute_with_ack(command)
+                .map(|ack| (ack.result, Some(ack.committed)))
+        } else {
+            meta.execute(command).map(|result| (result, None))
+        }
     })
     .await;
 
-    match put_res {
-        Ok(Ok(yadb_metakv::KvResult::TxnOk { .. })) if st.meta.is_openraft() => {}
-        Ok(Ok(yadb_metakv::KvResult::PutOk { .. })) if !st.meta.is_openraft() => {}
-        Ok(Ok(yadb_metakv::KvResult::CasConflict { .. })) => {
+    let (result, committed) = match put_res {
+        Ok(Ok(pair)) => pair,
+        Ok(Err(e)) => return meta_err_resp(&st, e),
+        Err(e) => return api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+    match result {
+        yadb_metakv::KvResult::TxnOk { .. } if st.meta.is_openraft() => {}
+        yadb_metakv::KvResult::PutOk { .. } if !st.meta.is_openraft() => {}
+        yadb_metakv::KvResult::CasConflict { .. } => {
             return api_err(
                 StatusCode::CONFLICT,
                 "control state changed; replan and retry",
             )
         }
-        Ok(Ok(_)) => {
+        _ => {
             return api_err(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "unexpected control write result",
             )
         }
-        Ok(Err(e)) => return meta_err_resp(&st, e),
-        Err(e) => return api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 
     let generation = next_state.generation;
@@ -4229,7 +4311,14 @@ async fn handle_apply(
         *st.control.write().unwrap() = next_state;
     }
 
-    Json(ApplyResponse { generation, ops }).into_response()
+    let response = Json(ApplyResponse { generation, ops }).into_response();
+    match committed {
+        Some(id) => with_write_log_id(response, &yadb_metakv::WriteAck {
+            result,
+            committed: id,
+        }),
+        None => response,
+    }
 }
 
 // ============================================================================
@@ -9461,6 +9550,53 @@ mod security_tests {
             b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\naX\r\n0\r\n\r\n"
         )
         .is_err());
+    }
+
+    #[test]
+    fn proxy_response_carries_the_leader_log_position_and_refuses_a_malformed_one() {
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nx-yadb-log-index: 41\r\nx-yadb-log-term: 7\r\n\r\nok";
+        let response = parse_proxy_response(raw).unwrap();
+        assert_eq!(
+            response.log_position,
+            Some(("41".to_string(), "7".to_string())),
+            "a leader's committed log position must survive the hop"
+        );
+        // Both halves are required: half a position is not a position, and a
+        // client must not be able to read an index with no term.
+        let only_index = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nx-yadb-log-index: 41\r\n\r\nok";
+        assert_eq!(parse_proxy_response(only_index).unwrap().log_position, None);
+        // The value is a decimal log id, so free text is refused rather than
+        // copied into a header the client is meant to trust.
+        assert!(parse_proxy_response(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nx-yadb-log-index: 41x\r\nx-yadb-log-term: 7\r\n\r\nok"
+        )
+        .is_err());
+        assert!(parse_proxy_response(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nx-yadb-log-index: 41\r\nx-yadb-log-index: 42\r\nx-yadb-log-term: 7\r\n\r\nok"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn a_committed_write_response_names_its_log_entry() {
+        // The header pair is the whole observable: an index with no term, or a
+        // term with no index, is not evidence of a committed entry.
+        let ack = yadb_metakv::WriteAck {
+            result: yadb_metakv::KvResult::PutOk {
+                revision: 1,
+                version: 1,
+            },
+            committed: yadb_metakv::CommittedLogId { index: 9, term: 3 },
+        };
+        let response = with_write_log_id(
+            axum::http::StatusCode::OK.into_response(),
+            &ack,
+        );
+        assert_eq!(
+            response.headers().get("x-yadb-log-index").unwrap(),
+            "9"
+        );
+        assert_eq!(response.headers().get("x-yadb-log-term").unwrap(), "3");
     }
 
     #[test]

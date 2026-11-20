@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 use yadb_io::StorageFs;
 
 use crate::kv::{KvCommand, KvResult, MetaStateMachine, WatchEvent};
+use crate::openraft_client::WriteAck;
 use crate::wal::{RaftWal, WalRecord};
 use crate::{KvValue, MetaError, MetaSnapshot};
 
@@ -475,6 +476,20 @@ impl<FS: StorageFs> LocalMetaKv<FS> {
             return client.execute(cmd);
         }
         self.legacy().lock().unwrap().propose(cmd)
+    }
+
+    /// The sibling of [`Self::execute`] that also reports the committed log
+    /// entry the write occupies.
+    ///
+    /// This is what makes "the write is durable in the log at index N" an
+    /// observation rather than an inference from a later status sample. A
+    /// legacy (non-OpenRaft) store has no log, so it reports
+    /// `StorageUnavailable` instead of inventing an index.
+    pub fn execute_with_ack(&self, cmd: KvCommand) -> Result<WriteAck, MetaError> {
+        if let Some(client) = &self.openraft {
+            return client.execute_with_ack(cmd);
+        }
+        Err(MetaError::StorageUnavailable)
     }
 
     /// Read one key. `Ok(None)` means the key is absent; `Err` means it could
