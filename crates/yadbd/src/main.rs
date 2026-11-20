@@ -11727,6 +11727,313 @@ mod raft_status_tests {
         (state, dir, vec![control, group2, group3])
     }
 
+    fn gate3_request(body: Vec<u8>, key: Option<&str>) -> axum::extract::Request {
+        let mut builder = axum::http::Request::builder()
+            .method("POST")
+            .header("content-type", "application/json")
+            .header("x-yadb-subject", "tester")
+            .header(
+                "x-yadb-subject-signature",
+                subject_signature("secret", "tester"),
+            );
+        if let Some(key) = key {
+            builder = builder.header("idempotency-key", key);
+        }
+        builder.body(axum::body::Body::from(body)).unwrap()
+    }
+
+    fn gate3_apply_body() -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({"yaml": "apiVersion: yadb.io/v1alpha1\nkind: Project\nmetadata: {name: alpha}\nspec: {quotas: {maxStorageBytes: 100000000, maxIops: 1000}, members: [{subject: tester, role: readWrite}]}\n"})).unwrap()
+    }
+
+    async fn gate3_resolve(st: &AppState, key: &str) -> Response {
+        let body = serde_json::to_vec(&serde_json::json!({"scope":"control", "key":key})).unwrap();
+        handle_resolve(State(st.clone()), gate3_request(body, None)).await
+    }
+
+    async fn gate3_parts(response: Response) -> (StatusCode, HeaderMap, Vec<u8>) {
+        let (parts, body) = response.into_parts();
+        (
+            parts.status,
+            parts.headers,
+            axum::body::to_bytes(body, 65536).await.unwrap().to_vec(),
+        )
+    }
+
+    async fn gate3_state(tag: &str) -> (AppState, std::path::PathBuf, Vec<YadbRaft>) {
+        let (mut st, dir, rafts) = multigroup_state(tag).await;
+        st.subject_secret = Some("secret".into());
+        st.admin_subjects = vec!["tester".into()];
+        (st, dir, rafts)
+    }
+
+    async fn gate3_stop(rafts: Vec<YadbRaft>, dir: std::path::PathBuf) {
+        for raft in rafts {
+            raft.shutdown().await.unwrap();
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gate3_lost_response_resolves_and_replays_once() {
+        let (st, dir, rafts) = gate3_state("gate3-lost").await;
+        let body = gate3_apply_body();
+        let original = gate3_parts(
+            apply_dispatch(State(st.clone()), gate3_request(body.clone(), Some("lost"))).await,
+        )
+        .await;
+        assert_eq!(original.0, StatusCode::OK);
+        let generation = serde_json::from_slice::<serde_json::Value>(&original.2).unwrap()
+            ["generation"]
+            .as_u64()
+            .unwrap();
+        assert_eq!(generation, 1);
+        // The caller discards the delivered response after publication.
+        let resolved = gate3_parts(gate3_resolve(&st, "lost").await).await;
+        assert_eq!(resolved.0, StatusCode::OK);
+        let result: serde_json::Value = serde_json::from_slice(&resolved.2).unwrap();
+        assert_eq!(result["outcome"], "committed");
+        assert_eq!(result["reason"], serde_json::Value::Null);
+        assert_eq!(result["response"]["status"], original.0.as_u16());
+        assert_eq!(
+            result["response"]["headers"]["content-type"],
+            original.1["content-type"].to_str().unwrap()
+        );
+        assert_eq!(
+            BASE64
+                .decode(result["response"]["body_base64"].as_str().unwrap())
+                .unwrap(),
+            original.2
+        );
+        let replay =
+            gate3_parts(apply_dispatch(State(st.clone()), gate3_request(body, Some("lost"))).await)
+                .await;
+        assert_eq!(replay, original);
+        let snapshot = read_apply_snapshot(&st)
+            .await
+            .unwrap_or_else(|_| panic!("control read failed"));
+        assert_eq!(snapshot.control.generation, generation);
+        gate3_stop(rafts, dir).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gate3_capacity_refuses_fresh_but_allows_existing() {
+        let (st, dir, rafts) = gate3_state("gate3-capacity").await;
+        let body = gate3_apply_body();
+        let original = gate3_parts(
+            apply_dispatch(
+                State(st.clone()),
+                gate3_request(body.clone(), Some("existing")),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(original.0, StatusCode::OK);
+        let meta = st.meta.clone();
+        tokio::task::spawn_blocking(move || {
+            meta.execute(KvCommand::Put {
+                key: IDEMPOTENCY_USAGE_KEY.into(),
+                value: serde_json::to_vec(&IdempotencyUsage {
+                    version: 1,
+                    records: MAX_IDEMPOTENCY_RECORDS,
+                    bytes: 0,
+                })
+                .unwrap(),
+            })
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        let before = read_apply_snapshot(&st)
+            .await
+            .unwrap_or_else(|_| panic!("control read failed"));
+        let fresh = gate3_parts(
+            apply_dispatch(
+                State(st.clone()),
+                gate3_request(body.clone(), Some("fresh")),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(fresh.0, StatusCode::TOO_MANY_REQUESTS);
+        let after = read_apply_snapshot(&st)
+            .await
+            .unwrap_or_else(|_| panic!("control read failed"));
+        assert_eq!(before.revision, after.revision);
+        assert_eq!(before.control.generation, after.control.generation);
+        assert_eq!(
+            gate3_parts(
+                apply_dispatch(State(st.clone()), gate3_request(body, Some("existing"))).await
+            )
+            .await,
+            original
+        );
+        let existing = gate3_parts(gate3_resolve(&st, "existing").await).await;
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&existing.2).unwrap()["outcome"],
+            "committed"
+        );
+        let fresh_resolve = gate3_parts(gate3_resolve(&st, "fresh").await).await;
+        assert_eq!(fresh_resolve.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&fresh_resolve.2).unwrap(),
+            serde_json::json!({"outcome":"unknown","reason":"capacity_exhausted","response":null})
+        );
+        gate3_stop(rafts, dir).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gate3_fence_and_mutation_both_orders() {
+        let (st, dir, rafts) = gate3_state("gate3-fence").await;
+        let key = record_key("tester", "queued");
+        // Prepare a delayed publication with the same absent-record guard as the
+        // handler. Submit only after resolve has durably fenced the key.
+        let delayed = KvCommand::RevisionTxn {
+            guards: vec![yadb_metakv::RevisionGuard {
+                key: key.clone(),
+                expected_mod_revision: 0,
+            }],
+            ops: vec![
+                yadb_metakv::TxnOp::Put {
+                    key: CONTROL_STATE_KEY.into(),
+                    value: b"must-not-publish".to_vec(),
+                },
+                yadb_metakv::TxnOp::Put {
+                    key,
+                    value: b"must-not-publish".to_vec(),
+                },
+            ],
+        };
+        let fenced = gate3_parts(gate3_resolve(&st, "queued").await).await;
+        assert_eq!(fenced.0, StatusCode::OK);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&fenced.2).unwrap(),
+            serde_json::json!({"outcome":"not_committed","reason":"fenced","response":null})
+        );
+        let meta = st.meta.clone();
+        let result = tokio::task::spawn_blocking(move || meta.execute(delayed))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(result, yadb_metakv::KvResult::CasConflict { .. }));
+        let state = read_apply_snapshot(&st)
+            .await
+            .unwrap_or_else(|_| panic!("control read failed"));
+        assert_eq!(state.revision, 0);
+        let refused = gate3_parts(
+            apply_dispatch(
+                State(st.clone()),
+                gate3_request(gate3_apply_body(), Some("queued")),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(refused.0, StatusCode::CONFLICT);
+
+        let committed = gate3_parts(
+            apply_dispatch(
+                State(st.clone()),
+                gate3_request(gate3_apply_body(), Some("winner")),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(committed.0, StatusCode::OK);
+        let resolved = gate3_parts(gate3_resolve(&st, "winner").await).await;
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&resolved.2).unwrap()["outcome"],
+            "committed"
+        );
+        gate3_stop(rafts, dir).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gate3_scope_isolation_and_cross_group_rejection() {
+        let (st, dir, rafts) = gate3_state("gate3-scope").await;
+        let applied = gate3_parts(
+            apply_dispatch(
+                State(st.clone()),
+                gate3_request(gate3_apply_body(), Some("same")),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(applied.0, StatusCode::OK);
+        let alpha = project_idempotency_scope(&st, 1)
+            .await
+            .unwrap_or_else(|_| panic!("alpha scope"));
+        let beta = project_idempotency_scope(&st, 2)
+            .await
+            .unwrap_or_else(|_| panic!("beta scope"));
+        let alpha_key = project_record_key(&alpha.records, "tester", "same");
+        let beta_key = project_record_key(&beta.records, "tester", "same");
+        let control_key = record_key("tester", "same");
+        let meta = st.meta.clone();
+        let a = alpha_key.clone();
+        let b = beta_key.clone();
+        let c = control_key.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            meta.execute(KvCommand::RevisionTxn {
+                guards: vec![],
+                ops: vec![
+                    yadb_metakv::TxnOp::Put {
+                        key: a,
+                        value: b"wrong".to_vec(),
+                    },
+                    yadb_metakv::TxnOp::Put {
+                        key: b,
+                        value: b"wrong".to_vec(),
+                    },
+                    yadb_metakv::TxnOp::Put {
+                        key: c,
+                        value: b"wrong".to_vec(),
+                    },
+                ],
+            })
+        })
+        .await
+        .unwrap();
+        assert!(
+            matches!(result, Err(MetaError::Routing(_))),
+            "cross-group transaction must be rejected: {result:?}"
+        );
+        let meta = st.meta.clone();
+        let alpha_key2 = alpha_key.clone();
+        let beta_key2 = beta_key.clone();
+        let snapshots = tokio::task::spawn_blocking(move || {
+            (
+                meta.try_linearizable_snapshot(&[alpha_key2], &[]).unwrap(),
+                meta.try_linearizable_snapshot(&[beta_key2], &[]).unwrap(),
+            )
+        })
+        .await
+        .unwrap();
+        assert!(snapshots.0.get(&alpha_key).is_none());
+        assert!(snapshots.1.get(&beta_key).is_none());
+        let resolved = gate3_parts(gate3_resolve(&st, "same").await).await;
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&resolved.2).unwrap()["outcome"],
+            "committed"
+        );
+        gate3_stop(rafts, dir).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gate3_unavailable_leader_is_unknown() {
+        let (st, dir, rafts) = gate3_state("gate3-unknown").await;
+        rafts[0].shutdown().await.unwrap();
+        let result = gate3_parts(gate3_resolve(&st, "missing").await).await;
+        assert_eq!(result.0, StatusCode::SERVICE_UNAVAILABLE);
+        let json: serde_json::Value = serde_json::from_slice(&result.2).unwrap();
+        assert_eq!(json["outcome"], "unknown");
+        assert_eq!(json["reason"], "leader_unavailable");
+        assert_eq!(json["response"], serde_json::Value::Null);
+        for raft in rafts.into_iter().skip(1) {
+            raft.shutdown().await.unwrap();
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// In-process Raft transport for a group that spans several nodes inside one
     /// test process. A client resolves its target in the shared map at call
     /// time, so a leadership change moves no bytes and binds no ports.
