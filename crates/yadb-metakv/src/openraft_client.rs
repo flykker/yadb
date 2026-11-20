@@ -38,6 +38,48 @@ pub struct GroupObservation {
     pub commit_error: Option<String>,
 }
 
+/// The committed log entry a client write occupies: its index in the group's
+/// log and the leader term that proposed it.
+///
+/// This pair is what makes an acknowledgement checkable against a log. A
+/// replica that holds `index` at `term` holds the entry the acknowledgement
+/// named; a replica that does not hold it has not caught up with that write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CommittedLogId {
+    pub index: u64,
+    pub term: u64,
+}
+
+/// A client write this leader acknowledged, together with the committed log
+/// entry the write occupies.
+///
+/// The log id is the one OpenRaft returned for this entry — never an index
+/// sampled from the local metrics after the fact, which another writer's
+/// append may already have moved past. An outcome that is not known to have
+/// committed (forward-to-leader, lost reply, timeout) is a [`MetaError`]
+/// instead, so it carries no index at all.
+///
+/// A caller that must answer an idempotent replay with the *original* index
+/// stores this value with the replay record: re-serving the stored
+/// acknowledgement reports the entry that first committed, not a later one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteAck {
+    pub result: KvResult,
+    pub committed: CommittedLogId,
+}
+
+impl WriteAck {
+    /// Index of the log entry that holds this write.
+    pub fn index(&self) -> u64 {
+        self.committed.index
+    }
+
+    /// Term of the leader that proposed the entry at [`Self::index`].
+    pub fn term(&self) -> u64 {
+        self.committed.term
+    }
+}
+
 /// Control-scope idempotency records live here. It is byte-identical to the
 /// prefix `record_key` in `yadbd` builds, so existing records stay readable.
 ///
@@ -337,26 +379,21 @@ impl GroupRouter {
         Ok(&self.groups[&id])
     }
     pub(crate) fn execute(&self, cmd: KvCommand) -> Result<KvResult, MetaError> {
-        use crate::TxnOp;
-        let mut keys: Vec<&str> = Vec::new();
-        match &cmd {
-            KvCommand::Put { key, .. }
-            | KvCommand::Delete { key }
-            | KvCommand::CompareAndSwap { key, .. } => keys.push(key),
-            KvCommand::Txn { guards, ops } => {
-                keys.extend(guards.iter().map(|g| g.key.as_str()));
-                keys.extend(ops.iter().map(|op| match op {
-                    TxnOp::Put { key, .. } | TxnOp::Delete { key } => key.as_str(),
-                }));
-            }
-            KvCommand::RevisionTxn { guards, ops } => {
-                keys.extend(guards.iter().map(|g| g.key.as_str()));
-                keys.extend(ops.iter().map(|op| match op {
-                    TxnOp::Put { key, .. } | TxnOp::Delete { key } => key.as_str(),
-                }));
-            }
-        }
-        self.group_for(keys)?.execute(cmd)
+        self.group_for(routing_keys(&cmd))?.execute(cmd)
+    }
+    /// Submit one write and report the committed log entry it occupies.
+    ///
+    /// The keys are routed before anything is submitted, on the same rule as
+    /// [`Self::execute`]: a scope spanning groups fails here and no group
+    /// appends an entry.
+    ///
+    /// `dead_code`: the library-level route the daemon's write path will call
+    /// once the acknowledgement is surfaced; the in-crate tests drive
+    /// `OpenRaftClient::execute_with_ack` directly. Marking it allowed keeps the
+    /// warning list meaningful until that caller exists.
+    #[allow(dead_code)]
+    pub(crate) fn execute_with_ack(&self, cmd: KvCommand) -> Result<WriteAck, MetaError> {
+        self.group_for(routing_keys(&cmd))?.execute_with_ack(cmd)
     }
     pub(crate) fn try_snapshot(
         &self,
@@ -603,7 +640,34 @@ impl GroupRouter {
     }
 }
 
-type Request = (KvCommand, mpsc::SyncSender<Result<KvResult, MetaError>>);
+/// Every key `cmd` touches, in the order the routing rules see them.
+///
+/// Shared by the two write entry points so `execute` and `execute_with_ack`
+/// can never disagree about which group owns a command.
+fn routing_keys(cmd: &KvCommand) -> Vec<&str> {
+    use crate::TxnOp;
+    let mut keys: Vec<&str> = Vec::new();
+    match cmd {
+        KvCommand::Put { key, .. }
+        | KvCommand::Delete { key }
+        | KvCommand::CompareAndSwap { key, .. } => keys.push(key),
+        KvCommand::Txn { guards, ops } => {
+            keys.extend(guards.iter().map(|g| g.key.as_str()));
+            keys.extend(ops.iter().map(|op| match op {
+                TxnOp::Put { key, .. } | TxnOp::Delete { key } => key.as_str(),
+            }));
+        }
+        KvCommand::RevisionTxn { guards, ops } => {
+            keys.extend(guards.iter().map(|g| g.key.as_str()));
+            keys.extend(ops.iter().map(|op| match op {
+                TxnOp::Put { key, .. } | TxnOp::Delete { key } => key.as_str(),
+            }));
+        }
+    }
+    keys
+}
+
+type Request = (KvCommand, mpsc::SyncSender<Result<WriteAck, MetaError>>);
 
 /// Enqueue a command for the bridge worker.
 ///
@@ -621,7 +685,11 @@ fn enqueue(sender: &mpsc::SyncSender<Request>, request: Request) -> Result<(), M
 ///
 /// A dropped or silent worker is genuinely ambiguous: the command was enqueued,
 /// so it may have been submitted to Raft before the reply path disappeared.
-fn await_reply(receiver: mpsc::Receiver<Result<KvResult, MetaError>>) -> Result<KvResult, MetaError> {
+/// The result is then an error, which carries no log id: reporting an index
+/// here would claim a commit the leader never confirmed.
+fn await_reply(
+    receiver: mpsc::Receiver<Result<WriteAck, MetaError>>,
+) -> Result<WriteAck, MetaError> {
     receiver
         .recv_timeout(Duration::from_secs(6))
         .map_err(|_| {
@@ -673,13 +741,15 @@ mod tests {
     use crate::openraft_storage::DurableOpenRaftLog;
     use crate::{CasGuard, LocalMetaKv, RevisionGuard, TxnOp};
     use openraft::error::{
-        Fatal, RPCError, RaftError, ReplicationClosed, StreamingError, Unreachable,
+        Fatal, RPCError, RaftError, RemoteError, ReplicationClosed, StreamingError, Unreachable,
     };
     use openraft::network::RPCOption;
     use openraft::raft::{
         AppendEntriesRequest, AppendEntriesResponse, SnapshotResponse, VoteRequest, VoteResponse,
     };
-    use openraft::{BasicNode, RaftNetwork, RaftNetworkFactory, Snapshot, Vote};
+    use openraft::{
+        BasicNode, EntryPayload, RaftLogReader, RaftNetwork, RaftNetworkFactory, Snapshot, Vote,
+    };
     use std::{collections::BTreeMap, io, sync::Arc};
     use yadb_io::SimFs;
 
@@ -1367,6 +1437,587 @@ mod tests {
         drop(DurableMetaStateMachine::open(dir.join("state"), &id).unwrap());
         std::fs::remove_dir_all(dir).unwrap();
     }
+
+    /// A durable single-node group whose log handle is kept aside, so a test can
+    /// read back the entry an acknowledgement names.
+    struct SingleNodeGroup {
+        dir: std::path::PathBuf,
+        raft: YadbRaft,
+        state: DurableMetaStateMachine,
+        log: DurableOpenRaftLog,
+    }
+
+    async fn single_node_group(cluster: u8) -> SingleNodeGroup {
+        let dir = std::env::temp_dir().join(format!(
+            "yadb-write-ack-{cluster}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let id = ReplicaIdentity::new(
+            GroupIdentity {
+                cluster: [cluster; 16],
+                group: 1,
+                incarnation: 1,
+            },
+            1,
+            vec![1],
+        )
+        .unwrap();
+        let log = DurableOpenRaftLog::create(dir.join("log"), &id).unwrap();
+        let state = DurableMetaStateMachine::create(dir.join("state"), &id).unwrap();
+        let config = Arc::new(openraft::Config::default().validate().unwrap());
+        let raft = YadbRaft::new(1, config, NoNetwork, log.clone(), state.clone())
+            .await
+            .unwrap();
+        raft.initialize(BTreeMap::from([(1, BasicNode::new("one"))]))
+            .await
+            .unwrap();
+        raft.wait(Some(Duration::from_secs(5)))
+            .current_leader(1, "leader")
+            .await
+            .unwrap();
+        SingleNodeGroup {
+            dir,
+            raft,
+            state,
+            log,
+        }
+    }
+
+    /// The log entry at `index`, or a failure naming the index when the log does
+    /// not hold it.
+    async fn log_entry(log: &DurableOpenRaftLog, index: u64) -> openraft::Entry<C> {
+        let mut log = log.clone();
+        let mut entries = log
+            .try_get_log_entries(index..index + 1)
+            .await
+            .unwrap_or_else(|error| panic!("reading log entry {index} failed: {error}"));
+        assert_eq!(entries.len(), 1, "log index {index} must hold an entry");
+        entries.remove(0)
+    }
+
+    fn put(key: &str, value: &[u8]) -> KvCommand {
+        KvCommand::Put {
+            key: key.into(),
+            value: value.to_vec(),
+        }
+    }
+
+    /// A committed write reports the log entry it occupies, and that entry is
+    /// the one the node then applies.
+    ///
+    /// Inversion: report a constant or zero index and the payload assertions
+    /// below fail; the second write's strictly greater index makes a constant
+    /// impossible to miss.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_committed_write_reports_the_index_it_occupies() {
+        let node = single_node_group(51).await;
+        let client = OpenRaftClient::new(
+            node.raft.clone(),
+            node.state.clone(),
+            tokio::runtime::Handle::current(),
+        );
+
+        let first = put("ack/one", b"v1");
+        let ack = client.execute_with_ack(first.clone()).unwrap();
+        assert!(matches!(ack.result, KvResult::PutOk { .. }));
+        assert!(ack.index() > 0, "a committed entry has a real index");
+
+        let entry = log_entry(&node.log, ack.index()).await;
+        assert_eq!(entry.log_id.index, ack.index());
+        assert_eq!(
+            entry.log_id.leader_id.term,
+            ack.term(),
+            "the reported term must be the term of the entry at the reported index"
+        );
+        match &entry.payload {
+            EntryPayload::Normal(command) => assert_eq!(command, &first),
+            other => panic!("the acknowledged index holds a non-command payload: {other:?}"),
+        }
+
+        // The entry appears applied on the node that acknowledged it.
+        // `RaftMetrics` is published asynchronously, so the acknowledgement can
+        // land before the metrics watcher reports the apply; poll briefly rather
+        // than reading one lagging sample.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let applied = loop {
+            let applied = client.role_info().4;
+            if applied >= ack.index() {
+                break applied;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "applied index {applied} never reached the acknowledged index {}",
+                ack.index()
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        assert!(applied >= ack.index());
+        let observation = loop {
+            let observation = client.observation(1).await;
+            if observation.commit_index.is_some_and(|i| i >= ack.index()) {
+                break observation;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "commit index {:?} never reached the acknowledged index {} ({:?})",
+                observation.commit_index,
+                ack.index(),
+                observation.commit_error
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        assert!(observation.commit_index.is_some_and(|i| i >= ack.index()));
+        assert_eq!(
+            node.state
+                .try_snapshot(&["ack/one".into()], &[])
+                .unwrap()
+                .get("ack/one")
+                .unwrap()
+                .value,
+            b"v1".to_vec()
+        );
+
+        // A later write occupies a later entry, so the report tracks the entry
+        // rather than being a fixed value.
+        let second = put("ack/two", b"v2");
+        let next = client.execute_with_ack(second.clone()).unwrap();
+        assert!(
+            next.index() > ack.index(),
+            "the second write must occupy a later entry: {} then {}",
+            ack.index(),
+            next.index()
+        );
+        let entry = log_entry(&node.log, next.index()).await;
+        match &entry.payload {
+            EntryPayload::Normal(command) => assert_eq!(command, &second),
+            other => panic!("the second index holds a non-command payload: {other:?}"),
+        }
+
+        drop(client);
+        node.raft.shutdown().await.unwrap();
+        drop(node.raft);
+        std::fs::remove_dir_all(node.dir).unwrap();
+    }
+
+    /// Each acknowledgement names the entry that holds *its* command, even when
+    /// several writers are in flight.
+    ///
+    /// This is the inversion guard against reporting a freshly sampled index:
+    /// an implementation that answers with `metrics.last_log_index` (or any
+    /// other "current" index) names another writer's entry as soon as writes
+    /// overlap, and the payload comparison fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn overlapping_writes_each_report_their_own_entry() {
+        let node = single_node_group(52).await;
+        let client = OpenRaftClient::new(
+            node.raft.clone(),
+            node.state.clone(),
+            tokio::runtime::Handle::current(),
+        );
+        let mut writers = Vec::new();
+        for writer in 0..2u8 {
+            let client = client.clone();
+            writers.push(std::thread::spawn(move || {
+                (0..8u8)
+                    .map(|n| {
+                        let command = put(&format!("ack/{writer}/{n}"), &[writer, n]);
+                        let ack = client.execute_with_ack(command.clone()).unwrap();
+                        (command, ack)
+                    })
+                    .collect::<Vec<_>>()
+            }));
+        }
+        let mut acks: Vec<(KvCommand, WriteAck)> = writers
+            .into_iter()
+            .flat_map(|writer| writer.join().unwrap())
+            .collect();
+        acks.sort_by_key(|(_, ack)| ack.index());
+
+        let mut indices: Vec<u64> = acks.iter().map(|(_, ack)| ack.index()).collect();
+        indices.dedup();
+        assert_eq!(indices.len(), acks.len(), "every write owns a distinct entry");
+        for (command, ack) in &acks {
+            let entry = log_entry(&node.log, ack.index()).await;
+            assert_eq!(entry.log_id.index, ack.index());
+            assert_eq!(entry.log_id.leader_id.term, ack.term());
+            match &entry.payload {
+                EntryPayload::Normal(committed) => assert_eq!(
+                    committed, command,
+                    "index {} must hold the command its acknowledgement reported",
+                    ack.index()
+                ),
+                other => panic!("index {} holds a non-command payload: {other:?}", ack.index()),
+            }
+        }
+        let last = acks.last().unwrap().1.index();
+        assert!(
+            client.role_info().4 >= last,
+            "every acknowledged entry must be applied"
+        );
+
+        drop(client);
+        node.raft.shutdown().await.unwrap();
+        drop(node.raft);
+        std::fs::remove_dir_all(node.dir).unwrap();
+    }
+
+    /// A stored acknowledgement replays the original committed index.
+    ///
+    /// This is what an idempotent replay needs from this layer: the index is
+    /// carried *with* the result, so a caller that stores the pair re-serves the
+    /// entry that first committed, even after the log has moved past it. The
+    /// stored value does not drift as later writes apply.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stored_ack_replays_the_original_committed_index() {
+        let node = single_node_group(53).await;
+        let client = OpenRaftClient::new(
+            node.raft.clone(),
+            node.state.clone(),
+            tokio::runtime::Handle::current(),
+        );
+        let command = put("ack/replayed", b"once");
+        let original = client.execute_with_ack(command.clone()).unwrap();
+        // The replay record a caller keeps holds both halves of the answer.
+        let stored = original.clone();
+
+        for n in 0..3u8 {
+            client
+                .execute_with_ack(put(&format!("ack/later/{n}"), &[n]))
+                .unwrap();
+        }
+        assert!(
+            client.role_info().4 > stored.index(),
+            "later writes must move the applied index past the stored entry"
+        );
+        assert_eq!(stored.index(), original.index());
+        assert_eq!(stored.result, original.result);
+
+        let entry = log_entry(&node.log, stored.index()).await;
+        assert_eq!(entry.log_id.leader_id.term, stored.term());
+        match &entry.payload {
+            EntryPayload::Normal(committed) => assert_eq!(committed, &command),
+            other => panic!("the stored index holds a non-command payload: {other:?}"),
+        }
+
+        // Re-submitting through this layer is a new entry: OpenRaft appends one
+        // entry per `client_write` and has no request-id dedup. A caller that
+        // must answer with the original index replays the stored ack, which the
+        // assertions above pin to the original entry.
+        let resent = client.execute_with_ack(command).unwrap();
+        assert!(
+            resent.index() > original.index(),
+            "an unkeyed re-submission occupies its own entry: {} then {}",
+            original.index(),
+            resent.index()
+        );
+
+        drop(client);
+        node.raft.shutdown().await.unwrap();
+        drop(node.raft);
+        std::fs::remove_dir_all(node.dir).unwrap();
+    }
+
+    /// In-process peer routing: every RPC is delivered straight to the target
+    /// `Raft` handle, so a three-node group needs no sockets.
+    #[derive(Clone, Default)]
+    struct InProcessNetwork {
+        peers: Arc<std::sync::Mutex<BTreeMap<u32, YadbRaft>>>,
+    }
+
+    struct InProcessLink {
+        target: u32,
+        peers: Arc<std::sync::Mutex<BTreeMap<u32, YadbRaft>>>,
+    }
+
+    impl InProcessLink {
+        fn peer(&self) -> Result<YadbRaft, Unreachable> {
+            self.peers
+                .lock()
+                .unwrap()
+                .get(&self.target)
+                .cloned()
+                .ok_or_else(|| Unreachable::new(&io::Error::other("peer is not registered")))
+        }
+    }
+
+    impl RaftNetworkFactory<C> for InProcessNetwork {
+        type Network = InProcessLink;
+
+        async fn new_client(&mut self, target: u32, _: &BasicNode) -> InProcessLink {
+            InProcessLink {
+                target,
+                peers: self.peers.clone(),
+            }
+        }
+    }
+
+    impl RaftNetwork<C> for InProcessLink {
+        async fn append_entries(
+            &mut self,
+            rpc: AppendEntriesRequest<C>,
+            _: RPCOption,
+        ) -> Result<AppendEntriesResponse<u32>, RPCError<u32, BasicNode, RaftError<u32>>> {
+            let peer = self.peer().map_err(RPCError::Unreachable)?;
+            peer.append_entries(rpc)
+                .await
+                .map_err(|error| RPCError::RemoteError(RemoteError::new(self.target, error)))
+        }
+
+        async fn vote(
+            &mut self,
+            rpc: VoteRequest<u32>,
+            _: RPCOption,
+        ) -> Result<VoteResponse<u32>, RPCError<u32, BasicNode, RaftError<u32>>> {
+            let peer = self.peer().map_err(RPCError::Unreachable)?;
+            peer.vote(rpc)
+                .await
+                .map_err(|error| RPCError::RemoteError(RemoteError::new(self.target, error)))
+        }
+
+        async fn full_snapshot(
+            &mut self,
+            vote: Vote<u32>,
+            snapshot: Snapshot<C>,
+            _: impl std::future::Future<Output = ReplicationClosed> + Send + 'static,
+            _: RPCOption,
+        ) -> Result<SnapshotResponse<u32>, StreamingError<C, Fatal<u32>>> {
+            let peer = self.peer()?;
+            peer.install_full_snapshot(vote, snapshot)
+                .await
+                .map_err(|fatal| StreamingError::from(Unreachable::new(&fatal)))
+        }
+    }
+
+    /// A reported index is present on a follower after it converges.
+    ///
+    /// This is the library-level half of "acknowledged only once a follower
+    /// holds the index": the acknowledgement names an entry, and a replica that
+    /// did not serve the write ends up holding that entry at that index and
+    /// term. It does not show the follower held it at acknowledgement time.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_reported_index_reaches_a_follower() {
+        let dir = std::env::temp_dir().join(format!(
+            "yadb-write-ack-followers-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = Arc::new(openraft::Config::default().validate().unwrap());
+        let peers: Arc<std::sync::Mutex<BTreeMap<u32, YadbRaft>>> = Arc::default();
+        let mut rafts = BTreeMap::new();
+        let mut states = BTreeMap::new();
+        let mut logs = BTreeMap::new();
+        for node in 1..=3u32 {
+            let id = ReplicaIdentity::new(
+                GroupIdentity {
+                    cluster: [54; 16],
+                    group: 1,
+                    incarnation: 1,
+                },
+                node,
+                vec![1, 2, 3],
+            )
+            .unwrap();
+            let log = DurableOpenRaftLog::create(dir.join(format!("log-{node}")), &id).unwrap();
+            let state =
+                DurableMetaStateMachine::create(dir.join(format!("state-{node}")), &id).unwrap();
+            let raft = YadbRaft::new(
+                node,
+                config.clone(),
+                InProcessNetwork {
+                    peers: peers.clone(),
+                },
+                log.clone(),
+                state.clone(),
+            )
+            .await
+            .unwrap();
+            peers.lock().unwrap().insert(node, raft.clone());
+            rafts.insert(node, raft);
+            states.insert(node, state);
+            logs.insert(node, log);
+        }
+        rafts[&1]
+            .initialize(BTreeMap::from([
+                (1, BasicNode::new("one")),
+                (2, BasicNode::new("two")),
+                (3, BasicNode::new("three")),
+            ]))
+            .await
+            .unwrap();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        let leader = loop {
+            let seen: Vec<Option<u32>> = rafts
+                .values()
+                .map(|raft| raft.metrics().borrow().current_leader)
+                .collect();
+            if let Some(id) = seen[0].filter(|id| {
+                seen.iter().all(|leader| *leader == Some(*id))
+                    && rafts[id].metrics().borrow().state == openraft::ServerState::Leader
+            }) {
+                break id;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the group did not settle on one leader: {seen:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+
+        let client = OpenRaftClient::new(
+            rafts[&leader].clone(),
+            states[&leader].clone(),
+            tokio::runtime::Handle::current(),
+        );
+        let command = put("ack/follower", b"replicated");
+        let ack = client.execute_with_ack(command.clone()).unwrap();
+        assert!(ack.index() > 0);
+
+        let follower = (1..=3).find(|node| *node != leader).unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let applied = rafts[&follower]
+                .metrics()
+                .borrow()
+                .last_applied
+                .map_or(0, |id| id.index);
+            if applied >= ack.index() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "follower {follower} did not apply index {} (applied {applied})",
+                ack.index()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let entry = log_entry(&logs[&follower], ack.index()).await;
+        assert_eq!(entry.log_id.index, ack.index());
+        assert_eq!(
+            entry.log_id.leader_id.term,
+            ack.term(),
+            "the follower's entry at the reported index must be the reported term"
+        );
+        match &entry.payload {
+            EntryPayload::Normal(committed) => assert_eq!(committed, &command),
+            other => panic!("the follower's index holds a non-command payload: {other:?}"),
+        }
+        assert_eq!(
+            states[&follower]
+                .try_snapshot(&["ack/follower".into()], &[])
+                .unwrap()
+                .get("ack/follower")
+                .unwrap()
+                .value,
+            b"replicated".to_vec()
+        );
+
+        drop(client);
+        for raft in rafts.values() {
+            raft.shutdown().await.unwrap();
+        }
+        drop(rafts);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A bridge whose worker submits the command and then loses the reply, the
+    /// ambiguity `await_reply` exists for. Unlike a bridge that refuses the
+    /// command, this one really commits it, so the test can show that the write
+    /// happened while no index was reported for it.
+    fn reply_dropping_client(
+        raft: YadbRaft,
+        state: DurableMetaStateMachine,
+        handle: tokio::runtime::Handle,
+    ) -> OpenRaftClient {
+        let (sender, receiver) = mpsc::sync_channel::<Request>(64);
+        let stopping = Arc::new(AtomicBool::new(false));
+        let worker_stopping = stopping.clone();
+        let worker_handle = handle.clone();
+        let worker_raft = raft.clone();
+        let worker = std::thread::Builder::new()
+            .name("yadb-openraft-lost-reply".into())
+            .spawn(move || {
+                while let Ok((cmd, reply)) = receiver.recv() {
+                    if worker_stopping.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let raft = worker_raft.clone();
+                    worker_handle.spawn(async move {
+                        let _ = raft.client_write(cmd).await;
+                        // The outcome is no longer reported: the reply path is
+                        // gone after the write was already submitted.
+                        drop(reply);
+                    });
+                }
+            })
+            .expect("could not start the lost-reply bridge");
+        OpenRaftClient {
+            raft,
+            state,
+            handle,
+            bridge: Arc::new(Bridge {
+                sender: Some(sender),
+                worker: Some(worker),
+                stopping,
+            }),
+        }
+    }
+
+    /// An ambiguous write reports no index and keeps the unknown outcome.
+    ///
+    /// Inversion: report an index for the lost reply and this test fails, because
+    /// the call would return `Ok` where the assertion demands
+    /// `OpenRaftWriteUnknown`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_ambiguous_write_reports_no_index() {
+        let node = single_node_group(55).await;
+        let client = reply_dropping_client(
+            node.raft.clone(),
+            node.state.clone(),
+            tokio::runtime::Handle::current(),
+        );
+        let error = client
+            .execute_with_ack(put("ack/ambiguous", b"maybe"))
+            .expect_err("a lost reply is not a confirmed commit");
+        assert!(
+            matches!(error, MetaError::OpenRaftWriteUnknown(_)),
+            "a lost reply must stay unknown, got {error:?}"
+        );
+        // The write itself did commit: the ambiguity is in the report, and no
+        // index is available for it.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let present = node
+                .state
+                .try_snapshot(&["ack/ambiguous".into()], &[])
+                .unwrap()
+                .get("ack/ambiguous")
+                .is_some();
+            if present {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the ambiguous write must still have committed for this test to be meaningful"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        drop(client);
+        node.raft.shutdown().await.unwrap();
+        drop(node.raft);
+        std::fs::remove_dir_all(node.dir).unwrap();
+    }
 }
 
 impl OpenRaftClient {
@@ -1396,12 +2047,24 @@ impl OpenRaftClient {
                     let raft = worker_raft.clone();
                     worker_handle.spawn(async move {
                         let result = match raft.client_write(cmd).await {
-                            Ok(response) => Ok(response.data),
+                            // `ClientWriteResponse::log_id` is the entry OpenRaft
+                            // applied for this request. It is the only value that
+                            // names where the write actually lives: sampling the
+                            // metrics afterwards would name whatever was last
+                            // appended, not this write.
+                            Ok(response) => Ok(WriteAck {
+                                result: response.data,
+                                committed: CommittedLogId {
+                                    index: response.log_id.index,
+                                    term: response.log_id.leader_id.term,
+                                },
+                            }),
                             Err(RaftError::APIError(ClientWriteError::ForwardToLeader(f))) => {
                                 Err(MetaError::NotLeader {
                                     leader: f.leader_id,
                                 })
                             }
+                            // No confirmed commit, so no log id is reported.
                             Err(error) => Err(MetaError::OpenRaftWriteUnknown(error.to_string())),
                         };
                         let _ = reply.send(result);
@@ -1422,6 +2085,16 @@ impl OpenRaftClient {
     }
 
     pub(crate) fn execute(&self, cmd: KvCommand) -> Result<KvResult, MetaError> {
+        self.execute_with_ack(cmd).map(|ack| ack.result)
+    }
+
+    /// Submit one write and report the committed log entry it occupies.
+    ///
+    /// This is the sibling of [`Self::execute`] for callers that need the
+    /// evidence, not only the result: a committed write returns the index and
+    /// term of the entry that holds it, while every outcome that is not known
+    /// to have committed returns an error and therefore no index.
+    pub(crate) fn execute_with_ack(&self, cmd: KvCommand) -> Result<WriteAck, MetaError> {
         let runtime = tokio::runtime::Handle::try_current().ok();
         if runtime
             .as_ref()
