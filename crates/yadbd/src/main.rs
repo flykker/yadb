@@ -3039,6 +3039,25 @@ fn resolve_capacity_exhausted() -> Response {
     resolve_unknown("capacity_exhausted")
 }
 
+/// The answer when the fence transaction did not produce a record.
+///
+/// The two failures are not the same. A bridge that refused the command
+/// provably never enqueued it, so the key is still unfenced and a retry can
+/// establish the outcome; that case carries `x-yadb-write-outcome: not-sent`
+/// (and no `do-not-retry`) so a client can tell it apart from a fence that may
+/// still commit. Every other error — a lost reply, a timed-out proposal, a
+/// leadership change mid-fence — stays `unknown/fence_outcome_unknown`; resolve
+/// is safe to repeat, but the answer must never be read as a rejection.
+fn resolve_fence_error(err: &MetaError) -> Response {
+    let mut response = resolve_unknown("fence_outcome_unknown");
+    if matches!(err, MetaError::OpenRaftWriteNotSent(_)) {
+        response
+            .headers_mut()
+            .insert("x-yadb-write-outcome", HeaderValue::from_static("not-sent"));
+    }
+    response
+}
+
 #[derive(Deserialize)]
 struct ResolvePayload {
     scope: String,
@@ -3920,6 +3939,7 @@ async fn resolve_control(
                     _ => resolve_unknown("quorum_unavailable"),
                 }
             }
+            Ok(Err(error)) => return resolve_fence_error(&error),
             _ => return resolve_unknown("fence_outcome_unknown"),
         }
     }
@@ -4041,6 +4061,7 @@ async fn resolve_project(
             // resolve fenced this key. Re-read rather than guess which, and never
             // retry a submission whose outcome is unknown.
             Ok(Ok(yadb_metakv::KvResult::CasConflict { .. })) if attempt < 3 => continue,
+            Ok(Err(error)) => return resolve_fence_error(&error),
             _ => return resolve_unknown("fence_outcome_unknown"),
         }
     }
@@ -11766,6 +11787,56 @@ mod raft_status_tests {
         serde_json::to_vec(&serde_json::json!({"yaml": "apiVersion: yadb.io/v1alpha1\nkind: Project\nmetadata: {name: alpha}\nspec: {quotas: {maxStorageBytes: 100000000, maxIops: 1000}, members: [{subject: tester, role: readWrite}]}\n"})).unwrap()
     }
 
+    /// A project, a pool and a block volume, so a keyed UNMAP has a target.
+    fn gate3_block_body() -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({"yaml": concat!(
+            "apiVersion: yadb.io/v1alpha1\n",
+            "kind: StoragePool\n",
+            "metadata: {name: data}\n",
+            "spec: {erasure: {scheme: mirror, replicas: 1}, failureDomains: 1, handoffSlots: 1}\n",
+            "---\n",
+            "apiVersion: yadb.io/v1alpha1\n",
+            "kind: Project\n",
+            "metadata: {name: alpha}\n",
+            "spec: {quotas: {maxStorageBytes: 100000000, maxIops: 1000}, members: [{subject: tester, role: readWrite}]}\n",
+            "---\n",
+            "apiVersion: yadb.io/v1alpha1\n",
+            "kind: BlockVolume\n",
+            "metadata: {name: disk, project: alpha}\n",
+            "spec: {pool: data, sizeBytes: 8192}\n",
+        )}))
+        .unwrap()
+    }
+
+    async fn project_resolve(st: &AppState, project: &str, key: &str) -> Response {
+        let body = serde_json::to_vec(&serde_json::json!({
+            "scope": "project",
+            "project": project,
+            "key": key,
+        }))
+        .unwrap();
+        handle_resolve(State(st.clone()), gate3_request(body, None)).await
+    }
+
+    /// One keyed UNMAP of project `alpha`'s volume, through the real handler.
+    async fn unmap_alpha(
+        st: &AppState,
+        key: &str,
+        offset: u64,
+        len: u64,
+    ) -> (StatusCode, HeaderMap, Vec<u8>) {
+        let body = serde_json::to_vec(&serde_json::json!({"offset": offset, "len": len})).unwrap();
+        gate3_parts(
+            handle_block_unmap(
+                State(st.clone()),
+                Path(("alpha".to_string(), "disk".to_string())),
+                gate3_request(body, Some(key)),
+            )
+            .await,
+        )
+        .await
+    }
+
     async fn gate3_resolve(st: &AppState, key: &str) -> Response {
         let body = serde_json::to_vec(&serde_json::json!({"scope":"control", "key":key})).unwrap();
         handle_resolve(State(st.clone()), gate3_request(body, None)).await
@@ -12089,6 +12160,345 @@ mod raft_status_tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// Control-scope and project-scope records are different keyspaces.
+    ///
+    /// A client may reuse one key and subject in both scopes, so a writer that
+    /// mixed the namespaces would replay one scope's response in the other.
+    /// Both directions are driven through the real handlers: a project UNMAP
+    /// after a control apply with the same key must execute and record its own
+    /// empty 200, and a control apply after a project UNMAP with the same key
+    /// must execute and record its own JSON response. Each record is then read
+    /// back from the group that owns it, and neither group holds the other's
+    /// record.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gate3_project_and_control_records_do_not_serve_each_other() {
+        let (st, dir, rafts) = gate3_state("gate3-isolation").await;
+        let applied = gate3_parts(
+            apply_dispatch(
+                State(st.clone()),
+                gate3_request(gate3_block_body(), Some("shared")),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(applied.0, StatusCode::OK);
+        assert!(
+            !applied.2.is_empty(),
+            "the control response must be recorded, otherwise the test proves nothing"
+        );
+
+        let control_key = record_key("tester", "shared");
+        let alpha = project_idempotency_scope(&st, 1)
+            .await
+            .unwrap_or_else(|_| panic!("alpha scope"));
+        let project_key = project_record_key(&alpha.records, "tester", "shared");
+        assert_ne!(
+            project_key, control_key,
+            "a project record and a control record must never share a key"
+        );
+
+        // A project UNMAP whose client key matches the control record must not
+        // replay the control response: it runs and records an empty 200.
+        let project = unmap_alpha(&st, "shared", 0, 4096).await;
+        assert_eq!(project.0, StatusCode::OK);
+        assert!(
+            project.2.is_empty(),
+            "UNMAP records an empty 200, not the control apply's JSON"
+        );
+        assert_ne!(project.2, applied.2);
+
+        // Replaying the project key returns the project response again.
+        let replay = unmap_alpha(&st, "shared", 0, 4096).await;
+        assert_eq!(replay.0, project.0);
+        assert_eq!(replay.2, project.2);
+        assert_ne!(replay.2, applied.2);
+
+        // The reverse direction: a key that exists only as a project record
+        // must not serve a control apply.
+        let project_only = unmap_alpha(&st, "project-only", 0, 4096).await;
+        assert_eq!(project_only.0, StatusCode::OK);
+        assert!(project_only.2.is_empty());
+        let control = gate3_parts(
+            apply_dispatch(
+                State(st.clone()),
+                gate3_request(gate3_apply_body(), Some("project-only")),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(control.0, StatusCode::OK);
+        let control_json: serde_json::Value =
+            serde_json::from_slice(&control.2).unwrap_or_else(|_| {
+                panic!("a control apply must not replay the project UNMAP's empty body")
+            });
+        assert!(control_json["generation"].is_u64());
+        assert_ne!(control.2, project_only.2);
+        let control_replay = gate3_parts(
+            apply_dispatch(
+                State(st.clone()),
+                gate3_request(gate3_apply_body(), Some("project-only")),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(control_replay, control);
+
+        // Each record is in its own group, and the other group has neither.
+        let project_only_key = project_record_key(&alpha.records, "tester", "project-only");
+        for key in [&project_key, &project_only_key] {
+            assert!(
+                st.meta
+                    .try_linearizable_group_snapshot(2, std::slice::from_ref(key), &[])
+                    .unwrap()
+                    .get(key)
+                    .is_some(),
+                "the project record must be committed in the project group"
+            );
+            assert!(
+                st.meta
+                    .try_linearizable_group_snapshot(1, std::slice::from_ref(key), &[])
+                    .unwrap()
+                    .get(key)
+                    .is_none(),
+                "the control group must not hold a project record"
+            );
+        }
+        assert!(
+            st.meta
+                .try_linearizable_group_snapshot(1, &[control_key.clone()], &[])
+                .unwrap()
+                .get(&control_key)
+                .is_some(),
+            "the control record must be committed in the control group"
+        );
+        assert!(
+            st.meta
+                .try_linearizable_group_snapshot(2, &[control_key.clone()], &[])
+                .unwrap()
+                .get(&control_key)
+                .is_none(),
+            "the project group must not hold a control record"
+        );
+        gate3_stop(rafts, dir).await;
+    }
+
+    /// A project resolve runs on the project group's leader, not the control
+    /// group's.
+    ///
+    /// The fixture leads control on node 2 and group 2 (project `alpha`) on
+    /// node 1, so a resolve served here must neither ask node 2 nor fall back to
+    /// the local control image. A committed record written in group 2 must come
+    /// back as `committed`; a fresh key must be fenced locally. A fallback to
+    /// the control group would answer `not_committed` for the first case and
+    /// fail the whole resolve for the second.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn gate3_project_resolve_uses_the_project_leader_not_the_control_leader() {
+        let mut fixture = split_leadership_state("gate3-project-resolve").await;
+        fixture.state.subject_secret = Some("secret".into());
+        let st = fixture.state.clone();
+        let (_, control_role, _, control_leader, _) = st.meta.role_info();
+        assert_eq!(control_role, RoleState::Follower);
+        assert_eq!(control_leader, Some(2));
+        let (_, group_role, _, group_leader, _) = st.meta.role_info_for_group(2).unwrap();
+        assert_eq!(group_role, RoleState::Leader);
+        assert_eq!(group_leader, Some(1));
+        assert_ne!(
+            control_leader, group_leader,
+            "the fixture must place the control leader and the group-2 leader on different nodes"
+        );
+
+        let alpha = project_idempotency_scope(&st, 1)
+            .await
+            .unwrap_or_else(|_| panic!("alpha scope"));
+        // A committed record written in the project's own group. Resolution
+        // must find it through that group's quorum read; the local control
+        // image has no such record.
+        let committed_key = project_record_key(&alpha.records, "tester", "done");
+        let committed = IdempotencyRecord {
+            version: 1,
+            fingerprint: "fp".into(),
+            outcome: "committed".into(),
+            response: Some(RecordedResponse {
+                status: 200,
+                headers: BTreeMap::from([("content-type".into(), "text/plain".into())]),
+                body_base64: BASE64.encode(b"done-body"),
+            }),
+        };
+        let meta = st.meta.clone();
+        let key_in = committed_key.clone();
+        let value = serde_json::to_vec(&committed).unwrap();
+        tokio::task::spawn_blocking(move || meta.execute(KvCommand::Put { key: key_in, value }))
+            .await
+            .unwrap()
+            .unwrap();
+
+        let resolved = gate3_parts(project_resolve(&st, "alpha", "done").await).await;
+        assert_eq!(resolved.0, StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&resolved.2)
+            .unwrap_or_else(|_| panic!("resolve must answer JSON, not a forwarded peer body"));
+        assert_eq!(json["outcome"], "committed");
+        assert_eq!(json["reason"], serde_json::Value::Null);
+        assert_eq!(json["response"]["status"], 200);
+        assert_eq!(
+            BASE64
+                .decode(json["response"]["body_base64"].as_str().unwrap())
+                .unwrap(),
+            b"done-body"
+        );
+
+        // A fresh key is fenced in the project group, locally, even though this
+        // node is not the control leader.
+        let fenced = gate3_parts(project_resolve(&st, "alpha", "missing").await).await;
+        assert_eq!(fenced.0, StatusCode::OK);
+        let fenced_json: serde_json::Value = serde_json::from_slice(&fenced.2).unwrap();
+        assert_eq!(
+            fenced_json,
+            serde_json::json!({"outcome":"not_committed","reason":"fenced","response":null})
+        );
+        let again = gate3_parts(project_resolve(&st, "alpha", "missing").await).await;
+        assert_eq!(again.0, fenced.0);
+        assert_eq!(again.2, fenced.2);
+
+        // The records are in group 2; the control group holds neither, and the
+        // control group's leadership did not change while resolving.
+        let fenced_key = project_record_key(&alpha.records, "tester", "missing");
+        for key in [&committed_key, &fenced_key] {
+            assert!(
+                st.meta
+                    .try_linearizable_group_snapshot(2, std::slice::from_ref(key), &[])
+                    .unwrap()
+                    .get(key)
+                    .is_some(),
+                "the project record must be committed in the project group"
+            );
+        }
+        for client_key in ["done", "missing"] {
+            let control_key = record_key("tester", client_key);
+            assert!(
+                st.meta
+                    .try_snapshot(&[control_key.clone()], &[])
+                    .unwrap()
+                    .get(&control_key)
+                    .is_none(),
+                "a project resolve must not write the control namespace"
+            );
+        }
+        let (_, control_role_after, _, control_leader_after, _) = st.meta.role_info();
+        assert_eq!(
+            (control_role_after, control_leader_after),
+            (control_role, control_leader)
+        );
+
+        for raft in fixture.rafts {
+            raft.shutdown().await.unwrap();
+        }
+        let _ = std::fs::remove_dir_all(fixture.dir);
+    }
+
+    /// A failed quorum read is a refusal, not an absent record.
+    ///
+    /// The local state still holds the committed record and the control image,
+    /// so a fallback to `try_snapshot` would find them; answering "no record"
+    /// instead of "cannot prove quorum" would let a duplicate apply through.
+    /// Once the group cannot prove quorum, `read_apply_snapshot`, a direct
+    /// caller, and `read_record` must all fail closed, and the refused apply
+    /// must write nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gate3_quorum_read_failure_is_a_refusal_not_an_absent_record() {
+        let (st, dir, rafts) = gate3_state("gate3-quorum-refusal").await;
+        let body = gate3_apply_body();
+        let applied = gate3_parts(
+            apply_dispatch(State(st.clone()), gate3_request(body.clone(), Some("kept"))).await,
+        )
+        .await;
+        assert_eq!(applied.0, StatusCode::OK);
+        let kept = record_key("tester", "kept");
+        assert!(
+            st.meta
+                .try_snapshot(&[kept.clone()], &[])
+                .unwrap()
+                .get(&kept)
+                .is_some(),
+            "the local state must hold the record before quorum is lost"
+        );
+        let before = read_apply_snapshot(&st)
+            .await
+            .unwrap_or_else(|_| panic!("quorum read"));
+        for raft in rafts {
+            raft.shutdown().await.unwrap();
+        }
+        // The local copy is still readable, so this is a quorum failure, not a
+        // local outage.
+        assert!(
+            st.meta
+                .try_snapshot(&[CONTROL_STATE_KEY.into()], &[])
+                .is_ok(),
+            "the local state must stay readable, otherwise this test proves nothing"
+        );
+        let response = match read_apply_snapshot(&st).await {
+            Ok(_) => panic!("apply snapshot was served without a quorum read"),
+            Err(response) => response,
+        };
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        // A direct caller treats the failure as a refusal: no plan, no write.
+        let manifests = parse_manifests(
+            &serde_json::from_slice::<ManifestPayload>(&body)
+                .unwrap()
+                .yaml,
+        )
+        .unwrap();
+        let fresh = record_key("tester", "fresh");
+        let direct = commit_keyed_apply(&st, &fresh, &request_fingerprint(&body), &manifests).await;
+        assert_eq!(direct.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let direct_json: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(direct.into_body(), 65536)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            direct_json.get("error").is_some(),
+            "a refusal is an error, not an apply result"
+        );
+        assert!(direct_json.get("generation").is_none());
+        // The real handler must refuse too, and must not fall through to
+        // "no record, so this is a fresh key" and try to commit.
+        let dispatch = gate3_parts(
+            apply_dispatch(
+                State(st.clone()),
+                gate3_request(body.clone(), Some("fresh")),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(dispatch.0, StatusCode::SERVICE_UNAVAILABLE);
+        let dispatch_json: serde_json::Value = serde_json::from_slice(&dispatch.2).unwrap();
+        assert!(
+            dispatch_json.get("error").is_some(),
+            "the handler must report a refusal, not an apply result"
+        );
+        // A record read that cannot prove quorum is an error, never `None`:
+        // `None` is what makes resolve fence a key that already committed.
+        assert!(read_record(&st, &kept).await.is_err());
+        // Nothing was written by the refused apply.
+        let after = st
+            .meta
+            .try_snapshot(&[CONTROL_STATE_KEY.into()], &[])
+            .unwrap();
+        let control: ControlPlaneState =
+            serde_json::from_slice(&after.get(&CONTROL_STATE_KEY).unwrap().value).unwrap();
+        assert_eq!(control.generation, before.control.generation);
+        assert!(
+            st.meta
+                .try_snapshot(&[fresh.clone()], &[])
+                .unwrap()
+                .get(&fresh)
+                .is_none(),
+            "a refused apply must not leave a record"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// In-process Raft transport for a group that spans several nodes inside one
     /// test process. A client resolves its target in the shared map at call
     /// time, so a leadership change moves no bytes and binds no ports.
@@ -12274,6 +12684,345 @@ mod raft_status_tests {
         .unwrap();
         mesh.lock().unwrap().insert(node, raft.clone());
         (raft, state)
+    }
+
+    /// A mesh whose entry-bearing appends are withheld on demand.
+    ///
+    /// Empty appends (heartbeats) still reach the peer, so the leader can prove
+    /// quorum for a linearizable read; an append carrying a log entry is never
+    /// answered. That is exactly the state in which a write was submitted and
+    /// accepted into the leader's log but its outcome cannot be known: it may
+    /// commit later, so it must never be reported as a rejection.
+    #[derive(Clone)]
+    struct GatedNetwork {
+        nodes: Arc<Mutex<BTreeMap<u32, YadbRaft>>>,
+        withhold_entries: Arc<AtomicBool>,
+        target: u32,
+    }
+
+    impl GatedNetwork {
+        fn peer(&self) -> Result<YadbRaft, Unreachable> {
+            self.nodes
+                .lock()
+                .unwrap()
+                .get(&self.target)
+                .cloned()
+                .ok_or_else(|| {
+                    Unreachable::new(&std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "no such replica in this test group",
+                    ))
+                })
+        }
+    }
+
+    impl RaftNetworkFactory<C> for GatedNetwork {
+        type Network = Self;
+        async fn new_client(&mut self, target: u32, _: &BasicNode) -> Self {
+            Self {
+                target,
+                ..self.clone()
+            }
+        }
+    }
+
+    impl RaftNetwork<C> for GatedNetwork {
+        async fn append_entries(
+            &mut self,
+            rpc: AppendEntriesRequest<C>,
+            _: RPCOption,
+        ) -> Result<AppendEntriesResponse<u32>, RPCError<u32, BasicNode, RaftError<u32>>> {
+            if self.withhold_entries.load(Ordering::SeqCst) && !rpc.entries.is_empty() {
+                return std::future::pending().await;
+            }
+            let peer = self.peer()?;
+            peer.append_entries(rpc)
+                .await
+                .map_err(|e| RPCError::RemoteError(RemoteError::new(self.target, e)))
+        }
+        async fn vote(
+            &mut self,
+            rpc: VoteRequest<u32>,
+            _: RPCOption,
+        ) -> Result<VoteResponse<u32>, RPCError<u32, BasicNode, RaftError<u32>>> {
+            let peer = self.peer()?;
+            peer.vote(rpc)
+                .await
+                .map_err(|e| RPCError::RemoteError(RemoteError::new(self.target, e)))
+        }
+        async fn full_snapshot(
+            &mut self,
+            vote: Vote<u32>,
+            snapshot: Snapshot<C>,
+            cancel: impl std::future::Future<Output = ReplicationClosed> + Send + 'static,
+            _: RPCOption,
+        ) -> Result<SnapshotResponse<u32>, StreamingError<C, Fatal<u32>>> {
+            let peer = self.peer().map_err(StreamingError::from)?;
+            tokio::select! {
+                result = peer.install_full_snapshot(vote, snapshot) => result
+                    .map_err(|e| StreamingError::RemoteError(RemoteError::new(self.target, e))),
+                closed = cancel => Err(StreamingError::Closed(closed)),
+            }
+        }
+    }
+
+    async fn gated_replica(
+        dir: &std::path::Path,
+        cluster: [u8; 16],
+        group: u64,
+        node: u32,
+        voters: &[u32],
+        mesh: &Arc<Mutex<BTreeMap<u32, YadbRaft>>>,
+        withhold_entries: &Arc<AtomicBool>,
+        config: Arc<::openraft::Config>,
+        tag: &str,
+    ) -> (YadbRaft, DurableMetaStateMachine) {
+        let identity = ReplicaIdentity::new(
+            GroupIdentity {
+                cluster,
+                group,
+                incarnation: 1,
+            },
+            node,
+            voters.to_vec(),
+        )
+        .unwrap();
+        let log = DurableOpenRaftLog::create(dir.join(format!("{tag}-log")), &identity).unwrap();
+        let state =
+            DurableMetaStateMachine::create(dir.join(format!("{tag}-state")), &identity).unwrap();
+        let raft = YadbRaft::new(
+            node,
+            config,
+            GatedNetwork {
+                nodes: mesh.clone(),
+                withhold_entries: withhold_entries.clone(),
+                target: 0,
+            },
+            log,
+            state.clone(),
+        )
+        .await
+        .unwrap();
+        mesh.lock().unwrap().insert(node, raft.clone());
+        (raft, state)
+    }
+
+    /// A three-node control group led by this node, with a gate that can stop
+    /// acknowledging log entries while heartbeats keep flowing.
+    ///
+    /// The gate starts open so the group can elect a leader and commit its
+    /// initial entries. The test then closes it immediately before resolving,
+    /// which leaves the resolve's linearizable read working (empty appends pass)
+    /// and its fence write submitted but undecided (entry appends are withheld).
+    async fn withholding_control_state(
+        tag: &str,
+    ) -> (AppState, std::path::PathBuf, Vec<YadbRaft>, Arc<AtomicBool>) {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("yadb-{tag}-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cluster = [94u8; 16];
+        let mesh = Arc::new(Mutex::new(BTreeMap::new()));
+        let withhold_entries = Arc::new(AtomicBool::new(false));
+        // A long lease keeps node 1 leading for the whole 6 s reply timeout, so
+        // the fence is undecided rather than rejected by a leadership change.
+        let config = raft_config(30_000, 40_000);
+        let (node1, state1) = gated_replica(
+            &dir,
+            cluster,
+            1,
+            1,
+            &[1, 2, 3],
+            &mesh,
+            &withhold_entries,
+            config.clone(),
+            "control-n1",
+        )
+        .await;
+        let (node2, _state2) = gated_replica(
+            &dir,
+            cluster,
+            1,
+            2,
+            &[1, 2, 3],
+            &mesh,
+            &withhold_entries,
+            config.clone(),
+            "control-n2",
+        )
+        .await;
+        let (node3, _state3) = gated_replica(
+            &dir,
+            cluster,
+            1,
+            3,
+            &[1, 2, 3],
+            &mesh,
+            &withhold_entries,
+            config.clone(),
+            "control-n3",
+        )
+        .await;
+        node1
+            .initialize(BTreeMap::from([
+                (1, BasicNode::new("one")),
+                (2, BasicNode::new("two")),
+                (3, BasicNode::new("three")),
+            ]))
+            .await
+            .unwrap();
+        node1
+            .wait(Some(Duration::from_secs(5)))
+            .current_leader(1, "control leader")
+            .await
+            .unwrap();
+        // Commit one entry in this term so a later linearizable read has a
+        // committed read log id and does not need to propose a blank entry.
+        let probe = node1
+            .client_write(KvCommand::Put {
+                key: "/sys/gate3-probe".into(),
+                value: b"probe".to_vec(),
+            })
+            .await
+            .unwrap();
+        let wanted = probe.log_id.index;
+        for _ in 0..400 {
+            if node1
+                .metrics()
+                .borrow()
+                .last_applied
+                .is_some_and(|id| id.index >= wanted)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // Explicit routing requires two distinct data groups even when the test
+        // only exercises the control scope; they are idle singletons.
+        let (group2, group2_state) = singleton_group(&dir, 2).await;
+        let (group3, group3_state) = singleton_group(&dir, 3).await;
+        let meta = LocalMetaKv::from_openraft_groups(
+            1,
+            BTreeMap::from([
+                (1, (node1.clone(), state1)),
+                (2, (group2.clone(), group2_state)),
+                (3, (group3.clone(), group3_state)),
+            ]),
+            BTreeMap::from([(1, 2), (2, 3)]),
+            BTreeMap::new(),
+            tokio::runtime::Handle::current(),
+        )
+        .unwrap();
+        let fs = OsFs::new(&dir).unwrap();
+        let mut control = ControlPlaneState::new();
+        control.generation = 1;
+        let state = AppState {
+            openraft: None,
+            listen_addr: "127.0.0.1:0".into(),
+            internal_peer_addrs: None,
+            fs,
+            meta: meta.clone(),
+            raft_token: Some("secret".into()),
+            subject_secret: Some("secret".into()),
+            admin_subjects: vec!["tester".into()],
+            control: Arc::new(RwLock::new(control)),
+            control_refresh: Arc::new(std::sync::Mutex::new(())),
+            control_freshness: Arc::new(std::sync::Mutex::new(ControlFreshness::default())),
+            pools: Arc::new(RwLock::new(BTreeMap::new())),
+            local_vdisks: Arc::new(RwLock::new(BTreeMap::new())),
+            last_scrub: Arc::new(RwLock::new(None)),
+            last_gc: Arc::new(RwLock::new(None)),
+            reader_lease: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
+            reader_lease_ttl_ms: yadb_metakv::gc::DEFAULT_TTL_MS,
+            s3: ObjectStoreEngine::new(meta.clone(), 4096),
+            db: DatabaseEngine::new(meta.clone(), 100),
+            block: BlockVolumeEngine::new(meta, DEFAULT_BLOCK_SIZE),
+        };
+        (
+            state,
+            dir,
+            vec![node1, node2, node3, group2, group3],
+            withhold_entries,
+        )
+    }
+
+    /// An undecided fence is `unknown`, never a rejection.
+    ///
+    /// The control group keeps a quorum for heartbeats, so the record read is
+    /// served, but the fence entry is never acknowledged. The resolve must
+    /// answer `unknown/fence_outcome_unknown` and leave the key unfenced: a
+    /// client that read this as `not_committed` would conclude no mutation can
+    /// still win, which the withheld entry does not establish.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn gate3_unknown_fence_write_is_not_a_rejection() {
+        let (st, dir, rafts, withhold_entries) =
+            withholding_control_state("gate3-fence-unknown").await;
+        withhold_entries.store(true, Ordering::SeqCst);
+        let started = Instant::now();
+        let response = gate3_parts(gate3_resolve(&st, "uncertain").await).await;
+        let json: serde_json::Value = serde_json::from_slice(&response.2).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"outcome":"unknown","reason":"fence_outcome_unknown","response":null}),
+            "an undecided fence must be unknown, not a rejection"
+        );
+        assert_ne!(json["outcome"], "not_committed");
+        assert_eq!(response.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            started.elapsed() >= Duration::from_secs(5),
+            "the fence must have been submitted and timed out, not refused before enqueue"
+        );
+        // The proposal never applied, so the key is not fenced.
+        let key = record_key("tester", "uncertain");
+        assert!(
+            st.meta
+                .try_snapshot(&[key.clone()], &[])
+                .unwrap()
+                .get(&key)
+                .is_none(),
+            "a fence reported as unknown must not have applied"
+        );
+        // Release the withheld appends before tearing the group down.
+        withhold_entries.store(false, Ordering::SeqCst);
+        for raft in rafts {
+            raft.shutdown().await.unwrap();
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A fence the bridge refused was provably never submitted, so resolve
+    /// reports it as retryable (`not-sent`, no `do-not-retry`) instead of
+    /// leaving the client unable to tell it from an undecided fence.
+    #[test]
+    fn gate3_unsent_fence_is_reported_retryable() {
+        let not_sent = resolve_fence_error(&MetaError::OpenRaftWriteNotSent("queue full".into()));
+        assert_eq!(not_sent.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            not_sent
+                .headers()
+                .get("x-yadb-write-outcome")
+                .map(|v| v.to_str().unwrap()),
+            Some("not-sent"),
+            "a fence that provably never reached Raft must be marked retryable"
+        );
+        assert!(
+            !not_sent.headers().contains_key("x-yadb-retry"),
+            "an unsent fence must not forbid a retry"
+        );
+        let unknown = resolve_fence_error(&MetaError::OpenRaftWriteUnknown("lost".into()));
+        assert_eq!(unknown.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            !unknown.headers().contains_key("x-yadb-write-outcome"),
+            "an undecided fence must not claim it was never sent"
+        );
+        let uncommitted = resolve_fence_error(&MetaError::UncommittedIndex(7));
+        assert!(
+            !uncommitted.headers().contains_key("x-yadb-write-outcome"),
+            "an uncommitted index is ambiguous, not provably unsent"
+        );
     }
 
     /// A deployment whose control group and project groups have *different*
