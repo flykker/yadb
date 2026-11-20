@@ -607,7 +607,29 @@ pub enum WireResponse {
 struct WireCall {
     nonce: [u8; 32],
     challenge: [u8; 32],
+    #[serde(deserialize_with = "deserialize_inline_request")]
     request: WireRequest,
+}
+
+// Snapshots have a separate authenticated, budgeted streaming path. Reject
+// this variant at its enum tag, before serde visits (or allocates) its data,
+// rather than deserializing it and rejecting it after the fact. This does not
+// bound the allocations of AppendEntries or account for decoded JSON memory.
+fn deserialize_inline_request<'de, D>(deserializer: D) -> Result<WireRequest, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(bound = "")]
+    enum InlineRequest {
+        AppendEntries(Box<AppendEntriesRequest<C>>),
+        Vote(Box<VoteRequest<u32>>),
+    }
+
+    Ok(match InlineRequest::deserialize(deserializer)? {
+        InlineRequest::AppendEntries(request) => WireRequest::AppendEntries(request),
+        InlineRequest::Vote(request) => WireRequest::Vote(request),
+    })
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1624,6 +1646,24 @@ mod reply_tests {
     use super::*;
     use crate::multiraft::GroupIdentity;
     use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn inline_snapshot_is_rejected_before_its_data_is_parsed() {
+        // The malformed value proves rejection occurs at the variant tag,
+        // without parsing or allocating the snapshot data, regardless of size.
+        let json = format!(
+            "{{\"nonce\":[{}],\"challenge\":[{}],\"request\":{{\"InstallSnapshot\":{{\"data\":!}}}}}}",
+            vec!["0"; 32].join(","),
+            vec!["0"; 32].join(",")
+        );
+        let error = serde_json::from_str::<WireCall>(&json).err().unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("unknown variant `InstallSnapshot`"),
+            "inline snapshot must be rejected before its data is parsed: {error}"
+        );
+    }
 
     #[tokio::test]
     async fn challenge_length_is_checked_before_body_read() {
