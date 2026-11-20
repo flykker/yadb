@@ -39,6 +39,15 @@ const MAX_LIVE_ENTRIES: usize = 4096;
 const MAX_LOG_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_LOG_FRAMES: usize = 1024;
 const CHECKPOINT_VERSION: u32 = 1;
+/// Do not rewrite the log to reclaim less than this.
+///
+/// A reclaim is a full checkpoint publish (write, sync, rename, directory
+/// sync). Rewriting to save a few kilobytes trades durable write amplification
+/// for negligible space, so the superseded prefix must be worth a MiB before
+/// [`reclaim_superseded_locked`] acts. Above the floor the rewrite is also
+/// required to save more than it keeps, which bounds the file at roughly twice
+/// its live checkpoint plus this floor.
+const RECLAIM_MIN_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(bound = "")]
@@ -414,6 +423,56 @@ fn compact(inner: &mut Inner, checkpoint: &[u8], fault: Option<Fault>) -> io::Re
     inner.file = OpenOptions::new().read(true).append(true).open(&active)?;
     inner.bytes = (inner.header.len() + checkpoint.len()) as u64;
     inner.frames = 1;
+    Ok(())
+}
+
+/// Reclaim the part of the log file that a durable purge marker superseded.
+///
+/// Only `Purge` may trigger this. Its record is synced before this runs, so
+/// `inner.state.purged` is a durable marker naming exactly the prefix that is
+/// no longer needed; the checkpoint written here carries the same marker plus
+/// every retained entry, so nothing acknowledged is dropped. No other record
+/// can shrink the file safely: an append extends it, and a truncate's dropped
+/// suffix may legitimately be re-appended by a new leader.
+///
+/// The rewrite is the same [`compact`] used at the append-time limits, so a
+/// failure leaves either the old log or a complete checkpoint and poisons the
+/// handle for a validated reopen.
+fn reclaim_superseded_locked(inner: &mut Inner) -> Result<(), StorageError<u32>> {
+    if inner.failed {
+        return Err(storage_error(
+            ErrorSubject::Store,
+            ErrorVerb::Write,
+            io::Error::other("storage requires recovery"),
+        ));
+    }
+    let checkpoint = checkpoint_frame(&inner.state)
+        .map_err(|error| storage_error(ErrorSubject::Logs, ErrorVerb::Write, error))?;
+    let live = (inner.header.len() + checkpoint.len()) as u64;
+    let superseded = inner.bytes.saturating_sub(live);
+    // Never rewrite to save less than the floor, and never rewrite to save
+    // less than the image that replaces the file.
+    if superseded < RECLAIM_MIN_BYTES || superseded <= live {
+        return Ok(());
+    }
+    let fault = match inner.fault {
+        Some(
+            fault @ (Fault::CheckpointWriteFails
+            | Fault::CheckpointWritePartial
+            | Fault::CheckpointSync
+            | Fault::CheckpointRename
+            | Fault::CheckpointDirSync
+            | Fault::CheckpointAfterDirSync),
+        ) => {
+            inner.fault = None;
+            Some(fault)
+        }
+        _ => None,
+    };
+    if let Err(error) = compact(inner, &checkpoint, fault) {
+        inner.failed = true;
+        return Err(storage_error(ErrorSubject::Logs, ErrorVerb::Write, error));
+    }
     Ok(())
 }
 
@@ -1190,7 +1249,13 @@ impl RaftLogStorage<C> for DurableOpenRaftLog {
     }
 
     async fn purge(&mut self, log_id: LogId<u32>) -> Result<(), StorageError<u32>> {
-        self.append_durable(&Record::Purge(log_id))
+        self.append_durable(&Record::Purge(log_id))?;
+        // The purge marker is durable now, so the prefix it names can never be
+        // needed again. Shrink the file here instead of waiting for a later
+        // append to cross `MAX_LOG_BYTES` or `MAX_LOG_FRAMES`: a group that
+        // writes, snapshots and purges, then goes quiet, would otherwise keep
+        // every superseded byte on disk indefinitely.
+        reclaim_superseded_locked(&mut self.inner.lock().unwrap())
     }
 }
 
@@ -3162,5 +3227,239 @@ mod tests {
         drop(store);
         let mut reopened = DurableOpenRaftLog::open(&dir.0, &identity()).unwrap();
         assert_eq!(readable_indices(&mut reopened).await, vec![0, 1]);
+    }
+
+    /// Per-file apparent bytes in `dir`, sorted by name. Used by the
+    /// measurement test so every leftover file can be classified.
+    fn measure_files(dir: &Path) -> Vec<(String, u64)> {
+        let mut files: Vec<(String, u64)> = fs::read_dir(dir)
+            .unwrap()
+            .map(|item| {
+                let item = item.unwrap();
+                let meta = item.metadata().unwrap();
+                (item.file_name().to_string_lossy().into_owned(), meta.len())
+            })
+            .filter(|(_, len)| *len > 0)
+            .collect();
+        files.sort();
+        files
+    }
+
+    fn total(files: &[(String, u64)]) -> u64 {
+        files.iter().map(|(_, len)| len).sum()
+    }
+
+    /// A 512-byte value serialises to roughly 2 KiB of JSON, so a batch of
+    /// 1000 of these is ~2 MiB on disk: large enough to exercise the byte
+    /// bound without thousands of fsyncs.
+    fn padded_entry(index: u64) -> Entry<C> {
+        Entry {
+            log_id: LogId::new(CommittedLeaderId::new(1, 1), index),
+            payload: EntryPayload::Normal(KvCommand::Put {
+                key: "k".to_string(),
+                value: vec![index as u8; 512],
+            }),
+        }
+    }
+
+    /// Fill a log with `batches * 1000` padded entries, returning the next
+    /// unused index. One `Record::Append` per batch, like a catch-up append.
+    fn fill_log(store: &DurableOpenRaftLog, batches: u64) -> u64 {
+        let mut next = 0u64;
+        for _ in 0..batches {
+            let entries: Vec<_> = (0..1000)
+                .map(|_| {
+                    let entry = padded_entry(next);
+                    next += 1;
+                    entry
+                })
+                .collect();
+            store.append_durable(&Record::Append(entries)).unwrap();
+        }
+        next
+    }
+
+    /// Measure the real on-disk bytes of one group under the two workloads the
+    /// limits exist for. Not an assertion: this is the measurement the TODO
+    /// prose asks for, so the bound the reclamation test pins is grounded in
+    /// observed bytes rather than in the constants alone.
+    #[tokio::test]
+    async fn measure_disk_growth_workload() {
+        use crate::openraft_state_machine::DurableMetaStateMachine;
+        use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
+
+        // The log: a workload that fills the byte budget, then snapshots and
+        // purges it all. Before reclamation the purge reclaimed nothing.
+        {
+            let dir = TempDir::new();
+            let log_dir = dir.0.join("log");
+            let mut log = DurableOpenRaftLog::create(&log_dir, &identity()).unwrap();
+            let next = fill_log(&log, 4);
+            eprintln!(
+                "log filled next={next} files={:?} total={}",
+                measure_files(&log_dir),
+                total(&measure_files(&log_dir))
+            );
+            log.purge(padded_entry(next - 1).log_id).await.unwrap();
+            eprintln!(
+                "log after purge files={:?} total={}",
+                measure_files(&log_dir),
+                total(&measure_files(&log_dir))
+            );
+        }
+
+        // The state machine: applies accumulate in the delta until the entry
+        // bound folds them into one image and removes the delta.
+        {
+            let dir = TempDir::new();
+            let state_dir = dir.0.join("state");
+            let mut sm = DurableMetaStateMachine::create(&state_dir, &identity()).unwrap();
+            let mut next = 0u64;
+            for batch in 0..8u64 {
+                let entries: Vec<_> = (0..512)
+                    .map(|_| {
+                        let entry = Entry {
+                            log_id: LogId::new(CommittedLeaderId::new(1, 1), next),
+                            payload: EntryPayload::Normal(KvCommand::Put {
+                                key: "k".to_string(),
+                                value: vec![next as u8; 1024],
+                            }),
+                        };
+                        next += 1;
+                        entry
+                    })
+                    .collect();
+                sm.apply(entries).await.unwrap();
+                eprintln!(
+                    "state batch {batch} next={next} files={:?}",
+                    measure_files(&state_dir)
+                );
+            }
+            // A snapshot keeps the delta empty afterwards too.
+            sm.build_snapshot().await.unwrap();
+            eprintln!("state after snapshot files={:?}", measure_files(&state_dir));
+        }
+    }
+
+    /// The bound the reclamation must hold: a purge names a prefix the group
+    /// can never read again, so the file must shrink to the live checkpoint
+    /// instead of retaining the superseded bytes until an append happens to
+    /// cross `MAX_LOG_BYTES`.
+    #[tokio::test]
+    async fn purge_reclaims_the_superseded_prefix_within_the_measured_bound() {
+        let dir = TempDir::new();
+        let mut store = DurableOpenRaftLog::create(&dir.0, &identity()).unwrap();
+        let next = fill_log(&store, 2);
+        let before = fs::metadata(dir.0.join("openraft.log")).unwrap().len();
+        assert!(
+            before > RECLAIM_MIN_BYTES * 2,
+            "the workload must hold well over the reclaim floor: {before}"
+        );
+
+        store.purge(padded_entry(next - 1).log_id).await.unwrap();
+        let after = fs::metadata(dir.0.join("openraft.log")).unwrap().len();
+
+        assert!(
+            after * 4 < before,
+            "a purge must reclaim the superseded prefix: before={before} after={after}"
+        );
+        assert!(
+            after < RECLAIM_MIN_BYTES,
+            "a log with no retained entries must shrink to its checkpoint, got {after} bytes"
+        );
+        // The durable marker is still there, and the reclaimed log reopens.
+        assert_eq!(
+            store.coverage().last_purged,
+            Some(padded_entry(next - 1).log_id)
+        );
+        drop(store);
+        let mut reopened = DurableOpenRaftLog::open(&dir.0, &identity()).unwrap();
+        assert_eq!(
+            reopened.coverage().last_purged,
+            Some(padded_entry(next - 1).log_id)
+        );
+        assert!(reopened.coverage().first_index.is_none());
+        assert!(readable_indices(&mut reopened).await.is_empty());
+    }
+
+    /// Reclamation rewrites the file from the recovered state, so the retained
+    /// suffix and the vote must come back exactly, not merely be reported.
+    #[tokio::test]
+    async fn acknowledged_writes_survive_reclamation_and_reopen() {
+        let dir = TempDir::new();
+        let mut store = DurableOpenRaftLog::create(&dir.0, &identity()).unwrap();
+        let next = fill_log(&store, 2);
+        store
+            .append_durable(&Record::Vote(Vote::new(3, 1)))
+            .unwrap();
+        let boundary = next - 101;
+        store.purge(padded_entry(boundary).log_id).await.unwrap();
+        let after = fs::metadata(dir.0.join("openraft.log")).unwrap().len();
+        assert!(
+            after < RECLAIM_MIN_BYTES,
+            "the purge must have reclaimed the superseded prefix, got {after} bytes"
+        );
+
+        let retained: Vec<u64> = (boundary + 1..next).collect();
+        assert_eq!(readable_indices(&mut store).await, retained);
+        assert_eq!(store.read_vote().await.unwrap(), Some(Vote::new(3, 1)));
+
+        drop(store);
+        let mut reopened = DurableOpenRaftLog::open(&dir.0, &identity()).unwrap();
+        assert_eq!(readable_indices(&mut reopened).await, retained);
+        assert_eq!(reopened.read_vote().await.unwrap(), Some(Vote::new(3, 1)));
+        assert_eq!(
+            reopened.coverage().last_purged,
+            Some(padded_entry(boundary).log_id)
+        );
+        assert_eq!(reopened.coverage().first_index, Some(boundary + 1));
+        // The retained values are the acknowledged ones, not a regenerated
+        // image: the last entry's payload must be byte-identical.
+        let last = reopened.try_get_log_entries(next - 1..next).await.unwrap();
+        assert_eq!(last, vec![padded_entry(next - 1)]);
+    }
+
+    /// A crash at any reclaim step must leave a store that reopens with the
+    /// purge marker and every retained entry. The marker is synced before the
+    /// rewrite starts, so the only question is which side of the rename the
+    /// crash left behind, and both are valid logs.
+    #[tokio::test]
+    async fn crash_between_reclaim_steps_leaves_a_reopenable_store() {
+        for fault in [
+            Fault::CheckpointWriteFails,
+            Fault::CheckpointWritePartial,
+            Fault::CheckpointSync,
+            Fault::CheckpointRename,
+            Fault::CheckpointDirSync,
+            Fault::CheckpointAfterDirSync,
+        ] {
+            let dir = TempDir::new();
+            let mut store = DurableOpenRaftLog::create(&dir.0, &identity()).unwrap();
+            let next = fill_log(&store, 2);
+            let boundary = next - 101;
+            store.inner.lock().unwrap().fault = Some(fault);
+            let error = store
+                .purge(padded_entry(boundary).log_id)
+                .await
+                .expect_err("an injected reclaim fault must be reported");
+            assert!(
+                !error.to_string().is_empty(),
+                "{fault:?} must surface the failure"
+            );
+            drop(store);
+
+            let mut reopened = DurableOpenRaftLog::open(&dir.0, &identity())
+                .unwrap_or_else(|error| panic!("{fault:?} must reopen: {error}"));
+            assert_eq!(
+                reopened.coverage().last_purged,
+                Some(padded_entry(boundary).log_id),
+                "{fault:?}"
+            );
+            assert_eq!(
+                readable_indices(&mut reopened).await,
+                (boundary + 1..next).collect::<Vec<_>>(),
+                "{fault:?}"
+            );
+        }
     }
 }
