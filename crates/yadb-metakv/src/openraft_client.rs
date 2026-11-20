@@ -1175,6 +1175,22 @@ mod tests {
         // leaders' log and applied indices are the observable proof. All three
         // groups are single-node leaders here, so a submission would apply
         // immediately and this snapshot would move.
+        // Settle the three leaders before taking the snapshot. A `Put` returns
+        // once its entry is committed, which is not the same instant as the
+        // state machine applying it: a snapshot taken in between would record a
+        // lagging `last_applied` and the later comparison would see it "move"
+        // although nothing was submitted. Waiting for `last_applied` to reach
+        // `last_log_index` makes the baseline a property of the setup writes,
+        // not of the scheduling of this task.
+        for raft in &rafts {
+            let metrics = raft.metrics().borrow().clone();
+            if let Some(last_log) = metrics.last_log_index {
+                raft.wait(Some(Duration::from_secs(5)))
+                    .applied_index_at_least(Some(last_log), "applied the setup writes")
+                    .await
+                    .unwrap();
+            }
+        }
         let progress = |rafts: &[YadbRaft]| -> Vec<(u64, u64)> {
             rafts
                 .iter()
