@@ -22,8 +22,9 @@ pub mod sys;
 #[doc(hidden)]
 pub mod fault {
     pub use crate::sys::fault::{
-        dir_syncs, file_syncs, lock, reads, renames, terminate, writes, Armed, DirSyncFault,
-        FileSyncFault, LockFault, ReadFault, RenameFault, WriteFault,
+        dir_syncs, file_syncs, lock, power_cuts, reads, renames, terminate, volatile_cache, writes,
+        Armed, DirSyncFault, FileSyncFault, LockFault, PowerCutFault, ReadFault, RenameFault,
+        VolatileGuard, WriteFault,
     };
 }
 
@@ -611,6 +612,131 @@ mod tests {
         let file = fs.open_rw(path, true).unwrap();
         file.write_at(0, record).unwrap();
         file.sync_data().unwrap();
+    }
+
+    #[test]
+    fn volatile_unsynced_bytes_disappear_on_cut() {
+        let root = tmp_dir("volatile-unsynced");
+        let os = OsFs::new(&root).unwrap();
+        let file = os.open_rw("state", true).unwrap();
+        let _cache = sys::fault::volatile_cache();
+        file.write_at(0, b"pending").unwrap();
+        assert_eq!(fs::read(root.join("state")).unwrap(), b"");
+        sys::fault::power_cuts(&[sys::fault::PowerCutFault::Cut]);
+        assert_eq!(
+            file.sync_data().unwrap_err().kind(),
+            io::ErrorKind::Interrupted
+        );
+        assert_eq!(fs::read(root.join("state")).unwrap(), b"");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn volatile_synced_bytes_survive_cut() {
+        let root = tmp_dir("volatile-synced");
+        let os = OsFs::new(&root).unwrap();
+        let file = os.open_rw("state", true).unwrap();
+        let _cache = sys::fault::volatile_cache();
+        file.write_at(0, b"durable").unwrap();
+        sys::fault::power_cuts(&[
+            sys::fault::PowerCutFault::Pass,
+            sys::fault::PowerCutFault::Cut,
+        ]);
+        file.sync_data().unwrap();
+        assert_eq!(
+            file.sync_data().unwrap_err().kind(),
+            io::ErrorKind::Interrupted
+        );
+        assert_eq!(fs::read(root.join("state")).unwrap(), b"durable");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn volatile_rename_requires_directory_sync_to_survive_cut() {
+        let root = tmp_dir("volatile-rename");
+        let os = OsFs::new(&root).unwrap();
+        fs::write(root.join("old"), b"data").unwrap();
+        let _cache = sys::fault::volatile_cache();
+        os.rename_atomic("old", "new").unwrap();
+        sys::fault::power_cuts(&[sys::fault::PowerCutFault::Cut]);
+        assert_eq!(
+            os.sync_dir("").unwrap_err().kind(),
+            io::ErrorKind::Interrupted
+        );
+        assert!(root.join("old").exists());
+        assert!(!root.join("new").exists());
+        os.rename_atomic("old", "new").unwrap();
+        sys::fault::power_cuts(&[
+            sys::fault::PowerCutFault::Pass,
+            sys::fault::PowerCutFault::Cut,
+        ]);
+        os.sync_dir("").unwrap();
+        assert_eq!(
+            os.sync_dir("").unwrap_err().kind(),
+            io::ErrorKind::Interrupted
+        );
+        assert!(!root.join("old").exists());
+        assert_eq!(fs::read(root.join("new")).unwrap(), b"data");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn volatile_overwrite_composes_before_flush() {
+        let root = tmp_dir("volatile-overwrite");
+        let os = OsFs::new(&root).unwrap();
+        let file = os.open_rw("state", true).unwrap();
+        let _cache = sys::fault::volatile_cache();
+        file.write_at(0, b"abcdefgh").unwrap();
+        file.write_at(2, b"XYZ").unwrap();
+        assert_eq!(fs::read(root.join("state")).unwrap(), b"");
+        let mut data = [0; 8];
+        file.read_exact_at(0, &mut data).unwrap();
+        assert_eq!(&data, b"abXYZfgh");
+        file.sync_data().unwrap();
+        assert_eq!(fs::read(root.join("state")).unwrap(), b"abXYZfgh");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn volatile_append_writes_compose_and_flush() {
+        use std::io::Write;
+        let root = tmp_dir("volatile-append");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("state");
+        let mut init = File::create(&path).unwrap();
+        init.write_all(b"old").unwrap();
+        drop(init);
+        let file = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        let _cache = sys::fault::volatile_cache();
+        sys::write_all(&file, b"abc").unwrap();
+        sys::write_at(&file, 4, b"X").unwrap();
+        sys::write_all(&file, b"!").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"old");
+        sys::sync_data(&file).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"oldaXc!");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn volatile_guard_discards_pending_state_before_reenable() {
+        let root = tmp_dir("volatile-guard");
+        let os = OsFs::new(&root).unwrap();
+        let file = os.open_rw("state", true).unwrap();
+        {
+            let _cache = sys::fault::volatile_cache();
+            file.write_at(0, b"discard").unwrap();
+            assert_eq!(fs::read(root.join("state")).unwrap(), b"");
+        }
+        {
+            let _cache = sys::fault::volatile_cache();
+            file.sync_data().unwrap();
+        }
+        assert_eq!(fs::read(root.join("state")).unwrap(), b"");
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
