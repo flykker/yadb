@@ -188,10 +188,64 @@ pub fn sweep(
     pools: &BTreeMap<String, std::sync::Arc<PoolStriper<OsFs>>>,
     control: &ControlPlaneState,
 ) -> SweepOutcome {
-    if meta.is_openraft() {
-        return sweep_groups(meta, pools, control);
+    // One span per pass carries the identity a log reader needs to join that
+    // pass's events: which path ran, how many groups it covered, and - once the
+    // legacy pass has one - the collector lease it ran under. A field is
+    // recorded only when it exists, so a refusal before the lease is acquired
+    // has no lease field rather than a placeholder.
+    let openraft = meta.is_openraft();
+    let mode = if openraft { "multiraft" } else { "legacy" };
+    let pass = tracing::info_span!(
+        "gc_pass",
+        mode,
+        groups = tracing::field::Empty,
+        collector_expires_at_ms = tracing::field::Empty,
+    );
+    let _pass = pass.enter();
+    let outcome = if openraft {
+        sweep_groups(meta, pools, control)
+    } else {
+        sweep_legacy(meta, pools, control)
+    };
+    log_sweep_outcome(&outcome, mode);
+    outcome
+}
+
+/// Emits exactly one summary event per pass - and one event per refusal, pool
+/// and failure it recorded - never one per fragment. A pass over a million
+/// fragments therefore stays a fixed handful of lines. The refusal reason and
+/// every failure are carried as fields so they can be filtered and grouped
+/// rather than read out of prose.
+fn log_sweep_outcome(outcome: &SweepOutcome, mode: &'static str) {
+    if let Some(reason) = &outcome.refusal {
+        tracing::warn!(
+            mode,
+            reason = %reason,
+            leases_live = outcome.leases_live,
+            blobs_live = outcome.blobs_live,
+            fragments_deleted = outcome.fragments_deleted,
+            bytes_reclaimed = outcome.bytes_reclaimed,
+            pools_refused = outcome.pools_refused.len(),
+            groups_refused = outcome.groups_refused.len(),
+            "gc pass refused"
+        );
+    } else {
+        tracing::info!(
+            mode,
+            blobs_live = outcome.blobs_live,
+            fragments_deleted = outcome.fragments_deleted,
+            bytes_reclaimed = outcome.bytes_reclaimed,
+            barriers_applied = outcome.barriers_applied,
+            leases_live = outcome.leases_live,
+            "gc pass completed"
+        );
     }
-    sweep_legacy(meta, pools, control)
+    for pool in &outcome.pools_refused {
+        tracing::warn!(reason = %pool, "gc pool refused");
+    }
+    for error in &outcome.errors {
+        tracing::error!(error = %error, "gc pass failure");
+    }
 }
 
 /// Metadata prefixes whose manifests name the blobs a repair pass has to check.
@@ -269,6 +323,19 @@ pub fn repair_scan_groups(
     pools: &BTreeMap<String, std::sync::Arc<PoolStriper<OsFs>>>,
     control: &ControlPlaneState,
 ) -> RepairOutcome {
+    let outcome = repair_scan_groups_inner(meta, pools, control);
+    log_repair_outcome(&outcome);
+    outcome
+}
+
+/// The body of [`repair_scan_groups`], split out so that every exit - including
+/// a refusal before any group is scanned - goes through one logging point and
+/// is logged exactly once.
+fn repair_scan_groups_inner(
+    meta: &LocalMetaKv<OsFs>,
+    pools: &BTreeMap<String, std::sync::Arc<PoolStriper<OsFs>>>,
+    control: &ControlPlaneState,
+) -> RepairOutcome {
     let scopes = match meta.gc_group_scopes() {
         Ok(scopes) => scopes,
         Err(error) => {
@@ -291,7 +358,13 @@ pub fn repair_scan_groups(
     for scope in &scopes {
         match repair_group(meta, pools, control, scope, &mut outcome, &mut missing_pools) {
             Ok(()) => {}
-            Err(reason) => refusals.push(format!("group {} refused: {reason}", scope.group_id)),
+            Err(reason) => {
+                // One event per refused group, with the group id and the reason.
+                // Repair checks blobs one by one but logs none of them, so a
+                // large scan stays a fixed number of lines.
+                tracing::warn!(group = scope.group_id, reason = %reason, "repair group refused");
+                refusals.push(format!("group {} refused: {reason}", scope.group_id));
+            }
         }
     }
     for pool_name in missing_pools {
@@ -309,6 +382,45 @@ pub fn repair_scan_groups(
     }
     outcome.groups_refused = refusals;
     outcome
+}
+
+/// Emits one summary event per repair scan, plus one event per refusal and
+/// failure. Nothing is logged per blob: a scan of a million blobs stays a fixed
+/// handful of lines, and the counts are structured fields so a collector can
+/// chart them without parsing prose.
+fn log_repair_outcome(outcome: &RepairOutcome) {
+    if let Some(reason) = &outcome.refusal {
+        tracing::warn!(
+            reason = %reason,
+            blobs_checked = outcome.blobs_checked,
+            blobs_intact = outcome.blobs_intact,
+            blobs_unrecoverable = outcome.blobs_unrecoverable,
+            blobs_repaired = outcome.blobs_repaired,
+            fragments_repaired = outcome.fragments_repaired,
+            groups_refused = outcome.groups_refused.len(),
+            "repair scan refused"
+        );
+    } else {
+        tracing::info!(
+            blobs_checked = outcome.blobs_checked,
+            blobs_intact = outcome.blobs_intact,
+            blobs_unrecoverable = outcome.blobs_unrecoverable,
+            blobs_repaired = outcome.blobs_repaired,
+            fragments_repaired = outcome.fragments_repaired,
+            "repair scan completed"
+        );
+    }
+    if outcome.blobs_unrecoverable > 0 {
+        // Data loss, not a per-blob report: the count is the signal and the
+        // scan's own outcome still names the blobs to the caller.
+        tracing::error!(
+            blobs_unrecoverable = outcome.blobs_unrecoverable,
+            "repair found unrecoverable blobs"
+        );
+    }
+    for error in &outcome.errors {
+        tracing::error!(error = %error, "repair scan failure");
+    }
 }
 
 /// One group's repair pass: prove its live set, then repair every blob in it.
@@ -451,6 +563,13 @@ fn sweep_legacy(
             ))
         }
     };
+    // Join this pass's events to the collector lease it actually holds. The
+    // field is empty for a pass refused before this point, which is accurate:
+    // there was no lease to name.
+    tracing::Span::current().record(
+        "collector_expires_at_ms",
+        collector.lease().expires_at_ms,
+    );
 
     let mut outcome = SweepOutcome::default();
 
@@ -653,6 +772,7 @@ fn sweep_groups(
         );
     }
 
+    tracing::Span::current().record("groups", scopes.len());
     let mut outcome = SweepOutcome::default();
     let present = enumerate_present(pools, &mut outcome);
 
@@ -661,7 +781,13 @@ fn sweep_groups(
     for scope in &scopes {
         match sweep_group(meta, pools, control, scope, &present, &mut outcome) {
             Ok(()) => swept += 1,
-            Err(reason) => refusals.push(format!("group {} refused: {reason}", scope.group_id)),
+            Err(reason) => {
+                // One event per refused group, carrying the group id and the
+                // reason the group was refused. The summary event below repeats
+                // the aggregate, never the per-fragment work.
+                tracing::warn!(group = scope.group_id, reason = %reason, "gc group refused");
+                refusals.push(format!("group {} refused: {reason}", scope.group_id));
+            }
         }
     }
 
@@ -695,6 +821,15 @@ fn sweep_group(
     outcome: &mut SweepOutcome,
 ) -> Result<(), String> {
     let group = scope.group_id;
+    // One span per group pass. `collector_expires_at_ms` is recorded only once
+    // this group actually holds its collector record, so a group refused before
+    // that point names the group but no lease.
+    let group_span = tracing::info_span!(
+        "gc_group",
+        group,
+        collector_expires_at_ms = tracing::field::Empty,
+    );
+    let _group_span = group_span.enter();
 
     // 1. Leader-only. A follower's applied state can lag a committed manifest,
     // and deleting from that view loses a fragment the manifest references.
@@ -742,6 +877,11 @@ fn sweep_group(
     let mut collector =
         yadb_metakv::gc::acquire_collector_in(meta, group, expected, COLLECTOR_LEASE_MS)
             .map_err(|error| format!("collector lease unavailable: {error}"))?;
+    // Join this group's events to the collector lease it holds.
+    tracing::Span::current().record(
+        "collector_expires_at_ms",
+        collector.lease().expires_at_ms,
+    );
 
     // 3b. Re-check the fence now that admission is closed. A writer that
     // published its lease between the check in step 2 and this acquisition is
@@ -1462,9 +1602,13 @@ mod tests {
 
         let after = f.disk_bytes();
         let live = f.live_bytes();
-        eprintln!(
-            "block overwrite: before={before} after={after} live={live} fragments={} reclaimed={}",
-            outcome.fragments_deleted, outcome.bytes_reclaimed
+        tracing::debug!(
+            before,
+            after,
+            live,
+            fragments_deleted = outcome.fragments_deleted,
+            bytes_reclaimed = outcome.bytes_reclaimed,
+            "block overwrite"
         );
         assert!(after < before, "before={before} after={after}");
         // Only the newest generation may remain: 16 fragments per slot plus the
@@ -1529,11 +1673,13 @@ mod tests {
         assert!(outcome.bytes_reclaimed > 0, "{outcome:?}");
         assert!(outcome.errors.is_empty(), "{outcome:?}");
         let after = f.disk_bytes();
-        eprintln!(
-            "table compaction: before={before} after={after} live={} fragments={} reclaimed={}",
-            f.live_bytes(),
-            outcome.fragments_deleted,
-            outcome.bytes_reclaimed
+        tracing::debug!(
+            before,
+            after,
+            live = f.live_bytes(),
+            fragments_deleted = outcome.fragments_deleted,
+            bytes_reclaimed = outcome.bytes_reclaimed,
+            "table compaction"
         );
         assert!(after < before, "before={before} after={after}");
 
@@ -1578,9 +1724,13 @@ mod tests {
         assert!(outcome.errors.is_empty(), "{outcome:?}");
         let after = f.disk_bytes();
         let live = f.live_bytes();
-        eprintln!(
-            "s3 overwrite+delete: before={before} after={after} live={live} fragments={} reclaimed={}",
-            outcome.fragments_deleted, outcome.bytes_reclaimed
+        tracing::debug!(
+            before,
+            after,
+            live,
+            fragments_deleted = outcome.fragments_deleted,
+            bytes_reclaimed = outcome.bytes_reclaimed,
+            "s3 overwrite+delete"
         );
         assert!(after < before, "before={before} after={after}");
         assert!(
@@ -1615,11 +1765,13 @@ mod tests {
         );
 
         let outcome = f.sweep();
-        eprintln!(
-            "refused write: committed={before} after-failure={after_failure} after-sweep={} fragments={} reclaimed={}",
-            f.disk_bytes(),
-            outcome.fragments_deleted,
-            outcome.bytes_reclaimed
+        tracing::debug!(
+            committed = before,
+            after_failure,
+            after_sweep = f.disk_bytes(),
+            fragments_deleted = outcome.fragments_deleted,
+            bytes_reclaimed = outcome.bytes_reclaimed,
+            "refused write"
         );
         assert!(outcome.refusal.is_none(), "{outcome:?}");
         assert!(outcome.fragments_deleted > 0, "{outcome:?}");
@@ -4399,6 +4551,287 @@ mod tests {
             drop(s3);
             drop(engine);
             shutdown(f).await;
+        }
+    }
+
+    /// Logging tests. The crate has no `tracing-test` (it is not vendored for
+    /// the offline build), so `Capture` below is the smallest recording
+    /// subscriber that proves what these tests need: the level, message and
+    /// fields of every event a pass emits. It is installed with
+    /// `tracing::subscriber::with_default`, which is thread-local, so it never
+    /// touches the process-wide default or another test's events.
+    mod logging {
+        use super::*;
+
+        #[derive(Debug, Clone)]
+        struct Recorded {
+            level: tracing::Level,
+            message: String,
+            fields: Vec<(String, String)>,
+        }
+
+        impl Recorded {
+            fn field(&self, name: &str) -> Option<&str> {
+                self.fields
+                    .iter()
+                    .find(|(field, _)| field == name)
+                    .map(|(_, value)| value.as_str())
+            }
+        }
+
+        #[derive(Debug, Clone, Default)]
+        struct Capture {
+            events: Arc<std::sync::Mutex<Vec<Recorded>>>,
+        }
+
+        impl Capture {
+            fn events(&self) -> Vec<Recorded> {
+                self.events.lock().unwrap().clone()
+            }
+        }
+
+        impl tracing::Subscriber for Capture {
+            fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+                *metadata.level() <= tracing::Level::INFO
+            }
+
+            fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                static NEXT: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(1);
+                tracing::span::Id::from_u64(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+            }
+
+            fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+            fn record_follows_from(
+                &self,
+                _span: &tracing::span::Id,
+                _follows: &tracing::span::Id,
+            ) {
+            }
+
+            fn event(&self, event: &tracing::Event<'_>) {
+                let mut fields = Fields::default();
+                event.record(&mut fields);
+                self.events.lock().unwrap().push(Recorded {
+                    level: *event.metadata().level(),
+                    message: fields.message,
+                    fields: fields.fields,
+                });
+            }
+
+            fn enter(&self, _span: &tracing::span::Id) {}
+
+            fn exit(&self, _span: &tracing::span::Id) {}
+        }
+
+        #[derive(Default)]
+        struct Fields {
+            message: String,
+            fields: Vec<(String, String)>,
+        }
+
+        impl Fields {
+            fn push(&mut self, field: &tracing::field::Field, value: String) {
+                if field.name() == "message" {
+                    self.message = value;
+                } else {
+                    self.fields.push((field.name().to_string(), value));
+                }
+            }
+        }
+
+        impl tracing::field::Visit for Fields {
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                self.push(field, value.to_string());
+            }
+
+            fn record_debug(
+                &mut self,
+                field: &tracing::field::Field,
+                value: &dyn std::fmt::Debug,
+            ) {
+                self.push(field, format!("{value:?}"));
+            }
+        }
+
+        /// Runs `f` under a recording subscriber and returns what it logged.
+        fn capture<T>(f: impl FnOnce() -> T) -> (T, Vec<Recorded>) {
+            let capture = Capture::default();
+            let result = tracing::subscriber::with_default(capture.clone(), f);
+            (result, capture.events())
+        }
+
+        #[test]
+        fn a_refused_pass_logs_one_warning_with_the_reason() {
+            let f = Fixture::new("log-refusal");
+            let engine = block_engine(&f);
+            engine
+                .write_at(1, "disk", POOL, 1 << 20, 0, b"pinned")
+                .unwrap();
+            let lease =
+                yadb_metakv::gc::acquire_reader(&f.meta, 1, f.meta.revision_or_panic(), 30_000)
+                    .unwrap();
+            let (outcome, events) = capture(|| f.sweep());
+            lease.release().unwrap();
+
+            let reason = outcome.refusal.clone().expect("a live lease must refuse");
+            let warnings: Vec<&Recorded> = events
+                .iter()
+                .filter(|event| event.level == tracing::Level::WARN)
+                .collect();
+            assert_eq!(
+                warnings.len(),
+                1,
+                "a refused pass is one warning, not a flood: {events:?}"
+            );
+            let event = warnings[0];
+            assert_eq!(event.message, "gc pass refused");
+            assert_eq!(event.field("reason"), Some(reason.as_str()));
+            assert!(
+                event.field("reason").unwrap().contains("live lease"),
+                "the refusal reason must survive as a field: {event:?}"
+            );
+            assert_eq!(event.field("mode"), Some("legacy"));
+            assert_eq!(event.field("fragments_deleted"), Some("0"));
+            assert!(
+                events.iter().all(|event| event.level != tracing::Level::INFO),
+                "a refused pass must not also be reported as completed: {events:?}"
+            );
+        }
+
+        #[test]
+        fn a_healthy_pass_logs_one_info_and_no_per_fragment_events() {
+            let f = Fixture::new("log-healthy");
+            let engine = block_engine(&f);
+            // Many fragments are superseded. The block channel deletes through
+            // durable barriers, so a per-fragment log line in the barrier path
+            // would be visible as a flood here.
+            for i in 0..32u8 {
+                write_generation(&engine, i);
+            }
+            // The SQL tablet channel is not barrier-safe, so its garbage is
+            // deleted with exact per-fragment tombstones. That is the path where
+            // a naive per-fragment log line would go, so it must be covered too.
+            let db = DatabaseEngine::new(f.meta.clone(), 16);
+            db.register_pool("wal", f.pool.clone());
+            db.register_pool("data", f.pool.clone());
+            db.execute_sql(
+                1,
+                "db",
+                "wal",
+                "data",
+                1,
+                "CREATE TABLE t (id INT PRIMARY KEY, v INT);",
+            )
+            .unwrap();
+            for i in 0..64 {
+                db.execute_sql(
+                    1,
+                    "db",
+                    "wal",
+                    "data",
+                    1,
+                    &format!("INSERT INTO t VALUES ({i}, {i});"),
+                )
+                .unwrap();
+            }
+            db.execute_sql(1, "db", "wal", "data", 1, "DELETE FROM t WHERE id < 32;")
+                .unwrap();
+
+            let (outcome, events) = capture(|| f.sweep());
+
+            assert!(outcome.refusal.is_none(), "{outcome:?}");
+            assert!(outcome.fragments_deleted > 0, "{outcome:?}");
+            assert!(outcome.barriers_applied > 0, "{outcome:?}");
+            assert_eq!(
+                events.len(),
+                1,
+                "a healthy pass over {} deleted fragments ({} barriers) must log once, not per fragment: {events:?}",
+                outcome.fragments_deleted,
+                outcome.barriers_applied
+            );
+            let event = &events[0];
+            assert_eq!(event.level, tracing::Level::INFO, "{event:?}");
+            assert_eq!(event.message, "gc pass completed");
+            assert_eq!(event.field("mode"), Some("legacy"));
+            assert_eq!(
+                event.field("fragments_deleted"),
+                Some(outcome.fragments_deleted.to_string().as_str())
+            );
+            for event in &events {
+                for name in ["fragment", "fragment_id", "blob", "blob_id", "part"] {
+                    assert!(
+                        event.field(name).is_none(),
+                        "a healthy pass must not name an individual fragment ({name}): {event:?}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn a_refused_repair_scan_logs_a_warning_with_the_reason() {
+            // Legacy metadata cannot enumerate per-group scopes, so the scan
+            // refuses before checking a blob. That is still one warning naming
+            // the reason, never a per-blob line.
+            let f = Fixture::new("log-repair-refusal");
+            let (outcome, events) =
+                capture(|| repair_scan_groups(&f.meta, &f.pools, &f.control));
+
+            let reason = outcome
+                .refusal
+                .clone()
+                .expect("legacy metadata cannot enumerate groups");
+            let warnings: Vec<&Recorded> = events
+                .iter()
+                .filter(|event| event.level == tracing::Level::WARN)
+                .collect();
+            assert_eq!(warnings.len(), 1, "{events:?}");
+            assert_eq!(warnings[0].message, "repair scan refused");
+            assert_eq!(warnings[0].field("reason"), Some(reason.as_str()));
+            assert!(
+                warnings[0]
+                    .field("reason")
+                    .unwrap()
+                    .contains("metadata groups cannot be enumerated"),
+                "{events:?}"
+            );
+        }
+
+        #[test]
+        fn a_healthy_repair_summary_carries_the_counts_and_flags_data_loss_once() {
+            let healthy = RepairOutcome {
+                blobs_checked: 1_000,
+                blobs_intact: 998,
+                blobs_repaired: 2,
+                fragments_repaired: 6,
+                ..RepairOutcome::default()
+            };
+            let (_, events) = capture(|| log_repair_outcome(&healthy));
+            assert_eq!(events.len(), 1, "{events:?}");
+            assert_eq!(events[0].level, tracing::Level::INFO, "{events:?}");
+            assert_eq!(events[0].message, "repair scan completed");
+            assert_eq!(events[0].field("blobs_checked"), Some("1000"));
+            assert_eq!(events[0].field("blobs_intact"), Some("998"));
+            assert_eq!(events[0].field("blobs_unrecoverable"), Some("0"));
+
+            // Data loss is a failure: one error event with the count, not one
+            // event per unrecoverable blob.
+            let lossy = RepairOutcome {
+                blobs_checked: 1_000,
+                blobs_intact: 990,
+                blobs_unrecoverable: 10,
+                ..RepairOutcome::default()
+            };
+            let (_, events) = capture(|| log_repair_outcome(&lossy));
+            let errors: Vec<&Recorded> = events
+                .iter()
+                .filter(|event| event.level == tracing::Level::ERROR)
+                .collect();
+            assert_eq!(errors.len(), 1, "{events:?}");
+            assert_eq!(errors[0].message, "repair found unrecoverable blobs");
+            assert_eq!(errors[0].field("blobs_unrecoverable"), Some("10"));
+            assert_eq!(events.len(), 2, "{events:?}");
         }
     }
 }

@@ -1732,6 +1732,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-rustls",
+ "tracing",
  "tracing-subscriber",
  "yadb-blob",
  "yadb-block",
