@@ -460,11 +460,34 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   refused chunk fails the connection closed while the same sender's next
   snapshot succeeds
   (`a_refused_snapshot_chunk_fails_closed_and_the_next_snapshot_succeeds`).
-  Still open: disk growth, startup replay, general memory and CPU admission
+  The chunk's byte payload is now padded RFC 4648 base64 instead of a JSON
+  array of decimal numbers, decoded in one pass with the legacy array still
+  accepted
+  (`a_legacy_array_of_numbers_chunk_still_decodes_to_the_same_bytes`), and the
+  chunk frame bound is recomputed from that cost
+  (`a_maximum_chunk_round_trips_byte_exactly_and_fits_the_frame`): payload
+  933,935 → 349,838 bytes, worst-case frame 2,802,256 → 1,176,324, and the
+  17 MiB `large_snapshot_stream_round_trip` from 53–85 s to 19–21 s.
+  A purge now reclaims the superseded prefix through the existing `compact`
+  path when the reclaimable range is at least `RECLAIM_MIN_BYTES` (1 MiB) and
+  larger than the replacing checkpoint, so a fully purged log does not keep its
+  old bytes on disk: measured 7,737,930 → 176 bytes, where the same purge
+  previously left 7,738,005. The image-rebuild evidence spool
+  (`state.json.corrupt*`) is bounded to `2 * MAX_IMAGE`, pruned oldest-first
+  under exact `state.json.corrupt[.N]` names, reports what it dropped in
+  `ImageRebuild::dropped_images`/`dropped_bytes`, and refuses a single image
+  larger than the budget
+  (`the_evidence_spool_is_bounded_and_reports_what_it_dropped`,
+  `a_single_image_larger_than_the_spool_budget_is_refused`).
+  Still open: disk growth under sustained compaction pressure, startup replay,
+  general memory and CPU admission
   across groups, the receiver's on-disk staging area, and end-to-end snapshot
   capacity under the default deadlines. The encoded-frame reservation does not
-  bound the transient decoded JSON, and `MAX_PAYLOAD` is verified only after a
-  `REQUEST` body of up to `MAX_FRAME` has been buffered.
+  bound the transient decoded bytes, and `MAX_PAYLOAD` is verified only after a
+  `REQUEST` body of up to `MAX_FRAME` has been buffered. The chunk frame is
+  still 4.5× the data rather than 1.4× because `SignedRaftEnvelope.payload` is
+  itself written as a JSON array of numbers in `openraft_transport.rs`, which
+  this change does not touch.
   The checkpoint implementation is under validation: 32 MiB active-log limit,
   1024 replay frames, 4096 retained live entries and an 8 MiB serialized live
   checkpoint. Replacements sync a new file, rename, sync the directory, then
@@ -793,6 +816,24 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   per read path. The group-scoped counter also means projects that share a group
   share one budget, which is intended but not yet exercised with a real second
   project on the same group.
+  The consistent-read paths are now proved where they exist for: a real follower
+  that is genuinely behind.
+  `crates/yadbd/tests/consistent_reads.rs` boots three daemons with three
+  singleton groups and `project_groups {1: 2, 2: 3}`, so node 3 follows the
+  group that owns project alpha. A userspace TCP relay in front of node 3's
+  group-2 transport is closed while every HTTP listener stays up, and the cut is
+  asserted rather than timed: node 3's `last_applied` for group 2 is unchanged
+  across a write node 2 applies and strictly below the leader's. Four contracts
+  hold on that stale follower: a consistent HEAD and a consistent SELECT return
+  the committed state, the same HEAD without the flag returns the stale one, a
+  consistent read with no quorum is refused rather than answered, and one
+  multi-statement consistent read sees a single snapshot. Inversions: not
+  forwarding a consistent HEAD answers 409 where 200 is required; serving the
+  local snapshot from the consistent path answers 200 with the stale object; a
+  barrier failure that falls back to the local snapshot does the same; and
+  reading later statements from local state makes the multi-statement read
+  observe the concurrent write. Open: single host, the block
+  `read_at_consistent` path is not driven, and no read spans groups atomically.
   - [x] Serve the S3 `?consistent=true` read through the gateway on the native
     listener. The listener used to reject the parameter as an unsupported
     subresource while a plain read answered from local applied state, so a
@@ -1322,8 +1363,20 @@ design; the removed draft is not kept in the tree.
   ALPN, exact leaf SHA-256 pins bound to node IDs and no plaintext fallback.
   TLS resumption/tickets are disabled. In-process three-node replication and
   untrusted/expired/wrong-node/plaintext/hostname/pin rejection tests pass.
+  A replica's pin state now survives a restart: `certificate-pins.json` (and its
+  `.tmp`) lives in the replica directory, carries a CRC32 over the semantic
+  content, merges over the configuration pins with revocations winning, refuses
+  startup on an empty active set, and is written as temp file, `sync_data`,
+  rename, `sync_dir` through `yadb_io::sys`. Pinned by the restart, revocation
+  and damaged-state tests, each inverted to fail: ignoring the stored file lets
+  a revoked pin come back, treating corrupt state as absent admits a damaged
+  replica, and dropping the temp+rename lets a torn write pass.
   Plaintext mode remains an explicit isolated-experiment API; provisioning,
-  deployment and rotation tests are not complete.
+  deployment and rolling rotation are not complete. The pin state is per
+  replica, not replicated through Raft, has no cross-group transaction (a
+  failure mid-fan-out leaves groups divergent), revocation is local only with
+  no CRL or OCSP, no interface distinguishes "revoked" from "never trusted", and
+  revoking the last pin of a single-pin node makes its next start refuse.
 - [ ] Define credential provisioning, authorization, rotation, revocation and
   membership changes; enforce message and snapshot size, concurrency and
   timeout limits. Test impersonation, wrong group/node, tampering, replay and
@@ -1517,11 +1570,32 @@ design; the removed draft is not kept in the tree.
     membership changes are unsupported and that moving a project, changing the
     replica count or replacing a host is a migration under
     `multiraft-migration.md`, not an edit of the voter list.
-  - [ ] Residual: run the alerts and the runbooks against a real multi-node
-    deployment. No rule has ever fired against live traffic, the thresholds
-    and `for:` durations are untuned, and every procedure above is derived from
-    the code and the single-host gates rather than rehearsed on
-    production-shaped infrastructure. Structured logging is still absent.
+  - [x] Evaluate every rule against a real cluster.
+    `scripts/yadb-container-alerts.py` imports the three-container harness and
+    evaluates all 12 rules in `deploy/monitoring/yadb-alerts.yml` against a real
+    three-container cluster: 587 samples over 50 declared families, a
+    Prometheus text parser that fails on an unparseable line rather than
+    skipping it, a PromQL subset evaluator with one-to-one matching on the full
+    label set (so a per-pool comparison really is per pool), and `for:`
+    arithmetic where a true-but-young expression is pending, never firing.
+    `scripts/test_yadb_container_alerts.py` unit-tests the parser, the
+    evaluator and the `for:` state machine offline. The run reported rather
+    than smoothed over three expressions true on a healthy cluster: followers
+    never take a GC or scrub pass (`YadbGcNoPass`, `YadbScrubNoPass` pending)
+    and the control-group leader's repair scan refuses the groups it does not
+    lead (`YadbScrubFailed` pending at 10m). One rule was driven into firing
+    for real: `YadbGcRefused`, from a committed reader lease refusing a GC pass
+    with HTTP 409, clearing after one TTL; `YadbNodeDown` was taken to firing
+    across its 2m `for:` window with a stopped daemon. Inversions: a dead scrape
+    port fails the run, an empty exposition and an empty family fail it, and a
+    scenario that should fire does not.
+  - [ ] Residual: run the alerts and the runbooks on production-shaped
+    infrastructure. The harness evaluates one kernel rather than a multi-host
+    deployment, one scrape is not a time series (only `YadbNodeDown` was
+    evaluated across a window), there is no Alertmanager routing, inhibition or
+    silencing, the thresholds and `for:` durations are untuned, and every
+    runbook procedure is still derived from the code and the single-host gates
+    rather than rehearsed. Structured logging is absent.
   Each group starts from strict bounded JSON configuration, explicit
   create/open/bootstrap, mandatory mTLS and a separate listener; its
   create/shutdown/reopen tests pass. The daemon now requires a version-2
@@ -1593,6 +1667,17 @@ design; the removed draft is not kept in the tree.
   and identity, converging on every key as a follower of the replacement. Each
   test asserts that no acknowledged key was lost, and the kill test reads every
   key back through the durable adapter after all three processes die.
+  Acknowledged writes are also tied to the entry that carried them rather than
+  to whichever replica answered: `a_committed_ack_survives_a_leader_change`
+  stops a leader of a three-node group, finds the replacement, and asserts the
+  replacement's durable log holds the same index, term and payload that the
+  acknowledgement named, with a strictly later term; inverting the entry term
+  to the new leader's term fails it. The library layer also does not deduplicate
+  a resubmitted command
+  (`the_library_layer_does_not_deduplicate_a_resubmitted_command`), so a caller
+  must carry its own key. This is in-process; there is no on-disk reopen across
+  the change and no real network, and no client-visible per-write index exists
+  outside the `x-yadb-log-index`/`x-yadb-log-term` response headers.
 - [ ] Test delayed and duplicated messages between independent processes, and
   run the process tests on more than one host.
   `three_process_mtls_delayed_and_duplicated_rpcs_do_not_break_agreement` puts a

@@ -3219,3 +3219,196 @@ crash gate), `cargo test -p yadb-io` (13), `cargo test -p yadbd --bin yadbd --
 (`test_doc_anchors.py`, `test_doc_test_names.py`, `test_protocols_review.py`,
 `test_openraft_suite_mapping.py`, `test_metrics_alert_rules.py`,
 `test_gc_refusal_protocol.py`).
+
+## Snapshot encoding, reclaimed purge bytes, a bounded evidence spool, a durable ack and a durable pin state (2026-11-21)
+
+Six changes landed together on `main` after the 2026-11-19 snapshot, each with a
+test that fails when the change is inverted. This section records what each one
+proves, the numbers behind it, and the inversions that were re-run by the
+orchestrator rather than taken from the implementing branch.
+
+### A snapshot chunk is base64, not an array of decimal numbers
+
+A chunk carried its bytes as a JSON array of numbers: `7` costs one byte,
+`255` costs four. On the 17 MiB round-trip fixture the payload was 933,935
+bytes of data written as 3,325,000 bytes of JSON, 3.56×, and the signed
+envelope wrote its own `Vec<u8>` payload the same way, so the frame reached
+10.69× the data. That single test was 31–33 s at 99% CPU on a faster suite and
+53–85 s under load: it dominated the whole `yadb-metakv` run.
+
+Chunk data is now padded RFC 4648 base64, 4/3 bytes per byte, decoded in one
+pass. Measured on the same fixture: payload 933,935 → 349,838 bytes (3.56× →
+1.34×), worst-case frame 2,802,256 → 1,176,324 (10.69× → 4.49×),
+`SNAPSHOT_CHUNK_FRAME` 4,210,688 → 1,406,304, and
+`large_snapshot_stream_round_trip` from 53–85 s to 19–21 s, which also takes the
+library suite from ~46 s to ~28 s.
+
+The decoder still accepts the legacy array of numbers, so a peer running the old
+encoder is understood rather than misread, and it is strict about padding and
+unused bits rather than decoding to different bytes
+(`a_legacy_array_of_numbers_chunk_still_decodes_to_the_same_bytes`,
+`a_maximum_chunk_round_trips_byte_exactly_and_fits_the_frame`). The frame bound
+is still checked before the body is read.
+
+Inversions, re-run on the merged tree: a decoder that accepts only the new form
+fails the legacy test with `invalid type: sequence, expected a base64 string or
+an array of byte values`; replacing the chunk frame bound with `usize::MAX`
+makes `a_declared_length_above_the_limit_is_refused_before_any_reservation`
+time out with `the limit check must not wait for a body: Elapsed(())`;
+corrupting one sextet of the encoder fails the round trip with
+`transport failure: peer closed the connection`; and shrinking the bound by a
+quarter fails the worst-case frame test with `a maximum chunk frame is 1399647
+bytes, above the 1056776-byte bound`.
+
+Not proved: loopback TLS only, no mixed-version rolling upgrade, peak decode
+memory holds the frame plus the envelope plus the base64 string plus the decoded
+vector, and the frame is still 4.5× rather than 1.4× because
+`SignedRaftEnvelope.payload` is itself a JSON array of numbers in
+`openraft_transport.rs`, which this change does not touch.
+
+### A purge reclaims the bytes it supersedes
+
+`reclaim_superseded_locked` in `openraft_storage.rs` compacts the superseded
+prefix through the existing `compact` path when the reclaimable range is at
+least `RECLAIM_MIN_BYTES` (1 MiB) and larger than the replacing checkpoint. A
+fully purged log used to keep every old byte: measured 7,738,005 bytes after a
+full purge before the change, 176 bytes after it (7,737,930 reclaimed).
+
+Inversions: disabling the reclaim fails `a purge must reclaim the superseded
+prefix` with `before=3868434 after=3868509`; taking a checkpoint from an empty
+live log keeps the retained suffix `[]` where the test needs `[1900..1999]`.
+
+### The corrupt-image evidence spool is bounded
+
+`state.json.corrupt*` was unbounded: every failed image left a copy behind
+forever. It is now capped at `2 * MAX_IMAGE`, pruned oldest-first, matched only
+by the exact names `state.json.corrupt` and `state.json.corrupt.N`, reports what
+it dropped in `ImageRebuild::dropped_images` and `dropped_bytes`, and refuses a
+single image larger than the budget
+(`the_evidence_spool_is_bounded_and_reports_what_it_dropped`,
+`a_single_image_larger_than_the_spool_budget_is_refused`).
+
+Inversions: skipping the prune fails with `one older image must go ... left: 0
+right: 1`; pruning by count alone fails the same assertion, because the budget
+is bytes and a count cannot bound them.
+
+### An acknowledged log id survives a leader change, and the library does not deduplicate
+
+`a_committed_ack_survives_a_leader_change` stops one node of a three-node
+group, finds the replacement, and asserts the replacement's durable log holds
+the same index, term and payload the acknowledgement named, with a strictly
+later term. `the_library_layer_does_not_deduplicate_a_resubmitted_command`
+asserts that resubmitting a command appends a second entry, so deduplication is
+the caller's key, not an implicit property.
+
+Inversions: writing the entry with the new leader's term instead of the
+proposer's fails with `left: 1 right: 2`; reporting `last_applied` as the
+acknowledged index fails
+`overlapping_writes_each_report_their_own_entry` with `left: 9 right: 16`.
+
+Not proved: in-process only, no on-disk reopen across the change, no real
+network, and no client-visible per-write index outside the
+`x-yadb-log-index`/`x-yadb-log-term` headers on the plain control apply.
+
+### A replica's certificate pin state survives a restart
+
+`certificate-pins.json` (and its `.tmp`) now lives in the replica directory,
+carries a CRC32 over the semantic content, merges over the configuration pins
+with revocations winning, refuses startup on an empty active set, and is written
+as a temp file, `sync_data`, rename and `sync_dir` through `yadb_io::sys`.
+
+Inversions: ignoring the stored file fails `the config's revoked pin must not
+come back after a restart` with `left: Ok(()) right: Err(AuthenticationFailed)`;
+treating corrupt state as absent fails `garbage: a damaged pin state must refuse
+startup`; dropping the temp+rename fails with `called Result::unwrap_err() on an
+Ok value: ()`.
+
+Not proved: the state is per replica rather than replicated through Raft, there
+is no cross-group transaction (a failure mid-fan-out leaves groups divergent),
+revocation is local only with no CRL or OCSP, no interface distinguishes
+"revoked" from "never trusted", and revoking the last pin of a single-pin node
+makes its next start refuse.
+
+### A consistent read is proved on a follower that is genuinely behind
+
+`crates/yadbd/tests/consistent_reads.rs` boots three daemons with three
+singleton groups and `project_groups {1: 2, 2: 3}`, so node 3 follows the group
+that owns project alpha. A userspace TCP relay in front of node 3's group-2
+transport is closed while every HTTP listener stays up, and the cut is asserted
+rather than timed: node 3's `last_applied` for group 2 is unchanged across a
+write node 2 applies and strictly below the leader's, so the staleness the test
+depends on is a measured fact.
+
+Four contracts hold on that stale follower: a consistent HEAD and a consistent
+SELECT return the committed state; the same HEAD without the flag returns the
+stale one, recorded explicitly as the documented difference; a consistent read
+with no quorum is refused rather than answered; and one multi-statement
+consistent read sees a single snapshot, never one new statement and one old.
+
+Inversions: not forwarding a consistent HEAD answers 409 where the test needs
+200; serving the local snapshot from the consistent path answers 200 with the
+stale object where no quorum exists; falling back to the local snapshot on a
+barrier failure does the same; and reading later statements from local state
+makes the multi-statement read observe the concurrent write with `left: 2
+right: 1`.
+
+Not proved: single host, the block `read_at_consistent` path is not driven, and
+no read spans groups atomically.
+
+### Every alert rule evaluated against a real cluster
+
+`scripts/yadb-container-alerts.py` imports the three-container harness and
+evaluates all 12 rules in `deploy/monitoring/yadb-alerts.yml` against a real
+three-container cluster: 587 samples over 50 declared families, a Prometheus
+text parser that fails on an unparseable line rather than skipping it, a PromQL
+subset evaluator with one-to-one matching on the full label set, and honest
+`for:` arithmetic where a true-but-young expression is pending, never firing.
+The merged-tree run took 182.1 s, left no container or network behind, and drove
+one rule into firing for real: `YadbGcRefused`, from a committed reader lease
+refusing a GC pass with HTTP 409, clearing after one TTL; `YadbNodeDown` was
+taken to firing across its 2m window with a stopped daemon.
+
+It also reported, rather than smoothed over, three expressions true on a healthy
+cluster: followers never take a GC or scrub pass (`YadbGcNoPass`,
+`YadbScrubNoPass` pending) and the control-group leader's repair scan refuses
+the groups it does not lead (`YadbScrubFailed` pending at 10m). Inversions: a
+dead scrape port fails the run, an empty exposition and an empty family fail it,
+and a scenario that should fire does not.
+
+Not proved: one kernel rather than multi-host, one scrape is not a time series
+(only `YadbNodeDown` was evaluated across a window), and there is no Alertmanager
+routing, inhibition or silencing.
+
+### Two guards repaired, not relaxed
+
+`test_doc_anchors.py` cited four lines that had moved; the citations and the
+guard moved together, so the claim and the check point at the same line.
+`test_doc_test_names.py` required a listed historical name to be absent as a
+substring, so `execute_with` counted as resurrected once `execute_with_ack`
+existed and the guard would have forced the documents to stop naming the
+function they narrate. A listed name is now absent only when it does not occur
+as a whole identifier, and a new test pins that `execute_with_ack` is not a
+resurrection while `LocalMetaKv::execute_with(cmd)` is.
+
+### A flake removed at its cause
+
+`multiple_real_groups_route_and_reject_cross_group` sampled each leader's
+`last_log_index`/`last_applied` immediately after three setup `Put`s, then
+asserted after 250 ms that the sample had not moved. A `Put` returns when its
+entry is committed, not when the state machine has applied it, so the baseline
+could be taken mid-apply and then "move" on its own. It only surfaced once the
+snapshot-encoding change made the rest of the suite faster. The test now waits
+for each leader's `last_applied` to reach its `last_log_index` first; the
+assertion keeps its meaning, because a submitted command would still move the
+indices.
+
+### Gates on this tree (2026-11-21)
+
+`cargo test -p yadb-metakv --lib` **293 passed** (30.2 s at 12 threads),
+`cargo test -p yadbd --bin yadbd -- --test-threads=1` **187 passed** (11.9 s),
+`cargo test -p yadb-io` **18 passed**, and all seven offline guards green:
+`test_doc_anchors.py` (9), `test_doc_test_names.py` (5),
+`test_protocols_review.py`, `test_openraft_suite_mapping.py`,
+`test_metrics_alert_rules.py`, `test_yadb_container_alerts.py` (30) and
+`tests/test_gc_refusal_protocol.py`. The container alert harness ran on this
+same tree: 182.1 s, no container or network left behind.
