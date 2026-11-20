@@ -6,17 +6,21 @@
 
 use std::collections::BTreeMap;
 use std::io::Cursor;
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use openraft::network::RaftNetworkFactory;
-use openraft::raft::VoteRequest;
-use openraft::{BasicNode, Snapshot};
+use openraft::raft::{VoteRequest, VoteResponse};
+use openraft::{BasicNode, Snapshot, Vote};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpSocket, TcpStream};
 
 use crate::multiraft::{GroupIdentity, ReplicaIdentity};
 use crate::openraft_net::{
     transport_counters, AuthenticatedTcpNetworkFactory, BoxFuture, RaftPeerServer, TransportConfig,
-    WireRequest, WireResponse,
+    WireRequest, WireResponse, MAX_FRAME, MAX_IN_FLIGHT_REQUEST_BYTES,
 };
 use crate::openraft_runtime::YadbRaft;
 use crate::openraft_state_machine::DurableMetaStateMachine;
@@ -541,4 +545,309 @@ async fn mutual_tls_rejects_untrusted_expired_wrong_node_and_plaintext_clients()
     assert_eq!(count.load(Ordering::SeqCst), 1);
     task.abort();
     let _ = task.await;
+}
+
+// ---- Two source addresses and the global in-flight frame budget ----
+//
+// `openraft_net` bounds the sum of live frame bodies with one global semaphore
+// (64 MiB, two maximum frames) and each source address with a sub-cap of half
+// of it. The open question is what two addresses acting together can hold:
+// each takes its own half, so together they can take everything. These tests
+// measure the total against the documented global bound and record exactly
+// what a third peer gets while both halves are stalled.
+//
+// A frame is measured by declaring its length and withholding the body: the
+// receiver reserves the declared bytes before it allocates or reads the body,
+// so the reservation is held for as long as the body stalls. Whether a
+// reservation is in place is observed from a third address by asking for one
+// byte. A fresh address has its whole share free, so a one-byte frame can only
+// wait on the global semaphore; the server closing the connection proves the
+// frame was read, and no close proves it is still waiting for budget.
+
+/// Frame kinds from the wire protocol. `openraft_net` keeps these private, so
+/// this file mirrors the two it speaks: the server opens with a challenge and
+/// a client request is kind 1.
+const CHALLENGE_KIND: u8 = 3;
+const REQUEST_KIND: u8 = 1;
+
+struct BudgetFixture {
+    addr: SocketAddr,
+    /// Requests that reached the handler, across the whole test.
+    dispatches: Arc<AtomicUsize>,
+    /// Client config for a real signed RPC from node 1 to node 2.
+    client: TransportConfig,
+    task: tokio::task::JoinHandle<()>,
+}
+
+/// A plaintext server whose handler counts dispatches and answers every RPC.
+/// The request timeout is long so a stalled frame stays stalled for the whole
+/// test rather than being cut off by the server's own deadline.
+async fn budget_fixture() -> BudgetFixture {
+    let server_node = 2u32;
+    let keys: BTreeMap<u32, Arc<NodeSigningKey>> =
+        (1..=3u32).map(|n| (n, Arc::new(seed(n)))).collect();
+    let registry = Arc::new(
+        PeerKeyRegistry::new(
+            keys.iter()
+                .map(|(id, key)| (*id, key.public_key()))
+                .collect(),
+        )
+        .unwrap(),
+    );
+    let dispatches = Arc::new(AtomicUsize::new(0));
+    let count = dispatches.clone();
+    let handler: Arc<dyn Fn(WireRequest) -> BoxFuture<WireResponse> + Send + Sync> =
+        Arc::new(move |_request| {
+            count.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {
+                WireResponse::Vote(Box::new(VoteResponse {
+                    vote: Vote::new(1, 2),
+                    vote_granted: true,
+                    last_log_id: None,
+                }))
+            })
+        });
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut config = TransportConfig::new(
+        identity(server_node),
+        keys[&server_node].clone(),
+        BTreeMap::new(),
+        registry.clone(),
+    );
+    config.request_timeout = Duration::from_secs(60);
+    let task = tokio::spawn(RaftPeerServer::from_listener(listener, config, handler).serve());
+    let client = TransportConfig::new(
+        identity(1),
+        keys[&1].clone(),
+        BTreeMap::from([(server_node, addr)]),
+        registry,
+    );
+    BudgetFixture {
+        addr,
+        dispatches,
+        client,
+        task,
+    }
+}
+
+fn vote_request() -> WireRequest {
+    WireRequest::Vote(Box::new(VoteRequest {
+        vote: Vote::new(1, 1),
+        last_log_id: None,
+    }))
+}
+
+/// Connects to `addr` from a specific loopback source address, so one test can
+/// present several distinct addresses to one listener. The server keys its
+/// per-address fairness by IP, and every RPC uses a fresh ephemeral port.
+async fn connect_from(source: &str, addr: SocketAddr) -> std::io::Result<TcpStream> {
+    let socket = TcpSocket::new_v4()?;
+    socket.bind(SocketAddr::new(source.parse().unwrap(), 0))?;
+    socket.connect(addr).await
+}
+
+async fn read_challenge(stream: &mut TcpStream) -> [u8; 32] {
+    let mut header = [0u8; 5];
+    stream.read_exact(&mut header).await.unwrap();
+    assert_eq!(header[0], CHALLENGE_KIND, "server must open with a challenge");
+    let length = u32::from_le_bytes(header[1..].try_into().unwrap()) as usize;
+    assert_eq!(length, 32, "the challenge is 32 bytes");
+    let mut challenge = [0u8; 32];
+    stream.read_exact(&mut challenge).await.unwrap();
+    challenge
+}
+
+/// Declares one maximum-size request frame from `source` and never sends the
+/// body. The returned stream must stay alive: dropping it ends the stalled
+/// read and releases the reservation.
+async fn stall_maximum_frame(addr: SocketAddr, source: &str) -> TcpStream {
+    let mut stream = connect_from(source, addr).await.unwrap();
+    read_challenge(&mut stream).await;
+    let mut header = [0u8; 5];
+    header[0] = REQUEST_KIND;
+    header[1..].copy_from_slice(&(MAX_FRAME as u32).to_le_bytes());
+    stream.write_all(&header).await.unwrap();
+    stream
+}
+
+/// One request frame from `source` that can be observed but never blocks the
+/// test: the write runs in a task so a body the server does not read only
+/// fills the socket buffer.
+struct Probe {
+    reader: tokio::net::tcp::OwnedReadHalf,
+    writer: tokio::task::JoinHandle<()>,
+}
+
+impl Probe {
+    async fn open(addr: SocketAddr, source: &str, bytes: usize) -> Self {
+        let mut stream = connect_from(source, addr).await.unwrap();
+        read_challenge(&mut stream).await;
+        let mut header = [0u8; 5];
+        header[0] = REQUEST_KIND;
+        header[1..].copy_from_slice(&(bytes as u32).to_le_bytes());
+        let (reader, mut writer) = stream.into_split();
+        let task = tokio::spawn(async move {
+            if writer.write_all(&header).await.is_err() {
+                return;
+            }
+            // The frame body is not a valid envelope, so an admitted frame is
+            // refused and the connection is closed; this test only needs to
+            // know whether the bytes were read.
+            let _ = writer.write_all(&vec![0u8; bytes]).await;
+        });
+        Self {
+            reader,
+            writer: task,
+        }
+    }
+
+    /// `true` once the server read the frame and closed the connection,
+    /// `false` if the frame is still waiting for budget after `wait`.
+    async fn served(&mut self, wait: Duration) -> bool {
+        let mut byte = [0u8; 1];
+        tokio::time::timeout(wait, self.reader.read(&mut byte))
+            .await
+            .is_ok()
+    }
+}
+
+impl Drop for Probe {
+    fn drop(&mut self) {
+        self.writer.abort();
+    }
+}
+
+/// Opens one-byte probes from `source` until one is not served. A one-byte
+/// frame from a fresh address cannot wait for anything but the global byte
+/// budget, so the returned probe proves the budget is exhausted. The probe is
+/// kept open: releasing a stalled address must be what serves it.
+async fn wait_until_budget_exhausted(addr: SocketAddr, source: &str) -> Probe {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let mut probe = Probe::open(addr, source, 1).await;
+        if !probe.served(Duration::from_millis(300)).await {
+            return probe;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "stalled frames never consumed the global in-flight byte budget: \
+             a one-byte frame from another address was served every time"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_source_addresses_together_hold_at_most_the_global_frame_budget() {
+    tokio::time::timeout(Duration::from_secs(120), async {
+        let f = budget_fixture().await;
+        // Two distinct source addresses each declare a maximum frame and never
+        // send the body, so each holds its whole per-address share.
+        let first = stall_maximum_frame(f.addr, "127.0.0.2").await;
+        let second = stall_maximum_frame(f.addr, "127.0.0.3").await;
+
+        // A third address asks for a single byte. Once that cannot be served,
+        // the two stalled frames hold every byte of the global budget.
+        let mut probe = wait_until_budget_exhausted(f.addr, "127.0.0.4").await;
+
+        // Measured: zero of the 64 MiB global budget remains. Each address is
+        // at MAX_FRAME, so their total is 2 * MAX_FRAME, which is exactly the
+        // documented global bound and never more. The per-address shares add
+        // up to the bound here; the global semaphore is what keeps the total
+        // from exceeding it, not the sub-caps.
+        assert_eq!(
+            2 * MAX_FRAME,
+            MAX_IN_FLIGHT_REQUEST_BYTES,
+            "two maximum frames must be the whole documented global bound"
+        );
+        assert!(
+            !probe.served(Duration::from_millis(250)).await,
+            "a third address reserved a byte while two addresses held the whole global budget"
+        );
+
+        // Releasing one address frees exactly its share, and the blocked probe
+        // is served: it was waiting for the global budget and nothing else.
+        drop(first);
+        assert!(
+            probe.served(Duration::from_secs(5)).await,
+            "releasing one stalled address did not free the budget its frame held"
+        );
+        drop(probe);
+
+        // The bound holds for a different pair too: the second address keeps
+        // its frame and a new address takes the freed half, so the total is
+        // the whole budget again and a fresh one-byte probe waits again.
+        let third = stall_maximum_frame(f.addr, "127.0.0.5").await;
+        let mut probe = wait_until_budget_exhausted(f.addr, "127.0.0.6").await;
+        assert!(
+            !probe.served(Duration::from_millis(250)).await,
+            "a third address reserved a byte while a second pair held the whole global budget"
+        );
+
+        assert_eq!(
+            f.dispatches.load(Ordering::SeqCst),
+            0,
+            "a stalled frame was dispatched"
+        );
+        drop(third);
+        drop(second);
+        drop(probe);
+        f.task.abort();
+        let _ = f.task.await;
+    })
+    .await
+    .expect("two-address global budget test timed out");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_addresses_holding_the_whole_budget_starve_a_third_peer() {
+    tokio::time::timeout(Duration::from_secs(120), async {
+        let f = budget_fixture().await;
+        let first = stall_maximum_frame(f.addr, "127.0.0.2").await;
+        let second = stall_maximum_frame(f.addr, "127.0.0.3").await;
+        let probe = wait_until_budget_exhausted(f.addr, "127.0.0.4").await;
+
+        // A real signed RPC from a third address (the client connects from
+        // 127.0.0.1) must not reach the handler while both halves are held:
+        // its frame waits for the global budget, and the client's own deadline
+        // is what ends the attempt.
+        let mut client = AuthenticatedTcpNetworkFactory::new(f.client.clone())
+            .new_client(2, &BasicNode::new("node-2"))
+            .await;
+        let starved = client
+            .call_for_test(vote_request(), Duration::from_secs(1))
+            .await;
+        assert!(
+            starved.is_err(),
+            "a third peer was served while two addresses held the whole budget: {starved:?}"
+        );
+        assert_eq!(
+            f.dispatches.load(Ordering::SeqCst),
+            0,
+            "the third peer's request reached the handler while the budget was exhausted"
+        );
+
+        // One address releasing its share is enough: the stall is the budget,
+        // not this peer. The third peer then completes a verified RPC.
+        drop(first);
+        let served = client
+            .call_for_test(vote_request(), Duration::from_secs(10))
+            .await;
+        assert!(
+            served.is_ok(),
+            "the third peer was still starved after one address released its share: {served:?}"
+        );
+        assert!(
+            f.dispatches.load(Ordering::SeqCst) >= 1,
+            "the third peer's request was answered without reaching the handler"
+        );
+
+        drop(second);
+        drop(probe);
+        f.task.abort();
+        let _ = f.task.await;
+    })
+    .await
+    .expect("two-address starvation test timed out");
 }
