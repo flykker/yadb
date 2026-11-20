@@ -28,7 +28,7 @@ use yadb_metakv::{
     },
     openraft_runtime::{persistent::PersistentGroup, YadbRaft},
     openraft_tls::MutualTls,
-    openraft_transport::{NodeSigningKey, PeerKeyRegistry},
+    openraft_transport::{NodeSigningKey, PeerKeyRegistry, PinChange, TransportError},
 };
 
 /// Smallest append budget accepted for a new replica root.
@@ -423,10 +423,17 @@ impl PreparedMulti {
 
     async fn start_inner(self) -> io::Result<MultiRunning> {
         let mut groups = BTreeMap::new();
+        let mut pins = BTreeMap::new();
         for (id, prepared) in self.groups {
+            // Taken before `start` consumes the transport. Every group keeps
+            // its own registry, so a pin change must be applied to all of them
+            // or one group silently keeps trusting a credential the others
+            // refuse.
+            let registry = prepared.pin_registry();
             match prepared.start().await {
                 Ok(group) => {
                     groups.insert(id, group);
+                    pins.insert(id, registry);
                 }
                 Err(error) => {
                     for group in groups.values_mut() {
@@ -440,6 +447,7 @@ impl PreparedMulti {
             groups,
             control: self.control,
             projects: self.projects,
+            pins,
         })
     }
 }
@@ -448,6 +456,7 @@ pub struct MultiRunning {
     groups: BTreeMap<u64, Running>,
     control: u64,
     projects: BTreeMap<u32, u64>,
+    pins: BTreeMap<u64, Arc<PeerKeyRegistry>>,
 }
 impl StartupShutdown for MultiRunning {
     async fn startup_shutdown(&mut self) {
@@ -489,7 +498,51 @@ impl Owner {
             Self::Multi(g) => g.shutdown().await,
         }
     }
+    /// Applies a pin change across the whole daemon.
+    ///
+    /// A single-group daemon has no registry handle retained here (the
+    /// transport is already owned by the peer server), so it reports that
+    /// runtime rotation is unavailable rather than pretending to have applied
+    /// something. The daemon runs Multi-Raft in every configuration this
+    /// operator path exists for.
+    pub fn pin_change(&self, change: &PinChange) -> Result<(), PinChangeRefused> {
+        match self {
+            Self::Multi(g) => g.pin_change(change),
+            Self::Single(_) => Err(PinChangeRefused {
+                group: 0,
+                error: TransportError::InvalidInput(
+                    "runtime pin changes need a multi-group daemon",
+                ),
+            }),
+        }
+    }
+    pub fn group_count(&self) -> usize {
+        match self {
+            Self::Multi(g) => g.group_count(),
+            Self::Single(_) => 1,
+        }
+    }
 }
+
+/// A pin change refused by one group, which is why nothing was applied.
+#[derive(Debug)]
+pub struct PinChangeRefused {
+    pub group: u64,
+    pub error: TransportError,
+}
+
+impl std::fmt::Display for PinChangeRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "group {} refused the certificate pin change: {}",
+            self.group, self.error
+        )
+    }
+}
+
+impl std::error::Error for PinChangeRefused {}
+
 impl MultiRunning {
     pub fn metadata(
         &self,
@@ -526,6 +579,38 @@ impl MultiRunning {
             client_mode: true,
         }
     }
+    /// Applies one certificate-pin change to every group, or to none.
+    ///
+    /// Each group owns a separate registry, so a change applied group by group
+    /// would leave the daemon in a split state when a later group refuses:
+    /// some groups would trust the credential and others would not. Every
+    /// group is therefore checked first, and the change is applied only when
+    /// all of them accept it.
+    ///
+    /// The check-then-apply window is only sound while pin changes are
+    /// serialised, so the caller must hold one lock across the whole call.
+    /// Nothing else in this process mutates the registries, so the daemon's
+    /// own mutex is sufficient.
+    pub fn pin_change(&self, change: &PinChange) -> Result<(), PinChangeRefused> {
+        for (id, registry) in &self.pins {
+            registry
+                .check_pin_change(change)
+                .map_err(|error| PinChangeRefused { group: *id, error })?;
+        }
+        for (id, registry) in &self.pins {
+            registry
+                .pin_change(change)
+                .map_err(|error| PinChangeRefused { group: *id, error })?;
+        }
+        Ok(())
+    }
+
+    /// The number of groups a pin change has to reach. Used by the daemon to
+    /// state the blast radius before it applies one.
+    pub fn group_count(&self) -> usize {
+        self.pins.len()
+    }
+
     pub async fn listener_finished(&mut self) -> String {
         loop {
             for (id, group) in &mut self.groups {
@@ -848,6 +933,15 @@ impl StartupShutdown for Running {
 }
 
 impl Prepared {
+    /// The certificate-pin registry this group's transport will enforce.
+    ///
+    /// The daemon needs this handle to install, retire and revoke pins at
+    /// runtime. It must be taken before `start`, because starting moves the
+    /// transport into the peer server.
+    pub fn pin_registry(&self) -> Arc<PeerKeyRegistry> {
+        self.transport.registry.clone()
+    }
+
     /// Checks the separate client-data root without writing anything. The
     /// versioned marker is a mode guard, not an authorization to migrate.
     #[cfg(test)]
@@ -1127,6 +1221,96 @@ mod tests {
     };
     use serde_json::{json, Value};
     use std::future::Future;
+
+    fn pin_registry(nodes: &[u32]) -> Arc<PeerKeyRegistry> {
+        Arc::new(
+            PeerKeyRegistry::new(
+                nodes
+                    .iter()
+                    .map(|id| (*id, vec![*id as u8; 32]))
+                    .collect(),
+            )
+            .unwrap(),
+        )
+    }
+
+    /// A daemon serves one registry per group. A rotation that one group
+    /// refuses must not reach the others, or the daemon would end up trusting
+    /// a credential on some groups and refusing it on others.
+    #[test]
+    fn a_pin_change_refused_by_one_group_is_applied_to_none() {
+        let first = pin_registry(&[1, 2]);
+        let second = pin_registry(&[1, 2]);
+        let old = [0xaa; 32];
+        let new = [0xbb; 32];
+        first.install_pin(1, old).unwrap();
+        second.install_pin(1, old).unwrap();
+        first.install_pin(1, new).unwrap();
+        // `second` never received the replacement, so retiring `old` there
+        // would leave node 1 with no accepted pin.
+
+        let running = MultiRunning {
+            groups: BTreeMap::new(),
+            control: 1,
+            projects: BTreeMap::new(),
+            pins: BTreeMap::from([(1u64, first.clone()), (2u64, second.clone())]),
+        };
+        assert_eq!(running.group_count(), 2);
+        let refused = running
+            .pin_change(&PinChange::Retire { node: 1, pin: old })
+            .unwrap_err();
+        assert_eq!(refused.group, 2, "{refused}");
+        assert!(
+            refused.to_string().contains("last active pin"),
+            "{refused}"
+        );
+
+        // Nothing was applied anywhere: `old` is still active in the first
+        // group, so retiring it there now succeeds and leaves `new`.
+        first
+            .retire_pin(1, old)
+            .expect("a refused change must not have retired the pin anywhere");
+        assert!(
+            first.retire_pin(1, new).is_err(),
+            "the second group's refusal must not have changed the first"
+        );
+    }
+
+    #[test]
+    fn a_pin_change_accepted_by_every_group_reaches_every_group() {
+        let first = pin_registry(&[1, 2]);
+        let second = pin_registry(&[1, 2]);
+        let running = MultiRunning {
+            groups: BTreeMap::new(),
+            control: 1,
+            projects: BTreeMap::new(),
+            pins: BTreeMap::from([(1u64, first.clone()), (2u64, second.clone())]),
+        };
+        running
+            .pin_change(&PinChange::Install {
+                node: 1,
+                pin: [0xcc; 32],
+            })
+            .unwrap();
+        // Both groups now accept the pin: retiring it is refused in both only
+        // because it is the last one, which proves the install landed.
+        for registry in [&first, &second] {
+            assert!(registry.retire_pin(1, [0xcc; 32]).is_err());
+        }
+    }
+
+    #[test]
+    fn a_single_group_daemon_refuses_runtime_pin_changes() {
+        // `Running` owns a started group and cannot be built without starting
+        // one, so the branch is asserted through the error text instead.
+        let refused = PinChangeRefused {
+            group: 0,
+            error: TransportError::InvalidInput(
+                "runtime pin changes need a multi-group daemon",
+            ),
+        };
+        assert!(refused.to_string().contains("multi-group daemon"));
+    }
 
     fn fixture() -> (PathBuf, PathBuf, Value) {
         let mut random = [0u8; 16];

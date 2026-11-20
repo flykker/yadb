@@ -82,6 +82,19 @@ pub(crate) fn verify_signature(public_key: &[u8], message: &[u8], signature: &[u
         .is_ok()
 }
 
+/// One operator-requested change to a node's accepted certificate pins.
+///
+/// The three operations are deliberately not symmetric. `Install` adds a pin
+/// and keeps the old ones, which is what makes rotation overlap. `Retire`
+/// removes one but refuses to leave a node with no pin. `Revoke` is the
+/// emergency path and may remove the last pin, taking effect on the next frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinChange {
+    Install { node: u32, pin: [u8; 32] },
+    Retire { node: u32, pin: [u8; 32] },
+    Revoke { node: u32, pin: [u8; 32] },
+}
+
 /// Trusted peer public keys, keyed by node id.
 #[derive(Debug, Clone, Default)]
 pub struct PeerKeyRegistry {
@@ -89,7 +102,7 @@ pub struct PeerKeyRegistry {
     pins: Arc<RwLock<CertificatePinRegistry>>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct CertificatePinRegistry {
     active: BTreeMap<u32, BTreeSet<[u8; 32]>>,
     owners: BTreeMap<[u8; 32], u32>,
@@ -127,58 +140,103 @@ impl PeerKeyRegistry {
     /// which a local registry cannot establish. A pin is bound to its first
     /// node for this registry's lifetime and a revoked pin cannot be reinstalled.
     pub fn install_pin(&self, node_id: u32, pin: [u8; 32]) -> Result<(), TransportError> {
-        let mut pins = self
-            .pins
-            .write()
-            .map_err(|_| TransportError::InvalidInput("certificate pin registry poisoned"))?;
-        if !self.keys.contains_key(&node_id)
-            || pins.revoked.contains(&pin)
-            || pins.owners.get(&pin).is_some_and(|owner| *owner != node_id)
-        {
-            return Err(TransportError::InvalidInput(
-                "certificate pin belongs to another, revoked or unknown node",
-            ));
-        }
-        pins.owners.insert(pin, node_id);
-        pins.active.entry(node_id).or_default().insert(pin);
-        Ok(())
+        self.pin_change(&PinChange::Install { node: node_id, pin })
     }
 
     /// Retires one pin, but never the last active pin for a node. Callers must
     /// first install the replacement and deploy it to every peer.
     pub fn retire_pin(&self, node_id: u32, pin: [u8; 32]) -> Result<(), TransportError> {
-        let mut pins = self
-            .pins
-            .write()
-            .map_err(|_| TransportError::InvalidInput("certificate pin registry poisoned"))?;
-        let active = pins
-            .active
-            .get_mut(&node_id)
-            .ok_or(TransportError::UnknownSender)?;
-        if active.len() <= 1 || !active.remove(&pin) {
-            return Err(TransportError::InvalidInput(
-                "certificate pin absent or last active pin",
-            ));
-        }
-        Ok(())
+        self.pin_change(&PinChange::Retire { node: node_id, pin })
     }
 
     /// Revocation is deliberately allowed to remove the last pin. It is an
     /// emergency operation and takes effect on the next frame check.
     pub fn revoke_pin(&self, node_id: u32, pin: [u8; 32]) -> Result<(), TransportError> {
+        self.pin_change(&PinChange::Revoke { node: node_id, pin })
+    }
+
+    /// Reports whether `pin_change` would succeed, without changing anything.
+    ///
+    /// A daemon serves several groups, each with its own registry. Checking
+    /// every group first and applying only when all of them accept is what
+    /// stops a rotation from leaving one group trusting a credential the
+    /// others have already refused. The check is advisory: it is only sound
+    /// while the caller serialises changes, because another writer between the
+    /// check and the apply would make it stale.
+    pub fn check_pin_change(&self, change: &PinChange) -> Result<(), TransportError> {
+        let pins = self
+            .pins
+            .read()
+            .map_err(|_| TransportError::InvalidInput("certificate pin registry poisoned"))?;
+        // Cloned only on the operator path, never per frame: `apply_pin_change`
+        // mutates, and running it against a copy is what keeps the check and
+        // the apply from being two copies of the same rules.
+        let mut probe = pins.clone();
+        Self::apply_pin_change(&self.keys, &mut probe, change, false)
+    }
+
+    /// Applies one pin change. See `check_pin_change` for the ordering rule.
+    pub fn pin_change(&self, change: &PinChange) -> Result<(), TransportError> {
         let mut pins = self
             .pins
             .write()
             .map_err(|_| TransportError::InvalidInput("certificate pin registry poisoned"))?;
-        if !pins
-            .active
-            .get_mut(&node_id)
-            .is_some_and(|active| active.remove(&pin))
-        {
-            return Err(TransportError::InvalidInput("certificate pin not active"));
+        Self::apply_pin_change(&self.keys, &mut pins, change, true)
+    }
+
+    fn apply_pin_change(
+        keys: &BTreeMap<u32, Vec<u8>>,
+        pins: &mut CertificatePinRegistry,
+        change: &PinChange,
+        apply: bool,
+    ) -> Result<(), TransportError> {
+        match *change {
+            PinChange::Install { node, pin } => {
+                if !keys.contains_key(&node)
+                    || pins.revoked.contains(&pin)
+                    || pins.owners.get(&pin).is_some_and(|owner| *owner != node)
+                {
+                    return Err(TransportError::InvalidInput(
+                        "certificate pin belongs to another, revoked or unknown node",
+                    ));
+                }
+                if apply {
+                    pins.owners.insert(pin, node);
+                    pins.active.entry(node).or_default().insert(pin);
+                }
+                Ok(())
+            }
+            PinChange::Retire { node, pin } => {
+                let active = pins.active.get(&node).ok_or(TransportError::UnknownSender)?;
+                // The last pin may not be retired: a node with no accepted pin
+                // can never authenticate again.
+                if active.len() <= 1 || !active.contains(&pin) {
+                    return Err(TransportError::InvalidInput(
+                        "certificate pin absent or last active pin",
+                    ));
+                }
+                if apply {
+                    pins.active
+                        .get_mut(&node)
+                        .expect("checked above")
+                        .remove(&pin);
+                }
+                Ok(())
+            }
+            PinChange::Revoke { node, pin } => {
+                if !pins.active.get(&node).is_some_and(|a| a.contains(&pin)) {
+                    return Err(TransportError::InvalidInput("certificate pin not active"));
+                }
+                if apply {
+                    pins.active
+                        .get_mut(&node)
+                        .expect("checked above")
+                        .remove(&pin);
+                    pins.revoked.insert(pin);
+                }
+                Ok(())
+            }
         }
-        pins.revoked.insert(pin);
-        Ok(())
     }
 
     pub(crate) fn register_initial_pins(
@@ -498,6 +556,46 @@ mod tests {
             Err(TransportError::AuthenticationFailed)
         );
         registry.check_pin(1, new).unwrap();
+    }
+
+    #[test]
+    fn a_pin_change_can_be_checked_without_being_applied() {
+        let (one, two) = keys();
+        let registry = registry(&one, &two);
+        let old = [11; 32];
+        let new = [12; 32];
+        registry.install_pin(1, old).unwrap();
+
+        // A check reports what the apply would do and changes nothing, which is
+        // what lets a daemon refuse a change on one group before touching any.
+        registry
+            .check_pin_change(&PinChange::Install { node: 1, pin: new })
+            .unwrap();
+        assert_eq!(
+            registry.check_pin(1, new),
+            Err(TransportError::AuthenticationFailed),
+            "a check must not install the pin"
+        );
+        assert_eq!(
+            registry.check_pin_change(&PinChange::Retire { node: 1, pin: old }),
+            Err(TransportError::InvalidInput(
+                "certificate pin absent or last active pin"
+            )),
+            "a check must report the same refusal the apply would"
+        );
+        registry.check_pin(1, old).unwrap();
+
+        registry
+            .pin_change(&PinChange::Install { node: 1, pin: new })
+            .unwrap();
+        registry.check_pin(1, new).unwrap();
+        registry
+            .pin_change(&PinChange::Retire { node: 1, pin: old })
+            .unwrap();
+        assert_eq!(
+            registry.check_pin(1, old),
+            Err(TransportError::AuthenticationFailed)
+        );
     }
 
     #[test]
