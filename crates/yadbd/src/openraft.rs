@@ -1112,6 +1112,15 @@ impl Prepared {
                     image.corrupt_bytes,
                     image.preserved_as.display(),
                 );
+                if image.dropped_images > 0 {
+                    eprintln!(
+                        "group {} node {}: dropped {} older corrupt image(s) ({} byte(s)) to keep the evidence spool bounded",
+                        self.identity.group().group,
+                        self.identity.node(),
+                        image.dropped_images,
+                        image.dropped_bytes,
+                    );
+                }
             }
         }
         #[cfg(test)]

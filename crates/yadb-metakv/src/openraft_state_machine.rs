@@ -36,6 +36,16 @@ const VERSION: u32 = 1;
 const MAX_IMAGE: usize = 64 * 1024 * 1024;
 const IMAGE_HEADER_LEN: usize = 24;
 
+/// Budget for the `state.json.corrupt*` evidence spool.
+///
+/// Two full images: enough to keep the current failure and the one before it,
+/// which is what makes "did this start corrupt the image, or was it already
+/// corrupt?" answerable. The previous bound was 1000 images with no byte limit,
+/// i.e. up to 64 GiB of evidence that could fill the disk and then make the
+/// replica refuse to open — the spool must never be able to cause the outage it
+/// is meant to explain.
+const MAX_CORRUPT_SPOOL_BYTES: u64 = 2 * MAX_IMAGE as u64;
+
 /// Applied entries appended after the last full-image checkpoint.
 ///
 /// `state.json` is a checkpoint: publishing it writes the whole image, syncs
@@ -175,6 +185,14 @@ pub struct ImageRebuild {
     pub preserved_as: PathBuf,
     /// Length of the corrupt image in bytes.
     pub corrupt_bytes: u64,
+    /// Number of older preserved images deleted to keep the spool bounded.
+    ///
+    /// Non-zero means evidence was deliberately discarded. The newest images
+    /// are kept because they describe the failure an operator is looking at
+    /// now; the oldest describe failures that were already dealt with.
+    pub dropped_images: u32,
+    /// Total bytes those deleted images occupied.
+    pub dropped_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -696,8 +714,17 @@ fn empty_image(identity: &ReplicaIdentity) -> Image {
 /// evidence of which validation failed. `OsDirectoryLock` excludes concurrent
 /// writers, so probing for a free name cannot race with another rebuild; an
 /// earlier `state.json.corrupt` is never overwritten.
+///
+/// The spool is bounded by [`MAX_CORRUPT_SPOOL_BYTES`]. An unbounded spool was
+/// the one remaining growth path here: a replica that rebuilds on every start —
+/// a disk that keeps flipping a bit, or a bug that republishes a corrupt image —
+/// would accumulate one full image per start, and the 1000-image cap meant up to
+/// 64 GiB before the replica refused to open at all. A full disk is a worse
+/// failure than losing old evidence, so the oldest images are deleted and the
+/// deletion is reported in [`ImageRebuild`] rather than performed silently.
 fn preserve_corrupt_image(dir: &Path, path: &Path) -> io::Result<ImageRebuild> {
     let corrupt_bytes = fs::metadata(path)?.len();
+    let (dropped_images, dropped_bytes) = make_spool_room(dir, corrupt_bytes)?;
     let mut preserved_as = dir.join("state.json.corrupt");
     let mut sequence = 0u32;
     loop {
@@ -718,7 +745,72 @@ fn preserve_corrupt_image(dir: &Path, path: &Path) -> io::Result<ImageRebuild> {
     Ok(ImageRebuild {
         preserved_as,
         corrupt_bytes,
+        dropped_images,
+        dropped_bytes,
     })
+}
+
+/// Returns the sequence number of a preserved image name, or `None` when the
+/// name is not one.
+///
+/// Only the exact `state.json.corrupt` spelling and its numbered variants are
+/// recognised. This is what keeps a cleanup from ever touching `state.json`,
+/// `state.json.tmp` or anything else in the directory: a prefix match would be
+/// enough to delete the live image.
+fn preserved_sequence(name: &str) -> Option<u32> {
+    let suffix = name.strip_prefix("state.json.corrupt")?;
+    if suffix.is_empty() {
+        return Some(0);
+    }
+    let digits = suffix.strip_prefix('.')?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// Deletes the oldest preserved images until `incoming` more bytes fit in the
+/// spool budget, and reports what it deleted.
+///
+/// Oldest first: `state.json.corrupt` then `.1`, `.2`, … A deletion is refused
+/// rather than allowed to fail silently, and the directory is synced so the
+/// removal survives a crash between the unlink and the rename.
+fn make_spool_room(dir: &Path, incoming: u64) -> io::Result<(u32, u64)> {
+    if incoming > MAX_CORRUPT_SPOOL_BYTES {
+        // A single image larger than the whole budget cannot be spooled at all.
+        // Refusing is honest: the caller's alternative is to keep nothing.
+        return Err(io::Error::other(
+            "corrupt state-machine image exceeds the preserved-evidence budget",
+        ));
+    }
+    let mut spool: Vec<(u32, PathBuf, u64)> = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(sequence) = preserved_sequence(name) else {
+            continue;
+        };
+        let bytes = entry.metadata().map(|m| m.len()).unwrap_or(0);
+        spool.push((sequence, entry.path(), bytes));
+    }
+    spool.sort_by_key(|(sequence, _, _)| *sequence);
+    let mut total: u64 = spool.iter().map(|(_, _, bytes)| *bytes).sum();
+    let mut dropped_images = 0u32;
+    let mut dropped_bytes = 0u64;
+    let mut index = 0;
+    while total.saturating_add(incoming) > MAX_CORRUPT_SPOOL_BYTES && index < spool.len() {
+        let (_, path, bytes) = &spool[index];
+        fs::remove_file(path)?;
+        total = total.saturating_sub(*bytes);
+        dropped_images += 1;
+        dropped_bytes += *bytes;
+        index += 1;
+    }
+    if dropped_images > 0 {
+        File::open(dir)?.sync_all()?;
+    }
+    Ok((dropped_images, dropped_bytes))
 }
 
 /// Publish `image` as `state.json` through a synced temporary file, so a crash
@@ -2511,6 +2603,8 @@ mod tests {
                 Some(ImageRebuild {
                     preserved_as: evidence.clone(),
                     corrupt_bytes: cut as u64,
+                    dropped_images: 0,
+                    dropped_bytes: 0,
                 }),
                 "a {cut}-byte image must be preserved as evidence"
             );
@@ -2911,6 +3005,8 @@ mod tests {
             Some(ImageRebuild {
                 preserved_as: evidence.clone(),
                 corrupt_bytes: corrupt.len() as u64,
+                dropped_images: 0,
+                dropped_bytes: 0,
             })
         );
         assert_eq!(fs::read(&evidence).unwrap(), corrupt);
@@ -3081,6 +3177,73 @@ mod tests {
         assert_eq!(report.preserved_as, dir.0.join("state.json.corrupt.1"));
         assert_eq!(fs::read(&report.preserved_as).unwrap(), second);
         assert_eq!(fs::read(&first_evidence).unwrap(), first);
+    }
+
+    // The evidence spool is bounded: a replica that rebuilds on every start must
+    // not accumulate images until the disk fills. The oldest are dropped, and
+    // the drop is reported rather than performed silently.
+    #[tokio::test]
+    async fn the_evidence_spool_is_bounded_and_reports_what_it_dropped() {
+        let dir = TempDir::new();
+        let budget = MAX_CORRUPT_SPOOL_BYTES;
+        // A real image, so the incoming size is the size of a real rebuild.
+        let mut sm = DurableMetaStateMachine::create(&dir.0, &identity()).unwrap();
+        sm.apply(vec![put(1, "a", b"one")]).await.unwrap();
+        drop(sm);
+        let image_len = fs::metadata(dir.0.join("state.json")).unwrap().len();
+        // Sparse files: only the logical length is accounted, so the spool can
+        // be filled to the budget without spending disk on it.
+        for name in ["state.json.corrupt", "state.json.corrupt.1"] {
+            let file = fs::File::create(dir.0.join(name)).unwrap();
+            file.set_len(budget / 2 + image_len).unwrap();
+        }
+        // An unrelated file must never be treated as spool.
+        fs::write(dir.0.join("operator-notes.txt"), b"keep").unwrap();
+        let live = corrupt_image(&dir.0);
+
+        let rebuilt = DurableMetaStateMachine::open_or_rebuild(
+            &dir.0,
+            &identity(),
+            LogCoverage {
+                last_purged: None,
+                first_index: Some(0),
+            },
+        )
+        .unwrap();
+        let report = rebuilt.rebuilt_image().expect("a rebuild must be reported");
+        assert_eq!(
+            report.dropped_images, 1,
+            "one older image must go so the new evidence fits the budget"
+        );
+        assert_eq!(report.dropped_bytes, budget / 2 + image_len);
+        // Oldest first: the unnumbered image is the oldest, so it is the one
+        // dropped and the new evidence takes its name back.
+        assert_eq!(report.preserved_as, dir.0.join("state.json.corrupt"));
+        assert_eq!(fs::read(&report.preserved_as).unwrap(), live);
+        // The image that was kept is still there, unmodified.
+        assert_eq!(
+            fs::metadata(dir.0.join("state.json.corrupt.1"))
+                .unwrap()
+                .len(),
+            budget / 2 + image_len
+        );
+        assert_eq!(
+            fs::read(dir.0.join("operator-notes.txt")).unwrap(),
+            b"keep",
+            "cleanup must never touch a file that is not preserved evidence"
+        );
+    }
+
+    #[test]
+    fn a_single_image_larger_than_the_spool_budget_is_refused() {
+        let dir = TempDir::new();
+        let error = make_spool_room(&dir.0, MAX_CORRUPT_SPOOL_BYTES + 1).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("exceeds the preserved-evidence budget"),
+            "unexpected error: {error}"
+        );
     }
 
     #[tokio::test]

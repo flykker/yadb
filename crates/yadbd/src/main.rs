@@ -3731,7 +3731,7 @@ async fn commit_keyed_apply(
         let meta = st.meta.clone();
         let record_key = key.to_owned();
         let result = tokio::task::spawn_blocking(move || {
-            meta.execute_with_ack(KvCommand::RevisionTxn {
+            meta.execute(KvCommand::RevisionTxn {
                 guards: vec![
                     yadb_metakv::RevisionGuard {
                         key: CONTROL_STATE_KEY.into(),
@@ -3767,11 +3767,20 @@ async fn commit_keyed_apply(
         })
         .await;
         match result {
-            Ok(Ok(ack)) if matches!(ack.result, yadb_metakv::KvResult::TxnOk { .. }) => {
+            // No log position is reported here, deliberately. The keyed contract
+            // is that a replay is byte-identical to the original response, and a
+            // position cannot be reproduced by a replay: the record a replay
+            // re-serves was written *by* this transaction, so storing the
+            // position would need a second entry whose index is not the one that
+            // committed. Naming a position on the first answer and not on the
+            // retry would make the two answers differ, which is worse than
+            // reporting none. The plain control apply, which has no replay
+            // contract, does report it.
+            Ok(Ok(yadb_metakv::KvResult::TxnOk { .. })) => {
                 st.refresh_openraft_control_async().await;
-                return with_write_log_id(replay_record(record, fingerprint), &ack);
+                return replay_record(record, fingerprint);
             }
-            Ok(Ok(ack)) if matches!(ack.result, yadb_metakv::KvResult::CasConflict { .. }) => {
+            Ok(Ok(yadb_metakv::KvResult::CasConflict { .. })) => {
                 match read_record(st, key).await {
                     Ok(Some(record)) => return replay_record(record, fingerprint),
                     Ok(None) if attempt < MAX_ATTEMPTS => continue,
