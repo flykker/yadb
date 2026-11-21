@@ -3260,11 +3260,55 @@ corrupting one sextet of the encoder fails the round trip with
 quarter fails the worst-case frame test with `a maximum chunk frame is 1399647
 bytes, above the 1056776-byte bound`.
 
-Not proved: loopback TLS only, no mixed-version rolling upgrade, peak decode
+Not proved: loopback TLS only, no mixed-version rolling upgrade, and peak decode
 memory holds the frame plus the envelope plus the base64 string plus the decoded
-vector, and the frame is still 4.5× rather than 1.4× because
-`SignedRaftEnvelope.payload` is itself a JSON array of numbers in
-`openraft_transport.rs`, which this change does not touch.
+vector.
+
+### The envelope stops re-expanding the payload it carries
+
+The chunk fix above left one expansion step in place: `SignedRaftEnvelope`'s
+`payload` and `signature` were `Vec<u8>` with serde's default encoding, a JSON
+array of decimal numbers, so a payload that was already base64 was expanded
+again at up to four bytes per byte. On the worst-case chunk fixture the frame
+was 1,176,324 bytes for 262,144 bytes of data, 4.49×, and the 17 MiB round trip
+took 19–21 s.
+
+Both fields are now base64 through a shared `wire_bytes` module, and the chunk
+field uses the same module instead of its own copy of the codec. The worst-case
+chunk frame is **466,779 bytes, 1.78×** the data; `SNAPSHOT_CHUNK_FRAME` is
+474,232 rather than 1,406,304; and `large_snapshot_stream_round_trip` falls from
+19–21 s to **7.3 s**, so the whole library suite is 28.7 s at 12 threads.
+
+That also fixed a latent bug rather than only a cost. `sign` accepts a payload
+up to `MAX_PAYLOAD` (16 MiB) and `write_frame` refuses a frame above `MAX_FRAME`
+(32 MiB), but a 16 MiB payload written as an array of numbers is 67,109,110
+bytes: any payload above roughly 8 MiB passed verification and then could not be
+framed at all, failing with `frame exceeds limit`. Base64 makes the whole
+accepted range sendable, and `a_maximum_payload_fits_in_a_frame` pins the two
+constants together so a future encoder change cannot separate them again.
+
+The decoder still accepts the legacy array for both fields, so a peer running
+the older encoder is understood
+(`an_envelope_written_by_the_legacy_encoder_still_decodes`), and it is strict
+about padding and unused bits rather than decoding a damaged field to different
+bytes (`a_damaged_envelope_field_is_refused_rather_than_read_as_other_bytes`,
+plus the codec's own two tests in `wire_bytes`).
+
+Inversions, re-run on the merged tree: writing the envelope payload as an array
+of numbers again fails the worst-case frame test with `a maximum chunk frame is
+1399509 bytes, above the 474232-byte bound`; writing the chunk field as an array
+again fails it with `1165827 bytes`; and the same envelope inversion fails
+`a_maximum_payload_fits_in_a_frame` with `a maximum payload frame is 67109110
+bytes, above the 33554432-byte frame limit`. Tightening the ratio assertion to
+`1.0` fails it with `a maximum chunk frame is 1.78x its bytes (466779)`, so the
+number above is the measured one and not a copy of the bound.
+
+Not proved: base64 of base64 is still two expansion steps, so the frame is 1.78×
+rather than 1.0×; a binary inner encoding would reach 1.0× but would end the
+legacy-array compatibility that a mixed-version deployment needs. The
+cross-process mTLS suite (`openraft_runtime::process_tests`, 5 tests) passes with
+the new encoding, which is the only mixed-encoder evidence there is: it is still
+one host and one build.
 
 ### A purge reclaims the bytes it supersedes
 

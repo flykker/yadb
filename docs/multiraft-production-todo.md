@@ -484,10 +484,18 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   across groups, the receiver's on-disk staging area, and end-to-end snapshot
   capacity under the default deadlines. The encoded-frame reservation does not
   bound the transient decoded bytes, and `MAX_PAYLOAD` is verified only after a
-  `REQUEST` body of up to `MAX_FRAME` has been buffered. The chunk frame is
-  still 4.5× the data rather than 1.4× because `SignedRaftEnvelope.payload` is
-  itself written as a JSON array of numbers in `openraft_transport.rs`, which
-  this change does not touch.
+  `REQUEST` body of up to `MAX_FRAME` has been buffered.
+  `SignedRaftEnvelope.payload` and `signature` are base64 too, so the envelope
+  no longer re-expands the payload it carries: the worst-case chunk frame is
+  466,779 bytes, **1.78×** the data rather than 4.49×, the frame bound is
+  474,232, and the 17 MiB round trip falls to **7.3 s**. That also closed a
+  latent bug: `MAX_PAYLOAD` is 16 MiB and `MAX_FRAME` is 32 MiB, but a 16 MiB
+  payload written as an array of numbers is 67,109,110 bytes, so `sign`
+  accepted payloads that `write_frame` then refused with `frame exceeds
+  limit` (`a_maximum_payload_fits_in_a_frame` pins the two constants
+  together). Base64 of base64 is still two expansion steps: a binary inner
+  encoding would take the chunk frame to 1.0×, and this change deliberately
+  keeps the inner message JSON so the decoder can still read a legacy array.
   The checkpoint implementation is under validation: 32 MiB active-log limit,
   1024 replay frames, 4096 retained live entries and an 8 MiB serialized live
   checkpoint. Replacements sync a new file, rename, sync the directory, then

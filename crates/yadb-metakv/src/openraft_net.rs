@@ -100,12 +100,14 @@ const SNAPSHOT_CONTEXT: &str = "yadb-openraft-snapshot-stream/1";
 pub const MAX_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024 + 24;
 const SNAPSHOT_CHUNK_BYTES: usize = 256 * 1024;
 const SNAPSHOT_MANIFEST_PAYLOAD: usize = 64 * 1024;
-// JSON encodes bytes twice (payload and envelope), at most 16 bytes per byte.
-const SNAPSHOT_MANIFEST_FRAME: usize = SNAPSHOT_MANIFEST_PAYLOAD * 4 + 4096;
-// A chunk payload carries its bytes base64-encoded (4 characters per 3 bytes)
-// and the signed envelope then writes that payload as a JSON array of decimal
-// numbers, at most 4 bytes per payload byte (three digits and a comma).
-const SNAPSHOT_CHUNK_FRAME: usize = SNAPSHOT_CHUNK_BYTES.div_ceil(3) * 4 * 4 + 8192;
+// A manifest payload is small JSON: the context string, a nonce, a challenge,
+// the vote, the snapshot meta and a 32-byte digest. The signed envelope then
+// writes that payload as base64 (4 characters per 3 bytes).
+const SNAPSHOT_MANIFEST_FRAME: usize = SNAPSHOT_MANIFEST_PAYLOAD.div_ceil(3) * 4 + 4096;
+// A chunk payload carries its bytes base64-encoded (4 characters per 3 bytes),
+// and the signed envelope then writes that payload base64-encoded as well, so
+// the frame is (4/3)^2 = 16/9 of the chunk, plus the envelope's own fields.
+const SNAPSHOT_CHUNK_FRAME: usize = (SNAPSHOT_CHUNK_BYTES.div_ceil(3) * 4).div_ceil(3) * 4 + 8192;
 
 // Bound repeated diagnostic volume while retaining evidence of persistent faults.
 static SNAPSHOT_FAILURES: AtomicU64 = AtomicU64::new(0);
@@ -652,94 +654,11 @@ struct SnapshotManifest {
     digest: [u8; 32],
 }
 
-/// RFC 4648 standard base64, padded. Snapshot chunks used to carry `data` as a
-/// JSON array of decimal numbers, which costs roughly 3.6 bytes per byte in the
-/// chunk payload and is expanded again by the signed envelope. Base64 costs
-/// 4/3 bytes per byte and decodes in one pass, so a chunk payload shrinks from
-/// ~3.56x to ~1.34x and the frame that carries it shrinks with it.
-const BASE64_ALPHABET: &[u8; 64] =
-    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-fn encode_base64(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for group in bytes.chunks(3) {
-        let b0 = group[0] as u32;
-        let b1 = *group.get(1).unwrap_or(&0) as u32;
-        let b2 = *group.get(2).unwrap_or(&0) as u32;
-        let n = (b0 << 16) | (b1 << 8) | b2;
-        out.push(BASE64_ALPHABET[(n >> 18) as usize & 0x3f] as char);
-        out.push(BASE64_ALPHABET[(n >> 12) as usize & 0x3f] as char);
-        out.push(if group.len() > 1 {
-            BASE64_ALPHABET[(n >> 6) as usize & 0x3f] as char
-        } else {
-            '='
-        });
-        out.push(if group.len() > 2 {
-            BASE64_ALPHABET[n as usize & 0x3f] as char
-        } else {
-            '='
-        });
-    }
-    out
-}
-
-/// Strict base64 decode: the input must be padded, four characters per group,
-/// with `=` only in the last two positions and no non-zero unused bits. A
-/// malformed chunk is refused rather than decoded to different bytes.
-fn decode_base64(text: &str) -> Option<Vec<u8>> {
-    let bytes = text.as_bytes();
-    if bytes.len() % 4 != 0 {
-        return None;
-    }
-    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
-    for (group_index, group) in bytes.chunks(4).enumerate() {
-        let mut n = 0u32;
-        let mut padding = 0usize;
-        for (index, &byte) in group.iter().enumerate() {
-            let value = if byte == b'=' {
-                if index < 2 {
-                    return None;
-                }
-                padding += 1;
-                0
-            } else {
-                if padding != 0 {
-                    return None;
-                }
-                base64_value(byte)?
-            };
-            n = (n << 6) | value as u32;
-        }
-        // Padding is only legal in the final group.
-        if padding != 0 && group_index + 1 != bytes.len() / 4 {
-            return None;
-        }
-        match padding {
-            0 => out.extend_from_slice(&[(n >> 16) as u8, (n >> 8) as u8, n as u8]),
-            1 if n & 0xff == 0 => out.extend_from_slice(&[(n >> 16) as u8, (n >> 8) as u8]),
-            2 if n & 0xffff == 0 => out.push((n >> 16) as u8),
-            _ => return None,
-        }
-    }
-    Some(out)
-}
-
-fn base64_value(byte: u8) -> Option<u8> {
-    match byte {
-        b'A'..=b'Z' => Some(byte - b'A'),
-        b'a'..=b'z' => Some(byte - b'a' + 26),
-        b'0'..=b'9' => Some(byte - b'0' + 52),
-        b'+' => Some(62),
-        b'/' => Some(63),
-        _ => None,
-    }
-}
-
 fn serialize_chunk_data<S: serde::Serializer>(
     data: &[u8],
     serializer: S,
 ) -> Result<S::Ok, S::Error> {
-    serializer.serialize_str(&encode_base64(data))
+    crate::wire_bytes::serialize(data, serializer)
 }
 
 /// Accepts both the current base64 string and the legacy array of numbers, so a
@@ -747,31 +666,7 @@ fn serialize_chunk_data<S: serde::Serializer>(
 fn deserialize_chunk_data<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Vec<u8>, D::Error> {
-    use serde::de::{Error, SeqAccess, Visitor};
-
-    struct ChunkData;
-
-    impl<'de> Visitor<'de> for ChunkData {
-        type Value = Vec<u8>;
-
-        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            formatter.write_str("a base64 string or an array of byte values")
-        }
-
-        fn visit_str<E: Error>(self, value: &str) -> Result<Vec<u8>, E> {
-            decode_base64(value).ok_or_else(|| E::custom("invalid base64 snapshot chunk data"))
-        }
-
-        fn visit_seq<A: SeqAccess<'de>>(self, mut sequence: A) -> Result<Vec<u8>, A::Error> {
-            let mut out = Vec::with_capacity(sequence.size_hint().unwrap_or(0));
-            while let Some(byte) = sequence.next_element::<u8>()? {
-                out.push(byte);
-            }
-            Ok(out)
-        }
-    }
-
-    deserializer.deserialize_any(ChunkData)
+    crate::wire_bytes::deserialize(deserializer)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -3350,19 +3245,25 @@ mod reply_tests {
 
     #[test]
     fn base64_round_trips_every_byte_value_and_length() {
+        // The codec itself is unit-tested in `wire_bytes`; this pins that the
+        // chunk field and the frame it produces use it, at the sizes the
+        // snapshot path actually sends.
         for length in 0..=64usize {
             let data: Vec<u8> = (0..length).map(|i| (i * 37 + 11) as u8).collect();
-            let encoded = encode_base64(&data);
+            let encoded = crate::wire_bytes::encode(&data);
             assert_eq!(encoded.len(), data.len().div_ceil(3) * 4);
-            assert_eq!(decode_base64(&encoded), Some(data));
+            assert_eq!(crate::wire_bytes::decode(&encoded), Some(data));
         }
         let all: Vec<u8> = (0..=255).collect();
-        assert_eq!(decode_base64(&encode_base64(&all)), Some(all));
+        assert_eq!(
+            crate::wire_bytes::decode(&crate::wire_bytes::encode(&all)),
+            Some(all)
+        );
         // The standard alphabet's two non-alphanumeric characters survive a
         // JSON string unescaped, which is what keeps the payload at 4/3.
         let high = [0xffu8, 0xff, 0xff];
-        assert_eq!(encode_base64(&high), "////");
-        assert_eq!(decode_base64("////"), Some(high.to_vec()));
+        assert_eq!(crate::wire_bytes::encode(&high), "////");
+        assert_eq!(crate::wire_bytes::decode("////"), Some(high.to_vec()));
     }
 
     #[test]
@@ -3374,13 +3275,14 @@ mod reply_tests {
         };
         let client = ReplicaIdentity::new(group, 1, vec![1, 2]).unwrap();
         let key = NodeSigningKey::from_seed(&[1; 32]).unwrap();
-        // Worst case for the wire form: every base64 sextet is 36 ('k') or the
-        // trailing 32 ('g'), both three-digit decimals once the signed
-        // envelope writes the payload as a JSON array of numbers.
+        // Every byte pattern has the same base64 length, so the worst case is
+        // now the envelope's own fields rather than a choice of data: base64
+        // and the JSON punctuation around it. The data is still the pattern
+        // that used to be worst (`k`/`g` sextets, three digits as decimals).
         let data: Vec<u8> = (0..SNAPSHOT_CHUNK_BYTES)
             .map(|i| [0x92u8, 0x49, 0x24][i % 3])
             .collect();
-        let encoded = encode_base64(&data);
+        let encoded = crate::wire_bytes::encode(&data);
         assert_eq!(encoded.len(), SNAPSHOT_CHUNK_BYTES.div_ceil(3) * 4);
         assert!(encoded
             .bytes()
@@ -3411,6 +3313,17 @@ mod reply_tests {
         assert_eq!(decoded.data, data);
         assert_eq!(sha256(&decoded.data), decoded.digest);
         assert_eq!(decoded.data.len(), SNAPSHOT_CHUNK_BYTES);
+        // The frame is (4/3)^2 of the chunk: the chunk field is base64 and the
+        // envelope writes the payload base64 again. Pinned so a return to a
+        // JSON array of numbers, in either place, fails here rather than only
+        // costing throughput silently.
+        let ratio = frame.len() as f64 / SNAPSHOT_CHUNK_BYTES as f64;
+        assert!(
+            ratio < 1.85,
+            "a maximum chunk frame is {:.2}x its bytes ({})",
+            ratio,
+            frame.len()
+        );
     }
 
     #[test]
@@ -3527,14 +3440,16 @@ mod reply_tests {
                 serde_json::to_value(chunk(challenge, 0, 3, digest, data.clone())).unwrap();
             match case {
                 "bad_base64" => value["data"] = serde_json::Value::String("!!!!".into()),
-                "wrong_length" => value["data"] = serde_json::Value::String(encode_base64(&[1, 2])),
+                "wrong_length" => {
+                    value["data"] = serde_json::Value::String(crate::wire_bytes::encode(&[1, 2]))
+                }
                 "wrong_digest" => {
                     value["digest"] = serde_json::Value::Array(vec![serde_json::json!(7); 32])
                 }
                 _ => {
                     // Valid base64 of the declared length, one byte different:
                     // only the whole-snapshot digest can refuse this chunk.
-                    let mut encoded = encode_base64(&data).into_bytes();
+                    let mut encoded = crate::wire_bytes::encode(&data).into_bytes();
                     encoded[0] = if encoded[0] == b'A' { b'B' } else { b'A' };
                     value["data"] = serde_json::Value::String(String::from_utf8(encoded).unwrap());
                 }

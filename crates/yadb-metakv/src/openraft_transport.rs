@@ -71,11 +71,7 @@ struct PinState {
 }
 
 impl PinState {
-    fn new(
-        installed: Vec<PinRecord>,
-        retired: Vec<[u8; 32]>,
-        revoked: Vec<[u8; 32]>,
-    ) -> Self {
+    fn new(installed: Vec<PinRecord>, retired: Vec<[u8; 32]>, revoked: Vec<[u8; 32]>) -> Self {
         let mut state = Self {
             version: PIN_STATE_VERSION,
             checksum: 0,
@@ -88,7 +84,8 @@ impl PinState {
     }
 
     fn sort(&mut self) {
-        self.installed.sort_by_key(|record| (record.node, record.pin));
+        self.installed
+            .sort_by_key(|record| (record.node, record.pin));
         self.installed.dedup();
         self.retired.sort();
         self.retired.dedup();
@@ -600,7 +597,10 @@ impl PeerKeyRegistry {
                 Ok(())
             }
             PinChange::Retire { node, pin } => {
-                let active = pins.active.get(&node).ok_or(TransportError::UnknownSender)?;
+                let active = pins
+                    .active
+                    .get(&node)
+                    .ok_or(TransportError::UnknownSender)?;
                 // The last pin may not be retired: a node with no accepted pin
                 // can never authenticate again.
                 if active.len() <= 1 || !active.contains(&pin) {
@@ -741,7 +741,15 @@ pub struct SignedRaftEnvelope {
     pub sender: u32,
     pub recipient: u32,
     pub sequence: u64,
+    /// Base64 on the wire, with the legacy array of numbers still accepted.
+    ///
+    /// The payload is the serialised inner message, and that message may
+    /// already carry base64 chunk data, so writing this field as a JSON array
+    /// of decimal numbers multiplied the cost twice: a snapshot chunk reached
+    /// 4.5x its bytes. Base64 here brings the same frame to ~1.8x.
+    #[serde(with = "crate::wire_bytes")]
     pub payload: Vec<u8>,
+    #[serde(with = "crate::wire_bytes")]
     pub signature: Vec<u8>,
 }
 
@@ -1079,11 +1087,7 @@ mod tests {
 
         for (case, bytes, expected) in [
             ("garbage", b"not a pin state".to_vec(), "is corrupt"),
-            (
-                "truncated",
-                valid[..valid.len() - 5].to_vec(),
-                "is corrupt",
-            ),
+            ("truncated", valid[..valid.len() - 5].to_vec(), "is corrupt"),
             ("flipped checksum", flipped, "failed its integrity check"),
         ] {
             let dir = TempDir::new();
@@ -1172,10 +1176,7 @@ mod tests {
         let error = PeerKeyRegistry::open_for_replica(keys, &initial, &dir.0)
             .err()
             .expect("retiring the last pin must refuse startup");
-        assert!(
-            error.to_string().contains("would leave node 1"),
-            "{error}"
-        );
+        assert!(error.to_string().contains("would leave node 1"), "{error}");
     }
 
     #[test]
@@ -1285,6 +1286,88 @@ mod tests {
             decoded.verify(&two, Some(1), &registry).unwrap(),
             b"append-entries"
         );
+    }
+
+    #[test]
+    fn an_envelope_written_by_the_legacy_encoder_still_decodes() {
+        // The payload and the signature used to be JSON arrays of decimal
+        // numbers. A peer that still writes that form must be understood: the
+        // frame is a valid envelope, only its encoding differs.
+        let (one, two) = identities();
+        let (key_one, key_two) = keys();
+        let registry = registry(&key_one, &key_two);
+        let envelope =
+            SignedRaftEnvelope::sign(&one, 2, 1, b"append-entries".to_vec(), &key_one).unwrap();
+        let legacy = serde_json::json!({
+            "version": envelope.version,
+            "group": envelope.group,
+            "sender": envelope.sender,
+            "recipient": envelope.recipient,
+            "sequence": envelope.sequence,
+            "payload": envelope.payload,
+            "signature": envelope.signature,
+        });
+        let bytes = serde_json::to_vec(&legacy).unwrap();
+        // The legacy form really is an array of numbers, not a string.
+        assert!(bytes.windows(11).any(|w| w == b"\"payload\":["));
+        let decoded = SignedRaftEnvelope::decode_json(&bytes).unwrap();
+        assert_eq!(
+            decoded.verify(&two, Some(1), &registry).unwrap(),
+            b"append-entries"
+        );
+        // And the current encoder is a string of the same bytes.
+        let current = envelope.encode_json().unwrap();
+        assert!(current.windows(11).any(|w| w == b"\"payload\":\""));
+        assert!(current.len() < bytes.len(), "base64 must be smaller");
+    }
+
+    #[test]
+    fn a_maximum_payload_fits_in_a_frame() {
+        // `MAX_PAYLOAD` is the largest payload `sign` accepts, and `MAX_FRAME`
+        // is the largest frame `write_frame` will send. Those two constants
+        // must agree, and they did not while the payload was written as a JSON
+        // array of decimal numbers: 16 MiB of bytes is at least 48 MiB of
+        // `255,`-style elements, so a payload above roughly 8 MiB could not be
+        // framed at all and `write_frame` refused it after `sign` accepted it.
+        // Base64 makes the envelope 4/3 of the payload, so the whole accepted
+        // range is sendable again.
+        let (one, _two) = identities();
+        let key = keys().0;
+        let payload = vec![0xffu8; MAX_PAYLOAD];
+        let frame = SignedRaftEnvelope::sign(&one, 2, 1, payload, &key)
+            .unwrap()
+            .encode_json()
+            .unwrap();
+        assert!(
+            frame.len() <= crate::openraft_net::MAX_FRAME,
+            "a maximum payload frame is {} bytes, above the {}-byte frame limit",
+            frame.len(),
+            crate::openraft_net::MAX_FRAME
+        );
+        // And the bound is not trivially satisfied: base64 is 4/3, not 1/1.
+        assert!(frame.len() > MAX_PAYLOAD);
+    }
+
+    #[test]
+    fn a_damaged_envelope_field_is_refused_rather_than_read_as_other_bytes() {
+        let (one, two) = identities();
+        let (key_one, _key_two) = keys();
+        let registry = registry(&key_one, &keys().1);
+        let envelope =
+            SignedRaftEnvelope::sign(&one, 2, 1, b"append-entries".to_vec(), &key_one).unwrap();
+        let mut value = serde_json::to_value(&envelope).unwrap();
+        // One character of the base64 payload changed. Strict decoding rejects
+        // a string whose length is not a multiple of four, so the frame is
+        // refused instead of being decoded to different bytes and then
+        // rejected by the signature check for the wrong reason.
+        let payload = value["payload"].as_str().unwrap().to_string();
+        value["payload"] = serde_json::Value::String(payload[..payload.len() - 1].to_string());
+        let bytes = serde_json::to_vec(&value).unwrap();
+        assert_eq!(
+            SignedRaftEnvelope::decode_json(&bytes),
+            Err(TransportError::Encoding)
+        );
+        let _ = (&two, &registry);
     }
 
     #[test]
