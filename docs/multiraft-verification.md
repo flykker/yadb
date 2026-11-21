@@ -3448,11 +3448,21 @@ indices.
 
 ### Gates on this tree (2026-11-21)
 
-`cargo test -p yadb-metakv --lib` **293 passed** (30.2 s at 12 threads),
-`cargo test -p yadbd --bin yadbd -- --test-threads=1` **187 passed** (11.9 s),
+`cargo test -p yadb-metakv --lib` **298 passed** (29.1 s at 12 threads), its
+`crash_gate` **10 passed** and `openraft_runtime::process_tests` **5 passed**,
+`cargo test -p yadbd --bin yadbd -- --test-threads=1` **187 passed** (11.3 s),
 `cargo test -p yadb-io` **18 passed**, and all seven offline guards green:
 `test_doc_anchors.py` (9), `test_doc_test_names.py` (5),
 `test_protocols_review.py`, `test_openraft_suite_mapping.py`,
 `test_metrics_alert_rules.py`, `test_yadb_container_alerts.py` (30) and
 `tests/test_gc_refusal_protocol.py`. The container alert harness ran on this
 same tree: 182.1 s, no container or network left behind.
+
+The live gate ran on this same tree at `3887dfd` (the envelope base64 change):
+`python3 tests/protocols.py` **27 PASS / 0 SKIP / 0 FAIL**, log
+`/tmp/opencode/live-gate-2026-11-21b.log`, cluster
+`/tmp/yadb-protocols-3ddn956u` on ports 19001+, and no container or daemon left
+running afterwards. The cross-process snapshot install in that run moved 1504
+entries in 56.4 s and installed a snapshot past the stopped node's index, so the
+new encoding is exercised by a real `InstallSnapshot` stream, not only by the
+crate-level round trip.
