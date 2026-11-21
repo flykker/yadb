@@ -67,7 +67,7 @@ class StartNodeReplicaModeTest(unittest.TestCase):
                     mock.patch.object(dev, 'sync_replica_modes',
                                       side_effect=lambda r: calls.append('sync')), \
                     mock.patch.object(dev, '_bring_up',
-                                      side_effect=lambda r, s, n: calls.append('start')):
+                                      side_effect=lambda r, s, n, g=None: calls.append('start')):
                 command(args_for(root, **extra))
             # The first start writes every config in create mode; a node started
             # afterwards must reconcile from the directories on disk first, or

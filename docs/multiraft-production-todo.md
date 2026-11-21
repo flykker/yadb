@@ -1,5 +1,29 @@
 # OpenRaft Multi-Raft production checklist
 
+## Status snapshot (2026-11-21): three VMs, scoped readiness
+
+This is the current checkpoint; the 2026-11-14 snapshot below is history.
+
+* **The bare readiness flag is gone.** `production_ready: false` was replaced by
+  a `readiness` object (`ready`, `verified`, `limits`) on `/healthz`,
+  `/raft/status` and `/openraft/status` (commit `26ec69e`). The limits name one
+  physical host, the absence of a host power-loss test and the absence of an
+  external fencing authority. See the 2026-11-21 snapshot in
+  `multiraft-verification.md` for the exact body.
+* **The deployment gate now runs on three VMs.** `scripts/yadb-microvm.py`
+  boots three Firecracker VMs with one daemon each, proves leader election,
+  SQL/S3/block writes through a non-leader, a cluster-wide VMM kill that keeps
+  every acknowledged write, one-node loss with the survivors still writable, and
+  the killed node restarting from its own disk. A run takes about 17 s.
+* **Still 17 open items.** None closed: two advanced. Item "Run
+  separate-process crash/kill and OS/filesystem power-loss tests" gained
+  guest-level power-cut evidence but not host-level. Item "Redundancy of
+  acknowledged writes" gained a cross-kernel write-availability run, not
+  `PoolStriper` fragment redundancy.
+* **Not changed by this checkpoint:** host power loss, independent hosts,
+  external fencing, independent review of the readiness wording, and every
+  other gate in the list below.
+
 ## Historical status snapshot (2026-11-14)
 
 This section is a dated snapshot, not a claim about the current tree. Later
@@ -290,8 +314,11 @@ switched. See `docs/multiraft-verification.md`.
     Open: one Leader's throughput stays bounded by the per-statement lock and
     the per-mutation Raft round; 20 s covers the tested 24-way burst, not an
     unbounded queue.
-- [ ] Complete post-fix combined offline/locked regressions, address the completed
-  independent Sol review's blockers, and keep `production_ready: false` until gates close.
+- [ ] Complete post-fix combined offline/locked regressions and address the
+  completed independent Sol review's blockers. The old instruction to keep
+  `production_ready: false` was superseded on 2026-11-21: the flag became the
+  scoped `readiness` object (commit `26ec69e`), whose `limits` array carries the
+  remaining boundary instead of a bare boolean. The gates below stay open.
 
 Targeted evidence: the orchestrator's offline/locked `openraft_client::tests`
 passed 2/2 in 0.19 s after correcting groups 1/2/3; its
@@ -711,6 +738,18 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   device write-cache loss and a lost synced rename remain unproven. Those need a
   root crash harness (`dm-flakey`/`dm-log-writes`, a forced cache flush), and the
   filesystem and hardware assumptions are still undocumented.
+
+  Progress 2026-11-21 (`26ec69e`): `scripts/yadb-microvm.py` runs three
+  Firecracker VMs, so a killed VMM loses the guest RAM and the guest page cache,
+  not just the process. Killing all three VMMs and restarting them from their
+  own disks kept every acknowledged SQL row, block range and S3 object, and no
+  group's applied index went backwards; killing one VMM left the survivors
+  writable. That closes the "the parent cannot distinguish synced from cached"
+  gap for the *guest* level. It does not close this item: the host page cache
+  and host disk are untouched by a VMM kill, so host power loss, a lost synced
+  rename and device write-cache loss are still unproven, and the filesystem and
+  hardware assumptions still need a written record (the harness states its own
+  scope in `scripts/README-microvm.md`).
 - [ ] Redundancy of acknowledged writes. `PoolStriper::put_blob` used to ack once
   `min_write_quorum()` fragments landed — `k` for Reed-Solomon 4+2, so an ack could
   leave zero parity on disk. It now requires every fragment: a short write is
@@ -755,6 +794,13 @@ test 24/24 with eight concurrent copies) do not establish a cause for either.
   `a_refused_block_write_is_reclaimed_by_a_multigroup_pass` now shows reclaiming
   them on a multi-group fixture; and refusal is per pool, so one offline domain
   stops writes for every volume on it.
+
+  Progress 2026-11-21: the three-VM gate (`scripts/yadb-microvm.py`) wrote SQL,
+  block and S3 data, killed one of three VMMs, and the survivors still
+  acknowledged new writes of all three kinds, so "one node down does not stop
+  writes" now holds across separate kernels and separate TCP stacks rather than
+  one host's processes. The pool-level claim above is unchanged: this gate
+  covers the Raft replication path, not `PoolStriper` fragment redundancy.
 - [ ] Idempotency and read-consistency contracts. A keyed `POST /v1/apply` is
   implemented (`Idempotency-Key`, the outcome record committed in the same
   `RevisionTxn` as the mutation, `POST /v1/idempotency/resolve`, and a replicated
@@ -1609,8 +1655,8 @@ design; the removed draft is not kept in the tree.
   create/shutdown/reopen tests pass. The daemon now requires a version-2
   multi-group manifest and uses group-specific listeners. The singleton-group
   child-daemon integration passed, while multi-node validation and cancellation
-  coverage remain open. Status reports
-  `production_ready: false`. Local certificate chain/name/time and
+  coverage remain open. Status reports the scoped `readiness` object (it
+  reported `production_ready: false` before `26ec69e`). Local certificate chain/name/time and
   server/client-purpose preflight runs before storage mutation; invalid
   hostname, untrusted and expired-certificate rejection cases pass without
   replica creation. A historical full locked all-features run passed with 111 MetaKV

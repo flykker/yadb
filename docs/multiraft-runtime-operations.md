@@ -72,8 +72,8 @@ Focused shutdown cancellation passes retain the borrowed owner and retry;
 startup cancellation remains unsafe. The POSIX compaction stale-FD claim was false;
 explicit reopen and an append regression are retained only. At the time of this
 snapshot the legacy runtime was still the default, no existing cluster had been
-switched, old data was untouched, no migration had occurred, and
-`production_ready: false`.
+switched, old data was untouched, no migration had occurred, and the daemon
+still answered `production_ready: false` (replaced by `readiness` in 26ec69e).
 
 Status: **not production-ready**. At the time of this snapshot the legacy runtime
 was the default; no existing or production cluster had been switched. The user
@@ -170,7 +170,8 @@ route requires a verified signed subject (`x-yadb-subject` together with a valid
 `x-yadb-subject-signature`) and returns `401` otherwise; without a configured
 secret no subject can be verified, so the route stays open. `--subject-secret` is
 mandatory, so in a supported deployment the route is always authenticated. It
-reports `production_ready: false`; `client_traffic` is `multiraft` for the
+reports the structured `readiness` object (`ready`, `verified`, `limits`) that
+replaced the bare `production_ready` flag; `client_traffic` is `multiraft` for the
 multi-group owner and `single-group` for a single-group one. Group node/state/term/
 leader are cached local observations, alongside `last_log_index`,
 `last_applied`, `millis_since_quorum_ack` and (on a leader) `replication`, which

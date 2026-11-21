@@ -60,6 +60,10 @@ EXTERNAL = {
 # Names that described YADB code which has since been removed. The reason is
 # the commit that removed it, so the document's narrative can be dated.
 HISTORICAL = {
+    # The bare readiness boolean the daemon used to emit. It was replaced
+    # by the structured `readiness` object in 26ec69e; the documents that
+    # name it are narrating the state before that change.
+    "production_ready": "replaced by `readiness` in 26ec69e",
     "execute_with": "removed with the legacy RaftCore in ad67c94",
     "drive_outbound_with": "removed with the legacy RaftCore in ad67c94",
     "execute_keeps_waiting_through_silence_shorter_than_the_no_quorum_window":

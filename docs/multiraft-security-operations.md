@@ -149,7 +149,7 @@ deployment cannot reach the unauthenticated branch.
   records a summary) and therefore requires the same signed, allowlisted admin
   subject as `/v1/apply`. There is no unauthenticated deployment to preserve: a
   daemon with an empty `--admin-subject` refuses to start, so every reachable
-  scrub is checked. (`crates/yadbd/src/main.rs:8545` enforces the allowlist; the
+  scrub is checked. (`crates/yadbd/src/main.rs:8565` enforces the allowlist; the
   comment above the handler states that `require_admin`'s empty-allowlist branch
   is kept for library callers and tests, not as a reachable daemon mode.)
 

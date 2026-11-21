@@ -1,5 +1,83 @@
 # Multi-Raft verification and release evidence
 
+## Status snapshot (2026-11-21): readiness is a scoped claim
+
+The daemon used to answer `/healthz`, `/raft/status` and `/openraft/status` with
+a bare `"production_ready": false`. That is an assertion the process cannot
+support: it cannot see the host's disks, whether the three nodes are physically
+independent, or whether an operator has an external fencing authority. On the
+user's instruction the flag was removed and replaced by a `readiness` object
+(commit `26ec69e`):
+
+```json
+"readiness": {
+  "ready": true,
+  "verified": "three-node multi-raft: leader election, SQL/S3/block writes, one-node loss, cluster-wide VMM kill with acknowledged writes intact",
+  "limits": ["one physical host; independent hosts are not exercised",
+             "a VMM kill is not a host power loss; the host page cache and disk are untouched",
+             "no external fencing authority is configured"]
+}
+```
+
+The UI card that repeated the old flag now points at those two endpoints. This
+is a claim with a named boundary, not a bare `true`: the `limits` array is part
+of the answer and a green run must be quoted with it.
+
+### The three-VM gate
+
+`scripts/yadb-microvm.py` runs three Firecracker VMs, one `yadbd` each, on a
+host bridge (`172.30.0.11`–`.13`, port base 23600). Each node has its own
+kernel, its own TCP/IP stack and its own writable ext4 disk; the shared rootfs
+is read-only. This is what a container cannot provide: a `SIGKILL`ed VMM frees
+the guest RAM, so an acknowledgement that never reached the block device is
+genuinely lost, whereas a killed container leaves its dirty pages in the host
+page cache.
+
+One run on `26ec69e` (`--only all`, 16.9 s, log kept under
+`/tmp/opencode/yadb-microvm-i_aipd9x`):
+
+* the cluster came up with leaders `{1: 1, 2: 2, 3: 3}` and every replica
+  applied its complete log;
+* `examples/platform.yaml` applied; the guest reported
+  `readiness.ready = true` with three named limits over its own listener;
+* one SQL insert, one block write and one S3 object (real `--s3-listen` port,
+  SigV4, bucket `invoices-2026`) were acknowledged through node 2 while the
+  control leader was node 1, and read back byte-exactly on all three nodes;
+* all three VMMs were killed at once; every group re-elected a leader, every
+  replica applied its complete log again, the pre-cut SQL row, block range and
+  object were served **locally** by all three nodes, and no group's applied
+  index went backwards;
+* one VMM was killed; the survivors elected leaders for every group and
+  acknowledged new SQL, block and S3 writes; the killed node restarted from its
+  own disk, caught up and read the writes made while it was down.
+
+The gate is falsifiable, not decorative: with the replicas' metadata directories
+deleted before the restart (a temporary inversion, reverted) the run fails at
+`every group elected a leader on every node`, because the acknowledged state is
+gone. The normal restart path also exercises ext4 journal recovery when a kill
+lands mid-commit.
+
+### Gates on the same commit
+
+Offline, `-j 12`, `CARGO_INCREMENTAL=0`, `YADB_TEST_TMPDIR=/tmp/opencode`:
+`cargo test -p yadbd --bin yadbd` **187 passed** (11.26 s, single-threaded
+because the binary binds fixed ports) and
+`cargo test -p yadbd --test openraft_daemon` **8 passed** (14.40 s).
+`scripts/test_doc_anchors.py` 9/9 and `scripts/test_doc_test_names.py` 5/5.
+
+### What this snapshot still does not prove
+
+The VMM kill is a power cut at the guest level: the host page cache, the host
+filesystem and the host disk are untouched, so host power loss remains
+unexercised. All three nodes share one CPU, one RAM budget and one physical
+disk, so this shows the protocol tolerates one dead node, not that the nodes are
+independent failure domains. No external fencing authority is configured. The
+open items in `multiraft-production-todo.md` remain open; this section records
+what the flag now says, not that every gate closed.
+
+Sections below that mention `production_ready` are dated snapshots: that field
+no longer exists in the daemon.
+
 ## Historical status snapshot (2026-11-14)
 
 This section is a dated snapshot, not a current-status claim. Later sections
@@ -373,8 +451,9 @@ on loopback ports 8420–8422 and Raft on 18420–18428. This is a clean restart
 all nine group configs are `mode: open, initialize: false`, not a first create.
 The binary SHA-256 is
 `5775b7bc278210deb7f6c8b91a3ca42ac94bb26daf3b3aade8b29583b7d85773`
-(mode `0700`, 158,373,144 bytes). `metadata_runtime` is `openraft` and
-`production_ready` is false.
+(mode `0700`, 158,373,144 bytes). `metadata_runtime` is `openraft`; at the
+time the snapshot was taken the daemon still answered `production_ready: false`,
+a field that has since been replaced by `readiness`.
 
 **The deployment is no longer empty and is not treated as an empty reference.**
 At 21:25:24 local on 2026-11-14 the control group committed one apply that exactly
@@ -1343,8 +1422,9 @@ and the status route is `/openraft/status`. A separate disposable root provision
 from that tree started with `--openraft-config`, `scripts/yadb-local.py verify`
 passed on all three nodes with `metadata_runtime: openraft`, the status JSON no
 longer carries an `experimental` field, and `GET /experimental/openraft/status`
-returns `404`. The cluster is still `production_ready: false`; the rename changes
-no runtime behaviour and no routing identity.
+returns `404`. The cluster still answered `production_ready: false` at that
+snapshot; the rename changed no runtime behaviour and no routing identity, and
+the flag has since been replaced by `readiness`.
 
 ## Required failure record format
 
@@ -1678,8 +1758,8 @@ A fresh root was provisioned and run with `scripts/yadb-openraft-dev.py` at port
 base 23500: three daemon processes, each hosting control group 1 and data groups
 2 and 3 (three replicas per group), mutual TLS, `--metadata-runtime openraft`,
 and the PostgreSQL, S3 and iSCSI listeners enabled. Every node reported
-`metadata_runtime: openraft`, `client_traffic: multiraft` and
-`production_ready: false`. `metadata_runtime` names the runtime, and the daemon
+`metadata_runtime: openraft` and `client_traffic: multiraft`, and (as the field
+was then) `production_ready: false`. `metadata_runtime` names the runtime, and the daemon
 emits only `openraft` or `legacy` there; `multiraft` is the topology
 (one control group plus data groups) and appears only in `client_traffic`.
 Initial leaders were g1 = node 1, g2 = node 2,
@@ -1781,9 +1861,10 @@ returning 500 instead of the expected 501).
   returned the refusal before `sweep_groups`, which was kept under
   `#[allow(dead_code)]`. The per-group path has since been re-enabled; see
   "Per-group garbage collection on Multi-Raft" below.
-* `production_ready` stays false: this run proves the runtime works on three
-  processes, not that the durability and authorization gates for production are
-  met.
+* Readiness: this run proved the runtime works on three processes, not that
+  the durability and authorization gates for production are met. The bare
+  `production_ready` flag it reported has since been replaced by the scoped
+  `readiness` object; see the 2026-11-21 snapshot at the top of this document.
 * After the kill drills all three groups ended up led by node 1, so the soft
   leadership preference for groups 2 and 3 was not met. That is allowed and
   documented; a preferred node does not reclaim leadership automatically.

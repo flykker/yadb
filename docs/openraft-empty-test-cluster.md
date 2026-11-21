@@ -25,7 +25,8 @@ on loopback ports 8420–8422 and Raft on 18420–18428. This is a clean restart
 all nine group configs are `mode: open, initialize: false`, not a first create.
 The binary SHA-256 is
 `5775b7bc278210deb7f6c8b91a3ca42ac94bb26daf3b3aade8b29583b7d85773`.
-`metadata_runtime` is `openraft` and `production_ready` is false. The deployment
+`metadata_runtime` is `openraft`; the daemon answered `production_ready: false`
+at that snapshot, a field since replaced by the scoped `readiness` object. The deployment
 is **no longer empty**: at 21:25:24 on 2026-11-14 an unidentified apply committed
 exactly `examples/platform.yaml` (generation `1`, project `billing`, database
 `billing/ledger`, object store `billing/receipts`, pools `wal-fast`/`data-ec`).
@@ -286,10 +287,13 @@ merely by agreeing to this work or running local integration tests.
   make direct low-level deletion or barrier endpoints safe to use.
 * Protocol write behavior on a follower must be tested separately from HTTP
   forwarding; engine-level tests do not establish transparent portal failover.
-* Keep `production_ready: false`. Changing the selected client runtime is not
-  production qualification. Snapshot capacity/deadlines, the prior process
-  catch-up regression, resource isolation, lifecycle, security and host durability
-  gates remain tracked separately.
+* Readiness is a scoped claim, not a bare flag. The old advice to keep
+  `production_ready: false` was superseded on 2026-11-21: the field became the
+  `readiness` object, whose `limits` array names what a green run does not
+  prove. Changing the selected client runtime is still not production
+  qualification. Snapshot capacity/deadlines, the prior process catch-up
+  regression, resource isolation, lifecycle, security and host durability gates
+  remain tracked separately.
 * Returning to legacy after OpenRaft writes is not a rollback. Legacy has not
   received those writes; use a separately reviewed migration procedure or
   discard only explicitly disposable test data after authorization.

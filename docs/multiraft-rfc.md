@@ -1,7 +1,10 @@
 # Multi-Raft for YADB: architecture and staged migration
 
-Status: design proposal. Multi-Raft is implemented and runs the daemon, but it is
-not production-ready: the open gates in the implementation checklist are listed in
+Status: design proposal. Multi-Raft is implemented and runs the daemon. Its
+readiness is a scoped claim, not a bare flag: the daemon reports `readiness`
+(`ready`, `verified`, `limits`) and the limits name one physical host, the
+absence of a host power-loss test and the absence of an external fencing
+authority. The open gates in the implementation checklist are listed in
 [multiraft-production-todo.md](multiraft-production-todo.md). Collection is no
 longer blanket-refused; it runs one leased pass per data group and refuses a
 specific pass when its own preconditions (leadership, an unreadable fence, live

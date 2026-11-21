@@ -12,14 +12,15 @@ sets `cache_type: Writeback`, which fsyncs the backing file).
 Scenarios, in the order they run:
 
   * the cluster comes up and every group elects a leader on every node;
-  * SQL, S3 and block writes are acknowledged and read back through another
-    node, with the project's group, not the control group, doing the work;
-  * killing one of three VMMs (a power cut at the guest level) keeps
-    acknowledged writes and keeps the survivors writable;
-  * the killed node restarts from its own disk and catches up.
+  * SQL, S3 and block writes are acknowledged through a non-leader and read
+    back byte-exactly through every node;
+  * all three VMMs are killed at once, restarted from their own disks, and the
+    writes acknowledged before the cut must still be served locally;
+  * one of three VMMs is killed: the survivors keep acknowledging writes, and
+    the killed node restarts from its own disk and catches up.
 
 Usage:
-    python3 scripts/yadb-microvm.py [--port-base 23600] [--keep] [--only up]
+    python3 scripts/yadb-microvm.py [--port-base 23600] [--only up|services|powercut|lose|all]
 
 The script re-execs itself under passwordless sudo, because tap devices, the
 bridge and Firecracker need root. See scripts/README-microvm.md for the one-time
@@ -208,15 +209,6 @@ class Cluster:
             errors.append(f'bridge: {result.stderr.strip()}')
         if errors:
             raise RuntimeError('link cleanup: ' + '; '.join(errors))
-
-    def set_link(self, node, up):
-        """Cut or restore one node's only network path.
-
-        A downed tap drops every packet in both directions, so this is a clean
-        partition: the node is alive and its own listener still answers locally,
-        but no peer can reach it and it can reach no peer.
-        """
-        run('ip', 'link', 'set', self.tap[node], 'up' if up else 'down')
 
     # ---- per-node disk ---------------------------------------------------
 
@@ -780,7 +772,7 @@ def main():
             victim = None
     finally:
         for node in list(cluster.procs):
-            cluster.kill_vm(node)
+            cluster.stop_vm(node)
         cluster.link_down()
         if not args.keep:
             shutil.rmtree(root, ignore_errors=True)
