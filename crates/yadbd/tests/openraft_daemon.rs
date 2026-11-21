@@ -554,7 +554,7 @@ fn daemon_multigroup_http_shutdown_reopen_and_root_guards() {
         let v: Value =
             serde_json::from_slice(&ok(public, "GET", path, b"", "application/json")).unwrap();
         assert_eq!(v["metadata_runtime"], "openraft");
-        assert_eq!(v["production_ready"], false);
+        assert_eq!(v["readiness"]["ready"], true);
     }
     // The removed runtime's internal endpoints are not merely unauthorized in
     // OpenRaft mode; they are absent, so a request falls through to the S3 wire

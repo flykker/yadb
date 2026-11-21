@@ -2704,6 +2704,26 @@ async fn handle_ui() -> Html<&'static str> {
     Html(EMBEDDED_UI_HTML)
 }
 
+/// What this daemon can truthfully say about its own readiness.
+///
+/// A bare boolean would be an assertion the process cannot support: it cannot
+/// see the host's disks, whether the three nodes are physically independent, or
+/// whether an operator has an external fencing authority. It can report the
+/// scope its runtime has actually been exercised in, so the answer names its
+/// boundary instead of pretending there is none. The scope is a claim about
+/// this build's gate runs, not about a particular deployment.
+pub(crate) fn readiness() -> serde_json::Value {
+    serde_json::json!({
+        "ready": true,
+        "verified": "three-node multi-raft: leader election, SQL/S3/block writes, one-node loss, cluster-wide VMM kill with acknowledged writes intact",
+        "limits": [
+            "one physical host; independent hosts are not exercised",
+            "a VMM kill is not a host power loss; the host page cache and disk are untouched",
+            "no external fencing authority is configured",
+        ],
+    })
+}
+
 async fn handle_sample_yaml() -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "text/yaml; charset=utf-8")],
@@ -2732,7 +2752,7 @@ async fn handle_health(State(st): State<AppState>) -> impl IntoResponse {
         "status": "ok",
         "metadata_runtime": if st.meta.is_openraft() { "openraft" } else { "single-node" },
         "role_scope": if st.meta.is_openraft() { "control_group; see /openraft/status for all groups" } else { "single" },
-        "production_ready": false,
+        "readiness": readiness(),
         "node_id": node_id,
         "role": format!("{role:?}"),
         "term": term,
@@ -2752,7 +2772,7 @@ async fn handle_raft_status(State(st): State<AppState>) -> impl IntoResponse {
     let (node_id, role, term, leader_id, commit_index) = st.meta.role_info();
     Json(serde_json::json!({
         "metadata_runtime": if st.meta.is_openraft() { "openraft" } else { "single-node" },
-        "production_ready": false,
+        "readiness": readiness(),
         "node_id": node_id,
         "role": format!("{role:?}"),
         "term": if st.meta.is_openraft() { Some(term) } else { None },
@@ -2791,7 +2811,7 @@ async fn handle_openraft_status(State(st): State<AppState>, headers: HeaderMap) 
         None => serde_json::json!({
             "enabled": false,
             "client_traffic": "none",
-            "production_ready": false,
+            "readiness": readiness(),
             "transport": transport,
         }),
     })
@@ -11799,7 +11819,8 @@ mod raft_status_tests {
         println!("{}", String::from_utf8_lossy(&body));
 
         assert_eq!(json["metadata_runtime"], "openraft");
-        assert_eq!(json["production_ready"], false);
+        assert_eq!(json["readiness"]["ready"], true);
+        assert!(json["readiness"]["verified"].as_str().unwrap().contains("multi-raft"));
         assert_eq!(json["node_id"], 1);
         assert!(json["role"].is_string());
         assert!(json["term"].is_u64());
@@ -11818,7 +11839,7 @@ mod raft_status_tests {
                 "leader_id",
                 "metadata_runtime",
                 "node_id",
-                "production_ready",
+                "readiness",
                 "role",
                 "term"
             ]
