@@ -12,7 +12,7 @@ user's instruction the flag was removed and replaced by a `readiness` object
 ```json
 "readiness": {
   "ready": true,
-  "verified": "three-node multi-raft: leader election, SQL/S3/block writes, one-node loss, cluster-wide VMM kill with acknowledged writes intact",
+  "verified": "three-node multi-raft: leader election, SQL/pgwire/S3/block writes forwarded to each shard's leader, one-node loss, cluster-wide VMM kill with acknowledged writes intact",
   "limits": ["one physical host; independent hosts are not exercised",
              "a VMM kill is not a host power loss; the host page cache and disk are untouched",
              "no external fencing authority is configured"]
@@ -33,16 +33,49 @@ the guest RAM, so an acknowledgement that never reached the block device is
 genuinely lost, whereas a killed container leaves its dirty pages in the host
 page cache.
 
-One run (`--only all`, 21.5 s, log `/tmp/opencode/vm-gate-2026-11-21c.log`):
+### How a shard maps to a Raft group
+
+The unit is the same as YDB's tablet: **one shard is one Raft group with one
+leader, and only that leader commits.** The mapping is explicit rather than
+implicit:
+
+* the manifest carries `project_groups`, which maps a project id to a group id
+  (`crates/yadbd/src/openraft.rs:223`). `examples/platform.yaml` creates one
+  project, `billing`, which the apply assigns project id 1; the harness's
+  manifest maps it to group 2, and control-plane keys stay in group 1.
+* a key routes to a group by its namespace: `/db/<project>/...`,
+  `/s3/<project>/...`, `/block/<project>/...` and their sequence namespaces all
+  resolve through the project, while `/sys/...` resolves to the control group
+  (`crates/yadb-metakv/src/openraft_client.rs:199`).
+* the HTTP entry point asks for the role **of that key's group**, not of the
+  control group (`crates/yadbd/src/main.rs:2181`). If this node is the group's
+  leader it commits locally; otherwise it forwards the request to the leader's
+  public address, carrying the caller's subject signature
+  (`crates/yadbd/src/main.rs:2264`).
+
+So a client may address any node — the shard's leader is the only node that
+commits, exactly as in YDB — and "write through a follower" is not a weaker
+test than "write through the leader": a follower answering `200` can only have
+done so by forwarding. What is *not* YDB-shaped yet is the split policy: a
+project's whole key space is one group, with no automatic tablet splits, so the
+number of shards equals the number of configured groups rather than growing
+with data.
+
+One run (`--only all`, 23.3 s, log `/tmp/opencode/vm-gate-2026-11-21f.log`):
 
 * the cluster came up with leaders `{1: 1, 2: 2, 3: 3}` and every replica
   applied its complete log;
 * `examples/platform.yaml` applied; the guest reported
   `readiness.ready = true` with three named limits over its own listener;
-* one SQL insert, one block write, one pgwire insert (real `--pg-listen` wire,
-  not the HTTP query route) and one S3 object (real `--s3-listen` port, SigV4,
-  bucket `invoices-2026`) were acknowledged through node 2 while the control
-  leader was node 1, and read back byte-exactly on all three nodes;
+* the shard topology was resolved first: control group 1 led by node 1, project
+  1's data group 2 led by node 2. One SQL insert, one block write, one pgwire
+  insert (real `--pg-listen` wire, not the HTTP query route) and one S3 object
+  (real `--s3-listen` port, SigV4, bucket `invoices-2026`) were acknowledged
+  through node 1, which is a **follower of group 2**. A follower cannot commit,
+  so the acknowledgement proves the request was forwarded to the shard's leader;
+  the log then shows the SQL write advanced group 2 and left group 1 untouched.
+  A second SQL write went directly to node 2, the group 2 leader. All of it read
+  back byte-exactly on all three nodes;
 * all three VMMs were killed at once; every group re-elected a leader, every
   replica applied its complete log again, the pre-cut SQL row, block range,
   pgwire row and object were served **locally** by all three nodes, and no

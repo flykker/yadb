@@ -498,6 +498,19 @@ class Cluster:
     def local_groups(self, node):
         return self.status(node)['local_observations']
 
+    def group_rows(self, node):
+        """Every group this node hosts, keyed by group id."""
+        return {row['group']: row for row in self.local_groups(node)}
+
+    def group_row(self, node, group):
+        rows = self.group_rows(node)
+        if group not in rows:
+            raise RuntimeError(f'node {node} hosts no group {group}')
+        return rows[group]
+
+    def applied_map(self, node):
+        return {group: applied_index(row) for group, row in self.group_rows(node).items()}
+
     def leader_of(self, node, group):
         for row in self.local_groups(node):
             if row['group'] == group:
@@ -635,40 +648,87 @@ def scenario_up(cluster):
 
 
 def scenario_services(cluster):
-    """SQL, S3 and block writes, acknowledged on one node and read on another."""
-    leaders = {group: cluster.leader_of(1, group) for group in DEV.GROUPS}
-    # Write through a node that is *not* the project group's leader, so the
-    # write is forwarded and the project's own group does the work.
-    control = leaders[DEV.CONTROL_GROUP]
-    follower = next(n for n in NODES if n != control)
+    """One write per service through a shard *follower*, then a direct one.
 
-    status, body = cluster.sql(follower, 'CREATE TABLE IF NOT EXISTS gate (id INT PRIMARY KEY, note TEXT)')
+    A shard is one Raft group with one leader, and only that leader commits.
+    The deployment's clients may address any node, so a follower that answers
+    `200` can only have done so by forwarding to the shard's leader: a follower
+    cannot commit on its own. That is the property checked here, and it is why
+    the entry node is chosen as a follower of the project's group rather than
+    as "some node that is not the control leader".
+    """
+    leaders = {group: cluster.leader_of(1, group) for group in DEV.GROUPS}
+    control_group = DEV.CONTROL_GROUP
+    # `billing` is the single project in examples/platform.yaml; the apply
+    # assigns it project id 1, which the manifest maps to its data group. The
+    # mapping is asserted below from the log itself instead of trusted.
+    project_group = DEV.PROJECT_GROUPS['1']
+    shard_leader = leaders[project_group]
+    entry = next(node for node in NODES if node != shard_leader)
+    entry_state = cluster.group_row(entry, project_group)['state']
+    assert entry_state != 'Leader', (
+        f'entry node {entry} leads group {project_group}; the forwarding path '
+        f'would not be exercised')
+    print(f'topology: control group {control_group} led by {leaders[control_group]}; '
+          f'project group {project_group} led by {shard_leader}; '
+          f'writing through node {entry} ({entry_state} of group {project_group})',
+          flush=True)
+
+    before = cluster.applied_map(1)
+
+    status, body = cluster.sql(entry, 'CREATE TABLE IF NOT EXISTS gate (id INT PRIMARY KEY, note TEXT)')
     assert status in (200, 201), f'CREATE TABLE HTTP {status}: {body[:200]!r}'
     status, body = cluster.sql(
-        follower, f"INSERT INTO gate (id, note) VALUES (1, '{GATE_NOTE}')")
+        entry, f"INSERT INTO gate (id, note) VALUES (1, '{GATE_NOTE}')")
     assert status in (200, 201), f'INSERT HTTP {status}: {body[:200]!r}'
-    print(f'SQL write acknowledged through node {follower} (control leader {control})', flush=True)
+    print(f'SQL write acknowledged by a follower of group {project_group}', flush=True)
+
+    # Which group actually took the entry? The write is a SQL statement, so the
+    # project's data group must advance and the answer comes from the log, not
+    # from the harness's own manifest.
+    def committed_in_project_group():
+        now = cluster.applied_map(1)
+        advanced = {group for group, index in now.items()
+                    if before.get(group) is not None and index > before[group]}
+        if not advanced:
+            return 'no group advanced yet'
+        if advanced != {project_group}:
+            return f'advanced {sorted(advanced)}, expected only {project_group}'
+        return None
+
+    eventually('the SQL write advances exactly the project group',
+               committed_in_project_group, 60)
+    print(f'the write committed in group {project_group}, not in the control group',
+          flush=True)
 
     payload = BLOCK_PAYLOAD
-    status, _, body = cluster.block_write(follower, 'vm-root', 0, payload)
+    status, _, body = cluster.block_write(entry, 'vm-root', 0, payload)
     assert status in (200, 201, 204), f'block PUT HTTP {status}: {body[:200]!r}'
-    print(f'block write acknowledged through node {follower}', flush=True)
+    print(f'block write acknowledged by a follower of group {project_group}', flush=True)
 
     # The database must answer over the real PostgreSQL wire, not only through
-    # the HTTP query route, and from a node that is not the group's leader.
-    conn = cluster.pg(follower)
+    # the HTTP query route.
+    conn = cluster.pg(entry)
     try:
         conn.query('CREATE TABLE IF NOT EXISTS pg_gate (id INT PRIMARY KEY, note TEXT)')
         conn.query(f"INSERT INTO pg_gate (id, note) VALUES (1, '{PG_NOTE}')")
         assert conn.rows('SELECT note FROM pg_gate WHERE id = 1') == [[PG_NOTE]]
     finally:
         conn.close()
-    print(f'pgwire write and read acknowledged through node {follower}', flush=True)
+    print(f'pgwire write and read acknowledged through node {entry}', flush=True)
 
     object_body = S3_BODY
-    status, _, body = cluster.s3_put(follower, S3_KEY, object_body)
+    status, _, body = cluster.s3_put(entry, S3_KEY, object_body)
     assert status in (200, 201, 204), f'S3 PUT HTTP {status}: {body[:200]!r}'
-    print(f'S3 write acknowledged through node {follower}', flush=True)
+    print(f'S3 write acknowledged by a follower of group {project_group}', flush=True)
+
+    # The direct path: a write addressed to the shard's own leader commits
+    # without any forwarding, which is the ordinary YDB-shaped path.
+    status, body = cluster.sql(
+        shard_leader, "INSERT INTO gate (id, note) VALUES (2, 'direct-leader')")
+    assert status in (200, 201), f'INSERT on the shard leader HTTP {status}: {body[:200]!r}'
+    print(f'SQL write acknowledged directly by the group {project_group} leader '
+          f'{shard_leader}', flush=True)
 
     # Read back through every node, which waits out ordinary follower lag.
     def all_read():
@@ -676,6 +736,9 @@ def scenario_services(cluster):
             s, b = cluster.sql(node, 'SELECT note FROM gate WHERE id = 1')
             if s != 200 or GATE_NOTE.encode() not in b:
                 return f'SQL on node {node}: HTTP {s} {b[:120]!r}'
+            s, b = cluster.sql(node, 'SELECT note FROM gate WHERE id = 2')
+            if s != 200 or b'direct-leader' not in b:
+                return f'SQL (direct) on node {node}: HTTP {s} {b[:120]!r}'
             s, _, b = cluster.block_read(node, 'vm-root', 0, len(payload))
             if s != 200 or b != payload:
                 return f'block on node {node}: HTTP {s} {b[:120]!r}'
@@ -696,8 +759,7 @@ def scenario_services(cluster):
     eventually('SQL, block, S3 and pgwire read back on all three nodes', all_read, 120)
     print('SQL, block, S3 and pgwire read back byte-exactly on all three nodes', flush=True)
 
-    # The project's group, not the control group, must have advanced.
-    rows = {row['group']: row for row in cluster.local_groups(1)}
+    rows = cluster.group_rows(1)
     assert set(rows) == set(DEV.GROUPS), f'node 1 reports groups {sorted(rows)}'
     print(f'groups observed: {sorted(rows)}; project groups '
           f'{DEV.PROJECT_GROUPS}', flush=True)
@@ -783,7 +845,7 @@ def scenario_lose_one(cluster):
     print('survivors elected leaders for every group', flush=True)
 
     writer = survivors[0]
-    status, body = cluster.sql(writer, "INSERT INTO gate (id, note) VALUES (2, 'after-loss')")
+    status, body = cluster.sql(writer, "INSERT INTO gate (id, note) VALUES (3, 'after-loss')")
     assert status in (200, 201), f'INSERT after loss HTTP {status}: {body[:200]!r}'
     print(f'SQL write acknowledged on {writer} with node {victim} down', flush=True)
 
@@ -797,7 +859,7 @@ def scenario_lose_one(cluster):
 
     def survivors_read():
         for node in survivors:
-            s, b = cluster.sql(node, 'SELECT note FROM gate WHERE id = 2')
+            s, b = cluster.sql(node, 'SELECT note FROM gate WHERE id = 3')
             if s != 200 or b'after-loss' not in b:
                 return f'SQL on node {node}: HTTP {s} {b[:120]!r}'
             s, _, b = cluster.block_read(node, 'vm-root', 64, len(payload))
@@ -829,7 +891,7 @@ def scenario_recover(cluster, victim, survivors):
     wait_for(f'node {victim} applied its complete log again', caught_up, 240)
 
     def reads_everything():
-        s, b = cluster.sql(victim, 'SELECT note FROM gate WHERE id = 2')
+        s, b = cluster.sql(victim, 'SELECT note FROM gate WHERE id = 3')
         return s == 200 and b'after-loss' in b
     wait_for(f'node {victim} reads the writes made while it was down', reads_everything, 180)
     print(f'node {victim} restarted from its own disk and caught up', flush=True)

@@ -45,6 +45,11 @@ CITATION_RE = re.compile(
 CURRENT_CLAIMS = {
     "crates/yadbd/src/main.rs:80": ["value_parser", "openraft"],
     "crates/yadbd/src/main.rs:8565": ["require_admin"],
+    # `multiraft-verification.md`: how a shard maps to a Raft group.
+    "crates/yadbd/src/openraft.rs:223": ["project_groups", "BTreeMap"],
+    "crates/yadb-metakv/src/openraft_client.rs:199": ["group_id", "key"],
+    "crates/yadbd/src/main.rs:2181": ["is_openraft", "project.is_some()"],
+    "crates/yadbd/src/main.rs:2264": ["proxy_http_to_peer"],
     "crates/yadb-metakv/src/gc.rs:790": ["acquire_writer", "map(Some)"],
     "crates/yadb-db/src/lib.rs:940": ["acquire_writer_if_legacy"],
     "crates/yadb-db/src/tablet.rs:916": ["acquire_writer_if_legacy"],

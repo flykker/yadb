@@ -2715,7 +2715,7 @@ async fn handle_ui() -> Html<&'static str> {
 pub(crate) fn readiness() -> serde_json::Value {
     serde_json::json!({
         "ready": true,
-        "verified": "three-node multi-raft: leader election, SQL/S3/block writes, one-node loss, cluster-wide VMM kill with acknowledged writes intact",
+        "verified": "three-node multi-raft: leader election, SQL/pgwire/S3/block writes forwarded to each shard's leader, one-node loss, cluster-wide VMM kill with acknowledged writes intact",
         "limits": [
             "one physical host; independent hosts are not exercised",
             "a VMM kill is not a host power loss; the host page cache and disk are untouched",

@@ -63,11 +63,17 @@ path; the images are 768 MiB each and live under `$YADB_TEST_TMPDIR` (default
 * `up` — every group elects a leader on every node, `examples/platform.yaml`
   applies, and every replica applies its complete log. The guest also reports
   the structured `readiness` object over `/healthz` and `/openraft/status`.
-* `services` — one SQL insert, one block write, one pgwire insert and one S3
-  object are acknowledged through a node that is *not* the project group's
-  leader, then read back byte-exactly through all three nodes. S3 goes over the
-  real `--s3-listen` port with SigV4, not the internal `/s3/...` route, and the
-  database is read over the real `--pg-listen` wire, not the HTTP query route.
+* `services` — a shard is one Raft group with one leader, so the scenario
+  resolves which group owns project 1 (`project_groups` in the manifest) and
+  which node leads it, then writes through a *follower of that group*. The
+  follower cannot commit on its own, so a `200` proves the write was forwarded
+  to the shard's leader. One SQL insert, one block write, one pgwire insert and
+  one S3 object go that way; the run then checks from the log that the SQL
+  write advanced **only** the project group, not the control group, and repeats
+  a write directly on the shard leader to cover the non-forwarded path. All
+  four are read back byte-exactly through every node. S3 uses the real
+  `--s3-listen` port with SigV4, not the internal `/s3/...` route, and the
+  database is read over the real `--pg-listen` wire, not the HTTP route.
 * `powercut` — all three VMMs are `SIGKILL`ed, then all three are restarted
   from their own disks. There is no peer left to copy from, so the pre-cut SQL
   row, block range, pgwire row and object can only come off each node's own

@@ -12,9 +12,11 @@ This is the current checkpoint; the 2026-11-14 snapshot below is history.
   `multiraft-verification.md` for the exact body.
 * **The deployment gate now runs on three VMs.** `scripts/yadb-microvm.py`
   boots three Firecracker VMs with one daemon each, proves leader election,
-  SQL/S3/block writes through a non-leader, a cluster-wide VMM kill that keeps
-  every acknowledged write, one-node loss with the survivors still writable, and
-  the killed node restarting from its own disk. A run takes about 17 s.
+  SQL/pgwire/S3/block writes through a *follower* of the owning shard's Raft
+  group (so a `200` proves forwarding to that shard's leader, and the log shows
+  the write advanced only that group), a cluster-wide VMM kill that keeps every
+  acknowledged write, one-node loss with the survivors still writable, and the
+  killed node restarting from its own disk. A run takes about 21 s.
 * **Still 17 open items.** None closed: two advanced. Item "Run
   separate-process crash/kill and OS/filesystem power-loss tests" gained
   guest-level power-cut evidence but not host-level. Item "Redundancy of
