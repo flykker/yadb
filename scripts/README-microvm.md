@@ -63,13 +63,15 @@ path; the images are 768 MiB each and live under `$YADB_TEST_TMPDIR` (default
 * `up` — every group elects a leader on every node, `examples/platform.yaml`
   applies, and every replica applies its complete log. The guest also reports
   the structured `readiness` object over `/healthz` and `/openraft/status`.
-* `services` — one SQL insert, one block write and one S3 object are
-  acknowledged through a node that is *not* the project group's leader, then
-  read back byte-exactly through all three nodes. S3 goes over the real
-  `--s3-listen` port with SigV4, not the internal `/s3/...` route.
+* `services` — one SQL insert, one block write, one pgwire insert and one S3
+  object are acknowledged through a node that is *not* the project group's
+  leader, then read back byte-exactly through all three nodes. S3 goes over the
+  real `--s3-listen` port with SigV4, not the internal `/s3/...` route, and the
+  database is read over the real `--pg-listen` wire, not the HTTP query route.
 * `powercut` — all three VMMs are `SIGKILL`ed, then all three are restarted
   from their own disks. There is no peer left to copy from, so the pre-cut SQL
-  row, block range and object can only come off each node's own backing file.
+  row, block range, pgwire row and object can only come off each node's own
+  backing file.
   The applied index of every group must not go backwards.
 * `lose` — one VMM is killed, the survivors must elect leaders for every group
   and keep acknowledging SQL, block and S3 writes, and the killed node must

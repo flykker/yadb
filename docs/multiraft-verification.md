@@ -33,20 +33,20 @@ the guest RAM, so an acknowledgement that never reached the block device is
 genuinely lost, whereas a killed container leaves its dirty pages in the host
 page cache.
 
-One run on `26ec69e` (`--only all`, 16.9 s, log kept under
-`/tmp/opencode/yadb-microvm-i_aipd9x`):
+One run (`--only all`, 21.5 s, log `/tmp/opencode/vm-gate-2026-11-21c.log`):
 
 * the cluster came up with leaders `{1: 1, 2: 2, 3: 3}` and every replica
   applied its complete log;
 * `examples/platform.yaml` applied; the guest reported
   `readiness.ready = true` with three named limits over its own listener;
-* one SQL insert, one block write and one S3 object (real `--s3-listen` port,
-  SigV4, bucket `invoices-2026`) were acknowledged through node 2 while the
-  control leader was node 1, and read back byte-exactly on all three nodes;
+* one SQL insert, one block write, one pgwire insert (real `--pg-listen` wire,
+  not the HTTP query route) and one S3 object (real `--s3-listen` port, SigV4,
+  bucket `invoices-2026`) were acknowledged through node 2 while the control
+  leader was node 1, and read back byte-exactly on all three nodes;
 * all three VMMs were killed at once; every group re-elected a leader, every
-  replica applied its complete log again, the pre-cut SQL row, block range and
-  object were served **locally** by all three nodes, and no group's applied
-  index went backwards;
+  replica applied its complete log again, the pre-cut SQL row, block range,
+  pgwire row and object were served **locally** by all three nodes, and no
+  group's applied index went backwards;
 * one VMM was killed; the survivors elected leaders for every group and
   acknowledged new SQL, block and S3 writes; the killed node restarted from its
   own disk, caught up and read the writes made while it was down.

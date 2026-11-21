@@ -36,6 +36,8 @@ import os
 import re
 import shutil
 import signal
+import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -68,6 +70,7 @@ MEM_MIB = 1536
 # The writes the service gate acknowledges once and every later scenario
 # checks against, so a power cut is judged by data written before it.
 GATE_NOTE = 'vm-gate'
+PG_NOTE = 'pg-gate'
 BLOCK_PAYLOAD = b'block-payload-over-microvm'
 S3_BODY = b's3-object-over-microvm'
 S3_KEY = '/invoices-2026/gate-object'
@@ -141,6 +144,78 @@ def s3_signed(secret, host, method, path, body=b'', extra=None):
     return headers
 
 
+class Pg:
+    """Minimal pgwire client: startup, cleartext password, simple query.
+
+    The daemon's own protocol tests use a fuller client; this one exists so the
+    VM gate can prove the database answers over the real PostgreSQL wire from
+    another VM, not just through the HTTP query route. Only text-format rows are
+    parsed, which is all a `SELECT` of integers and strings needs.
+    """
+
+    def __init__(self, host, port, user, database, secret, timeout=30):
+        self.sock = socket.create_connection((host, port), timeout=timeout)
+        startup = struct.pack('!I', 196608)
+        startup += f'user\0{user}\0database\0{database}\0\0'.encode()
+        self.sock.sendall(struct.pack('!I', len(startup) + 4) + startup)
+        assert self.packet() == (b'R', struct.pack('!I', 3)), 'expected cleartext auth'
+        self.send(b'p', secret.encode() + b'\0')
+        self.until_ready()
+
+    def exact(self, count):
+        data = b''
+        while len(data) < count:
+            chunk = self.sock.recv(count - len(data))
+            if not chunk:
+                raise RuntimeError('pgwire connection closed mid-message')
+            data += chunk
+        return data
+
+    def send(self, kind, body):
+        self.sock.sendall(kind + struct.pack('!I', len(body) + 4) + body)
+
+    def packet(self):
+        kind = self.exact(1)
+        size, = struct.unpack('!I', self.exact(4))
+        return kind, self.exact(size - 4)
+
+    def until_ready(self):
+        messages = []
+        while True:
+            kind, data = self.packet()
+            messages.append((kind, data))
+            if kind == b'Z':
+                return messages
+
+    def query(self, sql):
+        self.send(b'Q', sql.encode() + b'\0')
+        return self.until_ready()
+
+    def rows(self, sql):
+        out = self.query(sql)
+        assert not any(kind == b'E' for kind, _ in out), out
+        rows = []
+        for kind, data in out:
+            if kind != b'D':
+                continue
+            columns, = struct.unpack('!H', data[:2])
+            data = data[2:]
+            row = []
+            for _ in range(columns):
+                length, = struct.unpack('!i', data[:4])
+                data = data[4:]
+                row.append(None if length < 0 else data[:length].decode())
+                data = data[max(length, 0):]
+            rows.append(row)
+        return rows
+
+    def close(self):
+        try:
+            self.send(b'X', b'')
+        finally:
+            self.sock.close()
+
+
 def eventually(description, probe, timeout=120):
     """Retry a probe that returns None on success or a failure description."""
     deadline = time.monotonic() + timeout
@@ -180,7 +255,7 @@ class Cluster:
         self.images = {}
         self.secret = None
         self.protocol_secret = None
-        self.s3_secret = None
+        self.user_secret = None
 
     # ---- host networking -------------------------------------------------
 
@@ -459,6 +534,14 @@ class Cluster:
                                  '/db/billing/ledger/query', body, headers, timeout)
         return status, out
 
+    def pg(self, node, timeout=30):
+        """A pgwire connection to one node's PostgreSQL listener."""
+        # The protocol user's password comes from credentials.json; the
+        # signing secret is a different value and the listener closes the
+        # connection when they are mixed up.
+        return Pg(NODE_IP[node], DEV.pg_port(self.base, node), DEV.USER,
+                  'billing/ledger', self.user_secret, timeout)
+
     def apply(self, node, yaml_text):
         body = json.dumps({'yaml': yaml_text}).encode()
         headers = {'Content-Type': 'application/json',
@@ -473,12 +556,12 @@ class Cluster:
         return f'{NODE_IP[node]}:{DEV.s3_port(self.base, node)}'
 
     def s3_put(self, node, key, data, timeout=120):
-        headers = s3_signed(self.s3_secret, self.s3_host(node), 'PUT', key, data)
+        headers = s3_signed(self.user_secret, self.s3_host(node), 'PUT', key, data)
         return request(NODE_IP[node], DEV.s3_port(self.base, node), 'PUT', key,
                        data, headers, timeout)
 
     def s3_get(self, node, key, timeout=120):
-        headers = s3_signed(self.s3_secret, self.s3_host(node), 'GET', key)
+        headers = s3_signed(self.user_secret, self.s3_host(node), 'GET', key)
         return request(NODE_IP[node], DEV.s3_port(self.base, node), 'GET', key,
                        headers=headers, timeout=timeout)
 
@@ -571,8 +654,19 @@ def scenario_services(cluster):
     assert status in (200, 201, 204), f'block PUT HTTP {status}: {body[:200]!r}'
     print(f'block write acknowledged through node {follower}', flush=True)
 
+    # The database must answer over the real PostgreSQL wire, not only through
+    # the HTTP query route, and from a node that is not the group's leader.
+    conn = cluster.pg(follower)
+    try:
+        conn.query('CREATE TABLE IF NOT EXISTS pg_gate (id INT PRIMARY KEY, note TEXT)')
+        conn.query(f"INSERT INTO pg_gate (id, note) VALUES (1, '{PG_NOTE}')")
+        assert conn.rows('SELECT note FROM pg_gate WHERE id = 1') == [[PG_NOTE]]
+    finally:
+        conn.close()
+    print(f'pgwire write and read acknowledged through node {follower}', flush=True)
+
     object_body = S3_BODY
-    status, _, body = cluster.s3_put(follower, '/invoices-2026/gate-object', object_body)
+    status, _, body = cluster.s3_put(follower, S3_KEY, object_body)
     assert status in (200, 201, 204), f'S3 PUT HTTP {status}: {body[:200]!r}'
     print(f'S3 write acknowledged through node {follower}', flush=True)
 
@@ -588,9 +682,19 @@ def scenario_services(cluster):
             s, _, b = cluster.s3_get(node, S3_KEY)
             if s != 200 or b != object_body:
                 return f'S3 on node {node}: HTTP {s} {b[:120]!r}'
+            try:
+                conn = cluster.pg(node)
+                try:
+                    got = conn.rows('SELECT note FROM pg_gate WHERE id = 1')
+                finally:
+                    conn.close()
+            except (OSError, RuntimeError) as error:
+                return f'pgwire on node {node}: {type(error).__name__}: {error}'
+            if got != [[PG_NOTE]]:
+                return f'pgwire on node {node}: {got!r}'
         return None
-    eventually('SQL, block and S3 read back on all three nodes', all_read, 120)
-    print('SQL, block and S3 read back byte-exactly on all three nodes', flush=True)
+    eventually('SQL, block, S3 and pgwire read back on all three nodes', all_read, 120)
+    print('SQL, block, S3 and pgwire read back byte-exactly on all three nodes', flush=True)
 
     # The project's group, not the control group, must have advanced.
     rows = {row['group']: row for row in cluster.local_groups(1)}
@@ -632,9 +736,20 @@ def scenario_power_cut(cluster):
             s, _, b = cluster.s3_get(node, S3_KEY)
             if s != 200 or b != S3_BODY:
                 return f'S3 on node {node}: HTTP {s} {b[:120]!r}'
+            try:
+                conn = cluster.pg(node)
+                try:
+                    got = conn.rows('SELECT note FROM pg_gate WHERE id = 1')
+                finally:
+                    conn.close()
+            except (OSError, RuntimeError) as error:
+                return f'pgwire on node {node}: {type(error).__name__}: {error}'
+            if got != [[PG_NOTE]]:
+                return f'pgwire on node {node}: {got!r}'
         return None
     eventually('the pre-cut writes are served locally on all three nodes', local_reads, 180)
-    print('the pre-cut SQL, block and S3 writes are served locally on all three nodes', flush=True)
+    print('the pre-cut SQL, block, S3 and pgwire writes are served locally '
+          'on all three nodes', flush=True)
 
     # A committed entry cannot disappear from a node's log: if the applied
     # index went backwards, the disk lost data that had been acknowledged.
@@ -755,7 +870,7 @@ def main():
         secrets = DEV.load_secrets(root / 'provision')
         cluster.secret = secrets['subject']
         cluster.protocol_secret = secrets['raft']
-        cluster.s3_secret = DEV.ensure_credentials(root / 'provision')
+        cluster.user_secret = DEV.ensure_credentials(root / 'provision')
         cluster.link_up()
         for node in NODES:
             cluster.build_node_image(node)
